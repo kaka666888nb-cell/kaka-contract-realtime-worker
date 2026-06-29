@@ -1,9 +1,7 @@
 services:
   - type: web
     name: kaka-contract-realtime-worker
-    env: node
+    runtime: docker
     plan: free
-    buildCommand: npm install --omit=dev
-    startCommand: npm start
     healthCheckPath: /health
     autoDeploy: true
