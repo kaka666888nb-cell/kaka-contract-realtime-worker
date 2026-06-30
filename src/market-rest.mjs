@@ -73,31 +73,47 @@ function intervalMs(interval) {
 }
 function okxBar(interval) {
   return ({
-    '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
-    '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '12h': '12H',
-    '1d': '1Dutc', '3d': '3Dutc', '1w': '1Wutc', '1M': '1Mutc',
-  })[interval] || '15m';
+    '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m',
+    '1h':'1H','2h':'2H','4h':'4H','6h':'6H','12h':'12H',
+    '1d':'1Dutc','3d':'3Dutc','1w':'1Wutc','1M':'1Mutc',
+  })[interval] || null;
 }
 function gateBar(interval) {
   return ({
-    '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h',
-    '2h': '2h', '4h': '4h', '6h': '6h', '8h': '8h', '12h': '12h',
-    '1d': '1d', '3d': '3d', '1w': '7d',
-  })[interval] || '15m';
+    '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1h',
+    '2h':'2h','4h':'4h','6h':'6h','8h':'8h','12h':'12h',
+    '1d':'1d','1w':'7d','1M':'30d',
+  })[interval] || null;
 }
-function bitgetBar(interval) {
+function bitgetBar(interval, market) {
+  if (market === 'spot') {
+    return ({
+      '1m':'1min','3m':'3min','5m':'5min','15m':'15min','30m':'30min',
+      '1h':'1h','4h':'4h','6h':'6h','12h':'12h',
+      '1d':'1day','3d':'3day','1w':'1week','1M':'1M',
+    })[interval] || null;
+  }
   return ({
-    '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
-    '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '12h': '12H',
-    '1d': '1D', '3d': '3D', '1w': '1W', '1M': '1M',
-  })[interval] || '15m';
+    '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m',
+    '1h':'1H','4h':'4H','6h':'6H','12h':'12H',
+    '1d':'1D','3d':'3D','1w':'1W','1M':'1M',
+  })[interval] || null;
 }
 function bybitBar(interval) {
   return ({
-    '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
-    '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720',
-    '1d': 'D', '1w': 'W', '1M': 'M',
-  })[interval] || '15';
+    '1m':'1','3m':'3','5m':'5','15m':'15','30m':'30',
+    '1h':'60','2h':'120','4h':'240','6h':'360','12h':'720',
+    '1d':'D','1w':'W','1M':'M',
+  })[interval] || null;
+}
+function sourceIntervalFor(provider, interval) {
+  const fallback = {
+    okx: { '8h':'4h' },
+    gate: { '3d':'1d' },
+    bitget: { '2h':'1h', '8h':'4h' },
+    bybit: { '8h':'4h', '3d':'1d' },
+  };
+  return fallback[provider]?.[interval] || interval;
 }
 function coinbaseSourceGranularity(interval) {
   const targetSeconds = Math.max(60, Math.floor(intervalMs(interval) / 1000));
@@ -118,7 +134,7 @@ async function jsonFetch(urls, timeout = 15_000) {
         signal: controller.signal,
         headers: {
           accept: 'application/json',
-          'user-agent': 'KakaWeb3-Market-Worker/514.0',
+          'user-agent': 'KakaWeb3-Market-Worker/514.1.2',
         },
       });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -400,11 +416,11 @@ function krow(provider, market, symbol, interval, values) {
     volume: num(values[5]) || 0,
     quote_volume: num(values[6]) || 0,
     trade_count: num(values[7]) || 0,
-    source: `${provider}_official_public_kline_render`,
+    source: `${provider}_official_public_kline_render${sourceRows.length ? '_aggregated' : ''}`,
   };
 }
 
-function aggregateCoinbaseCandles(sourceRows, provider, market, symbol, interval) {
+function aggregateCandles(sourceRows, provider, market, symbol, interval) {
   const targetMs = intervalMs(interval);
   const buckets = new Map();
   const sorted = [...sourceRows].sort((a, b) => a.open_time_ms - b.open_time_ms);
@@ -490,15 +506,12 @@ async function coinbaseKlines(symbol, interval, end, limit) {
     pages += 1;
   }
   const dedupedSource = [...new Map(sourceRows.map((item) => [item.open_time_ms, item])).values()];
-  return aggregateCoinbaseCandles(dedupedSource, 'coinbase', 'spot', symbol, interval).slice(-limit);
+  return aggregateCandles(dedupedSource, 'coinbase', 'spot', symbol, interval).slice(-limit);
 }
 
-export async function fetchMarketKlines(provider, market, symbol, interval, end, limit) {
-  assertProviderMarket(provider, market);
+async function fetchNativeMarketKlines(provider, market, symbol, interval, end, limit) {
   let rows = [];
-  if (provider === 'coinbase') {
-    rows = await coinbaseKlines(symbol, interval, end, limit);
-  } else if (provider === 'binance') {
+  if (provider === 'binance') {
     const base = market === 'contract'
       ? 'https://fapi.binance.com/fapi/v1/klines'
       : 'https://api.binance.com/api/v3/klines';
@@ -507,60 +520,78 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
     );
     rows = (payload || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[7],a[8]])).filter(Boolean);
   } else if (provider === 'okx') {
+    const bar = okxBar(interval);
+    if (!bar) throw new Error(`okx interval ${interval} requires aggregation`);
     let after = end + 1;
     while (rows.length < limit) {
       const count = Math.min(300, limit - rows.length);
       const payload = await jsonFetch(
         `https://www.okx.com/api/v5/market/history-candles?instId=${encodeURIComponent(okxId(symbol, market))}` +
-        `&bar=${encodeURIComponent(okxBar(interval))}&after=${after}&limit=${count}`,
+        `&bar=${encodeURIComponent(bar)}&after=${after}&limit=${count}`,
       );
       const data = payload.data || [];
       if (!data.length) break;
       let oldest = after;
       for (const a of data) {
         const row = krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[7],0]);
-        if (row) {
-          rows.push(row);
-          oldest = Math.min(oldest, Number(a[0]));
-        }
+        if (row) { rows.push(row); oldest = Math.min(oldest, Number(a[0])); }
       }
       if (data.length < count || oldest >= after) break;
       after = oldest;
     }
   } else if (provider === 'gate') {
+    const bar = gateBar(interval);
+    if (!bar) throw new Error(`gate interval ${interval} requires aggregation`);
     const seconds = Math.max(60, Math.floor(intervalMs(interval) / 1000));
     const to = Math.floor(end / 1000);
     const from = Math.max(0, to - (limit + 5) * seconds);
     const url = market === 'contract'
       ? `https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=${encodeURIComponent(gateId(symbol))}` +
-        `&interval=${encodeURIComponent(gateBar(interval))}&from=${from}&to=${to}&limit=${Math.min(2000, limit)}`
+        `&interval=${encodeURIComponent(bar)}&from=${from}&to=${to}&limit=${Math.min(2000, limit)}`
       : `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${encodeURIComponent(gateId(symbol))}` +
-        `&interval=${encodeURIComponent(gateBar(interval))}&from=${from}&to=${to}&limit=${Math.min(1000, limit)}`;
+        `&interval=${encodeURIComponent(bar)}&from=${from}&to=${to}&limit=${Math.min(1000, limit)}`;
     const payload = await jsonFetch(url);
     rows = (payload || []).map((a) => Array.isArray(a)
       ? krow(provider, market, symbol, interval, [Number(a[0]) * 1000,a[5],a[3],a[4],a[2],a[6],a[1],0])
       : krow(provider, market, symbol, interval, [Number(a.t) * 1000,a.o,a.h,a.l,a.c,a.v,a.a ?? a.sum,a.n]))
       .filter(Boolean);
   } else if (provider === 'bitget') {
+    const bar = bitgetBar(interval, market);
+    if (!bar) throw new Error(`bitget interval ${interval} requires aggregation`);
     const base = market === 'contract'
       ? 'https://api.bitget.com/api/v2/mix/market/candles'
       : 'https://api.bitget.com/api/v2/spot/market/candles';
     const product = market === 'contract' ? '&productType=USDT-FUTURES' : '';
     const payload = await jsonFetch(
-      `${base}?symbol=${symbol}${product}&granularity=${encodeURIComponent(bitgetBar(interval))}` +
-      `&endTime=${end}&limit=${Math.min(1000, limit)}`,
+      `${base}?symbol=${symbol}${product}&granularity=${encodeURIComponent(bar)}` +
+      `&endTime=${end}&limit=${Math.min(market === 'spot' ? 200 : 1000, limit)}`,
     );
     rows = (payload.data || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
   } else if (provider === 'bybit') {
+    const bar = bybitBar(interval);
+    if (!bar) throw new Error(`bybit interval ${interval} requires aggregation`);
     const payload = await jsonFetch(
       `https://api.bybit.com/v5/market/kline?category=${market === 'contract' ? 'linear' : 'spot'}` +
-      `&symbol=${symbol}&interval=${encodeURIComponent(bybitBar(interval))}&end=${end}&limit=${Math.min(1000, limit)}`,
+      `&symbol=${symbol}&interval=${encodeURIComponent(bar)}&end=${end}&limit=${Math.min(1000, limit)}`,
     );
     rows = (payload.result?.list || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
   }
   return [...new Map(rows.map((item) => [item.open_time_ms, item])).values()]
     .sort((a, b) => a.open_time_ms - b.open_time_ms)
     .slice(-limit);
+}
+
+export async function fetchMarketKlines(provider, market, symbol, interval, end, limit) {
+  assertProviderMarket(provider, market);
+  if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
+  const sourceInterval = sourceIntervalFor(provider, interval);
+  const targetMs = intervalMs(interval);
+  const sourceMs = intervalMs(sourceInterval);
+  const factor = Math.max(1, Math.ceil(targetMs / sourceMs));
+  const sourceLimit = Math.min(5000, limit * factor + factor * 4);
+  const sourceRows = await fetchNativeMarketKlines(provider, market, symbol, sourceInterval, end, sourceLimit);
+  if (sourceInterval === interval) return sourceRows.slice(-limit);
+  return aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
 }
 
 export async function handleMarketApi(req, res, url) {

@@ -65,8 +65,8 @@ function okxChannel(interval) {
 }
 function gateInterval(interval) {
   const map = {
-    '1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','2h':'2h','4h':'4h',
-    '6h':'6h','8h':'8h','12h':'12h','1d':'1d','3d':'3d','1w':'7d',
+    '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','2h':'2h','4h':'4h',
+    '6h':'6h','8h':'8h','12h':'12h','1d':'1d','1w':'7d','1M':'30d',
   };
   return map[interval] || '15m';
 }
@@ -84,6 +84,14 @@ function bybitInterval(interval) {
     '4h':'240','6h':'360','12h':'720','1d':'D','1w':'W','1M':'M',
   };
   return map[interval] || '15';
+}
+function usesRestPolling(provider, interval) {
+  if (provider === 'coinbase' || provider === 'binance') return false;
+  if (provider === 'okx') return interval === '8h';
+  if (provider === 'gate') return interval === '3d';
+  if (provider === 'bitget') return interval === '2h' || interval === '8h';
+  if (provider === 'bybit') return interval === '8h' || interval === '3d';
+  return false;
 }
 function numberText(value, fallback = '0') {
   const parsed = Number(value);
@@ -212,6 +220,7 @@ async function coinbaseConfig(symbol, interval) {
 
 async function upstreamConfig(provider, market, symbol, interval) {
   if (provider === 'coinbase') return coinbaseConfig(symbol, interval);
+  if (usesRestPolling(provider, interval)) return { restPoll: true };
   if (provider === 'binance') return {
     url: market === 'contract'
       ? `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_${interval}`
@@ -353,6 +362,45 @@ wss.on('connection', async (client, _req, parsedUrl) => {
 
   let upstream;
   let heartbeat;
+  let restPollTimer;
+  let restPollBusy = false;
+  if (cfg.restPoll === true) {
+    const sendLatest = async () => {
+      if (restPollBusy || client.readyState !== WebSocket.OPEN) return;
+      restPollBusy = true;
+      try {
+        const rows = await fetchMarketKlines(provider, market, symbol, interval, Date.now(), 3);
+        const latest = rows.at(-1);
+        if (!latest || client.readyState !== WebSocket.OPEN) return;
+        client.send(normalizedMessage(
+          provider,
+          market,
+          symbol,
+          interval,
+          [latest.open_time_ms,latest.open,latest.high,latest.low,latest.close,latest.volume,latest.quote_volume],
+          Date.now() > Date.parse(latest.close_time || ''),
+          latest.trade_count,
+        ));
+      } catch (_) {
+        // 保持连接，下一轮继续读取同平台官方公开K线；绝不跨平台回落。
+      } finally {
+        restPollBusy = false;
+      }
+    };
+    client.send(JSON.stringify({ type:'ready', provider, market, symbol, interval, protocol:'kaka.market.realtime.v1', mode:'official_rest_poll' }));
+    await sendLatest();
+    restPollTimer = setInterval(sendLatest, 2500);
+    heartbeat = setInterval(() => {
+      if (client.readyState === WebSocket.OPEN) client.ping();
+    }, 20_000);
+    const cleanupPoll = () => {
+      clearInterval(restPollTimer);
+      clearInterval(heartbeat);
+    };
+    client.on('close', cleanupPoll);
+    client.on('error', cleanupPoll);
+    return;
+  }
   try {
     upstream = new WebSocket(cfg.url, { handshakeTimeout: 15_000 });
   } catch (error) {
@@ -409,4 +457,4 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 514.0 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 514.1.2 listening on ${PORT}`));
