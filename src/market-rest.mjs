@@ -134,7 +134,7 @@ async function jsonFetch(urls, timeout = 15_000) {
         signal: controller.signal,
         headers: {
           accept: 'application/json',
-          'user-agent': 'KakaWeb3-Market-Worker/514.1.2',
+          'user-agent': 'KakaWeb3-Market-Worker/514.1.4',
         },
       });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);

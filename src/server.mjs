@@ -6,7 +6,7 @@ const PORT = Number(process.env.PORT || 10000);
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const SPOT_PROVIDERS = ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate'];
 const CONTRACT_PROVIDERS = ['binance', 'okx', 'bybit', 'bitget', 'gate'];
-const VALID_INTERVALS = new Set(['1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1d','3d','1w','1M']);
+const VALID_INTERVALS = new Set(['timeline','1s','1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1d','3d','1w','1M']);
 
 function providerKey(raw) {
   const value = String(raw || '').trim().toLowerCase().replaceAll('gate.io', 'gate');
@@ -48,7 +48,7 @@ function gateSymbol(symbol) {
 }
 function intervalMs(interval) {
   const map = {
-    '1m':60_000,'3m':180_000,'5m':300_000,'15m':900_000,'30m':1_800_000,
+    'timeline':60_000,'1s':1_000,'1m':60_000,'3m':180_000,'5m':300_000,'15m':900_000,'30m':1_800_000,
     '1h':3_600_000,'2h':7_200_000,'4h':14_400_000,'6h':21_600_000,
     '8h':28_800_000,'12h':43_200_000,'1d':86_400_000,'3d':259_200_000,
     '1w':604_800_000,'1M':2_592_000_000,
@@ -133,7 +133,262 @@ function normalizedMessage(provider, market, symbol, interval, values, closed = 
   });
 }
 
-async function coinbaseConfig(symbol, interval) {
+
+function isRealtimeSecondInterval(interval) {
+  return interval === '1s';
+}
+
+function sourceInterval(interval) {
+  return interval === 'timeline' ? '1m' : interval;
+}
+
+function tradeItem(timestamp, price, size) {
+  const time = Number(timestamp);
+  const px = Number(price);
+  const qty = Math.abs(Number(size));
+  if (!Number.isFinite(time) || !Number.isFinite(px) || px <= 0 || !Number.isFinite(qty)) return null;
+  const normalizedTime = time < 10_000_000_000 ? time * 1000 : time;
+  return { time: normalizedTime, price: px, size: qty };
+}
+
+function secondTradeConfig(provider, market, symbol) {
+  if (provider === 'binance') {
+    return {
+      tradeMode: true,
+      url: market === 'contract'
+        ? `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@aggTrade`
+        : `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@aggTrade`,
+      subscribe: null,
+      parseTrades(raw) {
+        const message = JSON.parse(raw.toString());
+        const payload = message?.data ?? message;
+        if (payload?.e !== 'aggTrade') return [];
+        const item = tradeItem(payload.T ?? payload.E, payload.p, payload.q);
+        return item ? [item] : [];
+      },
+    };
+  }
+  if (provider === 'coinbase') {
+    const productId = coinbaseProductId(symbol);
+    return {
+      tradeMode: true,
+      url: 'wss://advanced-trade-ws.coinbase.com',
+      subscribe: [
+        { type: 'subscribe', product_ids: [productId], channel: 'market_trades' },
+        { type: 'subscribe', channel: 'heartbeats' },
+      ],
+      parseTrades(raw) {
+        const message = JSON.parse(raw.toString());
+        if (message?.channel !== 'market_trades') return [];
+        const items = [];
+        for (const event of Array.isArray(message.events) ? message.events : []) {
+          for (const trade of Array.isArray(event?.trades) ? event.trades : []) {
+            if (String(trade.product_id || '').toUpperCase() !== productId) continue;
+            const item = tradeItem(Date.parse(String(trade.time || '')), trade.price, trade.size);
+            if (item) items.push(item);
+          }
+        }
+        return items;
+      },
+    };
+  }
+  if (provider === 'okx') {
+    return {
+      tradeMode: true,
+      url: 'wss://ws.okx.com:8443/ws/v5/public',
+      subscribe: { op: 'subscribe', args: [{ channel: 'trades', instId: okxInstId(symbol, market) }] },
+      parseTrades(raw) {
+        const message = JSON.parse(raw.toString());
+        if (message?.arg?.channel !== 'trades') return [];
+        const items = [];
+        for (const trade of Array.isArray(message?.data) ? message.data : []) {
+          const item = tradeItem(trade.ts, trade.px ?? trade.price, trade.sz ?? trade.size);
+          if (item) items.push(item);
+        }
+        return items;
+      },
+    };
+  }
+  if (provider === 'bybit') {
+    return {
+      tradeMode: true,
+      url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
+      subscribe: { op: 'subscribe', args: [`publicTrade.${symbol}`] },
+      heartbeatMessage: { op: 'ping' },
+      parseTrades(raw) {
+        const message = JSON.parse(raw.toString());
+        if (!String(message?.topic || '').startsWith('publicTrade.')) return [];
+        const items = [];
+        for (const trade of Array.isArray(message?.data) ? message.data : []) {
+          const item = tradeItem(trade.T ?? message.ts, trade.p ?? trade.price, trade.v ?? trade.size);
+          if (item) items.push(item);
+        }
+        return items;
+      },
+    };
+  }
+  if (provider === 'bitget') {
+    return {
+      tradeMode: true,
+      url: 'wss://ws.bitget.com/v2/ws/public',
+      subscribe: {
+        op: 'subscribe',
+        args: [{
+          instType: market === 'contract' ? 'USDT-FUTURES' : 'SPOT',
+          channel: 'trade',
+          instId: symbol,
+        }],
+      },
+      parseTrades(raw) {
+        const message = JSON.parse(raw.toString());
+        if (message?.arg?.channel !== 'trade') return [];
+        const items = [];
+        for (const trade of Array.isArray(message?.data) ? message.data : []) {
+          if (Array.isArray(trade)) {
+            const item = tradeItem(trade[0], trade[1], trade[2]);
+            if (item) items.push(item);
+          } else if (trade && typeof trade === 'object') {
+            const item = tradeItem(trade.ts ?? message.ts, trade.price ?? trade.px, trade.size ?? trade.sz);
+            if (item) items.push(item);
+          }
+        }
+        return items;
+      },
+    };
+  }
+  if (provider === 'gate') {
+    const contract = market === 'contract';
+    return {
+      tradeMode: true,
+      url: contract ? 'wss://fx-ws.gateio.ws/v4/ws/usdt' : 'wss://api.gateio.ws/ws/v4/',
+      subscribe: {
+        time: Math.floor(Date.now() / 1000),
+        channel: contract ? 'futures.trades' : 'spot.trades',
+        event: 'subscribe',
+        payload: [gateSymbol(symbol)],
+      },
+      parseTrades(raw) {
+        const message = JSON.parse(raw.toString());
+        const expected = contract ? 'futures.trades' : 'spot.trades';
+        if (message?.channel !== expected || message?.event !== 'update') return [];
+        const list = Array.isArray(message?.result) ? message.result : (message?.result ? [message.result] : []);
+        const items = [];
+        for (const trade of list) {
+          const time = trade.create_time_ms ?? trade.create_time ?? trade.time_ms ?? trade.time;
+          const size = contract ? (trade.size ?? trade.amount) : (trade.amount ?? trade.size);
+          const item = tradeItem(time, trade.price, size);
+          if (item) items.push(item);
+        }
+        return items;
+      },
+    };
+  }
+  throw new Error('unsupported trade provider');
+}
+
+function createSecondTradeAggregator({ provider, market, symbol, interval, client }) {
+  let candle = null;
+  let lastOfficialPrice = null;
+  let lastTradeAt = 0;
+  let lastSentSignature = '';
+
+  function sendCandle(current, closed) {
+    if (!current || client.readyState !== WebSocket.OPEN) return;
+    const signature = `${current.start}:${current.open}:${current.high}:${current.low}:${current.close}:${current.volume}:${current.trades}:${closed}`;
+    if (signature === lastSentSignature) return;
+    lastSentSignature = signature;
+    client.send(normalizedMessage(
+      provider,
+      market,
+      symbol,
+      interval,
+      [current.start,current.open,current.high,current.low,current.close,current.volume,current.quoteVolume],
+      closed,
+      current.trades,
+    ));
+  }
+
+  function newFlatCandle(start, price) {
+    return {
+      start,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+      volume: 0,
+      quoteVolume: 0,
+      trades: 0,
+    };
+  }
+
+  function advanceTo(targetStart) {
+    if (!candle || lastOfficialPrice == null || targetStart <= candle.start) return;
+    sendCandle(candle, true);
+    const missing = Math.min(120, Math.max(0, Math.floor((targetStart - candle.start) / 1000) - 1));
+    let nextStart = candle.start + 1000;
+    for (let i = 0; i < missing; i++, nextStart += 1000) {
+      const flat = newFlatCandle(nextStart, lastOfficialPrice);
+      sendCandle(flat, true);
+    }
+    candle = newFlatCandle(targetStart, lastOfficialPrice);
+  }
+
+  function ingest(rawTrades) {
+    const now = Date.now();
+    const trades = (Array.isArray(rawTrades) ? rawTrades : [])
+      .filter((item) => item && item.time >= now - 120_000 && item.time <= now + 10_000)
+      .sort((a, b) => a.time - b.time);
+    let changed = false;
+    for (const trade of trades) {
+      const start = Math.floor(trade.time / 1000) * 1000;
+      if (!candle) {
+        candle = newFlatCandle(start, trade.price);
+        candle.volume = trade.size;
+        candle.quoteVolume = trade.size * trade.price;
+        candle.trades = 1;
+      } else if (start > candle.start) {
+        advanceTo(start);
+        candle.open = trade.price;
+        candle.high = trade.price;
+        candle.low = trade.price;
+        candle.close = trade.price;
+        candle.volume = trade.size;
+        candle.quoteVolume = trade.size * trade.price;
+        candle.trades = 1;
+      } else if (start === candle.start) {
+        candle.high = Math.max(candle.high, trade.price);
+        candle.low = Math.min(candle.low, trade.price);
+        candle.close = trade.price;
+        candle.volume += trade.size;
+        candle.quoteVolume += trade.size * trade.price;
+        candle.trades += 1;
+      } else {
+        continue;
+      }
+      lastOfficialPrice = trade.price;
+      lastTradeAt = Math.max(lastTradeAt, trade.time);
+      changed = true;
+    }
+    if (changed) sendCandle(candle, false);
+  }
+
+  function tick() {
+    if (!candle || lastOfficialPrice == null) return;
+    const nowBucket = Math.floor(Date.now() / 1000) * 1000;
+    if (nowBucket > candle.start) advanceTo(nowBucket);
+    sendCandle(candle, false);
+  }
+
+  return {
+    ingest,
+    tick,
+    status() {
+      return { hasTrade: lastOfficialPrice != null, lastTradeAt };
+    },
+  };
+}
+
+async function coinbaseConfig(symbol, interval, outputInterval = interval) {
   const productId = coinbaseProductId(symbol);
   const bucketMs = intervalMs(interval);
   let candle = null;
@@ -159,7 +414,7 @@ async function coinbaseConfig(symbol, interval) {
       'coinbase',
       'spot',
       symbol,
-      interval,
+      outputInterval,
       [current.start,current.open,current.high,current.low,current.close,current.volume,current.quoteVolume],
       closed,
       current.trades,
@@ -219,12 +474,14 @@ async function coinbaseConfig(symbol, interval) {
 }
 
 async function upstreamConfig(provider, market, symbol, interval) {
-  if (provider === 'coinbase') return coinbaseConfig(symbol, interval);
-  if (usesRestPolling(provider, interval)) return { restPoll: true };
+  const upstreamInterval = sourceInterval(interval);
+  if (isRealtimeSecondInterval(interval)) return secondTradeConfig(provider, market, symbol);
+  if (provider === 'coinbase') return coinbaseConfig(symbol, upstreamInterval, interval);
+  if (usesRestPolling(provider, upstreamInterval)) return { restPoll: true, sourceInterval: upstreamInterval };
   if (provider === 'binance') return {
     url: market === 'contract'
-      ? `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_${interval}`
-      : `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${interval}`,
+      ? `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`
+      : `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`,
     subscribe: null,
     parse(raw) {
       const message = JSON.parse(raw.toString());
@@ -236,7 +493,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
   };
   if (provider === 'okx') return {
     url: 'wss://ws.okx.com:8443/ws/v5/business',
-    subscribe: { op: 'subscribe', args: [{ channel: okxChannel(interval), instId: okxInstId(symbol, market) }] },
+    subscribe: { op: 'subscribe', args: [{ channel: okxChannel(upstreamInterval), instId: okxInstId(symbol, market) }] },
     parse(raw) {
       const message = JSON.parse(raw.toString());
       const candle = Array.isArray(message?.data) ? message.data[0] : null;
@@ -253,7 +510,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
         time: Math.floor(Date.now() / 1000),
         channel: contract ? 'futures.candlesticks' : 'spot.candlesticks',
         event: 'subscribe',
-        payload: [gateInterval(interval), gateSymbol(symbol)],
+        payload: [gateInterval(upstreamInterval), gateSymbol(symbol)],
       },
       parse(raw) {
         const message = JSON.parse(raw.toString());
@@ -273,7 +530,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
       op: 'subscribe',
       args: [{
         instType: market === 'contract' ? 'USDT-FUTURES' : 'SPOT',
-        channel: bitgetChannel(interval),
+        channel: bitgetChannel(upstreamInterval),
         instId: symbol,
       }],
     },
@@ -287,7 +544,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
   };
   if (provider === 'bybit') return {
     url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
-    subscribe: { op: 'subscribe', args: [`kline.${bybitInterval(interval)}.${symbol}`] },
+    subscribe: { op: 'subscribe', args: [`kline.${bybitInterval(upstreamInterval)}.${symbol}`] },
     heartbeatMessage: { op: 'ping' },
     parse(raw) {
       const message = JSON.parse(raw.toString());
@@ -308,7 +565,9 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
+      version: '514.1.5',
       protocol: 'kaka.market.realtime.v1',
+      realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
       spot_providers: SPOT_PROVIDERS,
       contract_providers: CONTRACT_PROVIDERS,
@@ -363,13 +622,15 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   let upstream;
   let heartbeat;
   let restPollTimer;
+  let secondTickTimer;
+  let secondAggregator;
   let restPollBusy = false;
   if (cfg.restPoll === true) {
     const sendLatest = async () => {
       if (restPollBusy || client.readyState !== WebSocket.OPEN) return;
       restPollBusy = true;
       try {
-        const rows = await fetchMarketKlines(provider, market, symbol, interval, Date.now(), 3);
+        const rows = await fetchMarketKlines(provider, market, symbol, cfg.sourceInterval || interval, Date.now(), 3);
         const latest = rows.at(-1);
         if (!latest || client.readyState !== WebSocket.OPEN) return;
         client.send(normalizedMessage(
@@ -410,6 +671,7 @@ wss.on('connection', async (client, _req, parsedUrl) => {
 
   const cleanup = () => {
     clearInterval(heartbeat);
+    clearInterval(secondTickTimer);
     try {
       if (upstream?.readyState === WebSocket.OPEN || upstream?.readyState === WebSocket.CONNECTING) upstream.close();
     } catch (_) {}
@@ -420,8 +682,16 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   upstream.on('open', () => {
     const subscriptions = Array.isArray(cfg.subscribe) ? cfg.subscribe : (cfg.subscribe ? [cfg.subscribe] : []);
     for (const subscription of subscriptions) upstream.send(JSON.stringify(subscription));
+    if (cfg.tradeMode === true) {
+      secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
+      secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
+    }
     if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({ type:'ready', provider, market, symbol, interval, protocol:'kaka.market.realtime.v1' }));
+      client.send(JSON.stringify({
+        type:'ready', provider, market, symbol, interval,
+        protocol:'kaka.market.realtime.v1',
+        mode: cfg.tradeMode === true ? 'official_public_trade_1s' : 'official_public_kline',
+      }));
     }
     heartbeat = setInterval(() => {
       if (upstream.readyState === WebSocket.OPEN) {
@@ -437,6 +707,11 @@ wss.on('connection', async (client, _req, parsedUrl) => {
     const text = raw.toString();
     if (text === 'pong') return;
     try {
+      if (cfg.tradeMode === true) {
+        const trades = cfg.parseTrades(raw);
+        secondAggregator?.ingest(trades);
+        return;
+      }
       const normalized = cfg.parse(raw);
       if (!normalized || client.readyState !== WebSocket.OPEN) return;
       const messages = Array.isArray(normalized) ? normalized : [normalized];
@@ -457,4 +732,4 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 514.1.2 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 514.1.5 listening on ${PORT}`));
