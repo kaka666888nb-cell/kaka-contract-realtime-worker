@@ -54,6 +54,7 @@ function clamp(value, min, max, fallback) {
 }
 function intervalMs(interval) {
   return ({
+    '1s': 1_000,
     '1m': 60_000,
     '3m': 180_000,
     '5m': 300_000,
@@ -134,7 +135,7 @@ async function jsonFetch(urls, timeout = 15_000) {
         signal: controller.signal,
         headers: {
           accept: 'application/json',
-          'user-agent': 'KakaWeb3-Market-Worker/514.1.4',
+          'user-agent': 'KakaWeb3-Market-Worker/514.1.6',
         },
       });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -416,7 +417,7 @@ function krow(provider, market, symbol, interval, values) {
     volume: num(values[5]) || 0,
     quote_volume: num(values[6]) || 0,
     trade_count: num(values[7]) || 0,
-    source: `${provider}_official_public_kline_render${sourceRows.length ? '_aggregated' : ''}`,
+    source: `${provider}_official_public_kline_render`,
   };
 }
 
@@ -581,8 +582,211 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
     .slice(-limit);
 }
 
+
+
+function normalizeTradeTimestamp(value) {
+  if (typeof value === 'string' && !/^\d+(?:\.\d+)?$/.test(value.trim())) {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  if (parsed < 10_000_000_000) return Math.round(parsed * 1000);
+  if (parsed > 10_000_000_000_000) return Math.round(parsed / 1000);
+  return Math.round(parsed);
+}
+
+function publicTrade(timestamp, price, size, id = '') {
+  const time = normalizeTradeTimestamp(timestamp);
+  const px = num(price);
+  const qty = Math.abs(num(size) || 0);
+  if (time === null || px === null || px <= 0) return null;
+  return { time, price: px, size: qty, id: String(id || '') };
+}
+
+function dedupePublicTrades(items) {
+  const seen = new Set();
+  const rows = [];
+  for (const trade of items) {
+    if (!trade) continue;
+    const key = trade.id || `${trade.time}:${trade.price}:${trade.size}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push(trade);
+  }
+  rows.sort((a, b) => a.time - b.time || a.price - b.price);
+  return rows;
+}
+
+async function recentPublicTrades(provider, market, symbol, end, limit) {
+  const wanted = Math.max(100, Math.min(5000, Number(limit) || 1000));
+  const trades = [];
+  if (provider === 'binance') {
+    const base = market === 'contract'
+      ? 'https://fapi.binance.com/fapi/v1/aggTrades'
+      : 'https://api.binance.com/api/v3/aggTrades';
+    let beforeId = null;
+    let pages = 0;
+    while (trades.length < wanted && pages < 6) {
+      const pageLimit = Math.min(1000, Math.max(100, wanted - trades.length));
+      let url;
+      if (beforeId == null) {
+        url = `${base}?symbol=${symbol}&endTime=${Math.max(1, end)}&limit=${pageLimit}`;
+      } else {
+        const fromId = Math.max(0, beforeId - pageLimit);
+        url = `${base}?symbol=${symbol}&fromId=${fromId}&limit=${pageLimit}`;
+      }
+      const payload = await jsonFetch(
+        market === 'spot'
+          ? [url, url.replace('https://api.binance.com', 'https://data-api.binance.vision')]
+          : url,
+        20_000,
+      );
+      const page = Array.isArray(payload) ? payload : [];
+      if (!page.length) break;
+      let oldestId = null;
+      for (const item of page) {
+        const trade = publicTrade(item.T ?? item.E, item.p, item.q, item.a ?? item.id);
+        if (trade && trade.time <= end + 5_000) trades.push(trade);
+        const id = Number(item.a ?? item.id);
+        if (Number.isFinite(id)) oldestId = oldestId == null ? id : Math.min(oldestId, id);
+      }
+      if (oldestId == null || oldestId <= 0 || oldestId === beforeId) break;
+      beforeId = oldestId;
+      pages += 1;
+    }
+  } else if (provider === 'coinbase') {
+    const productId = coinbaseProductId(symbol);
+    const payload = await jsonFetch(`${COINBASE_BASE_URL}/products/${encodeURIComponent(productId)}/trades`, 20_000);
+    for (const item of Array.isArray(payload) ? payload : []) {
+      const trade = publicTrade(item.time, item.price, item.size, item.trade_id);
+      if (trade && trade.time <= end + 5_000) trades.push(trade);
+    }
+  } else if (provider === 'okx') {
+    const payload = await jsonFetch(
+      `https://www.okx.com/api/v5/market/trades?instId=${encodeURIComponent(okxId(symbol, market))}&limit=500`,
+      20_000,
+    );
+    for (const item of payload.data || []) {
+      const trade = publicTrade(item.ts, item.px, item.sz, item.tradeId);
+      if (trade && trade.time <= end + 5_000) trades.push(trade);
+    }
+  } else if (provider === 'bybit') {
+    const category = market === 'contract' ? 'linear' : 'spot';
+    const maxLimit = market === 'contract' ? 1000 : 60;
+    const payload = await jsonFetch(
+      `https://api.bybit.com/v5/market/recent-trade?category=${category}&symbol=${symbol}&limit=${maxLimit}`,
+      20_000,
+    );
+    for (const item of payload.result?.list || []) {
+      const trade = publicTrade(item.time ?? item.T, item.price, item.size, item.execId ?? item.i);
+      if (trade && trade.time <= end + 5_000) trades.push(trade);
+    }
+  } else if (provider === 'bitget') {
+    const url = market === 'contract'
+      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${symbol}&productType=USDT-FUTURES&limit=100`
+      : `https://api.bitget.com/api/v2/spot/market/fills?symbol=${symbol}&limit=500`;
+    const payload = await jsonFetch(url, 20_000);
+    for (const item of payload.data || []) {
+      const trade = publicTrade(item.ts, item.price, item.size, item.tradeId);
+      if (trade && trade.time <= end + 5_000) trades.push(trade);
+    }
+  } else if (provider === 'gate') {
+    const raw = gateId(symbol);
+    const url = market === 'contract'
+      ? `https://api.gateio.ws/api/v4/futures/usdt/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
+      : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`;
+    const payload = await jsonFetch(url, 20_000);
+    for (const item of Array.isArray(payload) ? payload : []) {
+      const timestamp = item.create_time_ms ?? item.time_ms ?? item.create_time ?? item.time;
+      const trade = publicTrade(timestamp, item.price, item.amount ?? item.size, item.id);
+      if (trade && trade.time <= end + 5_000) trades.push(trade);
+    }
+  }
+  return dedupePublicTrades(trades).slice(-wanted);
+}
+
+function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limit) {
+  const buckets = new Map();
+  for (const trade of trades) {
+    if (!trade || trade.time > end + 5_000) continue;
+    const start = Math.floor(trade.time / 1000) * 1000;
+    const current = buckets.get(start);
+    if (!current) {
+      buckets.set(start, {
+        provider,
+        market_type: market,
+        symbol,
+        interval: '1s',
+        open_time: new Date(start).toISOString(),
+        open_time_ms: start,
+        close_time: new Date(start + 999).toISOString(),
+        open: trade.price,
+        high: trade.price,
+        low: trade.price,
+        close: trade.price,
+        volume: trade.size,
+        quote_volume: trade.size * trade.price,
+        trade_count: 1,
+        source: `${provider}_official_public_trade_1s_render`,
+      });
+    } else {
+      current.high = Math.max(current.high, trade.price);
+      current.low = Math.min(current.low, trade.price);
+      current.close = trade.price;
+      current.volume += trade.size;
+      current.quote_volume += trade.size * trade.price;
+      current.trade_count += 1;
+    }
+  }
+  const actual = [...buckets.values()].sort((a, b) => a.open_time_ms - b.open_time_ms);
+  if (!actual.length) return [];
+  const output = [];
+  let previous = actual[0];
+  output.push(previous);
+  for (let index = 1; index < actual.length; index++) {
+    const next = actual[index];
+    let cursor = previous.open_time_ms + 1000;
+    while (cursor < next.open_time_ms && output.length < limit * 2) {
+      output.push({
+        provider,
+        market_type: market,
+        symbol,
+        interval: '1s',
+        open_time: new Date(cursor).toISOString(),
+        open_time_ms: cursor,
+        close_time: new Date(cursor + 999).toISOString(),
+        open: previous.close,
+        high: previous.close,
+        low: previous.close,
+        close: previous.close,
+        volume: 0,
+        quote_volume: 0,
+        trade_count: 0,
+        source: `${provider}_official_public_trade_1s_gap_fill_render`,
+      });
+      cursor += 1000;
+    }
+    output.push(next);
+    previous = next;
+  }
+  return output.slice(-limit);
+}
+
+async function fetchSecondMarketKlines(provider, market, symbol, end, limit) {
+  // Binance Spot公开K线原生支持1s，直接读取最多1000根真实历史，避免以成交分页近似。
+  if (provider === 'binance' && market === 'spot') {
+    return fetchNativeMarketKlines(provider, market, symbol, '1s', end, Math.min(1000, limit));
+  }
+  const tradeLimit = Math.min(5000, Math.max(1000, limit * 8));
+  const trades = await recentPublicTrades(provider, market, symbol, end, tradeLimit);
+  return aggregateTradesToSecondRows(trades, provider, market, symbol, end, limit);
+}
+
 export async function fetchMarketKlines(provider, market, symbol, interval, end, limit) {
   assertProviderMarket(provider, market);
+  if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
+  if (interval === 'timeline') interval = '1m';
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
   const sourceInterval = sourceIntervalFor(provider, interval);
   const targetMs = intervalMs(interval);

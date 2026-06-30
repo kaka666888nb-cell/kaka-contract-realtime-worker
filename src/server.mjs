@@ -379,9 +379,45 @@ function createSecondTradeAggregator({ provider, market, symbol, interval, clien
     sendCandle(candle, false);
   }
 
+  function seedRows(rows) {
+    const sorted = (Array.isArray(rows) ? rows : [])
+      .filter((row) => row && Number.isFinite(Number(row.open_time_ms)) && Number(row.close) > 0)
+      .sort((a, b) => Number(a.open_time_ms) - Number(b.open_time_ms));
+    for (const row of sorted) {
+      if (client.readyState !== WebSocket.OPEN) break;
+      client.send(normalizedMessage(
+        provider,
+        market,
+        symbol,
+        interval,
+        [row.open_time_ms,row.open,row.high,row.low,row.close,row.volume,row.quote_volume],
+        Number(row.open_time_ms) + 1000 <= Date.now(),
+        row.trade_count,
+      ));
+    }
+    const latest = sorted.at(-1);
+    if (!latest) return;
+    const latestStart = Number(latest.open_time_ms);
+    if (!candle || latestStart > candle.start) {
+      candle = {
+        start: latestStart,
+        open: Number(latest.open),
+        high: Number(latest.high),
+        low: Number(latest.low),
+        close: Number(latest.close),
+        volume: Number(latest.volume || 0),
+        quoteVolume: Number(latest.quote_volume || 0),
+        trades: Number(latest.trade_count || 0),
+      };
+      lastOfficialPrice = candle.close;
+      lastTradeAt = latestStart;
+    }
+  }
+
   return {
     ingest,
     tick,
+    seedRows,
     status() {
       return { hasTrade: lastOfficialPrice != null, lastTradeAt };
     },
@@ -475,6 +511,28 @@ async function coinbaseConfig(symbol, interval, outputInterval = interval) {
 
 async function upstreamConfig(provider, market, symbol, interval) {
   const upstreamInterval = sourceInterval(interval);
+  if (isRealtimeSecondInterval(interval) && provider === 'binance' && market === 'spot') return {
+    url: `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_1s`,
+    subscribe: null,
+    parse(raw) {
+      const message = JSON.parse(raw.toString());
+      const kline = message?.k || message?.data?.k;
+      if (!kline) return null;
+      return normalizedMessage(provider, market, symbol, interval,
+        [kline.t,kline.o,kline.h,kline.l,kline.c,kline.v,kline.q], kline.x, kline.n);
+    },
+  };
+  if (isRealtimeSecondInterval(interval) && provider === 'binance' && market === 'contract') return {
+    url: `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}_perpetual@continuousKline_1s`,
+    subscribe: null,
+    parse(raw) {
+      const message = JSON.parse(raw.toString());
+      const kline = message?.k || message?.data?.k;
+      if (!kline) return null;
+      return normalizedMessage(provider, market, symbol, interval,
+        [kline.t,kline.o,kline.h,kline.l,kline.c,kline.v,kline.q], kline.x, kline.n);
+    },
+  };
   if (isRealtimeSecondInterval(interval)) return secondTradeConfig(provider, market, symbol);
   if (provider === 'coinbase') return coinbaseConfig(symbol, upstreamInterval, interval);
   if (usesRestPolling(provider, upstreamInterval)) return { restPoll: true, sourceInterval: upstreamInterval };
@@ -565,7 +623,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '514.1.5',
+      version: '514.1.6',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -685,6 +743,11 @@ wss.on('connection', async (client, _req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
+      fetchMarketKlines(provider, market, symbol, '1s', Date.now(), 500)
+        .then((historyRows) => secondAggregator?.seedRows(historyRows))
+        .catch(() => {
+          // 某平台最近成交历史暂不可用时继续实时流，不跨平台回落。
+        });
     }
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({
@@ -732,4 +795,4 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 514.1.5 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 514.1.6 listening on ${PORT}`));
