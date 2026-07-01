@@ -61,14 +61,18 @@ function okxChannel(interval) {
     '1h':'candle1H','2h':'candle2H','4h':'candle4H','6h':'candle6H','12h':'candle12H',
     '1d':'candle1Dutc','3d':'candle3Dutc','1w':'candle1Wutc','1M':'candle1Mutc',
   };
-  return map[interval] || 'candle15m';
+  return map[interval] || null;
 }
-function gateInterval(interval) {
-  const map = {
-    '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','2h':'2h','4h':'4h',
-    '6h':'6h','8h':'8h','12h':'12h','1d':'1d','1w':'7d','1M':'30d',
+function gateInterval(interval, market) {
+  const spot = {
+    '1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h',
+    '4h':'4h','8h':'8h','1d':'1d','1w':'7d','1M':'30d',
   };
-  return map[interval] || '15m';
+  const contract = {
+    '1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h',
+    '4h':'4h','8h':'8h','1d':'1d','1w':'7d',
+  };
+  return (market === 'contract' ? contract : spot)[interval] || null;
 }
 function bitgetChannel(interval) {
   const map = {
@@ -76,22 +80,18 @@ function bitgetChannel(interval) {
     '1h':'candle1H','2h':'candle2H','4h':'candle4H','6h':'candle6H','12h':'candle12H',
     '1d':'candle1D','3d':'candle3D','1w':'candle1W','1M':'candle1M',
   };
-  return map[interval] || 'candle15m';
+  return map[interval] || null;
 }
 function bybitInterval(interval) {
   const map = {
     '1m':'1','3m':'3','5m':'5','15m':'15','30m':'30','1h':'60','2h':'120',
     '4h':'240','6h':'360','12h':'720','1d':'D','1w':'W','1M':'M',
   };
-  return map[interval] || '15';
+  return map[interval] || null;
 }
-function usesRestPolling(provider, interval) {
-  if (provider === 'coinbase' || provider === 'binance') return false;
-  if (provider === 'okx') return interval === '8h';
-  if (provider === 'gate') return interval === '3d';
-  if (provider === 'bitget') return interval === '2h' || interval === '8h';
-  if (provider === 'bybit') return interval === '8h' || interval === '3d';
-  return false;
+function usesRestPolling(provider, interval, upstreamInterval) {
+  if (provider === 'coinbase' || provider === 'binance' || interval === 'timeline') return false;
+  return upstreamInterval !== interval;
 }
 function numberText(value, fallback = '0') {
   const parsed = Number(value);
@@ -138,8 +138,20 @@ function isRealtimeSecondInterval(interval) {
   return interval === '1s';
 }
 
-function sourceInterval(interval) {
-  return interval === 'timeline' ? '1m' : interval;
+function sourceInterval(provider, market, interval) {
+  if (interval === 'timeline') return '1m';
+  const fallback = {
+    okx: { '8h':'4h' },
+    bitget: { '2h':'1h', '8h':'4h' },
+    bybit: { '8h':'4h', '3d':'1d' },
+  };
+  if (provider === 'gate') {
+    const gateFallback = market === 'contract'
+      ? { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1M':'1d' }
+      : { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d' };
+    return gateFallback[interval] || interval;
+  }
+  return fallback[provider]?.[interval] || interval;
 }
 
 function tradeItem(timestamp, price, size) {
@@ -510,7 +522,7 @@ async function coinbaseConfig(symbol, interval, outputInterval = interval) {
 }
 
 async function upstreamConfig(provider, market, symbol, interval) {
-  const upstreamInterval = sourceInterval(interval);
+  const upstreamInterval = sourceInterval(provider, market, interval);
   if (isRealtimeSecondInterval(interval) && provider === 'binance' && market === 'spot') return {
     url: `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_1s`,
     subscribe: null,
@@ -535,7 +547,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
   };
   if (isRealtimeSecondInterval(interval)) return secondTradeConfig(provider, market, symbol);
   if (provider === 'coinbase') return coinbaseConfig(symbol, upstreamInterval, interval);
-  if (usesRestPolling(provider, upstreamInterval)) return { restPoll: true, sourceInterval: upstreamInterval };
+  if (usesRestPolling(provider, interval, upstreamInterval)) return { restPoll: true, sourceInterval: upstreamInterval };
   if (provider === 'binance') return {
     url: market === 'contract'
       ? `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`
@@ -549,26 +561,32 @@ async function upstreamConfig(provider, market, symbol, interval) {
         [kline.t,kline.o,kline.h,kline.l,kline.c,kline.v,kline.q], kline.x, kline.n);
     },
   };
-  if (provider === 'okx') return {
-    url: 'wss://ws.okx.com:8443/ws/v5/business',
-    subscribe: { op: 'subscribe', args: [{ channel: okxChannel(upstreamInterval), instId: okxInstId(symbol, market) }] },
-    parse(raw) {
-      const message = JSON.parse(raw.toString());
-      const candle = Array.isArray(message?.data) ? message.data[0] : null;
-      if (!Array.isArray(candle)) return null;
-      return normalizedMessage(provider, market, symbol, interval,
-        [candle[0],candle[1],candle[2],candle[3],candle[4],candle[5],candle[7]], String(candle[8]) === '1');
-    },
-  };
+  if (provider === 'okx') {
+    const channel = okxChannel(upstreamInterval);
+    if (!channel) throw new Error(`okx interval ${upstreamInterval} is not supported`);
+    return {
+      url: 'wss://ws.okx.com:8443/ws/v5/business',
+      subscribe: { op: 'subscribe', args: [{ channel, instId: okxInstId(symbol, market) }] },
+      parse(raw) {
+        const message = JSON.parse(raw.toString());
+        const candle = Array.isArray(message?.data) ? message.data[0] : null;
+        if (!Array.isArray(candle)) return null;
+        return normalizedMessage(provider, market, symbol, interval,
+          [candle[0],candle[1],candle[2],candle[3],candle[4],candle[5],candle[7]], String(candle[8]) === '1');
+      },
+    };
+  }
   if (provider === 'gate') {
     const contract = market === 'contract';
+    const channelInterval = gateInterval(upstreamInterval, market);
+    if (!channelInterval) throw new Error(`gate ${market} interval ${upstreamInterval} is not supported`);
     return {
       url: contract ? 'wss://fx-ws.gateio.ws/v4/ws/usdt' : 'wss://api.gateio.ws/ws/v4/',
       subscribe: {
         time: Math.floor(Date.now() / 1000),
         channel: contract ? 'futures.candlesticks' : 'spot.candlesticks',
         event: 'subscribe',
-        payload: [gateInterval(upstreamInterval), gateSymbol(symbol)],
+        payload: [channelInterval, gateSymbol(symbol)],
       },
       parse(raw) {
         const message = JSON.parse(raw.toString());
@@ -582,37 +600,45 @@ async function upstreamConfig(provider, market, symbol, interval) {
       },
     };
   }
-  if (provider === 'bitget') return {
-    url: 'wss://ws.bitget.com/v2/ws/public',
-    subscribe: {
-      op: 'subscribe',
-      args: [{
-        instType: market === 'contract' ? 'USDT-FUTURES' : 'SPOT',
-        channel: bitgetChannel(upstreamInterval),
-        instId: symbol,
-      }],
-    },
-    parse(raw) {
-      const message = JSON.parse(raw.toString());
-      const candle = Array.isArray(message?.data) ? message.data[0] : null;
-      if (!Array.isArray(candle)) return null;
-      return normalizedMessage(provider, market, symbol, interval,
-        [candle[0],candle[1],candle[2],candle[3],candle[4],candle[5],candle[6]], false);
-    },
-  };
-  if (provider === 'bybit') return {
-    url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
-    subscribe: { op: 'subscribe', args: [`kline.${bybitInterval(upstreamInterval)}.${symbol}`] },
-    heartbeatMessage: { op: 'ping' },
-    parse(raw) {
-      const message = JSON.parse(raw.toString());
-      if (!String(message?.topic || '').startsWith('kline.')) return null;
-      const candle = Array.isArray(message?.data) ? message.data[0] : null;
-      if (!candle || typeof candle !== 'object') return null;
-      return normalizedMessage(provider, market, symbol, interval,
-        [candle.start,candle.open,candle.high,candle.low,candle.close,candle.volume,candle.turnover], candle.confirm === true);
-    },
-  };
+  if (provider === 'bitget') {
+    const channel = bitgetChannel(upstreamInterval);
+    if (!channel) throw new Error(`bitget ${market} interval ${upstreamInterval} is not supported`);
+    return {
+      url: 'wss://ws.bitget.com/v2/ws/public',
+      subscribe: {
+        op: 'subscribe',
+        args: [{
+          instType: market === 'contract' ? 'USDT-FUTURES' : 'SPOT',
+          channel,
+          instId: symbol,
+        }],
+      },
+      parse(raw) {
+        const message = JSON.parse(raw.toString());
+        const candle = Array.isArray(message?.data) ? message.data[0] : null;
+        if (!Array.isArray(candle)) return null;
+        return normalizedMessage(provider, market, symbol, interval,
+          [candle[0],candle[1],candle[2],candle[3],candle[4],candle[5],candle[6]], false);
+      },
+    };
+  }
+  if (provider === 'bybit') {
+    const channelInterval = bybitInterval(upstreamInterval);
+    if (!channelInterval) throw new Error(`bybit interval ${upstreamInterval} is not supported`);
+    return {
+      url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
+      subscribe: { op: 'subscribe', args: [`kline.${channelInterval}.${symbol}`] },
+      heartbeatMessage: { op: 'ping' },
+      parse(raw) {
+        const message = JSON.parse(raw.toString());
+        if (!String(message?.topic || '').startsWith('kline.')) return null;
+        const candle = Array.isArray(message?.data) ? message.data[0] : null;
+        if (!candle || typeof candle !== 'object') return null;
+        return normalizedMessage(provider, market, symbol, interval,
+          [candle.start,candle.open,candle.high,candle.low,candle.close,candle.volume,candle.turnover], candle.confirm === true);
+      },
+    };
+  }
   throw new Error('unsupported provider');
 }
 
@@ -623,7 +649,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '514.1.6',
+      version: '515.1.2',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -795,4 +821,4 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 514.1.6 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 515.1.2 listening on ${PORT}`));

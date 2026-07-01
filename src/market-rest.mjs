@@ -79,12 +79,16 @@ function okxBar(interval) {
     '1d':'1Dutc','3d':'3Dutc','1w':'1Wutc','1M':'1Mutc',
   })[interval] || null;
 }
-function gateBar(interval) {
-  return ({
-    '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m','1h':'1h',
-    '2h':'2h','4h':'4h','6h':'6h','8h':'8h','12h':'12h',
-    '1d':'1d','1w':'7d','1M':'30d',
-  })[interval] || null;
+function gateBar(interval, market) {
+  const spot = {
+    '1s':'1s','1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h',
+    '4h':'4h','8h':'8h','1d':'1d','1w':'7d','1M':'30d',
+  };
+  const contract = {
+    '1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h',
+    '4h':'4h','8h':'8h','1d':'1d','1w':'7d',
+  };
+  return (market === 'contract' ? contract : spot)[interval] || null;
 }
 function bitgetBar(interval, market) {
   if (market === 'spot') {
@@ -107,13 +111,18 @@ function bybitBar(interval) {
     '1d':'D','1w':'W','1M':'M',
   })[interval] || null;
 }
-function sourceIntervalFor(provider, interval) {
+function sourceIntervalFor(provider, market, interval) {
   const fallback = {
     okx: { '8h':'4h' },
-    gate: { '3d':'1d' },
     bitget: { '2h':'1h', '8h':'4h' },
     bybit: { '8h':'4h', '3d':'1d' },
   };
+  if (provider === 'gate') {
+    const gateFallback = market === 'contract'
+      ? { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1M':'1d' }
+      : { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d' };
+    return gateFallback[interval] || interval;
+  }
   return fallback[provider]?.[interval] || interval;
 }
 function coinbaseSourceGranularity(interval) {
@@ -135,11 +144,27 @@ async function jsonFetch(urls, timeout = 15_000) {
         signal: controller.signal,
         headers: {
           accept: 'application/json',
-          'user-agent': 'KakaWeb3-Market-Worker/514.1.6',
+          'user-agent': 'KakaWeb3-Market-Worker/515.1.2',
         },
       });
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      return await response.json();
+      const bodyText = await response.text();
+      if (!response.ok) {
+        const endpoint = (() => {
+          try {
+            const parsed = new URL(url);
+            return `${parsed.host}${parsed.pathname}`;
+          } catch (_) {
+            return 'market-upstream';
+          }
+        })();
+        throw new Error(`${response.status} ${response.statusText} ${endpoint} ${bodyText.slice(0, 240)}`.trim());
+      }
+      if (!bodyText) return null;
+      try {
+        return JSON.parse(bodyText);
+      } catch (_) {
+        throw new Error(`invalid JSON from market upstream: ${bodyText.slice(0, 240)}`);
+      }
     } catch (error) {
       lastError = error;
     } finally {
@@ -541,21 +566,40 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
       after = oldest;
     }
   } else if (provider === 'gate') {
-    const bar = gateBar(interval);
-    if (!bar) throw new Error(`gate interval ${interval} requires aggregation`);
-    const seconds = Math.max(60, Math.floor(intervalMs(interval) / 1000));
-    const to = Math.floor(end / 1000);
-    const from = Math.max(0, to - (limit + 5) * seconds);
-    const url = market === 'contract'
-      ? `https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=${encodeURIComponent(gateId(symbol))}` +
-        `&interval=${encodeURIComponent(bar)}&from=${from}&to=${to}&limit=${Math.min(2000, limit)}`
-      : `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${encodeURIComponent(gateId(symbol))}` +
-        `&interval=${encodeURIComponent(bar)}&from=${from}&to=${to}&limit=${Math.min(1000, limit)}`;
-    const payload = await jsonFetch(url);
-    rows = (payload || []).map((a) => Array.isArray(a)
-      ? krow(provider, market, symbol, interval, [Number(a[0]) * 1000,a[5],a[3],a[4],a[2],a[6],a[1],0])
-      : krow(provider, market, symbol, interval, [Number(a.t) * 1000,a.o,a.h,a.l,a.c,a.v,a.a ?? a.sum,a.n]))
-      .filter(Boolean);
+    const bar = gateBar(interval, market);
+    if (!bar) throw new Error(`gate ${market} interval ${interval} requires aggregation`);
+    const seconds = Math.max(1, Math.floor(intervalMs(interval) / 1000));
+    const maxPoints = market === 'contract' ? 2000 : 1000;
+    const maxPages = market === 'contract' ? 3 : 5;
+    const endpointPaths = market === 'contract'
+      ? [
+          'https://api.gateio.ws/api/v4/futures/usdt/candlesticks',
+          'https://fx-api.gateio.ws/api/v4/futures/usdt/candlesticks',
+        ]
+      : ['https://api.gateio.ws/api/v4/spot/candlesticks'];
+    const key = market === 'contract' ? 'contract' : 'currency_pair';
+    let pageTo = Math.max(1, Math.floor(end / 1000));
+    let pages = 0;
+    while (rows.length < limit && pages < maxPages) {
+      const wanted = Math.min(maxPoints, Math.max(1, limit - rows.length));
+      const pageFrom = Math.max(0, pageTo - (wanted + 5) * seconds);
+      const urls = endpointPaths.map((base) =>
+        `${base}?${key}=${encodeURIComponent(gateId(symbol))}` +
+        `&interval=${encodeURIComponent(bar)}&from=${pageFrom}&to=${pageTo}`,
+      );
+      const payload = await jsonFetch(urls);
+      const pageRows = (Array.isArray(payload) ? payload : []).map((a) => Array.isArray(a)
+        ? krow(provider, market, symbol, interval, [Number(a[0]) * 1000,a[5],a[3],a[4],a[2],a[6],a[1],0])
+        : krow(provider, market, symbol, interval, [Number(a.t) * 1000,a.o,a.h,a.l,a.c,a.v,a.a ?? a.sum,a.n]))
+        .filter(Boolean);
+      if (!pageRows.length) break;
+      rows.push(...pageRows);
+      const oldestMs = Math.min(...pageRows.map((row) => Number(row.open_time_ms)));
+      const nextTo = Math.floor(oldestMs / 1000) - 1;
+      if (!Number.isFinite(nextTo) || nextTo >= pageTo || pageFrom <= 0) break;
+      pageTo = nextTo;
+      pages += 1;
+    }
   } else if (provider === 'bitget') {
     const bar = bitgetBar(interval, market);
     if (!bar) throw new Error(`bitget interval ${interval} requires aggregation`);
@@ -788,7 +832,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
-  const sourceInterval = sourceIntervalFor(provider, interval);
+  const sourceInterval = sourceIntervalFor(provider, market, interval);
   const targetMs = intervalMs(interval);
   const sourceMs = intervalMs(sourceInterval);
   const factor = Math.max(1, Math.ceil(targetMs / sourceMs));
