@@ -163,35 +163,169 @@ function configFor(provider, symbol) {
   throw new Error('unsupported_provider');
 }
 
-function prune(state) {
-  const cutoff = Date.now() - MAX_AGE_MS;
-  if (state.trades.length > MAX_TRADES_PER_STREAM) {
-    state.trades.splice(0, state.trades.length - MAX_TRADES_PER_STREAM);
+
+const FIVE_MIN_MS = 5 * 60 * 1000;
+const HISTORY_MS = 24 * 60 * 60 * 1000;
+const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_ACTIVE_TRADES_PER_BUCKET = 120000;
+const CORE_SYMBOLS = String(process.env.KAKA_FLOW_CORE_SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,DOTUSDT,LTCUSDT')
+  .split(',').map(symbolKey).filter((value) => value && value.endsWith('USDT'));
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+const PERSISTENCE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+const persistQueue = new Map();
+let persistFlushPromise = null;
+
+function percentile(sorted, percentileValue) {
+  if (!sorted.length) return 0;
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.ceil(sorted.length * percentileValue) - 1));
+  return sorted[index];
+}
+
+function emptyBucket(start) {
+  return { start, end: start + FIVE_MIN_MS, trades: [] };
+}
+
+function finalizeBucket(bucket, provider, symbol) {
+  const trades = Array.isArray(bucket?.trades) ? bucket.trades : [];
+  if (!trades.length) return null;
+  const amounts = trades.map((item) => item.quote).filter(Number.isFinite).sort((a, b) => a - b);
+  const p70 = percentile(amounts, 0.70);
+  const p95 = percentile(amounts, 0.95);
+  const row = {
+    provider, symbol, bucket_time: new Date(bucket.start).toISOString(), bucket_end_time: new Date(bucket.end).toISOString(),
+    buy_quote: 0, sell_quote: 0,
+    large_buy_quote: 0, large_sell_quote: 0,
+    medium_buy_quote: 0, medium_sell_quote: 0,
+    small_buy_quote: 0, small_sell_quote: 0,
+    large_buy_count: 0, large_sell_count: 0,
+    medium_buy_count: 0, medium_sell_count: 0,
+    small_buy_count: 0, small_sell_count: 0,
+    trade_count: 0, p70_quote: p70, p95_quote: p95,
+    source: 'render_exchange_websocket', updated_at: new Date().toISOString(),
+  };
+  for (const trade of trades) {
+    const tier = p95 > 0 && trade.quote >= p95 ? 'large' : (p70 > 0 && trade.quote >= p70 ? 'medium' : 'small');
+    const side = trade.side === 'buy' ? 'buy' : 'sell';
+    row[`${side}_quote`] += trade.quote;
+    row[`${tier}_${side}_quote`] += trade.quote;
+    row[`${tier}_${side}_count`] += 1;
+    row.trade_count += 1;
   }
-  let remove = 0;
-  while (remove < state.trades.length && state.trades[remove].time < cutoff) remove += 1;
-  if (remove > 0) state.trades.splice(0, remove);
+  return row;
+}
+
+function normalizePersistedRow(row) {
+  const start = normalizeTime(row.bucket_time);
+  const end = normalizeTime(row.bucket_end_time) || (start ? start + FIVE_MIN_MS : 0);
+  if (!start) return null;
+  const numberKeys = [
+    'buy_quote','sell_quote','large_buy_quote','large_sell_quote','medium_buy_quote','medium_sell_quote','small_buy_quote','small_sell_quote',
+    'large_buy_count','large_sell_count','medium_buy_count','medium_sell_count','small_buy_count','small_sell_count','trade_count','p70_quote','p95_quote'
+  ];
+  const next = { ...row, start, end };
+  for (const key of numberKeys) next[key] = asNumber(row[key]) ?? 0;
+  return next;
+}
+
+function queuePersist(row) {
+  if (!PERSISTENCE_ENABLED || !row) return;
+  const key = `${row.provider}:${row.symbol}:${row.bucket_time}`;
+  persistQueue.set(key, row);
+}
+
+async function flushPersistQueue() {
+  if (!PERSISTENCE_ENABLED || persistFlushPromise || persistQueue.size === 0) return;
+  const rows = [...persistQueue.values()].slice(0, 500);
+  for (const row of rows) persistQueue.delete(`${row.provider}:${row.symbol}:${row.bucket_time}`);
+  persistFlushPromise = (async () => {
+    try {
+      const response = await fetch(`${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?on_conflict=provider,symbol,bucket_time`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'content-type': 'application/json',
+          prefer: 'resolution=merge-duplicates,return=minimal',
+        },
+        body: JSON.stringify(rows),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
+    } catch (error) {
+      for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
+      console.error(`[Step614.2] flow bucket persist failed: ${error?.message || error}`);
+    }
+  })().finally(() => { persistFlushPromise = null; });
+  await persistFlushPromise;
+}
+
+async function loadPersistedHistory(state) {
+  if (!PERSISTENCE_ENABLED || state.historyLoaded || state.historyLoading) return;
+  state.historyLoading = true;
+  try {
+    const cutoff = new Date(Date.now() - HISTORY_MS - FIVE_MIN_MS).toISOString();
+    const query = new URLSearchParams({
+      select: '*', provider: `eq.${state.provider}`, symbol: `eq.${state.symbol}`,
+      bucket_time: `gte.${cutoff}`, order: 'bucket_time.asc', limit: '400',
+    });
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?${query}`, {
+      headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
+      signal: AbortSignal.timeout(12000),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`history_http_${response.status}:${text.slice(0, 180)}`);
+    const rows = JSON.parse(text);
+    for (const raw of Array.isArray(rows) ? rows : []) {
+      const row = normalizePersistedRow(raw);
+      if (row) state.completedBuckets.set(row.start, row);
+    }
+    state.historyLoaded = true;
+  } catch (error) {
+    state.historyError = String(error?.message || error).slice(0, 180);
+  } finally {
+    state.historyLoading = false;
+  }
+}
+
+function pruneState(state) {
+  const cutoff = Date.now() - RETENTION_MS;
+  for (const [start] of state.completedBuckets) if (start < cutoff) state.completedBuckets.delete(start);
+  for (const [start] of state.openBuckets) if (start < Date.now() - FIVE_MIN_MS * 2) state.openBuckets.delete(start);
+}
+
+function finalizeReadyBuckets(state, now = Date.now()) {
+  const readyBefore = Math.floor((now - 15000) / FIVE_MIN_MS) * FIVE_MIN_MS;
+  for (const [start, bucket] of [...state.openBuckets.entries()]) {
+    if (start >= readyBefore) continue;
+    const row = finalizeBucket(bucket, state.provider, state.symbol);
+    state.openBuckets.delete(start);
+    if (!row) continue;
+    const normalized = normalizePersistedRow(row);
+    if (normalized) state.completedBuckets.set(start, normalized);
+    queuePersist(row);
+  }
+  pruneState(state);
 }
 
 function ingest(state, items) {
   const now = Date.now();
   let added = 0;
   for (const item of items) {
-    if (!item || item.time < now - MAX_AGE_MS || item.time > now + 15000) continue;
+    if (!item || item.time < now - FIVE_MIN_MS * 2 || item.time > now + 15000) continue;
     const signature = `${item.time}:${item.price}:${item.size}:${item.side}`;
     if (state.recentIds.has(signature)) continue;
     state.recentIds.add(signature);
-    state.trades.push(item);
+    const start = Math.floor(item.time / FIVE_MIN_MS) * FIVE_MIN_MS;
+    let bucket = state.openBuckets.get(start);
+    if (!bucket) { bucket = emptyBucket(start); state.openBuckets.set(start, bucket); }
+    if (bucket.trades.length < MAX_ACTIVE_TRADES_PER_BUCKET) bucket.trades.push(item);
     added += 1;
   }
-  if (state.recentIds.size > 5000) {
-    const keep = [...state.recentIds].slice(-2500);
-    state.recentIds = new Set(keep);
-  }
+  if (state.recentIds.size > 10000) state.recentIds = new Set([...state.recentIds].slice(-5000));
   if (added > 0) {
-    state.trades.sort((a, b) => a.time - b.time);
-    state.lastTradeAt = state.trades.at(-1)?.time || state.lastTradeAt;
-    prune(state);
+    state.lastTradeAt = now;
+    finalizeReadyBuckets(state, now);
     for (const waiter of [...state.waiters]) waiter();
   }
 }
@@ -200,13 +334,11 @@ function startStream(state) {
   if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
   clearTimeout(state.reconnectTimer);
   const cfg = configFor(state.provider, state.symbol);
-  state.status = 'connecting';
-  state.error = '';
+  state.status = 'connecting'; state.error = '';
   const ws = new WebSocket(cfg.url, { handshakeTimeout: 15000 });
   state.ws = ws;
   ws.on('open', () => {
-    state.status = 'open';
-    state.reconnectAttempt = 0;
+    state.status = 'open'; state.reconnectAttempt = 0;
     for (const subscription of cfg.subscriptions) ws.send(JSON.stringify(subscription));
     clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = setInterval(() => {
@@ -218,16 +350,11 @@ function startStream(state) {
       } catch (_) {}
     }, 20000);
   });
-  ws.on('message', (raw) => {
-    try { ingest(state, cfg.parse(raw)); } catch (_) {}
-  });
+  ws.on('message', (raw) => { try { ingest(state, cfg.parse(raw)); } catch (_) {} });
   const close = (reason) => {
     if (state.ws !== ws) return;
-    clearInterval(state.heartbeatTimer);
-    state.heartbeatTimer = null;
-    state.ws = null;
-    state.status = 'closed';
-    state.error = String(reason || 'upstream_closed').slice(0, 180);
+    clearInterval(state.heartbeatTimer); state.heartbeatTimer = null; state.ws = null;
+    state.status = 'closed'; state.error = String(reason || 'upstream_closed').slice(0, 180);
     if (Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) {
       state.reconnectAttempt += 1;
       const delay = Math.min(RECONNECT_MAX_MS, 1000 * 2 ** Math.min(5, state.reconnectAttempt));
@@ -243,21 +370,26 @@ function getState(provider, symbol) {
   let state = states.get(key);
   if (!state) {
     state = {
-      key, provider, symbol, trades: [], recentIds: new Set(), waiters: new Set(),
-      ws: null, status: 'idle', error: '', lastTradeAt: 0, lastRequestedAt: Date.now(),
-      reconnectAttempt: 0, reconnectTimer: null, heartbeatTimer: null,
+      key, provider, symbol, openBuckets: new Map(), completedBuckets: new Map(), recentIds: new Set(), waiters: new Set(),
+      ws: null, status: 'idle', error: '', lastTradeAt: 0, lastRequestedAt: Date.now(), reconnectAttempt: 0,
+      reconnectTimer: null, heartbeatTimer: null, metricCache: null, historyLoaded: false, historyLoading: false, historyError: '',
     };
     states.set(key, state);
   }
   state.lastRequestedAt = Date.now();
+  loadPersistedHistory(state).catch(() => {});
   startStream(state);
   return state;
 }
 
-function percentile(sorted, percentileValue) {
-  if (!sorted.length) return 0;
-  const index = Math.max(0, Math.min(sorted.length - 1, Math.ceil(sorted.length * percentileValue) - 1));
-  return sorted[index];
+function provisionalRows(state) {
+  const rows = [];
+  for (const bucket of state.openBuckets.values()) {
+    const row = finalizeBucket(bucket, state.provider, state.symbol);
+    const normalized = row ? normalizePersistedRow(row) : null;
+    if (normalized) rows.push(normalized);
+  }
+  return rows;
 }
 
 function chooseBucketMs(coverageMs) {
@@ -265,26 +397,8 @@ function chooseBucketMs(coverageMs) {
   if (coverageMs >= 6 * 60 * 60 * 1000) return 60 * 60 * 1000;
   if (coverageMs >= 60 * 60 * 1000) return 10 * 60 * 1000;
   if (coverageMs >= 10 * 60 * 1000) return 2 * 60 * 1000;
-  if (coverageMs >= 2 * 60 * 1000) return 30 * 1000;
-  return Math.max(1000, Math.ceil(Math.max(1000, coverageMs) / 10 / 1000) * 1000);
+  return FIVE_MIN_MS;
 }
-
-
-async function fetchJson(url, timeoutMs = 3500) {
-  const response = await fetch(url, {
-    headers: { 'accept': 'application/json', 'user-agent': 'KakaWeb3/614.1.3.3' },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`http_${response.status}:${text.slice(0, 120)}`);
-  return JSON.parse(text);
-}
-
-function isoFrom(value) {
-  const time = normalizeTime(value);
-  return time ? new Date(time).toISOString() : new Date().toISOString();
-}
-
 async function fetchVenueMetrics(state) {
   const now = Date.now();
   if (state.metricCache && now - state.metricCache.at < 30000) return state.metricCache.value;
@@ -375,197 +489,111 @@ async function fetchVenueMetrics(state) {
   return value;
 }
 
+
+function mergeRowsFor24h(state) {
+  finalizeReadyBuckets(state);
+  const cutoff = Date.now() - HISTORY_MS;
+  const byStart = new Map();
+  for (const row of state.completedBuckets.values()) if (row.end >= cutoff) byStart.set(row.start, row);
+  for (const row of provisionalRows(state)) if (row.end >= cutoff) byStart.set(row.start, row);
+  return [...byStart.values()].sort((a, b) => a.start - b.start);
+}
+
 function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
-  prune(state);
-  const trades = state.trades;
-  const firstTime = trades[0]?.time || 0;
-  const lastTime = trades.at(-1)?.time || 0;
-  const coverageMs = firstTime && lastTime ? Math.max(0, lastTime - firstTime) : 0;
-  const quoteAmounts = trades.map((trade) => trade.quote).filter(Number.isFinite).sort((a, b) => a - b);
-  const p70 = percentile(quoteAmounts, 0.70);
-  const p95 = percentile(quoteAmounts, 0.95);
-
-  const distribution = {
-    large_buy_quote: 0, large_sell_quote: 0,
-    regular_buy_quote: 0, regular_sell_quote: 0,
-  };
-  const tierMap = new Map([
-    ['large', { tier: 'large', buy_quote: 0, sell_quote: 0, buy_count: 0, sell_count: 0 }],
-    ['medium', { tier: 'medium', buy_quote: 0, sell_quote: 0, buy_count: 0, sell_count: 0 }],
-    ['small', { tier: 'small', buy_quote: 0, sell_quote: 0, buy_count: 0, sell_count: 0 }],
-  ]);
-
-  for (const trade of trades) {
-    const large = p95 > 0 && trade.quote >= p95;
-    const tierName = large ? 'large' : (p70 > 0 && trade.quote >= p70 ? 'medium' : 'small');
-    const tier = tierMap.get(tierName);
-    if (trade.side === 'buy') {
-      tier.buy_quote += trade.quote;
-      tier.buy_count += 1;
-      distribution[large ? 'large_buy_quote' : 'regular_buy_quote'] += trade.quote;
-    } else {
-      tier.sell_quote += trade.quote;
-      tier.sell_count += 1;
-      distribution[large ? 'large_sell_quote' : 'regular_sell_quote'] += trade.quote;
-    }
-  }
-
+  const rows = mergeRowsFor24h(state);
+  const firstTime = rows[0]?.start || 0;
+  const lastTime = rows.at(-1)?.end || 0;
+  const coverageMs = firstTime && lastTime ? Math.max(0, Math.min(HISTORY_MS, lastTime - firstTime)) : 0;
+  const completeCount = rows.filter((row) => row.end <= Date.now()).length;
+  const historyComplete = coverageMs >= HISTORY_MS - 15 * 60 * 1000 && completeCount >= 276;
   const bucketMs = chooseBucketMs(coverageMs);
   const grouped = new Map();
-  for (const trade of trades) {
-    const start = Math.floor(trade.time / bucketMs) * bucketMs;
+  for (const row of rows) {
+    const start = Math.floor(row.start / bucketMs) * bucketMs;
     let bucket = grouped.get(start);
-    if (!bucket) {
-      bucket = { start, end: start + bucketMs, buy: 0, sell: 0, samples: 0 };
-      grouped.set(start, bucket);
-    }
-    if (trade.side === 'buy') bucket.buy += trade.quote;
-    else bucket.sell += trade.quote;
-    bucket.samples += 1;
+    if (!bucket) bucket = { start, end: start + bucketMs, buy: 0, sell: 0, samples: 0 };
+    bucket.buy += row.buy_quote; bucket.sell += row.sell_quote; bucket.samples += row.trade_count;
+    grouped.set(start, bucket);
   }
-  let buckets = [...grouped.values()].sort((a, b) => a.start - b.start);
-  if (buckets.length > 24) buckets = buckets.slice(-24);
-  const flowBuckets = buckets.map((bucket) => ({
-    start_time_ms: bucket.start,
-    end_time_ms: bucket.end,
-    buy_quote_volume: bucket.buy,
-    sell_quote_volume: bucket.sell,
-    net_quote_volume: bucket.buy - bucket.sell,
-    samples: bucket.samples,
-  }));
-  const takerRows = flowBuckets.map((bucket) => ({
-    source_time: new Date(bucket.start_time_ms).toISOString(),
-    open_time: new Date(bucket.start_time_ms).toISOString(),
-    buy_quote_volume: bucket.buy_quote_volume,
-    sell_quote_volume: bucket.sell_quote_volume,
-    buy_sell_ratio: bucket.sell_quote_volume > 0 ? bucket.buy_quote_volume / bucket.sell_quote_volume : null,
-    sample_count: bucket.samples,
-  }));
-  let cumulative = 0;
-  const cvdRows = flowBuckets.map((bucket) => {
-    const delta = bucket.net_quote_volume;
-    cumulative += delta;
-    return {
-      source_time: new Date(bucket.start_time_ms).toISOString(),
-      open_time: new Date(bucket.start_time_ms).toISOString(),
-      delta_quote: delta,
-      delta_volume: delta,
-      cvd_quote: cumulative,
-      cvd: cumulative,
-    };
-  });
-  const tiers = [...tierMap.values()].map((tier) => ({
-    ...tier,
-    net_quote: tier.buy_quote - tier.sell_quote,
-    trade_count: tier.buy_count + tier.sell_count,
+  let flowBuckets = [...grouped.values()].sort((a,b)=>a.start-b.start);
+  if (flowBuckets.length > 24) flowBuckets = flowBuckets.slice(-24);
+  flowBuckets = flowBuckets.map((bucket) => ({
+    start_time_ms: bucket.start, end_time_ms: bucket.end,
+    buy_quote_volume: bucket.buy, sell_quote_volume: bucket.sell,
+    net_quote_volume: bucket.buy - bucket.sell, samples: bucket.samples,
   }));
 
-  const totalBuy = distribution.large_buy_quote + distribution.regular_buy_quote;
-  const totalSell = distribution.large_sell_quote + distribution.regular_sell_quote;
-  const scope = coverageMs >= 20 * 60 * 60 * 1000 ? 'rolling_24h' : 'rolling_sample';
+  const distribution = { large_buy_quote: 0, large_sell_quote: 0, regular_buy_quote: 0, regular_sell_quote: 0 };
+  const tierMap = new Map([
+    ['large', { tier:'large', buy_quote:0, sell_quote:0, buy_count:0, sell_count:0 }],
+    ['medium', { tier:'medium', buy_quote:0, sell_quote:0, buy_count:0, sell_count:0 }],
+    ['small', { tier:'small', buy_quote:0, sell_quote:0, buy_count:0, sell_count:0 }],
+  ]);
+  let p70Weighted = 0, p95Weighted = 0, thresholdWeight = 0, tradeCount = 0;
+  for (const row of rows) {
+    distribution.large_buy_quote += row.large_buy_quote; distribution.large_sell_quote += row.large_sell_quote;
+    distribution.regular_buy_quote += row.medium_buy_quote + row.small_buy_quote;
+    distribution.regular_sell_quote += row.medium_sell_quote + row.small_sell_quote;
+    for (const tierName of ['large','medium','small']) {
+      const tier = tierMap.get(tierName);
+      tier.buy_quote += row[`${tierName}_buy_quote`]; tier.sell_quote += row[`${tierName}_sell_quote`];
+      tier.buy_count += row[`${tierName}_buy_count`]; tier.sell_count += row[`${tierName}_sell_count`];
+    }
+    const weight = Math.max(1, row.trade_count); p70Weighted += row.p70_quote * weight; p95Weighted += row.p95_quote * weight; thresholdWeight += weight;
+    tradeCount += row.trade_count;
+  }
+  const tiers = [...tierMap.values()].map((tier) => ({ ...tier, net_quote:tier.buy_quote-tier.sell_quote, trade_count:tier.buy_count+tier.sell_count }));
+  const totalBuy = rows.reduce((sum,row)=>sum+row.buy_quote,0);
+  const totalSell = rows.reduce((sum,row)=>sum+row.sell_quote,0);
+  const takerRows = flowBuckets.map((bucket) => ({
+    source_time:new Date(bucket.start_time_ms).toISOString(), open_time:new Date(bucket.start_time_ms).toISOString(),
+    buy_quote_volume:bucket.buy_quote_volume, sell_quote_volume:bucket.sell_quote_volume,
+    buy_sell_ratio:bucket.sell_quote_volume>0?bucket.buy_quote_volume/bucket.sell_quote_volume:null, sample_count:bucket.samples,
+  }));
+  let cumulative=0;
+  const cvdRows = flowBuckets.map((bucket)=>{ cumulative += bucket.net_quote_volume; return {
+    source_time:new Date(bucket.start_time_ms).toISOString(), open_time:new Date(bucket.start_time_ms).toISOString(),
+    delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
+  };});
   return {
-    ok: true,
-    version: '614.1.3.3',
-    provider: state.provider,
-    symbol: state.symbol,
-    source: 'render_exchange_websocket_rolling',
-    scope,
-    stream_status: state.status,
-    stream_error: state.error,
-    trade_count: trades.length,
-    sample_started_at_ms: firstTime,
-    sample_ended_at_ms: lastTime,
-    coverage_ms: coverageMs,
-    bucket_ms: bucketMs,
-    thresholds: { p70_quote: p70, p95_quote: p95 },
-    distribution,
-    tiers,
-    flow_buckets: flowBuckets,
-    totals: {
-      buy_quote: totalBuy,
-      sell_quote: totalSell,
-      net_quote: totalBuy - totalSell,
-    },
-    metrics: {
-      oi_rows: Array.isArray(venueMetrics.oi_rows) ? venueMetrics.oi_rows : [],
-      ratio_rows: Array.isArray(venueMetrics.ratio_rows) ? venueMetrics.ratio_rows : [],
-      taker_rows: takerRows,
-      cvd_rows: cvdRows,
-    },
-    generated_at: new Date().toISOString(),
+    ok:true, version:'614.2', provider:state.provider, symbol:state.symbol,
+    source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
+    persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
+    stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
+    sample_started_at_ms:firstTime, sample_ended_at_ms:lastTime, coverage_ms:coverageMs, bucket_ms:bucketMs,
+    stored_5m_buckets:rows.length, expected_5m_buckets:288, coverage_ratio:Math.min(1, rows.length/288),
+    thresholds:{ p70_quote:thresholdWeight?p70Weighted/thresholdWeight:0, p95_quote:thresholdWeight?p95Weighted/thresholdWeight:0 },
+    distribution, tiers, flow_buckets:flowBuckets,
+    totals:{ buy_quote:totalBuy, sell_quote:totalSell, net_quote:totalBuy-totalSell },
+    metrics:{ oi_rows:Array.isArray(venueMetrics.oi_rows)?venueMetrics.oi_rows:[], ratio_rows:Array.isArray(venueMetrics.ratio_rows)?venueMetrics.ratio_rows:[], taker_rows:takerRows, cvd_rows:cvdRows },
+    generated_at:new Date().toISOString(),
   };
 }
 
-function sendJson(res, status, body) {
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'access-control-allow-origin': '*',
-  });
-  res.end(JSON.stringify(body));
+function sendJson(res,status,body){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','access-control-allow-origin':'*'});res.end(JSON.stringify(body));}
+function waitForTrades(state,minTrades,waitMs){
+  const count=()=>[...state.openBuckets.values()].reduce((sum,b)=>sum+b.trades.length,0);
+  if(count()>=minTrades||waitMs<=0)return Promise.resolve();
+  return new Promise((resolve)=>{let timer;const done=()=>{clearTimeout(timer);state.waiters.delete(check);resolve();};const check=()=>{if(count()>=minTrades)done();};state.waiters.add(check);timer=setTimeout(done,waitMs);});
 }
 
-function waitForTrades(state, minTrades, waitMs) {
-  if (state.trades.length >= minTrades || waitMs <= 0) return Promise.resolve();
-  return new Promise((resolve) => {
-    let timer;
-    const done = () => {
-      clearTimeout(timer);
-      state.waiters.delete(check);
-      resolve();
-    };
-    const check = () => {
-      if (state.trades.length >= minTrades) done();
-    };
-    state.waiters.add(check);
-    timer = setTimeout(done, waitMs);
-  });
+export async function handleContractFlow(req,res,url){
+  if(url.pathname==='/api/contract-flow/health'){
+    sendJson(res,200,{ok:true,version:'614.2',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+  }
+  if(url.pathname==='/api/contract-flow/warm'){
+    let started=0;
+    for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
+    sendJson(res,200,{ok:true,version:'614.2',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+  }
+  if(url.pathname!=='/api/contract-flow')return false;
+  if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
+  let provider=providerKey(url.searchParams.get('provider'));let symbol=symbolKey(url.searchParams.get('symbol'));let waitMs=Math.min(5000,Math.max(0,Number(url.searchParams.get('wait_ms')||3200)));
+  if(req.method==='POST'){const chunks=[];for await(const chunk of req)chunks.push(chunk);try{const body=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');provider=providerKey(body.provider)||provider;symbol=symbolKey(body.symbol)||symbol;if(Number.isFinite(Number(body.wait_ms)))waitMs=Math.min(5000,Math.max(0,Number(body.wait_ms)));}catch(_){}}
+  if(!provider||!symbol||!symbol.endsWith('USDT')){sendJson(res,400,{ok:false,error:'invalid_provider_or_symbol'});return true;}
+  const state=getState(provider,symbol);await loadPersistedHistory(state);await waitForTrades(state,20,waitMs);const venueMetrics=await fetchVenueMetrics(state);const payload=summarize(state,venueMetrics);
+  const hasData=payload.trade_count>0||payload.stored_5m_buckets>0;sendJson(res,hasData?200:503,hasData?payload:{...payload,ok:false,error:'building_24h_history'});return true;
 }
 
-export async function handleContractFlow(req, res, url) {
-  if (url.pathname === '/api/contract-flow/health') {
-    sendJson(res, 200, { ok: true, version: '614.1.3.3', streams: states.size, time: new Date().toISOString() });
-    return true;
-  }
-  if (url.pathname !== '/api/contract-flow') return false;
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    sendJson(res, 405, { ok: false, error: 'method_not_allowed' });
-    return true;
-  }
-  let provider = providerKey(url.searchParams.get('provider'));
-  let symbol = symbolKey(url.searchParams.get('symbol'));
-  let waitMs = Math.min(5000, Math.max(0, Number(url.searchParams.get('wait_ms') || 3200)));
-  if (req.method === 'POST') {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    try {
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-      provider = providerKey(body.provider) || provider;
-      symbol = symbolKey(body.symbol) || symbol;
-      if (Number.isFinite(Number(body.wait_ms))) waitMs = Math.min(5000, Math.max(0, Number(body.wait_ms)));
-    } catch (_) {}
-  }
-  if (!provider || !symbol || !symbol.endsWith('USDT')) {
-    sendJson(res, 400, { ok: false, error: 'invalid_provider_or_symbol' });
-    return true;
-  }
-  const state = getState(provider, symbol);
-  await waitForTrades(state, 60, waitMs);
-  const venueMetrics = await fetchVenueMetrics(state);
-  const payload = summarize(state, venueMetrics);
-  const status = payload.trade_count > 0 ? 200 : 503;
-  sendJson(res, status, payload.trade_count > 0 ? payload : { ...payload, ok: false, error: 'waiting_for_exchange_trades' });
-  return true;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, state] of states.entries()) {
-    prune(state);
-    if (now - state.lastRequestedAt <= IDLE_CLOSE_MS) continue;
-    clearInterval(state.heartbeatTimer);
-    clearTimeout(state.reconnectTimer);
-    try { state.ws?.close(1000, 'idle'); } catch (_) {}
-    states.delete(key);
-  }
-}, 60000).unref();
+setInterval(()=>{const now=Date.now();for(const [key,state] of states.entries()){finalizeReadyBuckets(state,now);if(now-state.lastRequestedAt<=IDLE_CLOSE_MS)continue;clearInterval(state.heartbeatTimer);clearTimeout(state.reconnectTimer);try{state.ws?.close(1000,'idle');}catch(_){}states.delete(key);}},60000).unref();
+setInterval(()=>{flushPersistQueue().catch(()=>{});},20000).unref();
