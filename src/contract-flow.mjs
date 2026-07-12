@@ -45,6 +45,22 @@ function asNumber(value) {
 }
 
 function normalizeTime(value) {
+  if (value instanceof Date) {
+    const parsedDate = value.getTime();
+    return Number.isFinite(parsedDate) ? parsedDate : null;
+  }
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return null;
+    const numeric = Number(text);
+    if (Number.isFinite(numeric)) {
+      if (numeric < 10_000_000_000) return Math.round(numeric * 1000);
+      if (numeric > 10_000_000_000_000) return Math.round(numeric / 1000);
+      return Math.round(numeric);
+    }
+    const parsedIso = Date.parse(text);
+    return Number.isFinite(parsedIso) ? parsedIso : null;
+  }
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return null;
   if (parsed < 10_000_000_000) return Math.round(parsed * 1000);
@@ -254,7 +270,7 @@ async function flushPersistQueue() {
       if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
-      console.error(`[Step614.2] flow bucket persist failed: ${error?.message || error}`);
+      console.error(`[Step614.2.1] flow bucket persist failed: ${error?.message || error}`);
     }
   })().finally(() => { persistFlushPromise = null; });
   await persistFlushPromise;
@@ -556,7 +572,7 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
   };});
   return {
-    ok:true, version:'614.2', provider:state.provider, symbol:state.symbol,
+    ok:true, version:'614.2.1', provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
     persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
     stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
@@ -579,12 +595,12 @@ function waitForTrades(state,minTrades,waitMs){
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'614.2',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'614.2.1',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
     let started=0;
     for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:'614.2',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'614.2.1',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
