@@ -68,17 +68,18 @@ function normalizeTime(value) {
   return Math.round(parsed);
 }
 
-function tradeItem(time, price, size, side) {
+function tradeItem(time, price, size, side, sizeMultiplier = 1) {
   const ts = normalizeTime(time);
   const px = asNumber(price);
-  const qty = Math.abs(asNumber(size) ?? 0);
+  const multiplier = Math.abs(asNumber(sizeMultiplier) ?? 1);
+  const qty = Math.abs(asNumber(size) ?? 0) * multiplier;
   const normalizedSide = String(side || '').toLowerCase();
   if (!ts || !px || px <= 0 || !qty || qty <= 0) return null;
   if (normalizedSide !== 'buy' && normalizedSide !== 'sell') return null;
   return { time: ts, price: px, size: qty, quote: px * qty, side: normalizedSide };
 }
 
-function configFor(provider, symbol) {
+function configFor(provider, symbol, quantityMultiplier = 1) {
   if (provider === 'binance') {
     return {
       url: `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@aggTrade`,
@@ -169,7 +170,7 @@ function configFor(provider, symbol) {
         for (const row of rows) {
           const signedSize = asNumber(row.size ?? row.amount);
           const side = row.side || (signedSize == null ? '' : signedSize >= 0 ? 'buy' : 'sell');
-          const item = tradeItem(row.create_time_ms ?? row.create_time ?? row.time_ms ?? row.time, row.price, signedSize, side);
+          const item = tradeItem(row.create_time_ms ?? row.create_time ?? row.time_ms ?? row.time, row.price, signedSize, side, quantityMultiplier);
           if (item) items.push(item);
         }
         return items;
@@ -337,7 +338,7 @@ async function flushPersistQueue() {
       if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
-      console.error(`[Step615.1] flow bucket persist failed: ${error?.message || error}`);
+      console.error(`[Step615.2] flow bucket persist failed: ${error?.message || error}`);
     }
   })().finally(() => { persistFlushPromise = null; });
   await persistFlushPromise;
@@ -414,10 +415,49 @@ function ingest(state, items) {
   }
 }
 
+
+async function loadGateContractMultiplier(state) {
+  if (state.provider !== 'gate') return 1;
+  if (state.gateQuantoMultiplier && state.gateQuantoMultiplier > 0) return state.gateQuantoMultiplier;
+  const contract = gateSymbol(state.symbol);
+  const payload = await firstWorkingJson([
+    `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
+    `https://fx-api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
+  ], { timeoutMs: 8000 });
+  const multiplier = asNumber(payload?.quanto_multiplier);
+  if (multiplier == null || multiplier <= 0) throw new Error('gate_contract_multiplier_missing');
+  state.gateQuantoMultiplier = multiplier;
+  return multiplier;
+}
+
+function scheduleGateMultiplierRetry(state, reason) {
+  state.status = 'contract_meta_wait';
+  state.error = String(reason || 'gate_contract_multiplier_unavailable').slice(0, 180);
+  clearTimeout(state.reconnectTimer);
+  if (Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) {
+    state.reconnectTimer = setTimeout(() => startStream(state), 30000);
+  }
+}
+
 function startStream(state) {
   if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
   clearTimeout(state.reconnectTimer);
-  const cfg = configFor(state.provider, state.symbol);
+  if (state.provider === 'gate' && !(state.gateQuantoMultiplier > 0)) {
+    state.status = 'loading_contract_meta';
+    if (!state.gateMultiplierPromise) {
+      state.gateMultiplierPromise = loadGateContractMultiplier(state)
+        .then(() => {
+          state.gateMultiplierPromise = null;
+          if (states.get(state.key) === state && Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) startStream(state);
+        })
+        .catch((error) => {
+          state.gateMultiplierPromise = null;
+          scheduleGateMultiplierRetry(state, error?.message || error);
+        });
+    }
+    return;
+  }
+  const cfg = configFor(state.provider, state.symbol, state.gateQuantoMultiplier || 1);
   state.status = 'connecting'; state.error = '';
   const ws = new WebSocket(cfg.url, { handshakeTimeout: 15000 });
   state.ws = ws;
@@ -479,7 +519,8 @@ function getState(provider, symbol) {
       ws: null, status: 'idle', error: '', lastTradeAt: 0, lastPrice: null, lastRequestedAt: Date.now(), reconnectAttempt: 0,
       reconnectTimer: null, heartbeatTimer: null,
       metricRows: new Map(), metricLoaded: false, metricLoading: false, metricError: '', metricFetchedAt: 0,
-      metricFetchPromise: null, metricCooldownUntil: 0,
+      metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0,
+      gateQuantoMultiplier: null, gateMultiplierPromise: null,
       historyLoaded: false, historyLoading: false, historyError: '',
     };
     states.set(key, state);
@@ -516,7 +557,7 @@ function isoFrom(value) {
 
 async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
   const response = await fetch(url, {
-    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615.1', ...headers },
+    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615.2', ...headers },
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
@@ -596,21 +637,21 @@ async function flushMetricPersistQueue() {
   for (const row of rows) metricPersistQueue.delete(metricKey(row));
   metricPersistFlushPromise = (async () => {
     try {
-      const response = await fetch(`${SUPABASE_URL}/rest/v1/${METRIC_TABLE}?on_conflict=provider,symbol,bucket_time`, {
+      const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/app_upsert_contract_position_metrics`, {
         method: 'POST',
         headers: {
           apikey: SUPABASE_SERVICE_ROLE_KEY,
           authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
           'content-type': 'application/json',
-          prefer: 'resolution=merge-duplicates,return=minimal',
+          prefer: 'return=minimal',
         },
-        body: JSON.stringify(rows),
+        body: JSON.stringify({ p_rows: rows }),
         signal: AbortSignal.timeout(15000),
       });
       if (!response.ok) throw new Error(`metric_persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) metricPersistQueue.set(metricKey(row), row);
-      console.error(`[Step615.1] contract metrics persist failed: ${error?.message || error}`);
+      console.error(`[Step615.2] contract metrics persist failed: ${error?.message || error}`);
     }
   })().finally(() => { metricPersistFlushPromise = null; });
   await metricPersistFlushPromise;
@@ -794,7 +835,7 @@ async function fetchOkxMetricRows(state) {
   if (settled[0].status === 'fulfilled') {
     for (const item of Array.isArray(settled[0].value?.data) ? settled[0].value.data : []) {
       const row = metricPoint(map, state.provider, state.symbol, item.ts ?? now);
-      row.open_interest = asNumber(item.oi);
+      row.open_interest = asNumber(item.oiCcy ?? item.openInterestCcy);
       row.open_interest_value = asNumber(item.oiUsd);
     }
   }
@@ -865,6 +906,7 @@ async function fetchBitgetMetricRows(state) {
 
 async function fetchGateMetricRows(state) {
   const contract = gateSymbol(state.symbol);
+  const multiplier = await loadGateContractMultiplier(state);
   const raw = await firstWorkingJson([
     `https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
     `https://fx-api.gateio.ws/api/v4/futures/usdt/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
@@ -872,7 +914,8 @@ async function fetchGateMetricRows(state) {
   const map = new Map();
   for (const item of Array.isArray(raw) ? raw : []) {
     const row = metricPoint(map, state.provider, state.symbol, item.time ?? item.timestamp);
-    row.open_interest = asNumber(item.open_interest);
+    const contracts = asNumber(item.open_interest);
+    row.open_interest = contracts == null ? null : contracts * multiplier;
     row.open_interest_value = asNumber(item.open_interest_usd);
     applyRatioFromParts(row, 'global', item.long_short_ratio, item.long_users ?? item.long_ratio, item.short_users ?? item.short_ratio);
     applyRatioFromParts(row, 'top_account', item.top_long_short_account_ratio, item.top_long_account, item.top_short_account);
@@ -888,6 +931,23 @@ async function fetchProviderMetricRows(state) {
   if (state.provider === 'bitget') return fetchBitgetMetricRows(state);
   if (state.provider === 'gate') return fetchGateMetricRows(state);
   return [];
+}
+
+
+function recentMetricFamilyStatus(state) {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  const recent = [...state.metricRows.values()].filter((row) => metricRowStart(row) >= cutoff);
+  const has = (fields) => recent.some((row) => fields.some((field) => asNumber(row[field]) != null));
+  const status = {
+    oi: has(['open_interest', 'open_interest_value']),
+    global_account: has(['global_long_short_ratio', 'global_long_account', 'global_short_account']),
+    top_account: has(['top_account_long_short_ratio', 'top_account_long', 'top_account_short']),
+    top_position: has(['top_position_long_short_ratio', 'top_position_long', 'top_position_short']),
+  };
+  const required = state.provider === 'binance' || state.provider === 'gate'
+    ? ['oi', 'global_account', 'top_account', 'top_position']
+    : ['oi', 'global_account'];
+  return { ...status, required, complete: required.every((key) => status[key] === true) };
 }
 
 function metricPayloadFromState(state) {
@@ -913,15 +973,18 @@ function metricPayloadFromState(state) {
       ratioRows.push({ source_time: sourceTime, ratio_type: type, long_short_ratio: ratio, long_account: longShare, short_account: shortShare });
     }
   }
-  return { oi_rows: oiRows, ratio_rows: ratioRows, metric_error: state.metricError, metric_updated_at: rows.at(-1)?.bucket_time || null };
+  return { oi_rows: oiRows, ratio_rows: ratioRows, metric_error: state.metricError, metric_updated_at: rows.at(-1)?.bucket_time || null, metric_status: recentMetricFamilyStatus(state) };
 }
 
 async function fetchVenueMetrics(state) {
   await loadPersistedMetrics(state);
   const now = Date.now();
   const latest = [...state.metricRows.keys()].sort((a, b) => b - a)[0] || 0;
-  const fresh = latest && now - latest < METRIC_REFRESH_MS + 30000;
-  if (fresh || now < state.metricCooldownUntil) return metricPayloadFromState(state);
+  const statusBefore = recentMetricFamilyStatus(state);
+  const fullFresh = statusBefore.complete && latest && now - latest < METRIC_REFRESH_MS + 30000;
+  const partialRetryInterval = state.metricPartialRetryCount < 2 ? 60000 : METRIC_REFRESH_MS;
+  const partialRetryFresh = !statusBefore.complete && state.metricFetchedAt && now - state.metricFetchedAt < partialRetryInterval;
+  if (fullFresh || partialRetryFresh || now < state.metricCooldownUntil) return metricPayloadFromState(state);
   if (!state.metricFetchPromise) {
     state.metricFetchPromise = (async () => {
       try {
@@ -934,10 +997,14 @@ async function fetchVenueMetrics(state) {
         state.metricFetchedAt = Date.now();
         state.metricError = '';
         state.metricCooldownUntil = 0;
+        const statusAfter = recentMetricFamilyStatus(state);
+        state.metricPartialRetryCount = statusAfter.complete ? 0 : Math.min(3, state.metricPartialRetryCount + 1);
         await flushMetricPersistQueue();
       } catch (error) {
         const message = String(error?.message || error).slice(0, 700);
         state.metricError = message;
+        state.metricFetchedAt = Date.now();
+        state.metricPartialRetryCount = Math.min(3, state.metricPartialRetryCount + 1);
         const restricted = /upstream_(418|429|451)|banned|restricted|cloudfront/i.test(message);
         state.metricCooldownUntil = Date.now() + (restricted ? 30 * 60 * 1000 : 5 * 60 * 1000);
       }
@@ -1014,7 +1081,7 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
   };});
   return {
-    ok:true, version:'615.1', provider:state.provider, symbol:state.symbol,
+    ok:true, version:'615.2', provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
     persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
     stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
@@ -1037,12 +1104,12 @@ function waitForTrades(state,minTrades,waitMs){
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'615.1',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.2',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
     let started=0;
     for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:'615.1',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.2',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
