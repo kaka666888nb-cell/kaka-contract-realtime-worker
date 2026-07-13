@@ -109,7 +109,7 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
         if (message?.arg?.channel !== 'trades') return [];
         const items = [];
         for (const row of Array.isArray(message.data) ? message.data : []) {
-          const item = tradeItem(row.ts, row.px, row.sz, row.side);
+          const item = tradeItem(row.ts, row.px, row.sz, row.side, quantityMultiplier);
           if (item) items.push(item);
         }
         return items;
@@ -291,7 +291,12 @@ function finalizeBucket(bucket, provider, symbol) {
     trade_count: bucket.tradeCount,
     p70_quote: flowHistogramQuoteAt(p70Index),
     p95_quote: flowHistogramQuoteAt(p95Index),
-    source: provider === 'gate' ? 'render_exchange_websocket_histogram_gate_unit_v2' : 'render_exchange_websocket_histogram', updated_at: new Date().toISOString(),
+    source: provider === 'gate'
+      ? 'render_exchange_websocket_histogram_gate_unit_v2'
+      : (provider === 'okx'
+          ? 'render_exchange_websocket_histogram_okx_unit_v2'
+          : 'render_exchange_websocket_histogram'),
+    updated_at: new Date().toISOString(),
   };
   for (let i = 0; i < FLOW_HISTOGRAM_BINS; i += 1) {
     const tier = i >= p95Index ? 'large' : (i >= p70Index ? 'medium' : 'small');
@@ -342,7 +347,7 @@ async function flushPersistQueue() {
       if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
-      console.error(`[Step615.3] flow bucket persist failed: ${error?.message || error}`);
+      console.error(`[Step615.4] flow bucket persist failed: ${error?.message || error}`);
     }
   })().finally(() => { persistFlushPromise = null; });
   await persistFlushPromise;
@@ -368,6 +373,8 @@ async function loadPersistedHistory(state) {
       // Step615.3：615.3以前的Gate桶没有正确单位版本标记，可能仍含“张数当BTC”的旧金额。
       // 即使旧进程在SQL清理后又写回，也不会再被新版本加载。
       if (state.provider === 'gate' && String(raw?.source || '') !== 'render_exchange_websocket_histogram_gate_unit_v2') continue;
+      // Step615.4：OKX trades 的 sz 是合约张数，旧桶误按 BTC 数量计算。
+      if (state.provider === 'okx' && String(raw?.source || '') !== 'render_exchange_websocket_histogram_okx_unit_v2') continue;
       const row = normalizePersistedRow(raw);
       if (row) state.completedBuckets.set(row.start, row);
     }
@@ -423,6 +430,35 @@ function ingest(state, items) {
 }
 
 
+async function loadOkxContractMultiplier(state) {
+  if (state.provider !== 'okx') return 1;
+  if (state.okxContractMultiplier && state.okxContractMultiplier > 0) return state.okxContractMultiplier;
+  const instId = okxInstId(state.symbol);
+  const payload = await firstWorkingJson([
+    `https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`,
+    `https://aws.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`,
+  ], { timeoutMs: 8000 });
+  const item = Array.isArray(payload?.data) ? payload.data[0] : null;
+  const [base] = splitSymbol(state.symbol);
+  const ctVal = asNumber(item?.ctVal);
+  const ctMult = asNumber(item?.ctMult) ?? 1;
+  const ctValCcy = String(item?.ctValCcy || '').toUpperCase();
+  if (ctVal == null || ctVal <= 0 || ctMult <= 0 || (ctValCcy && ctValCcy !== base)) {
+    throw new Error('okx_contract_multiplier_missing');
+  }
+  state.okxContractMultiplier = ctVal * ctMult;
+  return state.okxContractMultiplier;
+}
+
+function scheduleOkxMultiplierRetry(state, reason) {
+  state.status = 'contract_meta_wait';
+  state.error = String(reason || 'okx_contract_multiplier_unavailable').slice(0, 180);
+  clearTimeout(state.reconnectTimer);
+  if (Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) {
+    state.reconnectTimer = setTimeout(() => startStream(state), 30000);
+  }
+}
+
 async function loadGateContractMultiplier(state) {
   if (state.provider !== 'gate') return 1;
   if (state.gateQuantoMultiplier && state.gateQuantoMultiplier > 0) return state.gateQuantoMultiplier;
@@ -449,6 +485,21 @@ function scheduleGateMultiplierRetry(state, reason) {
 function startStream(state) {
   if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
   clearTimeout(state.reconnectTimer);
+  if (state.provider === 'okx' && !(state.okxContractMultiplier > 0)) {
+    state.status = 'loading_contract_meta';
+    if (!state.okxMultiplierPromise) {
+      state.okxMultiplierPromise = loadOkxContractMultiplier(state)
+        .then(() => {
+          state.okxMultiplierPromise = null;
+          if (states.get(state.key) === state && Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) startStream(state);
+        })
+        .catch((error) => {
+          state.okxMultiplierPromise = null;
+          scheduleOkxMultiplierRetry(state, error?.message || error);
+        });
+    }
+    return;
+  }
   if (state.provider === 'gate' && !(state.gateQuantoMultiplier > 0)) {
     state.status = 'loading_contract_meta';
     if (!state.gateMultiplierPromise) {
@@ -464,7 +515,10 @@ function startStream(state) {
     }
     return;
   }
-  const cfg = configFor(state.provider, state.symbol, state.gateQuantoMultiplier || 1);
+  const quantityMultiplier = state.provider === 'okx'
+    ? (state.okxContractMultiplier || 1)
+    : (state.provider === 'gate' ? (state.gateQuantoMultiplier || 1) : 1);
+  const cfg = configFor(state.provider, state.symbol, quantityMultiplier);
   state.status = 'connecting'; state.error = '';
   const ws = new WebSocket(cfg.url, { handshakeTimeout: 15000 });
   state.ws = ws;
@@ -527,6 +581,7 @@ function getState(provider, symbol) {
       reconnectTimer: null, heartbeatTimer: null,
       metricRows: new Map(), metricLoaded: false, metricLoading: false, metricError: '', metricFetchedAt: 0,
       metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0,
+      okxContractMultiplier: null, okxMultiplierPromise: null,
       gateQuantoMultiplier: null, gateMultiplierPromise: null,
       historyLoaded: false, historyLoading: false, historyError: '',
     };
@@ -662,7 +717,7 @@ async function flushMetricPersistQueue() {
       if (!response.ok) throw new Error(`metric_persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) metricPersistQueue.set(metricKey(row), row);
-      console.error(`[Step615.3] contract metrics persist failed: ${error?.message || error}`);
+      console.error(`[Step615.4] contract metrics persist failed: ${error?.message || error}`);
     }
   })().finally(() => { metricPersistFlushPromise = null; });
   await metricPersistFlushPromise;
@@ -1110,7 +1165,7 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
   };});
   return {
-    ok:true, version:'615.3', provider:state.provider, symbol:state.symbol,
+    ok:true, version:'615.4', provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
     persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
     stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
@@ -1133,12 +1188,12 @@ function waitForTrades(state,minTrades,waitMs){
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'615.3',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.4',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
     let started=0;
     for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:'615.3',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.4',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
