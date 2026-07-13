@@ -40,6 +40,10 @@ function gateSymbol(symbol) {
 }
 
 function asNumber(value) {
+  // Step615.3：Number(null) 与 Number('') 都会得到 0。
+  // 资金指标的“缺失”不能被转换成 0，否则会覆盖数据库中的真实值并让卡片忽有忽无。
+  if (value == null || typeof value === 'boolean') return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -287,7 +291,7 @@ function finalizeBucket(bucket, provider, symbol) {
     trade_count: bucket.tradeCount,
     p70_quote: flowHistogramQuoteAt(p70Index),
     p95_quote: flowHistogramQuoteAt(p95Index),
-    source: 'render_exchange_websocket_histogram', updated_at: new Date().toISOString(),
+    source: provider === 'gate' ? 'render_exchange_websocket_histogram_gate_unit_v2' : 'render_exchange_websocket_histogram', updated_at: new Date().toISOString(),
   };
   for (let i = 0; i < FLOW_HISTOGRAM_BINS; i += 1) {
     const tier = i >= p95Index ? 'large' : (i >= p70Index ? 'medium' : 'small');
@@ -338,7 +342,7 @@ async function flushPersistQueue() {
       if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
-      console.error(`[Step615.2] flow bucket persist failed: ${error?.message || error}`);
+      console.error(`[Step615.3] flow bucket persist failed: ${error?.message || error}`);
     }
   })().finally(() => { persistFlushPromise = null; });
   await persistFlushPromise;
@@ -361,6 +365,9 @@ async function loadPersistedHistory(state) {
     if (!response.ok) throw new Error(`history_http_${response.status}:${text.slice(0, 180)}`);
     const rows = JSON.parse(text);
     for (const raw of Array.isArray(rows) ? rows : []) {
+      // Step615.3：615.3以前的Gate桶没有正确单位版本标记，可能仍含“张数当BTC”的旧金额。
+      // 即使旧进程在SQL清理后又写回，也不会再被新版本加载。
+      if (state.provider === 'gate' && String(raw?.source || '') !== 'render_exchange_websocket_histogram_gate_unit_v2') continue;
       const row = normalizePersistedRow(raw);
       if (row) state.completedBuckets.set(row.start, row);
     }
@@ -557,7 +564,7 @@ function isoFrom(value) {
 
 async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
   const response = await fetch(url, {
-    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615.2', ...headers },
+    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615.3', ...headers },
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
@@ -607,7 +614,11 @@ function normalizeMetricRow(raw) {
     'top_account_long_short_ratio','top_account_long','top_account_short',
     'top_position_long_short_ratio','top_position_long','top_position_short',
   ];
-  for (const field of fields) row[field] = asNumber(raw[field]);
+  for (const field of fields) {
+    const value = asNumber(raw[field]);
+    // OI、账户占比与多空比在本模块中都应为正值；旧版由null误转出的0视为缺失。
+    row[field] = value != null && value > 0 ? value : null;
+  }
   row.source = String(raw?.source || row.source);
   row.updated_at = String(raw?.updated_at || row.updated_at);
   return row;
@@ -651,7 +662,7 @@ async function flushMetricPersistQueue() {
       if (!response.ok) throw new Error(`metric_persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) metricPersistQueue.set(metricKey(row), row);
-      console.error(`[Step615.2] contract metrics persist failed: ${error?.message || error}`);
+      console.error(`[Step615.3] contract metrics persist failed: ${error?.message || error}`);
     }
   })().finally(() => { metricPersistFlushPromise = null; });
   await metricPersistFlushPromise;
@@ -937,7 +948,10 @@ async function fetchProviderMetricRows(state) {
 function recentMetricFamilyStatus(state) {
   const cutoff = Date.now() - 30 * 60 * 1000;
   const recent = [...state.metricRows.values()].filter((row) => metricRowStart(row) >= cutoff);
-  const has = (fields) => recent.some((row) => fields.some((field) => asNumber(row[field]) != null));
+  const has = (fields) => recent.some((row) => fields.some((field) => {
+    const value = asNumber(row[field]);
+    return value != null && value > 0;
+  }));
   const status = {
     oi: has(['open_interest', 'open_interest_value']),
     global_account: has(['global_long_short_ratio', 'global_long_account', 'global_short_account']),
@@ -960,8 +974,14 @@ function metricPayloadFromState(state) {
   const ratioRows = [];
   for (const row of rows) {
     const sourceTime = row.bucket_time;
-    if (row.open_interest != null || row.open_interest_value != null) {
-      oiRows.push({ source_time: sourceTime, open_interest: row.open_interest, open_interest_value: row.open_interest_value });
+    const validOi = asNumber(row.open_interest) != null && asNumber(row.open_interest) > 0;
+    const validOiValue = asNumber(row.open_interest_value) != null && asNumber(row.open_interest_value) > 0;
+    if (validOi || validOiValue) {
+      oiRows.push({
+        source_time: sourceTime,
+        open_interest: validOi ? row.open_interest : null,
+        open_interest_value: validOiValue ? row.open_interest_value : null,
+      });
     }
     const ratios = [
       ['global_account', row.global_long_short_ratio, row.global_long_account, row.global_short_account],
@@ -969,8 +989,17 @@ function metricPayloadFromState(state) {
       ['top_position', row.top_position_long_short_ratio, row.top_position_long, row.top_position_short],
     ];
     for (const [type, ratio, longShare, shortShare] of ratios) {
-      if (ratio == null && longShare == null && shortShare == null) continue;
-      ratioRows.push({ source_time: sourceTime, ratio_type: type, long_short_ratio: ratio, long_account: longShare, short_account: shortShare });
+      const validRatio = asNumber(ratio) != null && asNumber(ratio) > 0;
+      const validLong = asNumber(longShare) != null && asNumber(longShare) > 0;
+      const validShort = asNumber(shortShare) != null && asNumber(shortShare) > 0;
+      if (!validRatio && !validLong && !validShort) continue;
+      ratioRows.push({
+        source_time: sourceTime,
+        ratio_type: type,
+        long_short_ratio: validRatio ? ratio : null,
+        long_account: validLong ? longShare : null,
+        short_account: validShort ? shortShare : null,
+      });
     }
   }
   return { oi_rows: oiRows, ratio_rows: ratioRows, metric_error: state.metricError, metric_updated_at: rows.at(-1)?.bucket_time || null, metric_status: recentMetricFamilyStatus(state) };
@@ -1081,7 +1110,7 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
   };});
   return {
-    ok:true, version:'615.2', provider:state.provider, symbol:state.symbol,
+    ok:true, version:'615.3', provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
     persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
     stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
@@ -1104,12 +1133,12 @@ function waitForTrades(state,minTrades,waitMs){
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'615.2',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.3',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
     let started=0;
     for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:'615.2',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.3',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
