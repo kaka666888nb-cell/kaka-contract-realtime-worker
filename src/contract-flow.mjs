@@ -208,6 +208,12 @@ const METRIC_TABLE = 'app_contract_position_5m_cache';
 const metricPersistQueue = new Map();
 let metricPersistFlushPromise = null;
 const BINANCE_API_KEY = String(process.env.BINANCE_API_KEY || '').trim();
+const CONTRACT_META_TTL_MS = 30 * 1000;
+const CONTRACT_META_STALE_MS = 30 * 60 * 1000;
+const CONTRACT_META_RETRY_MS = 90 * 1000;
+const CONTRACT_META_RESTRICTED_RETRY_MS = 30 * 60 * 1000;
+const contractMetaCache = new Map();
+
 
 function percentile(sorted, percentileValue) {
   if (!sorted.length) return 0;
@@ -347,7 +353,7 @@ async function flushPersistQueue() {
       if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
-      console.error(`[Step615.4] flow bucket persist failed: ${error?.message || error}`);
+      console.error(`[Step615.5] flow bucket persist failed: ${error?.message || error}`);
     }
   })().finally(() => { persistFlushPromise = null; });
   await persistFlushPromise;
@@ -619,7 +625,7 @@ function isoFrom(value) {
 
 async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
   const response = await fetch(url, {
-    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615.3', ...headers },
+    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615.5', ...headers },
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
@@ -630,6 +636,223 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
   }
   try { return text.trim() ? JSON.parse(text) : null; }
   catch (_) { throw new Error(`upstream_invalid_json:${text.slice(0, 160)}`); }
+}
+
+
+function firstDataObject(payload) {
+  const direct = payload?.data;
+  if (Array.isArray(direct)) return direct.find((item) => item && typeof item === 'object') || null;
+  if (direct && typeof direct === 'object') {
+    if (Array.isArray(direct.list)) return direct.list.find((item) => item && typeof item === 'object') || null;
+    return direct;
+  }
+  const result = payload?.result;
+  if (Array.isArray(result?.list)) return result.list.find((item) => item && typeof item === 'object') || null;
+  if (Array.isArray(result)) return result.find((item) => item && typeof item === 'object') || null;
+  if (result && typeof result === 'object') return result;
+  return null;
+}
+
+function firstFinite(...values) {
+  for (const value of values) {
+    const parsed = asNumber(value);
+    if (parsed != null && Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function fundingPercent(raw) {
+  const value = asNumber(raw);
+  if (value == null) return null;
+  return Math.abs(value) <= 1 ? value * 100 : value;
+}
+
+function normalizeContractMeta(provider, symbol, raw = {}) {
+  const markPrice = firstFinite(raw.mark_price, raw.markPrice, raw.markPx);
+  const indexPrice = firstFinite(raw.index_price, raw.indexPrice, raw.idxPx);
+  const lastPrice = firstFinite(raw.last_price, raw.lastPrice, raw.last, raw.lastPr);
+  const fundingRaw = firstFinite(raw.last_funding_rate, raw.funding_rate, raw.fundingRate, raw.lastFundingRate);
+  const nextFundingMs = normalizeTime(raw.next_funding_time ?? raw.nextFundingTime ?? raw.nextUpdate ?? raw.nextSettleTime ?? raw.fundingTime);
+  const sourceMs = normalizeTime(raw.source_time ?? raw.time ?? raw.ts ?? raw.requestTime ?? Date.now()) || Date.now();
+  const basis = markPrice != null && indexPrice != null && indexPrice !== 0
+    ? (markPrice - indexPrice) / indexPrice * 100
+    : null;
+  return {
+    provider,
+    symbol,
+    mark_price: markPrice,
+    index_price: indexPrice,
+    last_price: lastPrice,
+    last_funding_rate: fundingRaw,
+    last_funding_rate_percent: fundingPercent(fundingRaw),
+    next_funding_time: nextFundingMs ? new Date(nextFundingMs).toISOString() : null,
+    mark_index_basis_percent: basis,
+    source_time: new Date(sourceMs).toISOString(),
+    cached_at: new Date().toISOString(),
+    source: String(raw.source || `${provider}_official_contract_meta`),
+  };
+}
+
+async function fetchBinanceContractMeta(symbol) {
+  const raw = await firstWorkingJson([
+    `https://fapi1.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`,
+    `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`,
+  ], { timeoutMs: 5000 });
+  return normalizeContractMeta('binance', symbol, {
+    ...raw,
+    mark_price: raw?.markPrice,
+    index_price: raw?.indexPrice,
+    last_funding_rate: raw?.lastFundingRate,
+    next_funding_time: raw?.nextFundingTime,
+    source_time: raw?.time,
+    source: 'binance_premium_index',
+  });
+}
+
+async function fetchOkxContractMeta(symbol) {
+  const instId = okxInstId(symbol);
+  const [base, quote] = splitSymbol(symbol);
+  const indexId = `${base}-${quote}`;
+  const settled = await Promise.allSettled([
+    firstWorkingNonEmptyDataJson([
+      `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`,
+      `https://aws.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`,
+    ], { timeoutMs: 5000 }),
+    firstWorkingNonEmptyDataJson([
+      `https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId=${encodeURIComponent(instId)}`,
+      `https://aws.okx.com/api/v5/public/mark-price?instType=SWAP&instId=${encodeURIComponent(instId)}`,
+    ], { timeoutMs: 5000 }),
+    firstWorkingNonEmptyDataJson([
+      `https://www.okx.com/api/v5/market/index-tickers?instId=${encodeURIComponent(indexId)}`,
+      `https://aws.okx.com/api/v5/market/index-tickers?instId=${encodeURIComponent(indexId)}`,
+    ], { timeoutMs: 5000 }),
+  ]);
+  const funding = settled[0].status === 'fulfilled' ? firstDataObject(settled[0].value) : null;
+  const mark = settled[1].status === 'fulfilled' ? firstDataObject(settled[1].value) : null;
+  const index = settled[2].status === 'fulfilled' ? firstDataObject(settled[2].value) : null;
+  if (!funding && !mark && !index) {
+    throw new Error(settled.map((item) => item.status === 'rejected' ? String(item.reason?.message || item.reason) : '').join(' | ').slice(0, 700) || 'okx_contract_meta_empty');
+  }
+  return normalizeContractMeta('okx', symbol, {
+    mark_price: mark?.markPx,
+    index_price: index?.idxPx,
+    last_funding_rate: funding?.fundingRate ?? funding?.settFundingRate,
+    next_funding_time: funding?.nextFundingTime ?? funding?.fundingTime,
+    source_time: funding?.ts ?? mark?.ts ?? index?.ts,
+    source: 'okx_funding_mark_index',
+  });
+}
+
+async function fetchBybitContractMeta(symbol) {
+  const raw = await firstWorkingJson([
+    `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`,
+    `https://api.bytick.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`,
+  ], { timeoutMs: 5500 });
+  const item = firstDataObject(raw);
+  if (!item) throw new Error('bybit_contract_meta_empty');
+  return normalizeContractMeta('bybit', symbol, {
+    ...item,
+    mark_price: item.markPrice,
+    index_price: item.indexPrice,
+    last_price: item.lastPrice,
+    last_funding_rate: item.fundingRate,
+    next_funding_time: item.nextFundingTime,
+    source_time: raw?.time,
+    source: 'bybit_linear_ticker',
+  });
+}
+
+async function fetchBitgetContractMeta(symbol) {
+  const encoded = encodeURIComponent(symbol);
+  const settled = await Promise.allSettled([
+    fetchJson(`https://api.bitget.com/api/v2/mix/market/ticker?symbol=${encoded}&productType=USDT-FUTURES`, { timeoutMs: 5500 }),
+    fetchJson(`https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol=${encoded}&productType=USDT-FUTURES`, { timeoutMs: 5500 }),
+    fetchJson(`https://api.bitget.com/api/v2/mix/market/symbol-price?symbol=${encoded}&productType=USDT-FUTURES`, { timeoutMs: 5500 }),
+  ]);
+  const ticker = settled[0].status === 'fulfilled' ? firstDataObject(settled[0].value) : null;
+  const funding = settled[1].status === 'fulfilled' ? firstDataObject(settled[1].value) : null;
+  const prices = settled[2].status === 'fulfilled' ? firstDataObject(settled[2].value) : null;
+  if (!ticker && !funding && !prices) {
+    throw new Error(settled.map((item) => item.status === 'rejected' ? String(item.reason?.message || item.reason) : '').join(' | ').slice(0, 700) || 'bitget_contract_meta_empty');
+  }
+  return normalizeContractMeta('bitget', symbol, {
+    mark_price: prices?.markPrice ?? ticker?.markPrice,
+    index_price: prices?.indexPrice ?? ticker?.indexPrice,
+    last_price: prices?.lastPr ?? prices?.lastPrice ?? ticker?.lastPr ?? ticker?.lastPrice,
+    last_funding_rate: funding?.fundingRate ?? ticker?.fundingRate,
+    next_funding_time: funding?.nextUpdate ?? funding?.nextFundingTime ?? ticker?.nextSettleTime,
+    source_time: funding?.ts ?? prices?.ts ?? ticker?.ts ?? settled[0]?.value?.requestTime,
+    source: 'bitget_contract_ticker_funding_price',
+  });
+}
+
+async function fetchGateContractMeta(symbol) {
+  const contract = gateSymbol(symbol);
+  const raw = await firstWorkingJson([
+    `https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=${encodeURIComponent(contract)}`,
+    `https://fx-api.gateio.ws/api/v4/futures/usdt/tickers?contract=${encodeURIComponent(contract)}`,
+  ], { timeoutMs: 5500 });
+  const item = Array.isArray(raw) ? raw[0] : firstDataObject(raw);
+  if (!item) throw new Error('gate_contract_meta_empty');
+  return normalizeContractMeta('gate', symbol, {
+    mark_price: item.mark_price,
+    index_price: item.index_price,
+    last_price: item.last,
+    last_funding_rate: item.funding_rate ?? item.funding_rate_indicative,
+    source_time: Date.now(),
+    source: 'gate_futures_ticker',
+  });
+}
+
+async function fetchProviderContractMeta(provider, symbol) {
+  if (provider === 'binance') return fetchBinanceContractMeta(symbol);
+  if (provider === 'okx') return fetchOkxContractMeta(symbol);
+  if (provider === 'bybit') return fetchBybitContractMeta(symbol);
+  if (provider === 'bitget') return fetchBitgetContractMeta(symbol);
+  if (provider === 'gate') return fetchGateContractMeta(symbol);
+  throw new Error('unsupported_contract_meta_provider');
+}
+
+async function getContractMeta(provider, symbol) {
+  const key = `${provider}:${symbol}`;
+  const now = Date.now();
+  let entry = contractMetaCache.get(key);
+  if (!entry) {
+    entry = { value: null, fetchedAt: 0, cooldownUntil: 0, promise: null, error: '' };
+    contractMetaCache.set(key, entry);
+  }
+  if (entry.value && now - entry.fetchedAt <= CONTRACT_META_TTL_MS) {
+    return { ...entry.value, stale: false, meta_error: '' };
+  }
+  if (now < entry.cooldownUntil) {
+    return entry.value && now - entry.fetchedAt <= CONTRACT_META_STALE_MS
+      ? { ...entry.value, stale: true, meta_error: entry.error }
+      : null;
+  }
+  if (!entry.promise) {
+    entry.promise = (async () => {
+      try {
+        const value = await fetchProviderContractMeta(provider, symbol);
+        entry.value = value;
+        entry.fetchedAt = Date.now();
+        entry.cooldownUntil = 0;
+        entry.error = '';
+        return { ...value, stale: false, meta_error: '' };
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 700);
+        entry.error = message;
+        const restricted = /upstream_(418|429|451)|banned|too many requests|restricted|cloudfront/i.test(message);
+        entry.cooldownUntil = Date.now() + (restricted ? CONTRACT_META_RESTRICTED_RETRY_MS : CONTRACT_META_RETRY_MS);
+        if (entry.value && Date.now() - entry.fetchedAt <= CONTRACT_META_STALE_MS) {
+          return { ...entry.value, stale: true, meta_error: message };
+        }
+        return null;
+      } finally {
+        entry.promise = null;
+      }
+    })();
+  }
+  return entry.promise;
 }
 
 function metricBucketStart(value = Date.now()) {
@@ -717,7 +940,7 @@ async function flushMetricPersistQueue() {
       if (!response.ok) throw new Error(`metric_persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) metricPersistQueue.set(metricKey(row), row);
-      console.error(`[Step615.4] contract metrics persist failed: ${error?.message || error}`);
+      console.error(`[Step615.5] contract metrics persist failed: ${error?.message || error}`);
     }
   })().finally(() => { metricPersistFlushPromise = null; });
   await metricPersistFlushPromise;
@@ -1165,7 +1388,7 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
   };});
   return {
-    ok:true, version:'615.4', provider:state.provider, symbol:state.symbol,
+    ok:true, version:'615.5', provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
     persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
     stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
@@ -1188,19 +1411,27 @@ function waitForTrades(state,minTrades,waitMs){
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'615.4',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.5',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+  }
+  if(url.pathname==='/api/contract-meta'){
+    if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
+    let provider=providerKey(url.searchParams.get('provider'));let symbol=symbolKey(url.searchParams.get('symbol'));
+    if(req.method==='POST'){const chunks=[];for await(const chunk of req)chunks.push(chunk);try{const body=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');provider=providerKey(body.provider)||provider;symbol=symbolKey(body.symbol)||symbol;}catch(_){}}
+    if(!provider||!symbol||!symbol.endsWith('USDT')){sendJson(res,400,{ok:false,error:'invalid_provider_or_symbol'});return true;}
+    const meta=await getContractMeta(provider,symbol);
+    sendJson(res,meta?200:503,meta?{ok:true,version:'615.5',provider,symbol,contract_meta:meta}:{ok:false,version:'615.5',provider,symbol,error:'contract_meta_unavailable'});return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
     let started=0;
     for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:'615.4',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.5',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
   let provider=providerKey(url.searchParams.get('provider'));let symbol=symbolKey(url.searchParams.get('symbol'));let waitMs=Math.min(5000,Math.max(0,Number(url.searchParams.get('wait_ms')||3200)));
   if(req.method==='POST'){const chunks=[];for await(const chunk of req)chunks.push(chunk);try{const body=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');provider=providerKey(body.provider)||provider;symbol=symbolKey(body.symbol)||symbol;if(Number.isFinite(Number(body.wait_ms)))waitMs=Math.min(5000,Math.max(0,Number(body.wait_ms)));}catch(_){}}
   if(!provider||!symbol||!symbol.endsWith('USDT')){sendJson(res,400,{ok:false,error:'invalid_provider_or_symbol'});return true;}
-  const state=getState(provider,symbol);await loadPersistedHistory(state);await waitForTrades(state,20,waitMs);const venueMetrics=await fetchVenueMetrics(state);const payload=summarize(state,venueMetrics);
+  const state=getState(provider,symbol);await loadPersistedHistory(state);await waitForTrades(state,20,waitMs);const [venueMetrics,contractMeta]=await Promise.all([fetchVenueMetrics(state),getContractMeta(provider,symbol)]);const payload=summarize(state,venueMetrics);payload.contract_meta=contractMeta;
   const hasData=payload.trade_count>0||payload.stored_5m_buckets>0;sendJson(res,hasData?200:503,hasData?payload:{...payload,ok:false,error:'building_24h_history'});return true;
 }
 

@@ -4,17 +4,198 @@ import { handleContractFlow } from './contract-flow.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
+const STEP_VERSION = '615.5';
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
   stdio: 'inherit',
 });
 
 child.on('exit', (code, signal) => {
-  console.error(`[Step615.4] legacy worker exited code=${code} signal=${signal || ''}`);
+  console.error(`[Step${STEP_VERSION}] legacy worker exited code=${code} signal=${signal || ''}`);
   process.exit(code || 1);
 });
 
-function proxyHttp(req, res) {
+const legacyCache = new Map();
+const legacyInflight = new Map();
+const legacyCircuit = new Map();
+const LEGACY_MAX_BODY_BYTES = 24 * 1024 * 1024;
+
+function legacyPolicy(pathname) {
+  if (pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 10 * 60_000 };
+  if (pathname === '/api/klines') return { freshMs: 45_000, staleMs: 30 * 60_000 };
+  if (pathname === '/api/universe') return { freshMs: 5 * 60_000, staleMs: 60 * 60_000 };
+  return null;
+}
+
+function circuitKey(url) {
+  const provider = (url.searchParams.get('provider') || '').toLowerCase();
+  const market = (url.searchParams.get('market_type') || '').toLowerCase();
+  return `${url.pathname}|${provider}|${market}`;
+}
+
+function isRestrictedFailure(statusCode, bodyText) {
+  const text = String(bodyText || '').toLowerCase();
+  return statusCode === 418 || statusCode === 429 || statusCode === 451 ||
+    text.includes('way too many requests') || text.includes('ip(') && text.includes('banned until') ||
+    text.includes('too many requests');
+}
+
+function isUpstreamFailure(statusCode, bodyText) {
+  const text = String(bodyText || '').toLowerCase();
+  return statusCode >= 500 || statusCode === 408 || statusCode === 418 || statusCode === 429 || statusCode === 451 ||
+    text.includes('<title>502</title>') || text.includes('bad gateway') || text.includes('legacy_worker_unavailable');
+}
+
+function openCircuit(key, statusCode, bodyText) {
+  const restricted = isRestrictedFailure(statusCode, bodyText);
+  const durationMs = restricted ? 30 * 60_000 : 90_000;
+  const current = legacyCircuit.get(key);
+  const until = Date.now() + durationMs;
+  legacyCircuit.set(key, {
+    until: Math.max(Number(current?.until || 0), until),
+    reason: restricted ? 'exchange_rate_limit_or_region_block' : 'upstream_unavailable',
+    statusCode,
+  });
+}
+
+function cleanResponseHeaders(headers = {}) {
+  const result = {};
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    if (lower === 'content-length' || lower === 'transfer-encoding' || lower === 'connection') continue;
+    if (value != null) result[name] = value;
+  }
+  result['cache-control'] = 'no-store';
+  return result;
+}
+
+function sendBuffered(res, result, extraHeaders = {}) {
+  if (res.headersSent) return res.end();
+  const body = Buffer.isBuffer(result.body) ? result.body : Buffer.from(String(result.body || ''));
+  res.writeHead(result.statusCode || 200, {
+    ...cleanResponseHeaders(result.headers),
+    ...extraHeaders,
+    'content-length': String(body.length),
+  });
+  res.end(body);
+}
+
+function sendCircuitJson(res, state) {
+  const retryAfterSeconds = Math.max(1, Math.ceil((Number(state?.until || Date.now()) - Date.now()) / 1000));
+  const body = Buffer.from(JSON.stringify({
+    ok: false,
+    error: 'legacy_rest_circuit_open',
+    reason: state?.reason || 'upstream_unavailable',
+    retry_after_seconds: retryAfterSeconds,
+  }));
+  res.writeHead(503, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'retry-after': String(retryAfterSeconds),
+    'content-length': String(body.length),
+  });
+  res.end(body);
+}
+
+function fetchLegacyBuffered(req) {
+  return new Promise((resolve, reject) => {
+    const upstream = http.request({
+      hostname: '127.0.0.1',
+      port: CHILD_PORT,
+      method: req.method,
+      path: req.url,
+      headers: { ...req.headers, host: `127.0.0.1:${CHILD_PORT}` },
+    }, (upstreamRes) => {
+      const chunks = [];
+      let total = 0;
+      upstreamRes.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > LEGACY_MAX_BODY_BYTES) {
+          upstreamRes.destroy(new Error('legacy_response_too_large'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      upstreamRes.on('end', () => resolve({
+        statusCode: upstreamRes.statusCode || 502,
+        headers: upstreamRes.headers,
+        body: Buffer.concat(chunks),
+      }));
+      upstreamRes.on('error', reject);
+    });
+    upstream.setTimeout(30_000, () => upstream.destroy(new Error('legacy_worker_timeout')));
+    upstream.on('error', reject);
+    req.pipe(upstream);
+  });
+}
+
+async function proxyCachedGet(req, res, url, policy) {
+  const now = Date.now();
+  const key = `${req.method}:${url.pathname}${url.search}`;
+  const groupKey = circuitKey(url);
+  const cached = legacyCache.get(key);
+  if (cached && now - cached.storedAt <= policy.freshMs) {
+    sendBuffered(res, cached, { 'x-kaka-cache': 'fresh' });
+    return;
+  }
+
+  const circuit = legacyCircuit.get(groupKey);
+  if (circuit && circuit.until > now) {
+    if (cached && now - cached.storedAt <= policy.staleMs) {
+      sendBuffered(res, cached, { 'x-kaka-cache': 'stale-circuit' });
+    } else {
+      sendCircuitJson(res, circuit);
+    }
+    return;
+  }
+  if (circuit) legacyCircuit.delete(groupKey);
+
+  let pending = legacyInflight.get(key);
+  if (!pending) {
+    pending = fetchLegacyBuffered(req)
+      .then((result) => {
+        const bodyText = result.body.toString('utf8', 0, Math.min(result.body.length, 4096));
+        if (isUpstreamFailure(result.statusCode, bodyText)) {
+          openCircuit(groupKey, result.statusCode, bodyText);
+          const error = new Error('legacy_upstream_failure');
+          error.result = result;
+          throw error;
+        }
+        if (result.statusCode >= 200 && result.statusCode < 300) {
+          legacyCache.set(key, { ...result, storedAt: Date.now() });
+        }
+        return result;
+      })
+      .finally(() => legacyInflight.delete(key));
+    legacyInflight.set(key, pending);
+  }
+
+  try {
+    const result = await pending;
+    sendBuffered(res, result, { 'x-kaka-cache': 'miss' });
+  } catch (error) {
+    const fallback = legacyCache.get(key);
+    if (fallback && Date.now() - fallback.storedAt <= policy.staleMs) {
+      sendBuffered(res, fallback, { 'x-kaka-cache': 'stale-error' });
+      return;
+    }
+    const state = legacyCircuit.get(groupKey) || {
+      until: Date.now() + 90_000,
+      reason: 'upstream_unavailable',
+    };
+    sendCircuitJson(res, state);
+  }
+}
+
+function proxyHttp(req, res, url) {
+  const policy = req.method === 'GET' ? legacyPolicy(url.pathname) : null;
+  if (policy) {
+    proxyCachedGet(req, res, url, policy).catch(() => {
+      if (!res.headersSent) sendCircuitJson(res, { until: Date.now() + 90_000, reason: 'proxy_error' });
+    });
+    return;
+  }
+
   const upstream = http.request({
     hostname: '127.0.0.1',
     port: CHILD_PORT,
@@ -25,7 +206,7 @@ function proxyHttp(req, res) {
     res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
     upstreamRes.pipe(res);
   });
-  upstream.setTimeout(30000, () => upstream.destroy(new Error('legacy_worker_timeout')));
+  upstream.setTimeout(30_000, () => upstream.destroy(new Error('legacy_worker_timeout')));
   upstream.on('error', (error) => {
     if (res.headersSent) return res.end();
     res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
@@ -41,7 +222,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'kaka-contract-realtime-worker',
-      version: '615.4',
+      version: STEP_VERSION,
       legacy_worker: '515.1.2',
       protocol: 'kaka.market.realtime.v1',
       providers: ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate'],
@@ -49,9 +230,29 @@ const server = http.createServer(async (req, res) => {
       contract_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow: '/api/contract-flow',
       contract_flow_warm: '/api/contract-flow/warm',
+      contract_meta: '/api/contract-meta',
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
       contract_position_metrics: '/api/contract-flow',
-      risk_controls: { flow_memory: 'fixed_histogram', metric_refresh_seconds: 300, partial_retry_seconds: 60, partial_retry_limit: 2, retention_hours: 72, metric_merge: 'coalesce_non_null', strict_null_numeric: true, app_metric_merge: 'time_and_family_key', okx_contract_value: true, okx_unit_source: 'v2', gate_contract_multiplier: true, gate_unit_source: 'v2' },
+      risk_controls: {
+        flow_memory: 'fixed_histogram',
+        metric_refresh_seconds: 300,
+        partial_retry_seconds: 60,
+        partial_retry_limit: 2,
+        retention_hours: 72,
+        metric_merge: 'coalesce_non_null',
+        strict_null_numeric: true,
+        app_metric_merge: 'time_and_family_key',
+        okx_contract_value: true,
+        okx_unit_source: 'v2',
+        gate_contract_multiplier: true,
+        gate_unit_source: 'v2',
+        legacy_rest_cache: true,
+        legacy_rest_inflight_coalescing: true,
+        legacy_rest_circuit_breaker: true,
+        restricted_cooldown_seconds: 1800,
+        transient_cooldown_seconds: 90,
+        contract_meta_cache_seconds: 30,
+      },
       time: new Date().toISOString(),
     }));
     return;
@@ -65,7 +266,7 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-  proxyHttp(req, res);
+  proxyHttp(req, res, url);
 });
 
 server.on('upgrade', (req, socket, head) => {
@@ -97,7 +298,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 function shutdown(signal) {
-  console.log(`[Step615.4] shutdown ${signal}`);
+  console.log(`[Step${STEP_VERSION}] shutdown ${signal}`);
   server.close(() => {
     child.kill('SIGTERM');
     process.exit(0);
@@ -108,5 +309,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step615.4] proxy + contract flow listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + contract flow listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
