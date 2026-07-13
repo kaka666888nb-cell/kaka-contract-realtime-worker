@@ -10,7 +10,7 @@ const child = spawn(process.execPath, ['src/server.mjs'], {
 });
 
 child.on('exit', (code, signal) => {
-  console.error(`[Step614.2.2] legacy worker exited code=${code} signal=${signal || ''}`);
+  console.error(`[Step615] legacy worker exited code=${code} signal=${signal || ''}`);
   process.exit(code || 1);
 });
 
@@ -41,7 +41,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: 'kaka-contract-realtime-worker',
-      version: '614.2.2',
+      version: '615',
       legacy_worker: '515.1.2',
       protocol: 'kaka.market.realtime.v1',
       providers: ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate'],
@@ -50,6 +50,8 @@ const server = http.createServer(async (req, res) => {
       contract_flow: '/api/contract-flow',
       contract_flow_warm: '/api/contract-flow/warm',
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
+      contract_position_metrics: '/api/contract-flow',
+      risk_controls: { flow_memory: 'fixed_histogram', metric_refresh_seconds: 300, retention_hours: 72 },
       time: new Date().toISOString(),
     }));
     return;
@@ -95,7 +97,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 function shutdown(signal) {
-  console.log(`[Step614.2.2] shutdown ${signal}`);
+  console.log(`[Step615] shutdown ${signal}`);
   server.close(() => {
     child.kill('SIGTERM');
     process.exit(0);
@@ -106,5 +108,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step614.2.2] proxy + contract flow listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step615] proxy + contract flow listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
