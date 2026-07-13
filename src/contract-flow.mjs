@@ -337,7 +337,7 @@ async function flushPersistQueue() {
       if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
-      console.error(`[Step615] flow bucket persist failed: ${error?.message || error}`);
+      console.error(`[Step615.1] flow bucket persist failed: ${error?.message || error}`);
     }
   })().finally(() => { persistFlushPromise = null; });
   await persistFlushPromise;
@@ -516,7 +516,7 @@ function isoFrom(value) {
 
 async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
   const response = await fetch(url, {
-    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615', ...headers },
+    headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/615.1', ...headers },
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
@@ -610,7 +610,7 @@ async function flushMetricPersistQueue() {
       if (!response.ok) throw new Error(`metric_persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
     } catch (error) {
       for (const row of rows) metricPersistQueue.set(metricKey(row), row);
-      console.error(`[Step615] contract metrics persist failed: ${error?.message || error}`);
+      console.error(`[Step615.1] contract metrics persist failed: ${error?.message || error}`);
     }
   })().finally(() => { metricPersistFlushPromise = null; });
   await metricPersistFlushPromise;
@@ -660,6 +660,40 @@ function applyRatio(row, prefix, ratio, longShare, shortShare) {
   if (l != null) row[`${prefix}_long`] = l;
   if (sh != null) row[`${prefix}_short`] = sh;
   if (r == null && l != null && sh != null && sh > 0) row[`${prefix}_long_short_ratio`] = l / sh;
+}
+
+function applyRatioFromParts(row, prefix, ratio, longPart, shortPart) {
+  const r = asNumber(ratio);
+  const longValue = asNumber(longPart);
+  const shortValue = asNumber(shortPart);
+  let longShare = null;
+  let shortShare = null;
+  if (longValue != null && shortValue != null && longValue >= 0 && shortValue >= 0) {
+    const total = longValue + shortValue;
+    if (total > 0) {
+      longShare = longValue / total;
+      shortShare = shortValue / total;
+    }
+  }
+  applyRatio(row, prefix, r, longShare, shortShare);
+  if (r == null && longValue != null && shortValue != null && shortValue > 0) {
+    row[`${prefix}_long_short_ratio`] = longValue / shortValue;
+  }
+}
+
+async function firstWorkingNonEmptyDataJson(urls, options = {}) {
+  const errors = [];
+  for (const url of urls) {
+    try {
+      const payload = await fetchJson(url, options);
+      const data = payload?.data;
+      if (Array.isArray(data) && data.length > 0) return payload;
+      errors.push(`empty_data:${url}`);
+    } catch (error) {
+      errors.push(String(error?.message || error));
+    }
+  }
+  throw new Error(errors.join(' | ').slice(0, 700) || 'all_upstreams_empty');
 }
 
 async function firstWorkingJson(urls, options = {}) {
@@ -715,17 +749,21 @@ async function fetchOkxMetricRows(state) {
   const now = Date.now();
   const begin = now - METRIC_HISTORY_MS;
   const settled = await Promise.allSettled([
-    firstWorkingJson([
+    firstWorkingNonEmptyDataJson([
       `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`,
       `https://aws.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${encodeURIComponent(instId)}`,
     ]),
-    firstWorkingJson([
+    firstWorkingNonEmptyDataJson([
       `https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=${encodeURIComponent(base)}&period=5m&begin=${begin}&end=${now}`,
       `https://aws.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=${encodeURIComponent(base)}&period=5m&begin=${begin}&end=${now}`,
+      `https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=${encodeURIComponent(base)}&period=5m`,
+      `https://aws.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=${encodeURIComponent(base)}&period=5m`,
     ]),
-    firstWorkingJson([
+    firstWorkingNonEmptyDataJson([
       `https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${encodeURIComponent(base)}&period=5m&begin=${begin}&end=${now}`,
       `https://aws.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${encodeURIComponent(base)}&period=5m&begin=${begin}&end=${now}`,
+      `https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${encodeURIComponent(base)}&period=5m`,
+      `https://aws.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${encodeURIComponent(base)}&period=5m`,
     ]),
   ]);
   if (!settled.some((item) => item.status === 'fulfilled')) throw new Error('okx_metrics_unavailable');
@@ -735,8 +773,6 @@ async function fetchOkxMetricRows(state) {
       const ts = Array.isArray(item) ? item[0] : item.ts;
       const row = metricPoint(map, state.provider, state.symbol, ts);
       if (Array.isArray(item)) {
-        // OKX Rubik returns aggregate OI first and turnover fields after it.
-        // Treat the aggregate OI as a quote-value series; do not mislabel turnover as OI.
         const value = asNumber(item[1]);
         if (value != null) row.open_interest_value = value;
       } else {
@@ -767,38 +803,35 @@ async function fetchOkxMetricRows(state) {
 
 async function fetchBybitMetricRows(state) {
   const hosts = ['https://api.bybit.com','https://api.bytick.com'];
-  let pair = null;
-  let lastError = null;
-  for (const host of hosts) {
-    try {
-      pair = await Promise.all([
-        fetchJson(`${host}/v5/market/open-interest?category=linear&symbol=${encodeURIComponent(state.symbol)}&intervalTime=5min&limit=200`, { timeoutMs: 7000 }),
-        fetchJson(`${host}/v5/market/account-ratio?category=linear&symbol=${encodeURIComponent(state.symbol)}&period=5min&limit=500`, { timeoutMs: 7000 }),
-      ]);
-      break;
-    } catch (error) { lastError = error; }
-  }
-  if (!pair) throw lastError || new Error('bybit_metrics_unavailable');
+  const settled = await Promise.allSettled([
+    firstWorkingJson(hosts.map((host) => `${host}/v5/market/open-interest?category=linear&symbol=${encodeURIComponent(state.symbol)}&intervalTime=5min&limit=200`), { timeoutMs: 7000 }),
+    firstWorkingJson(hosts.map((host) => `${host}/v5/market/account-ratio?category=linear&symbol=${encodeURIComponent(state.symbol)}&period=5min&limit=500`), { timeoutMs: 7000 }),
+  ]);
+  if (!settled.some((item) => item.status === 'fulfilled')) throw new Error('bybit_metrics_unavailable');
   const map = new Map();
-  for (const item of Array.isArray(pair[0]?.result?.list) ? pair[0].result.list : []) {
-    const row = metricPoint(map, state.provider, state.symbol, item.timestamp);
-    row.open_interest = asNumber(item.openInterest);
-    if (row.open_interest != null && state.lastPrice) row.open_interest_value = row.open_interest * state.lastPrice;
+  if (settled[0].status === 'fulfilled') {
+    for (const item of Array.isArray(settled[0].value?.result?.list) ? settled[0].value.result.list : []) {
+      const row = metricPoint(map, state.provider, state.symbol, item.timestamp);
+      row.open_interest = asNumber(item.openInterest);
+      if (row.open_interest != null && state.lastPrice) row.open_interest_value = row.open_interest * state.lastPrice;
+    }
   }
-  for (const item of Array.isArray(pair[1]?.result?.list) ? pair[1].result.list : []) {
-    const row = metricPoint(map, state.provider, state.symbol, item.timestamp);
-    applyRatio(row, 'global', null, item.buyRatio, item.sellRatio);
+  if (settled[1].status === 'fulfilled') {
+    for (const item of Array.isArray(settled[1].value?.result?.list) ? settled[1].value.result.list : []) {
+      const row = metricPoint(map, state.provider, state.symbol, item.timestamp);
+      applyRatio(row, 'global', item.longShortRatio, item.buyRatio, item.sellRatio);
+    }
   }
   return [...map.values()];
 }
 
 async function fetchBitgetMetricRows(state) {
+  const symbol = encodeURIComponent(state.symbol);
   const settled = await Promise.allSettled([
-    fetchJson(`https://api.bitget.com/api/v2/mix/market/open-interest?symbol=${encodeURIComponent(state.symbol)}&productType=usdt-futures`, { timeoutMs: 7000 }),
-    firstWorkingJson([
-      `https://api.bitget.com/api/v3/market/futures-long-short?symbol=${encodeURIComponent(state.symbol)}`,
-      `https://api.bitget.com/api/v2/mix/market/account-long-short?symbol=${encodeURIComponent(state.symbol)}&productType=usdt-futures&period=5m`,
-    ], { timeoutMs: 7000 }),
+    fetchJson(`https://api.bitget.com/api/v2/mix/market/open-interest?symbol=${symbol}&productType=usdt-futures`, { timeoutMs: 7000 }),
+    fetchJson(`https://api.bitget.com/api/v3/market/futures-long-short?symbol=${symbol}&period=5m`, { timeoutMs: 7000 }),
+    fetchJson(`https://api.bitget.com/api/v3/market/futures-account-long-short?symbol=${symbol}&period=5m`, { timeoutMs: 7000 }),
+    fetchJson(`https://api.bitget.com/api/v3/market/futures-position-long-short?symbol=${symbol}&period=5m`, { timeoutMs: 7000 }),
   ]);
   if (!settled.some((item) => item.status === 'fulfilled')) throw new Error('bitget_metrics_unavailable');
   const map = new Map();
@@ -812,16 +845,21 @@ async function fetchBitgetMetricRows(state) {
       if (row.open_interest_value == null && row.open_interest != null && state.lastPrice) row.open_interest_value = row.open_interest * state.lastPrice;
     }
   }
-  if (settled[1].status === 'fulfilled') {
-    const data = settled[1].value?.data;
+  const parseBitgetList = (settledItem, prefix, ratioKeys, longKeys, shortKeys) => {
+    if (settledItem.status !== 'fulfilled') return;
+    const data = settledItem.value?.data;
     const list = Array.isArray(data) ? data : (Array.isArray(data?.list) ? data.list : data ? [data] : []);
     for (const item of list) {
       const row = metricPoint(map, state.provider, state.symbol, item.ts ?? item.timestamp ?? item.time ?? Date.now());
-      const longShare = item.buyRatio ?? item.longAccountRatio ?? item.longRatio ?? item.longAccount;
-      const shortShare = item.sellRatio ?? item.shortAccountRatio ?? item.shortRatio ?? item.shortAccount;
-      applyRatio(row, 'global', item.longShortRatio ?? item.ratio, longShare, shortShare);
+      const ratio = ratioKeys.map((key) => item[key]).find((value) => value != null);
+      const longPart = longKeys.map((key) => item[key]).find((value) => value != null);
+      const shortPart = shortKeys.map((key) => item[key]).find((value) => value != null);
+      applyRatioFromParts(row, prefix, ratio, longPart, shortPart);
     }
-  }
+  };
+  parseBitgetList(settled[1], 'global', ['longShortRatio','ratio'], ['longRatio','buyRatio','longAccountRatio'], ['shortRatio','sellRatio','shortAccountRatio']);
+  parseBitgetList(settled[2], 'top_account', ['longShortAccountRatio','longShortRatio','ratio'], ['longAccountRatio','buyRatio','longRatio'], ['shortAccountRatio','sellRatio','shortRatio']);
+  parseBitgetList(settled[3], 'top_position', ['longShortPositionRatio','longShortRatio','ratio'], ['longPositionRatio','longRatio'], ['shortPositionRatio','shortRatio']);
   return [...map.values()];
 }
 
@@ -836,7 +874,9 @@ async function fetchGateMetricRows(state) {
     const row = metricPoint(map, state.provider, state.symbol, item.time ?? item.timestamp);
     row.open_interest = asNumber(item.open_interest);
     row.open_interest_value = asNumber(item.open_interest_usd);
-    applyRatio(row, 'global', item.long_short_ratio, item.long_ratio, item.short_ratio);
+    applyRatioFromParts(row, 'global', item.long_short_ratio, item.long_users ?? item.long_ratio, item.short_users ?? item.short_ratio);
+    applyRatioFromParts(row, 'top_account', item.top_long_short_account_ratio, item.top_long_account, item.top_short_account);
+    applyRatioFromParts(row, 'top_position', item.top_long_short_position_ratio, item.top_long_size, item.top_short_size);
   }
   return [...map.values()];
 }
@@ -974,7 +1014,7 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
   };});
   return {
-    ok:true, version:'615', provider:state.provider, symbol:state.symbol,
+    ok:true, version:'615.1', provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
     persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
     stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
@@ -997,12 +1037,12 @@ function waitForTrades(state,minTrades,waitMs){
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'615',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.1',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
     let started=0;
     for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:'615',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'615.1',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
