@@ -1,4 +1,4 @@
-const STEP_VERSION = '639';
+const STEP_VERSION = '639.1';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -11,6 +11,309 @@ const STALE_MS = 20_000;
 const META_FRESH_MS = 6 * 60 * 60_000;
 const TRANSIENT_COOLDOWN_MS = 90_000;
 const RESTRICTED_COOLDOWN_MS = 30 * 60_000;
+
+const BINANCE_WS_STATES = new Map();
+const BINANCE_WS_IDLE_MS = 75_000;
+const BINANCE_WS_ORDERBOOK_STALE_MS = 8_000;
+const BINANCE_WS_TRADES_STALE_MS = 12_000;
+const BINANCE_WS_START_TIMEOUT_MS = 6_000;
+const BINANCE_WS_HOSTS = ['fstream.binance.com', 'stream.binancefuture.com'];
+let BINANCE_WS_CTOR_PROMISE = null;
+
+async function resolveWebSocketCtor() {
+  if (!BINANCE_WS_CTOR_PROMISE) {
+    BINANCE_WS_CTOR_PROMISE = (async () => {
+      if (typeof globalThis.WebSocket === 'function') return globalThis.WebSocket;
+      try {
+        const imported = await import('ws');
+        return imported.WebSocket || imported.default;
+      } catch (_) {
+        throw new Error('binance_websocket_runtime_unavailable');
+      }
+    })();
+  }
+  return BINANCE_WS_CTOR_PROMISE;
+}
+
+function wsListen(socket, eventName, handler) {
+  if (typeof socket?.addEventListener === 'function') {
+    socket.addEventListener(eventName, handler);
+    return;
+  }
+  if (typeof socket?.on === 'function') {
+    socket.on(eventName, handler);
+    return;
+  }
+  socket[`on${eventName}`] = handler;
+}
+
+function wsReady(socket) {
+  return socket && Number(socket.readyState) === 1;
+}
+
+function closeWsQuietly(socket) {
+  try {
+    if (typeof socket?.terminate === 'function') socket.terminate();
+    else if (typeof socket?.close === 'function') socket.close();
+  } catch (_) {}
+}
+
+async function wsMessageText(eventOrData) {
+  const value = eventOrData && (typeof eventOrData === 'object' || typeof eventOrData === 'function') && 'data' in eventOrData
+    ? eventOrData.data
+    : eventOrData;
+  if (typeof value === 'string') return value;
+  if (Buffer.isBuffer(value)) return value.toString('utf8');
+  if (value instanceof ArrayBuffer) return Buffer.from(value).toString('utf8');
+  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('utf8');
+  if (value && typeof value.text === 'function') return await value.text();
+  return String(value ?? '');
+}
+
+function emptyBinanceConnection() {
+  return { socket: null, connecting: null, reconnectTimer: null, reconnectAttempt: 0, hostIndex: 0 };
+}
+
+function binanceWsState(symbol) {
+  const native = providerSymbol('binance', symbol);
+  let state = BINANCE_WS_STATES.get(native);
+  if (!state) {
+    state = {
+      native,
+      orderbookConnection: emptyBinanceConnection(),
+      tradesConnection: emptyBinanceConnection(),
+      orderbookLastAccessAt: 0,
+      tradesLastAccessAt: 0,
+      lastMessageAt: 0,
+      orderbook: null,
+      trades: [],
+      waiters: new Set(),
+      manuallyClosing: false,
+    };
+    BINANCE_WS_STATES.set(native, state);
+  }
+  return state;
+}
+
+function binanceConnection(state, view) {
+  return view === 'trades' ? state.tradesConnection : state.orderbookConnection;
+}
+
+function touchBinanceView(state, view) {
+  if (view === 'trades') state.tradesLastAccessAt = Date.now();
+  else state.orderbookLastAccessAt = Date.now();
+}
+
+function binanceViewReady(state, view) {
+  if (view === 'trades') {
+    return state.trades.length > 0 && Date.now() - Number(state.trades[0]?.time_ms || 0) <= BINANCE_WS_TRADES_STALE_MS;
+  }
+  return Boolean(state.orderbook && Date.now() - Number(state.orderbook.timestamp_ms || 0) <= BINANCE_WS_ORDERBOOK_STALE_MS);
+}
+
+function notifyBinanceWaiters(state) {
+  for (const waiter of [...state.waiters]) {
+    if (!binanceViewReady(state, waiter.view)) continue;
+    state.waiters.delete(waiter);
+    clearTimeout(waiter.timer);
+    waiter.resolve();
+  }
+}
+
+function rejectBinanceWaiters(state, view, error) {
+  for (const waiter of [...state.waiters]) {
+    if (waiter.view !== view) continue;
+    state.waiters.delete(waiter);
+    clearTimeout(waiter.timer);
+    waiter.reject(error);
+  }
+}
+
+function binanceStreamUrl(state, view, host) {
+  const streamSymbol = state.native.toLowerCase();
+  if (view === 'trades') {
+    return `wss://${host}/market/stream?streams=${streamSymbol}@aggTrade`;
+  }
+  return `wss://${host}/public/stream?streams=${streamSymbol}@depth20@100ms`;
+}
+
+function scheduleBinanceReconnect(state, view) {
+  const connection = binanceConnection(state, view);
+  const lastAccessAt = view === 'trades' ? state.tradesLastAccessAt : state.orderbookLastAccessAt;
+  if (state.manuallyClosing || connection.reconnectTimer || Date.now() - lastAccessAt > BINANCE_WS_IDLE_MS) return;
+  const delay = Math.min(15_000, 800 * (2 ** Math.min(connection.reconnectAttempt, 5)));
+  connection.reconnectAttempt += 1;
+  connection.reconnectTimer = setTimeout(() => {
+    connection.reconnectTimer = null;
+    ensureBinanceWs(state, view).catch(() => {});
+  }, delay);
+  connection.reconnectTimer.unref?.();
+}
+
+async function handleBinanceWsPayload(state, rawPayload) {
+  let decoded;
+  try {
+    const text = await wsMessageText(rawPayload);
+    decoded = JSON.parse(text);
+  } catch (_) {
+    return;
+  }
+  const data = decoded?.data ?? decoded;
+  const eventType = String(data?.e || '');
+  if (eventType === 'depthUpdate' || (Array.isArray(data?.b) && Array.isArray(data?.a))) {
+    const bids = normalizeLevels(data?.b ?? data?.bids, { side: 'bid' }).slice(0, 20);
+    const asks = normalizeLevels(data?.a ?? data?.asks, { side: 'ask' }).slice(0, 20);
+    if (bids.length && asks.length) {
+      state.orderbook = {
+        bids,
+        asks,
+        timestamp_ms: integerValue(data?.T) || integerValue(data?.E) || Date.now(),
+      };
+    }
+  } else if (eventType === 'aggTrade') {
+    const price = positiveNumber(data?.p);
+    const quantity = positiveNumber(data?.q);
+    const timeMs = integerValue(data?.T) || integerValue(data?.E);
+    if (price != null && quantity != null && timeMs > 0) {
+      const item = {
+        id: String(data?.a ?? `${timeMs}:${price}:${quantity}`),
+        time_ms: timeMs,
+        price,
+        quantity,
+        quote_amount: price * quantity,
+        side: data?.m === true ? 'sell' : 'buy',
+      };
+      if (!state.trades.length || state.trades[0].id !== item.id) {
+        state.trades.unshift(item);
+        if (state.trades.length > 120) state.trades.length = 120;
+      }
+    }
+  }
+  state.lastMessageAt = Date.now();
+  notifyBinanceWaiters(state);
+}
+
+function openBinanceSocket(WebSocketCtor, state, view, host) {
+  return new Promise((resolve, reject) => {
+    const url = binanceStreamUrl(state, view, host);
+    const socket = new WebSocketCtor(url);
+    let settled = false;
+    const startupTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      closeWsQuietly(socket);
+      const error = new Error(`binance_websocket_${view}_open_timeout`);
+      error.cooldownMs = 5_000;
+      reject(error);
+    }, BINANCE_WS_START_TIMEOUT_MS);
+    startupTimer.unref?.();
+    wsListen(socket, 'message', (payload) => {
+      handleBinanceWsPayload(state, payload).catch(() => {});
+    });
+    wsListen(socket, 'open', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(startupTimer);
+      resolve(socket);
+    });
+    wsListen(socket, 'error', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(startupTimer);
+      closeWsQuietly(socket);
+      const error = new Error(`binance_websocket_${view}_open_failed`);
+      error.cooldownMs = 5_000;
+      reject(error);
+    });
+  });
+}
+
+async function ensureBinanceWs(state, view) {
+  touchBinanceView(state, view);
+  const connection = binanceConnection(state, view);
+  if (wsReady(connection.socket)) return;
+  if (connection.connecting) return connection.connecting;
+  state.manuallyClosing = false;
+  connection.connecting = (async () => {
+    const WebSocketCtor = await resolveWebSocketCtor();
+    let lastError = null;
+    for (let offset = 0; offset < BINANCE_WS_HOSTS.length; offset += 1) {
+      const index = (connection.hostIndex + offset) % BINANCE_WS_HOSTS.length;
+      const host = BINANCE_WS_HOSTS[index];
+      try {
+        const socket = await openBinanceSocket(WebSocketCtor, state, view, host);
+        connection.socket = socket;
+        connection.hostIndex = index;
+        connection.reconnectAttempt = 0;
+        wsListen(socket, 'close', () => {
+          if (connection.socket === socket) connection.socket = null;
+          if (!state.manuallyClosing) scheduleBinanceReconnect(state, view);
+        });
+        wsListen(socket, 'error', () => {});
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error(`binance_websocket_${view}_all_hosts_failed`);
+  })().catch((error) => {
+    closeWsQuietly(connection.socket);
+    connection.socket = null;
+    rejectBinanceWaiters(state, view, error);
+    throw error;
+  }).finally(() => {
+    connection.connecting = null;
+  });
+  return connection.connecting;
+}
+
+async function waitForBinanceView(state, view, timeoutMs = BINANCE_WS_START_TIMEOUT_MS) {
+  touchBinanceView(state, view);
+  if (binanceViewReady(state, view)) return;
+  await ensureBinanceWs(state, view);
+  await new Promise((resolve, reject) => {
+    const waiter = { view, resolve, reject, timer: null };
+    waiter.timer = setTimeout(() => {
+      state.waiters.delete(waiter);
+      const error = new Error(`binance_websocket_${view}_data_timeout`);
+      error.cooldownMs = 5_000;
+      reject(error);
+    }, timeoutMs);
+    waiter.timer.unref?.();
+    state.waiters.add(waiter);
+    notifyBinanceWaiters(state);
+  });
+}
+
+function closeBinanceView(state, view) {
+  const connection = binanceConnection(state, view);
+  if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
+  connection.reconnectTimer = null;
+  closeWsQuietly(connection.socket);
+  connection.socket = null;
+  rejectBinanceWaiters(state, view, new Error(`binance_websocket_${view}_idle_closed`));
+}
+
+const binanceWsCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [symbol, state] of BINANCE_WS_STATES.entries()) {
+    if (state.orderbookLastAccessAt > 0 && now - state.orderbookLastAccessAt > BINANCE_WS_IDLE_MS) {
+      closeBinanceView(state, 'orderbook');
+      state.orderbookLastAccessAt = 0;
+      state.orderbook = null;
+    }
+    if (state.tradesLastAccessAt > 0 && now - state.tradesLastAccessAt > BINANCE_WS_IDLE_MS) {
+      closeBinanceView(state, 'trades');
+      state.tradesLastAccessAt = 0;
+      state.trades = [];
+    }
+    if (state.orderbookLastAccessAt === 0 && state.tradesLastAccessAt === 0) {
+      state.manuallyClosing = true;
+      BINANCE_WS_STATES.delete(symbol);
+    }
+  }
+}, 15_000);
+binanceWsCleanupTimer.unref?.();
 
 function normalizeProvider(value) {
   const raw = String(value || '').trim().toLowerCase();
@@ -97,7 +400,8 @@ function restrictedFailure(statusCode, text) {
 function openCircuit(key, error) {
   const statusCode = Number(error?.statusCode || 0);
   const restricted = restrictedFailure(statusCode, error?.bodyText || error?.message || '');
-  const durationMs = restricted ? RESTRICTED_COOLDOWN_MS : TRANSIENT_COOLDOWN_MS;
+  const explicitCooldownMs = Number(error?.cooldownMs || 0);
+  const durationMs = explicitCooldownMs > 0 ? explicitCooldownMs : restricted ? RESTRICTED_COOLDOWN_MS : TRANSIENT_COOLDOWN_MS;
   const current = CIRCUIT.get(key);
   CIRCUIT.set(key, {
     until: Math.max(Number(current?.until || 0), Date.now() + durationMs),
@@ -219,32 +523,27 @@ async function gateContractMultiplier(contract) {
 }
 
 async function loadBinance(view, symbol, limit) {
-  const native = providerSymbol('binance', symbol);
+  const state = binanceWsState(symbol);
+  await waitForBinanceView(state, view);
   if (view === 'trades') {
-    const url = `https://fapi.binance.com/fapi/v1/trades?symbol=${encodeURIComponent(native)}&limit=${limit}`;
-    const data = await fetchJson(url);
-    if (!Array.isArray(data)) throw new Error('binance_trades_invalid');
-    const items = data.map((row) => {
-      const price = positiveNumber(row?.price);
-      const quantity = positiveNumber(row?.qty);
-      const timeMs = integerValue(row?.time);
-      if (price == null || quantity == null || timeMs <= 0) return null;
-      return {
-        id: String(row?.id ?? `${timeMs}:${price}:${quantity}`),
-        time_ms: timeMs,
-        price,
-        quantity,
-        quote_amount: price * quantity,
-        side: row?.isBuyerMaker === true ? 'sell' : 'buy',
-      };
-    }).filter(Boolean);
-    return { items, timestamp_ms: items[0]?.time_ms || Date.now(), upstream_host: 'fapi.binance.com', native_symbol: native };
+    const items = state.trades.slice(0, limit).map((row) => ({ ...row }));
+    return {
+      items,
+      timestamp_ms: items[0]?.time_ms || state.lastMessageAt || Date.now(),
+      upstream_host: BINANCE_WS_HOSTS[binanceConnection(state, 'trades').hostIndex] || 'fstream.binance.com',
+      native_symbol: state.native,
+      transport: 'websocket_market_aggTrade',
+    };
   }
-  const url = `https://fapi.binance.com/fapi/v1/depth?symbol=${encodeURIComponent(native)}&limit=${limit}`;
-  const data = await fetchJson(url);
-  const bids = normalizeLevels(data?.bids, { side: 'bid' });
-  const asks = normalizeLevels(data?.asks, { side: 'ask' });
-  return { bids, asks, timestamp_ms: integerValue(data?.E) || integerValue(data?.T) || Date.now(), upstream_host: 'fapi.binance.com', native_symbol: native };
+  const snapshot = state.orderbook;
+  return {
+    bids: snapshot?.bids?.slice(0, limit).map((row) => ({ ...row })) || [],
+    asks: snapshot?.asks?.slice(0, limit).map((row) => ({ ...row })) || [],
+    timestamp_ms: snapshot?.timestamp_ms || state.lastMessageAt || Date.now(),
+    upstream_host: BINANCE_WS_HOSTS[binanceConnection(state, 'orderbook').hostIndex] || 'fstream.binance.com',
+    native_symbol: state.native,
+    transport: 'websocket_public_depth20_100ms',
+  };
 }
 
 async function loadOkx(view, symbol, limit) {
@@ -404,7 +703,8 @@ function buildPayload(provider, view, requestedSymbol, limit, data, cacheState =
     native_symbol: data.native_symbol,
     view,
     limit,
-    source: `${provider}_official_public_contract_${view}`,
+    source: provider === 'binance' ? `binance_official_public_contract_${view}_websocket` : `${provider}_official_public_contract_${view}`,
+    transport: data.transport || 'rest',
     upstream_host: data.upstream_host || '',
     timestamp_ms: integerValue(data.timestamp_ms) || Date.now(),
     cached_at: new Date().toISOString(),

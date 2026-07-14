@@ -5,7 +5,7 @@ import { handleContractDepth } from './contract-depth.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '639';
+const STEP_VERSION = '639.1';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -255,6 +255,11 @@ const server = http.createServer(async (req, res) => {
         contract_depth_cache_ms: 1200,
         contract_depth_stale_seconds: 20,
         contract_depth_page_visible_only: true,
+        binance_contract_depth_transport: 'websocket_public_depth20_100ms',
+        binance_contract_trades_transport: 'websocket_market_aggTrade',
+        binance_contract_rest_disabled_for_depth: true,
+        binance_websocket_endpoint_split_2026: true,
+        binance_websocket_hosts: ['fstream.binance.com', 'stream.binancefuture.com'],
       },
       time: new Date().toISOString(),
     }));
@@ -314,5 +319,5 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth (Binance WS) listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
