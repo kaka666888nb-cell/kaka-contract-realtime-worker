@@ -1,10 +1,12 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { handleContractFlow } from './contract-flow.mjs';
+import { handleContractDepth } from './contract-depth.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '615.5';
+const STEP_VERSION = '639';
+
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
   stdio: 'inherit',
@@ -36,14 +38,15 @@ function circuitKey(url) {
 function isRestrictedFailure(statusCode, bodyText) {
   const text = String(bodyText || '').toLowerCase();
   return statusCode === 418 || statusCode === 429 || statusCode === 451 ||
-    text.includes('way too many requests') || text.includes('ip(') && text.includes('banned until') ||
+    text.includes('way too many requests') ||
+    (text.includes('ip(') && text.includes('banned until')) ||
     text.includes('too many requests');
 }
 
 function isUpstreamFailure(statusCode, bodyText) {
   const text = String(bodyText || '').toLowerCase();
   return statusCode >= 500 || statusCode === 408 || statusCode === 418 || statusCode === 429 || statusCode === 451 ||
-    text.includes('<title>502</title>') || text.includes('bad gateway') || text.includes('legacy_worker_unavailable');
+    text.includes('502') || text.includes('bad gateway') || text.includes('legacy_worker_unavailable');
 }
 
 function openCircuit(key, statusCode, bodyText) {
@@ -138,7 +141,6 @@ async function proxyCachedGet(req, res, url, policy) {
     sendBuffered(res, cached, { 'x-kaka-cache': 'fresh' });
     return;
   }
-
   const circuit = legacyCircuit.get(groupKey);
   if (circuit && circuit.until > now) {
     if (cached && now - cached.storedAt <= policy.staleMs) {
@@ -173,16 +175,13 @@ async function proxyCachedGet(req, res, url, policy) {
   try {
     const result = await pending;
     sendBuffered(res, result, { 'x-kaka-cache': 'miss' });
-  } catch (error) {
+  } catch (_) {
     const fallback = legacyCache.get(key);
     if (fallback && Date.now() - fallback.storedAt <= policy.staleMs) {
       sendBuffered(res, fallback, { 'x-kaka-cache': 'stale-error' });
       return;
     }
-    const state = legacyCircuit.get(groupKey) || {
-      until: Date.now() + 90_000,
-      reason: 'upstream_unavailable',
-    };
+    const state = legacyCircuit.get(groupKey) || { until: Date.now() + 90_000, reason: 'upstream_unavailable' };
     sendCircuitJson(res, state);
   }
 }
@@ -195,7 +194,6 @@ function proxyHttp(req, res, url) {
     });
     return;
   }
-
   const upstream = http.request({
     hostname: '127.0.0.1',
     port: CHILD_PORT,
@@ -231,6 +229,8 @@ const server = http.createServer(async (req, res) => {
       contract_flow: '/api/contract-flow',
       contract_flow_warm: '/api/contract-flow/warm',
       contract_meta: '/api/contract-meta',
+      contract_depth: '/api/contract-depth',
+      contract_depth_views: ['orderbook', 'trades'],
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
       contract_position_metrics: '/api/contract-flow',
       risk_controls: {
@@ -252,12 +252,17 @@ const server = http.createServer(async (req, res) => {
         restricted_cooldown_seconds: 1800,
         transient_cooldown_seconds: 90,
         contract_meta_cache_seconds: 30,
+        contract_depth_cache_ms: 1200,
+        contract_depth_stale_seconds: 20,
+        contract_depth_page_visible_only: true,
       },
       time: new Date().toISOString(),
     }));
     return;
   }
+
   try {
+    if (await handleContractDepth(req, res, url)) return;
     if (await handleContractFlow(req, res, url)) return;
   } catch (error) {
     if (!res.headersSent) {
@@ -305,9 +310,9 @@ function shutdown(signal) {
   });
   setTimeout(() => process.exit(0), 5000).unref();
 }
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + contract flow listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
