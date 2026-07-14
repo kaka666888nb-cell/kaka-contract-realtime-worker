@@ -3,10 +3,11 @@ import { spawn } from 'node:child_process';
 import { handleContractFlow } from './contract-flow.mjs';
 import { handleContractDepth } from './contract-depth.mjs';
 import { handleContractLiquidation } from './contract-liquidation.mjs';
+import { handleContractFunding } from './contract-funding.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '640';
+const STEP_VERSION = '641.1';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -233,6 +234,8 @@ const server = http.createServer(async (req, res) => {
       contract_depth: '/api/contract-depth',
       contract_depth_views: ['orderbook', 'trades'],
       contract_liquidation: '/api/contract-liquidation',
+      contract_funding: '/api/contract-funding',
+      contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
       contract_position_metrics: '/api/contract-flow',
@@ -267,6 +270,9 @@ const server = http.createServer(async (req, res) => {
         contract_liquidation_retention_minutes: 15,
         contract_liquidation_idle_close_seconds: 75,
         liquidation_platform_strict_isolation: true,
+        contract_funding_current_and_history: true,
+        contract_funding_cache_seconds: 30,
+        gate_next_funding_source: 'futures_contract_funding_next_apply',
         liquidation_public_feeds: {
           binance: 'market_forceOrder',
           okx: 'public_liquidation-orders',
@@ -282,6 +288,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (await handleContractDepth(req, res, url)) return;
+    if (await handleContractFunding(req, res, url)) return;
     if (await handleContractLiquidation(req, res, url)) return;
     if (await handleContractFlow(req, res, url)) return;
   } catch (error) {
@@ -334,5 +341,5 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth + five-platform liquidation listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth + five-platform liquidation + five-platform funding listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

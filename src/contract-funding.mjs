@@ -1,0 +1,317 @@
+const ROUTE = '/api/contract-funding';
+const VERSION = '641.1';
+const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const CACHE = new Map();
+const INFLIGHT = new Map();
+const FRESH_MS = 30_000;
+const STALE_MS = 10 * 60_000;
+
+function sendJson(res, status, payload) {
+  const body = Buffer.from(JSON.stringify(payload));
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': String(body.length),
+  });
+  res.end(body);
+}
+
+function providerKey(value) {
+  return String(value || '').trim().toLowerCase().replace('gate.io', 'gate');
+}
+
+function canonicalSymbol(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function splitSymbol(symbol) {
+  for (const quote of ['USDT', 'USDC', 'USD']) {
+    if (symbol.endsWith(quote) && symbol.length > quote.length) {
+      return { base: symbol.slice(0, -quote.length), quote };
+    }
+  }
+  return { base: symbol.replace(/USDT$/, ''), quote: 'USDT' };
+}
+
+function nativeSymbol(provider, symbol) {
+  const { base, quote } = splitSymbol(symbol);
+  if (provider === 'okx') return `${base}-${quote}-SWAP`;
+  if (provider === 'gate') return `${base}_${quote}`;
+  return symbol;
+}
+
+function numberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function msValue(value) {
+  const n = numberOrNull(value);
+  if (n == null || n <= 0) return null;
+  return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
+}
+
+function iso(value) {
+  const ms = msValue(value);
+  if (ms == null) return null;
+  try { return new Date(ms).toISOString(); } catch (_) { return null; }
+}
+
+function currentRow({ provider, symbol, rate, nextTime, mark, index, sourceTime, intervalHours }) {
+  const decimal = numberOrNull(rate);
+  return {
+    provider,
+    market_type: 'contract',
+    symbol,
+    last_funding_rate: decimal,
+    funding_rate: decimal,
+    last_funding_rate_percent: decimal == null ? null : decimal * 100,
+    funding_rate_percent: decimal == null ? null : decimal * 100,
+    next_funding_time: iso(nextTime),
+    mark_price: numberOrNull(mark),
+    index_price: numberOrNull(index),
+    funding_interval_hours: numberOrNull(intervalHours),
+    source_time: iso(sourceTime) || new Date().toISOString(),
+    cached_at: new Date().toISOString(),
+  };
+}
+
+function historyRow({ provider, symbol, rate, time, mark }) {
+  const decimal = numberOrNull(rate);
+  const fundingTime = iso(time);
+  if (decimal == null || fundingTime == null) return null;
+  return {
+    provider,
+    market_type: 'contract',
+    symbol,
+    funding_time: fundingTime,
+    funding_rate: decimal,
+    funding_rate_percent: decimal * 100,
+    mark_price: numberOrNull(mark),
+    cached_at: new Date().toISOString(),
+  };
+}
+
+async function fetchJson(url, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'KakaWeb3/641.1 contract-funding',
+      },
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`HTTP_${response.status}:${text.slice(0, 160)}`);
+    return JSON.parse(text);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchPair(currentUrl, historyUrl) {
+  const [currentResult, historyResult] = await Promise.allSettled([
+    fetchJson(currentUrl),
+    fetchJson(historyUrl),
+  ]);
+  if (currentResult.status === 'rejected' && historyResult.status === 'rejected') {
+    throw new Error(`current:${currentResult.reason?.message || currentResult.reason};history:${historyResult.reason?.message || historyResult.reason}`);
+  }
+  return {
+    currentRaw: currentResult.status === 'fulfilled' ? currentResult.value : null,
+    historyRaw: historyResult.status === 'fulfilled' ? historyResult.value : null,
+    warnings: [
+      currentResult.status === 'rejected' ? `current:${currentResult.reason?.message || currentResult.reason}` : null,
+      historyResult.status === 'rejected' ? `history:${historyResult.reason?.message || historyResult.reason}` : null,
+    ].filter(Boolean),
+  };
+}
+
+async function fetchBinance(symbol, limit) {
+  const { currentRaw, historyRaw, warnings } = await fetchPair(
+    `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`,
+    `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+  );
+  const current = currentRow({
+    provider: 'binance', symbol,
+    rate: currentRaw?.lastFundingRate,
+    nextTime: currentRaw?.nextFundingTime,
+    mark: currentRaw?.markPrice,
+    index: currentRaw?.indexPrice,
+    sourceTime: currentRaw?.time,
+  });
+  const history = Array.isArray(historyRaw) ? historyRaw.map((item) => historyRow({
+    provider: 'binance', symbol,
+    rate: item?.fundingRate,
+    time: item?.fundingTime,
+    mark: item?.markPrice,
+  })).filter(Boolean) : [];
+  return { current, history, warnings, source: 'binance_official_public_funding_rest' };
+}
+
+async function fetchOkx(symbol, limit) {
+  const native = nativeSymbol('okx', symbol);
+  const { currentRaw, historyRaw, warnings } = await fetchPair(
+    `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(native)}`,
+    `https://www.okx.com/api/v5/public/funding-rate-history?instId=${encodeURIComponent(native)}&limit=${limit}`,
+  );
+  const item = Array.isArray(currentRaw?.data) ? currentRaw.data[0] : null;
+  const current = currentRow({
+    provider: 'okx', symbol,
+    rate: item?.fundingRate ?? item?.settFundingRate,
+    nextTime: item?.nextFundingTime,
+    sourceTime: item?.ts,
+  });
+  const history = Array.isArray(historyRaw?.data) ? historyRaw.data.map((row) => historyRow({
+    provider: 'okx', symbol,
+    rate: row?.realizedRate || row?.fundingRate,
+    time: row?.fundingTime,
+  })).filter(Boolean) : [];
+  return { current, history, warnings, source: 'okx_official_public_funding_rest', native_symbol: native };
+}
+
+async function fetchBybit(symbol, limit) {
+  const { currentRaw, historyRaw, warnings } = await fetchPair(
+    `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`,
+    `https://api.bybit.com/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+  );
+  const item = Array.isArray(currentRaw?.result?.list) ? currentRaw.result.list[0] : null;
+  const current = currentRow({
+    provider: 'bybit', symbol,
+    rate: item?.fundingRate,
+    nextTime: item?.nextFundingTime,
+    mark: item?.markPrice,
+    index: item?.indexPrice,
+    sourceTime: currentRaw?.time,
+    intervalHours: item?.fundingIntervalHour,
+  });
+  const history = Array.isArray(historyRaw?.result?.list) ? historyRaw.result.list.map((row) => historyRow({
+    provider: 'bybit', symbol,
+    rate: row?.fundingRate,
+    time: row?.fundingRateTimestamp,
+  })).filter(Boolean) : [];
+  return { current, history, warnings, source: 'bybit_official_public_funding_rest' };
+}
+
+async function fetchBitget(symbol, limit) {
+  const q = `symbol=${encodeURIComponent(symbol)}&productType=usdt-futures`;
+  const { currentRaw, historyRaw, warnings } = await fetchPair(
+    `https://api.bitget.com/api/v2/mix/market/current-fund-rate?${q}`,
+    `https://api.bitget.com/api/v2/mix/market/history-fund-rate?${q}&pageSize=${limit}`,
+  );
+  const item = Array.isArray(currentRaw?.data) ? currentRaw.data[0] : currentRaw?.data;
+  const current = currentRow({
+    provider: 'bitget', symbol,
+    rate: item?.fundingRate,
+    nextTime: item?.nextUpdate ?? item?.nextFundingTime,
+    sourceTime: currentRaw?.requestTime,
+    intervalHours: item?.fundingRateInterval,
+  });
+  const list = Array.isArray(historyRaw?.data) ? historyRaw.data : (Array.isArray(historyRaw?.data?.list) ? historyRaw.data.list : []);
+  const history = list.map((row) => historyRow({
+    provider: 'bitget', symbol,
+    rate: row?.fundingRate,
+    time: row?.fundingTime ?? row?.fundingRateTimestamp,
+  })).filter(Boolean);
+  return { current, history, warnings, source: 'bitget_official_public_funding_rest' };
+}
+
+async function fetchGate(symbol, limit) {
+  const native = nativeSymbol('gate', symbol);
+  const { currentRaw: contractRaw, historyRaw, warnings } = await fetchPair(
+    `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(native)}`,
+    `https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract=${encodeURIComponent(native)}&limit=${limit}`,
+  );
+  const current = currentRow({
+    provider: 'gate', symbol,
+    rate: contractRaw?.funding_rate ?? contractRaw?.funding_rate_indicative,
+    nextTime: contractRaw?.funding_next_apply,
+    mark: contractRaw?.mark_price,
+    index: contractRaw?.index_price,
+    sourceTime: Date.now(),
+    intervalHours: numberOrNull(contractRaw?.funding_interval) == null ? null : Number(contractRaw.funding_interval) / 3600,
+  });
+  const history = Array.isArray(historyRaw) ? historyRaw.map((row) => historyRow({
+    provider: 'gate', symbol,
+    rate: row?.funding_rate ?? row?.r ?? row?.rate,
+    time: row?.funding_time ?? row?.t ?? row?.time,
+    mark: row?.mark_price,
+  })).filter(Boolean) : [];
+  return { current, history, warnings, source: 'gate_official_public_funding_rest', native_symbol: native };
+}
+
+async function load(provider, symbol, limit) {
+  switch (provider) {
+    case 'binance': return fetchBinance(symbol, limit);
+    case 'okx': return fetchOkx(symbol, limit);
+    case 'bybit': return fetchBybit(symbol, limit);
+    case 'bitget': return fetchBitget(symbol, limit);
+    case 'gate': return fetchGate(symbol, limit);
+    default: throw new Error('unsupported_provider');
+  }
+}
+
+export async function handleContractFunding(req, res, url) {
+  if (url.pathname !== ROUTE) return false;
+  if (req.method !== 'GET') {
+    sendJson(res, 405, { ok: false, version: VERSION, error: 'method_not_allowed' });
+    return true;
+  }
+  const provider = providerKey(url.searchParams.get('provider'));
+  const symbol = canonicalSymbol(url.searchParams.get('symbol'));
+  const limit = Math.max(1, Math.min(100, Number(url.searchParams.get('limit') || 24) || 24));
+  if (!SUPPORTED.has(provider) || !symbol) {
+    sendJson(res, 400, { ok: false, version: VERSION, error: 'invalid_provider_or_symbol' });
+    return true;
+  }
+  const key = `${provider}|${symbol}|${limit}`;
+  const now = Date.now();
+  const cached = CACHE.get(key);
+  if (cached && now - cached.storedAt <= FRESH_MS) {
+    sendJson(res, 200, { ...cached.payload, cache_state: 'fresh' });
+    return true;
+  }
+  let pending = INFLIGHT.get(key);
+  if (!pending) {
+    pending = load(provider, symbol, limit)
+      .then((data) => {
+        const payload = {
+          ok: true,
+          version: VERSION,
+          provider,
+          market_type: 'contract',
+          symbol,
+          native_symbol: data.native_symbol || nativeSymbol(provider, symbol),
+          source: data.source,
+          current: data.current || null,
+          history: Array.isArray(data.history) ? data.history.slice(0, limit) : [],
+          warnings: Array.isArray(data.warnings) ? data.warnings : [],
+          timestamp_ms: Date.now(),
+        };
+        CACHE.set(key, { storedAt: Date.now(), payload });
+        return payload;
+      })
+      .finally(() => INFLIGHT.delete(key));
+    INFLIGHT.set(key, pending);
+  }
+  try {
+    const payload = await pending;
+    sendJson(res, 200, { ...payload, cache_state: 'miss' });
+  } catch (error) {
+    if (cached && now - cached.storedAt <= STALE_MS) {
+      sendJson(res, 200, { ...cached.payload, cache_state: 'stale', warning: String(error?.message || error) });
+    } else {
+      sendJson(res, 502, {
+        ok: false,
+        version: VERSION,
+        provider,
+        symbol,
+        error: String(error?.message || error),
+        reason: 'upstream_unavailable',
+      });
+    }
+  }
+  return true;
+}
