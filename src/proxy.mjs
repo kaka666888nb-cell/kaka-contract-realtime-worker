@@ -7,7 +7,7 @@ import { handleContractFunding } from './contract-funding.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '641.1';
+const STEP_VERSION = '645';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -234,6 +234,8 @@ const server = http.createServer(async (req, res) => {
       contract_depth: '/api/contract-depth',
       contract_depth_views: ['orderbook', 'trades'],
       contract_liquidation: '/api/contract-liquidation',
+      contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
+      contract_liquidation_scope: 'single_provider_single_symbol',
       contract_funding: '/api/contract-funding',
       contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
@@ -266,15 +268,20 @@ const server = http.createServer(async (req, res) => {
         binance_contract_rest_disabled_for_depth: true,
         binance_websocket_endpoint_split_2026: true,
         binance_websocket_hosts: ['fstream.binance.com', 'stream.binancefuture.com'],
-        contract_liquidation_page_visible_only: true,
-        contract_liquidation_retention_minutes: 15,
-        contract_liquidation_idle_close_seconds: 75,
+        contract_liquidation_page_visible_polling: true,
+        contract_liquidation_memory_aggregation: true,
+        contract_liquidation_raw_persistence: false,
+        contract_liquidation_short_bucket_minutes: 15,
+        contract_liquidation_hour_bucket_retention_days: 14,
+        contract_liquidation_max_period_days: 14,
+        contract_liquidation_dynamic_feed_idle_hours: 24,
+        contract_liquidation_dynamic_limit_per_provider: 12,
         liquidation_platform_strict_isolation: true,
         contract_funding_current_and_history: true,
         contract_funding_cache_seconds: 30,
         gate_next_funding_source: 'futures_contract_funding_next_apply',
         liquidation_public_feeds: {
-          binance: 'market_forceOrder',
+          binance: 'all_market_forceOrder',
           okx: 'public_liquidation-orders',
           bybit: 'public_allLiquidation',
           bitget: 'public_liquidation',
@@ -341,5 +348,5 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth + five-platform liquidation + five-platform funding listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth + single-venue liquidation statistics + five-platform funding listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

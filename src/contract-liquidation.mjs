@@ -1,12 +1,39 @@
-const STEP_VERSION = '640';
+const STEP_VERSION = '645';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();
+const STATS = new Map();
 const META_CACHE = new Map();
-const FEED_IDLE_MS = 75_000;
+const SERVICE_STARTED_AT_MS = Date.now();
 const READY_TIMEOUT_MS = 7_000;
-const EVENT_RETENTION_MS = 15 * 60_000;
-const MAX_EVENTS_PER_SYMBOL = 240;
+const DYNAMIC_FEED_IDLE_MS = 24 * 60 * 60_000;
+const RECENT_EVENT_RETENTION_MS = 24 * 60 * 60_000;
+const MAX_EVENTS_PER_SYMBOL = 60;
+const DEDUPE_RETENTION_MS = 2 * 60 * 60_000;
+const MINUTE_BUCKET_MS = 60_000;
+const QUARTER_BUCKET_MS = 15 * 60_000;
+const HOUR_BUCKET_MS = 60 * 60_000;
+const MINUTE_RETENTION_MS = 65 * 60_000;
+const QUARTER_RETENTION_MS = 25 * 60 * 60_000;
+const HOUR_RETENTION_MS = 15 * 24 * 60 * 60_000;
+const STATS_RETENTION_MS = 15 * 24 * 60 * 60_000;
 const META_FRESH_MS = 6 * 60 * 60_000;
+const DYNAMIC_LIMIT_PER_PROVIDER = Math.max(4, Math.min(24, Number(process.env.KAKA_LIQUIDATION_DYNAMIC_LIMIT || 12)));
+const CORE_SYMBOLS = String(process.env.KAKA_LIQUIDATION_CORE_SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,SUIUSDT')
+  .split(',')
+  .map((value) => value.trim().toUpperCase().replace(/[^A-Z0-9]/g, ''))
+  .filter(Boolean)
+  .slice(0, 20);
+const PERIODS = Object.freeze({
+  '15m': { durationMs: 15 * 60_000, chartBucketMs: 60_000, source: 'minute' },
+  '1h': { durationMs: 60 * 60_000, chartBucketMs: 5 * 60_000, source: 'minute' },
+  '4h': { durationMs: 4 * 60 * 60_000, chartBucketMs: 15 * 60_000, source: 'quarter' },
+  '12h': { durationMs: 12 * 60 * 60_000, chartBucketMs: 30 * 60_000, source: 'quarter' },
+  '24h': { durationMs: 24 * 60 * 60_000, chartBucketMs: 60 * 60_000, source: 'quarter' },
+  '3d': { durationMs: 3 * 24 * 60 * 60_000, chartBucketMs: 4 * 60 * 60_000, source: 'hour' },
+  '7d': { durationMs: 7 * 24 * 60 * 60_000, chartBucketMs: 12 * 60 * 60_000, source: 'hour' },
+  '14d': { durationMs: 14 * 24 * 60 * 60_000, chartBucketMs: 24 * 60 * 60_000, source: 'hour' },
+});
 let WS_CTOR_PROMISE = null;
 
 async function resolveWebSocketCtor() {
@@ -197,7 +224,7 @@ async function gateContractMultiplier(contract) {
 }
 
 function feedKey(provider, symbol) {
-  if (provider === 'okx' || provider === 'bitget') return `${provider}|all`;
+  if (GLOBAL_FEED_PROVIDERS.has(provider)) return `${provider}|all`;
   return `${provider}|${providerSymbol(provider, symbol)}`;
 }
 
@@ -206,7 +233,7 @@ function sourceInfo(provider) {
     case 'binance':
       return {
         source: 'binance_official_public_contract_liquidation_websocket',
-        transport: 'websocket_market_forceOrder',
+        transport: 'websocket_all_market_forceOrder',
         upstream_host: 'fstream.binance.com',
         coverage: 'largest_liquidation_per_symbol_within_1000ms',
       };
@@ -263,6 +290,9 @@ function createFeed(provider, symbol) {
     accessBySymbol: new Map(),
     waiters: new Set(),
     heartbeatTimer: null,
+    persistent: GLOBAL_FEED_PROVIDERS.has(provider),
+    core: false,
+    lastAccessAt: Date.now(),
     ...info,
   };
   FEEDS.set(key, feed);
@@ -275,19 +305,23 @@ function getFeed(provider, symbol) {
 }
 
 function touchFeed(feed, symbol) {
-  feed.accessBySymbol.set(compactSymbol(symbol), Date.now());
+  const now = Date.now();
+  feed.lastAccessAt = now;
+  feed.accessBySymbol.set(compactSymbol(symbol), now);
 }
 
 function symbolIsActive(feed, symbol) {
+  if (feed.persistent) return true;
   const compact = compactSymbol(symbol);
   const touchedAt = feed.accessBySymbol.get(compact);
-  return touchedAt != null && Date.now() - touchedAt <= FEED_IDLE_MS;
+  return touchedAt != null && Date.now() - touchedAt <= DYNAMIC_FEED_IDLE_MS;
 }
 
 function feedHasActiveSymbols(feed) {
+  if (feed.persistent) return true;
   const now = Date.now();
   for (const [symbol, time] of [...feed.accessBySymbol.entries()]) {
-    if (now - time <= FEED_IDLE_MS) return true;
+    if (now - time <= DYNAMIC_FEED_IDLE_MS) return true;
     feed.accessBySymbol.delete(symbol);
   }
   return false;
@@ -297,6 +331,236 @@ function feedEvents(feed, symbol) {
   const compact = compactSymbol(symbol);
   const rows = feed.eventsBySymbol.get(compact);
   return Array.isArray(rows) ? rows : [];
+}
+
+
+function statsKey(provider, symbol) {
+  return `${provider}|${compactSymbol(symbol)}`;
+}
+
+function createBucket(startMs, durationMs) {
+  return {
+    start_ms: startMs,
+    end_ms: startMs + durationMs,
+    long_notional: 0,
+    short_notional: 0,
+    total_notional: 0,
+    long_count: 0,
+    short_count: 0,
+    event_count: 0,
+    largest_event: null,
+  };
+}
+
+function cloneLargestEvent(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id || ''),
+    provider: String(row.provider || ''),
+    symbol: compactSymbol(row.symbol),
+    time_ms: integerValue(row.time_ms),
+    price: positiveNumber(row.price),
+    notional: positiveNumber(row.notional),
+    liquidation_side: String(row.liquidation_side || ''),
+  };
+}
+
+function applyEventToBucket(bucket, row) {
+  const value = positiveNumber(row?.notional);
+  if (value == null) return;
+  const side = String(row?.liquidation_side || '').toLowerCase();
+  bucket.total_notional += value;
+  bucket.event_count += 1;
+  if (side === 'long') {
+    bucket.long_notional += value;
+    bucket.long_count += 1;
+  } else if (side === 'short') {
+    bucket.short_notional += value;
+    bucket.short_count += 1;
+  }
+  if (!bucket.largest_event || value > Number(bucket.largest_event.notional || 0)) {
+    bucket.largest_event = cloneLargestEvent(row);
+  }
+}
+
+function mergeBucketInto(target, bucket) {
+  if (!bucket) return;
+  target.long_notional += Number(bucket.long_notional || 0);
+  target.short_notional += Number(bucket.short_notional || 0);
+  target.total_notional += Number(bucket.total_notional || 0);
+  target.long_count += Number(bucket.long_count || 0);
+  target.short_count += Number(bucket.short_count || 0);
+  target.event_count += Number(bucket.event_count || 0);
+  const candidate = bucket.largest_event;
+  if (candidate && (!target.largest_event || Number(candidate.notional || 0) > Number(target.largest_event.notional || 0))) {
+    target.largest_event = cloneLargestEvent(candidate);
+  }
+}
+
+function getStats(provider, symbol, { create = true, observedSinceMs = null } = {}) {
+  const normalizedSymbol = compactSymbol(symbol);
+  const key = statsKey(provider, normalizedSymbol);
+  let state = STATS.get(key);
+  if (!state && create) {
+    const now = Date.now();
+    state = {
+      key,
+      provider,
+      symbol: normalizedSymbol,
+      createdAt: Number(observedSinceMs || now),
+      observedSinceMs: Number(observedSinceMs || now),
+      lastAccessAt: now,
+      lastEventAt: 0,
+      lastGapAtMs: 0,
+      minuteBuckets: new Map(),
+      quarterBuckets: new Map(),
+      hourBuckets: new Map(),
+      recentEvents: [],
+      dedupe: new Map(),
+    };
+    STATS.set(key, state);
+  }
+  if (state) {
+    state.lastAccessAt = Date.now();
+    if (observedSinceMs && observedSinceMs > 0) {
+      state.observedSinceMs = Math.min(Number(state.observedSinceMs || observedSinceMs), Number(observedSinceMs));
+    }
+  }
+  return state;
+}
+
+
+function markFeedGap(feed) {
+  const now = Date.now();
+  if (GLOBAL_FEED_PROVIDERS.has(feed.provider)) {
+    for (const state of STATS.values()) {
+      if (state.provider === feed.provider) state.lastGapAtMs = now;
+    }
+    return;
+  }
+  const symbols = new Set([
+    compactSymbol(feed.requestedNativeSymbol),
+    ...feed.accessBySymbol.keys(),
+  ]);
+  for (const symbol of symbols) {
+    const state = getStats(feed.provider, symbol, { create: false });
+    if (state) state.lastGapAtMs = now;
+  }
+}
+
+function bucketFor(map, timeMs, durationMs) {
+  const start = Math.floor(timeMs / durationMs) * durationMs;
+  let bucket = map.get(start);
+  if (!bucket) {
+    bucket = createBucket(start, durationMs);
+    map.set(start, bucket);
+  }
+  return bucket;
+}
+
+function updateStats(row, observedSinceMs = null) {
+  const provider = normalizeProvider(row?.provider);
+  const symbol = compactSymbol(row?.symbol);
+  const timeMs = integerValue(row?.time_ms);
+  const id = String(row?.id || '');
+  if (!provider || !symbol || timeMs <= 0 || !id) return false;
+  const state = getStats(provider, symbol, { observedSinceMs });
+  if (!state) return false;
+  const seenAt = state.dedupe.get(id);
+  if (seenAt && Date.now() - seenAt <= DEDUPE_RETENTION_MS) return false;
+  state.dedupe.set(id, timeMs);
+  state.lastEventAt = Math.max(state.lastEventAt || 0, timeMs);
+  applyEventToBucket(bucketFor(state.minuteBuckets, timeMs, MINUTE_BUCKET_MS), row);
+  applyEventToBucket(bucketFor(state.quarterBuckets, timeMs, QUARTER_BUCKET_MS), row);
+  applyEventToBucket(bucketFor(state.hourBuckets, timeMs, HOUR_BUCKET_MS), row);
+  state.recentEvents.unshift({ ...row });
+  state.recentEvents.sort((a, b) => integerValue(b.time_ms) - integerValue(a.time_ms));
+  if (state.recentEvents.length > MAX_EVENTS_PER_SYMBOL) {
+    state.recentEvents.length = MAX_EVENTS_PER_SYMBOL;
+  }
+  trimStatsState(state);
+  return true;
+}
+
+function trimBucketMap(map, cutoffMs) {
+  for (const key of [...map.keys()]) {
+    if (Number(key) < cutoffMs) map.delete(key);
+  }
+}
+
+function trimStatsState(state) {
+  const now = Date.now();
+  trimBucketMap(state.minuteBuckets, now - MINUTE_RETENTION_MS);
+  trimBucketMap(state.quarterBuckets, now - QUARTER_RETENTION_MS);
+  trimBucketMap(state.hourBuckets, now - HOUR_RETENTION_MS);
+  state.recentEvents = state.recentEvents.filter((row) => integerValue(row.time_ms) >= now - RECENT_EVENT_RETENTION_MS).slice(0, MAX_EVENTS_PER_SYMBOL);
+  for (const [id, timeMs] of [...state.dedupe.entries()]) {
+    if (now - Number(timeMs || 0) > DEDUPE_RETENTION_MS) state.dedupe.delete(id);
+  }
+}
+
+function sourceMapForPeriod(state, period) {
+  if (period.source === 'minute') return state.minuteBuckets;
+  if (period.source === 'quarter') return state.quarterBuckets;
+  return state.hourBuckets;
+}
+
+function buildStatistics(state, periodKey, now = Date.now()) {
+  const period = PERIODS[periodKey] || PERIODS['24h'];
+  const cutoff = now - period.durationMs;
+  const sourceMap = sourceMapForPeriod(state, period);
+  const sourceBuckets = [...sourceMap.values()]
+    .filter((bucket) => Number(bucket.end_ms || 0) > cutoff && Number(bucket.start_ms || 0) <= now)
+    .sort((a, b) => Number(a.start_ms || 0) - Number(b.start_ms || 0));
+  const summary = createBucket(cutoff, period.durationMs);
+  for (const bucket of sourceBuckets) mergeBucketInto(summary, bucket);
+
+  const chart = new Map();
+  for (const bucket of sourceBuckets) {
+    const chartStart = Math.floor(Number(bucket.start_ms || 0) / period.chartBucketMs) * period.chartBucketMs;
+    let target = chart.get(chartStart);
+    if (!target) {
+      target = createBucket(chartStart, period.chartBucketMs);
+      chart.set(chartStart, target);
+    }
+    mergeBucketInto(target, bucket);
+  }
+  const chartBuckets = [...chart.values()].sort((a, b) => a.start_ms - b.start_ms);
+  const observedSinceMs = Math.max(0, Number(state?.observedSinceMs || state?.createdAt || now));
+  const coveredMs = Math.max(0, now - observedSinceMs);
+  const lastGapAtMs = Math.max(0, Number(state?.lastGapAtMs || 0));
+  const recentGap = lastGapAtMs > 0 && now - lastGapAtMs < period.durationMs;
+  return {
+    period: periodKey,
+    requested_duration_ms: period.durationMs,
+    chart_bucket_ms: period.chartBucketMs,
+    source_bucket: period.source,
+    coverage_start_ms: observedSinceMs,
+    coverage_end_ms: now,
+    covered_ms: Math.min(period.durationMs, coveredMs),
+    coverage_complete: coveredMs >= period.durationMs && !recentGap,
+    last_gap_at_ms: lastGapAtMs || null,
+    recent_gap: recentGap,
+    total_notional: summary.total_notional,
+    long_notional: summary.long_notional,
+    short_notional: summary.short_notional,
+    event_count: summary.event_count,
+    long_count: summary.long_count,
+    short_count: summary.short_count,
+    largest_event: summary.largest_event,
+    buckets: chartBuckets,
+  };
+}
+
+function enforceDynamicFeedLimit(provider) {
+  if (GLOBAL_FEED_PROVIDERS.has(provider)) return;
+  const dynamic = [...FEEDS.values()]
+    .filter((feed) => feed.provider === provider && !feed.persistent && !feed.core)
+    .sort((a, b) => Number(b.lastAccessAt || 0) - Number(a.lastAccessAt || 0));
+  for (const feed of dynamic.slice(DYNAMIC_LIMIT_PER_PROVIDER)) {
+    closeFeed(feed);
+    FEEDS.delete(feed.key);
+  }
 }
 
 function notifyReady(feed) {
@@ -316,7 +580,7 @@ function rejectReady(feed, error) {
 }
 
 function trimEvents(rows) {
-  const cutoff = Date.now() - EVENT_RETENTION_MS;
+  const cutoff = Date.now() - RECENT_EVENT_RETENTION_MS;
   const deduped = [];
   const seen = new Set();
   for (const row of rows) {
@@ -332,7 +596,6 @@ function trimEvents(rows) {
 
 function addEvent(feed, event) {
   const symbol = compactSymbol(event?.symbol);
-  if ((feed.provider === 'okx' || feed.provider === 'bitget') && !symbolIsActive(feed, symbol)) return;
   const timeMs = integerValue(event?.time_ms);
   const price = positiveNumber(event?.price);
   const notional = positiveNumber(event?.notional);
@@ -356,6 +619,9 @@ function addEvent(feed, event) {
   for (const key of ['quantity', 'quantity_contracts']) {
     if (row[key] == null) delete row[key];
   }
+  const observedSinceMs = feed.openedAt || SERVICE_STARTED_AT_MS;
+  const inserted = updateStats(row, observedSinceMs);
+  if (!inserted) return;
   const rows = [row, ...feedEvents(feed, symbol)];
   rows.sort((a, b) => integerValue(b.time_ms) - integerValue(a.time_ms));
   feed.eventsBySymbol.set(symbol, trimEvents(rows));
@@ -365,7 +631,7 @@ function addEvent(feed, event) {
 function websocketUrl(feed) {
   const native = feed.requestedNativeSymbol;
   if (feed.provider === 'binance') {
-    return `wss://fstream.binance.com/market/stream?streams=${native.toLowerCase()}@forceOrder`;
+    return 'wss://fstream.binance.com/ws/!forceOrder@arr';
   }
   if (feed.provider === 'okx') return 'wss://ws.okx.com:8443/ws/v5/public';
   if (feed.provider === 'bybit') return 'wss://stream.bybit.com/v5/public/linear';
@@ -429,6 +695,7 @@ function scheduleReconnect(feed) {
 }
 
 function closeFeed(feed) {
+  markFeedGap(feed);
   feed.manuallyClosing = true;
   if (feed.reconnectTimer) clearTimeout(feed.reconnectTimer);
   feed.reconnectTimer = null;
@@ -441,7 +708,12 @@ function closeFeed(feed) {
 }
 
 async function handleBinance(feed, data) {
-  const event = data?.data ?? data;
+  const payload = data?.data ?? data;
+  if (Array.isArray(payload)) {
+    for (const item of payload) await handleBinance(feed, item);
+    return;
+  }
+  const event = payload;
   if (String(event?.e || '') !== 'forceOrder' || !event?.o) return;
   if (integerValue(event?.st) === 2) return;
   const order = event.o;
@@ -470,7 +742,7 @@ async function handleOkx(feed, data) {
   for (const group of data.data) {
     const native = String(group?.instId || '');
     const symbol = compactSymbol(native);
-    if (!symbol || !Array.isArray(group?.details) || !symbolIsActive(feed, symbol)) continue;
+    if (!symbol || !Array.isArray(group?.details)) continue;
     const multiplier = await okxContractMultiplier(native);
     for (const detail of group.details) {
       const price = positiveNumber(detail?.bkPx);
@@ -532,7 +804,7 @@ async function handleBitget(feed, data) {
   if (String(data?.arg?.topic || '') !== 'liquidation' || !Array.isArray(data?.data)) return;
   for (const row of data.data) {
     const symbol = compactSymbol(row?.symbol);
-    if (!symbolIsActive(feed, symbol)) continue;
+    if (!symbol) continue;
     const side = String(row?.side || '').toLowerCase();
     const price = positiveNumber(row?.price);
     const notional = positiveNumber(row?.amount);
@@ -649,6 +921,7 @@ async function openFeed(feed) {
     wsListen(socket, 'close', () => {
       if (feed.socket === socket) feed.socket = null;
       feed.ready = false;
+      markFeedGap(feed);
       stopHeartbeat(feed);
       if (!feed.manuallyClosing) scheduleReconnect(feed);
     });
@@ -720,6 +993,11 @@ const cleanupTimer = setInterval(() => {
       closeWsQuietly(feed.socket);
     }
   }
+  for (const [key, state] of [...STATS.entries()]) {
+    trimStatsState(state);
+    const lastRelevant = Math.max(Number(state.lastEventAt || 0), Number(state.lastAccessAt || 0));
+    if (lastRelevant > 0 && now - lastRelevant > STATS_RETENTION_MS) STATS.delete(key);
+  }
 }, 15_000);
 cleanupTimer.unref?.();
 
@@ -727,6 +1005,36 @@ function clampLimit(value) {
   const parsed = integerValue(value);
   return Math.max(1, Math.min(parsed || 80, 120));
 }
+
+
+
+function markCoreFeed(feed) {
+  feed.core = true;
+  feed.persistent = true;
+  feed.lastAccessAt = Date.now();
+  return feed;
+}
+
+async function bootstrapCollection() {
+  for (const provider of ['binance', 'okx', 'bitget']) {
+    const feed = markCoreFeed(getFeed(provider, 'BTCUSDT'));
+    touchFeed(feed, 'BTCUSDT');
+    ensureFeed(feed).catch(() => {});
+  }
+  for (const provider of ['bybit', 'gate']) {
+    for (const symbol of CORE_SYMBOLS) {
+      const feed = markCoreFeed(getFeed(provider, symbol));
+      touchFeed(feed, symbol);
+      getStats(provider, symbol, { observedSinceMs: Date.now() });
+      ensureFeed(feed).catch(() => {});
+    }
+  }
+}
+
+const bootstrapTimer = setTimeout(() => {
+  bootstrapCollection().catch(() => {});
+}, 900);
+bootstrapTimer.unref?.();
 
 export async function handleContractLiquidation(req, res, url) {
   if (url.pathname !== '/api/contract-liquidation') return false;
@@ -749,6 +1057,8 @@ export async function handleContractLiquidation(req, res, url) {
   const symbol = compactSymbol(url.searchParams.get('symbol'));
   const limit = clampLimit(url.searchParams.get('limit'));
   const sinceMs = Math.max(0, integerValue(url.searchParams.get('since_ms')));
+  const requestedPeriod = String(url.searchParams.get('period') || '24h').trim().toLowerCase();
+  const period = Object.hasOwn(PERIODS, requestedPeriod) ? requestedPeriod : '24h';
   if (!SUPPORTED_PROVIDERS.has(provider)) {
     sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider });
     return true;
@@ -760,12 +1070,21 @@ export async function handleContractLiquidation(req, res, url) {
 
   const feed = getFeed(provider, symbol);
   touchFeed(feed, symbol);
+  enforceDynamicFeedLimit(provider);
+  const state = getStats(provider, symbol, {
+    observedSinceMs: feed.openedAt || (GLOBAL_FEED_PROVIDERS.has(provider) ? SERVICE_STARTED_AT_MS : Date.now()),
+  });
   try {
     await waitForReady(feed);
-    const items = feedEvents(feed, symbol)
+    const currentState = getStats(provider, symbol, {
+      observedSinceMs: feed.openedAt || (GLOBAL_FEED_PROVIDERS.has(provider) ? SERVICE_STARTED_AT_MS : Date.now()),
+    }) || state;
+    const recentRows = currentState?.recentEvents || feedEvents(feed, symbol);
+    const items = recentRows
       .filter((row) => sinceMs <= 0 || integerValue(row.time_ms) >= sinceMs)
       .slice(0, limit)
       .map((row) => ({ ...row }));
+    const statistics = buildStatistics(currentState, period);
     sendJson(res, 200, {
       ok: true,
       version: STEP_VERSION,
@@ -778,9 +1097,20 @@ export async function handleContractLiquidation(req, res, url) {
       transport: feed.transport,
       upstream_host: feed.upstream_host,
       coverage: feed.coverage,
+      aggregation_scope: 'single_provider_single_symbol',
+      retention: {
+        minute_buckets_minutes: 60,
+        quarter_hour_buckets_hours: 24,
+        hourly_buckets_days: 14,
+        raw_events_persisted: false,
+        process_memory_only: true,
+      },
+      available_periods: Object.keys(PERIODS),
+      service_started_at_ms: SERVICE_STARTED_AT_MS,
       session_started_at_ms: feed.openedAt || Date.now(),
       timestamp_ms: items[0]?.time_ms || feed.lastMessageAt || Date.now(),
-      last_event_at_ms: items[0]?.time_ms || null,
+      last_event_at_ms: items[0]?.time_ms || currentState?.lastEventAt || null,
+      statistics,
       items,
     });
   } catch (error) {
