@@ -85,6 +85,45 @@ function intervalMs(interval) {
     '1M': 2_592_000_000,
   })[interval] || 900_000;
 }
+function klineCoverage(rows, interval, endMs) {
+  const sorted = [...new Map((Array.isArray(rows) ? rows : []).map((row) => [Number(row?.open_time_ms), row])).values()]
+    .filter((row) => Number.isFinite(Number(row?.open_time_ms)))
+    .sort((a, b) => Number(a.open_time_ms) - Number(b.open_time_ms));
+  const step = intervalMs(interval);
+  if (!sorted.length) {
+    return {
+      row_count: 0,
+      first_open_time: null,
+      last_open_time: null,
+      gap_count: 0,
+      missing_intervals: 0,
+      lag_intervals_to_end: null,
+      continuous_to_current: false,
+    };
+  }
+  let gapCount = 0;
+  let missingIntervals = 0;
+  for (let index = 1; index < sorted.length; index += 1) {
+    const difference = Number(sorted[index].open_time_ms) - Number(sorted[index - 1].open_time_ms);
+    if (difference > step) {
+      gapCount += 1;
+      missingIntervals += Math.max(0, Math.round(difference / step) - 1);
+    }
+  }
+  const lastOpenMs = Number(sorted.at(-1).open_time_ms);
+  const targetOpenMs = Math.floor(Math.max(0, Number(endMs || Date.now()) - 1) / step) * step;
+  const lagIntervals = Math.max(0, Math.round((targetOpenMs - lastOpenMs) / step));
+  return {
+    row_count: sorted.length,
+    first_open_time: sorted[0].open_time || new Date(Number(sorted[0].open_time_ms)).toISOString(),
+    last_open_time: sorted.at(-1).open_time || new Date(lastOpenMs).toISOString(),
+    gap_count: gapCount,
+    missing_intervals: missingIntervals,
+    lag_intervals_to_end: lagIntervals,
+    continuous_to_current: gapCount === 0 && lagIntervals <= 1,
+  };
+}
+
 function okxBar(interval) {
   return ({
     '1m':'1m','3m':'3m','5m':'5m','15m':'15m','30m':'30m',
@@ -853,9 +892,8 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.2：Binance 合约历史K线先读取官方 data.binance.vision 日/月归档并持久化最后正确种子。
-    // Render 所在区域即使 fapi REST 受限，也能在清缓存/新安装后立即得到真实历史蜡烛；
-    // 当前未收盘蜡烛仍由既有官方 WebSocket 实时流更新，不跨平台、不造数据。
+    // Step650.3：Binance 合约历史K线先读官方日/月归档，再补官方当前日HTTP桥接并启动按需实时K线WebSocket。
+    // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit });
     if (seedRows.length) return seedRows;
   }
@@ -959,8 +997,9 @@ export async function handleMarketApi(req, res, url) {
         symbol,
         interval,
         rows,
-        source: rows[0]?.source || `${provider}_official_public_kline_render`,
-        cached_at: rows[0]?.cached_at || new Date().toISOString(),
+        coverage: klineCoverage(rows, interval, end),
+        source: rows.at(-1)?.source || rows[0]?.source || `${provider}_official_public_kline_render`,
+        cached_at: rows.at(-1)?.cached_at || rows[0]?.cached_at || new Date().toISOString(),
       });
       return true;
     }

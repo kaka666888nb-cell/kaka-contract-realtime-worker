@@ -1,4 +1,5 @@
 import { inflateRawSync } from 'node:zlib';
+import { WebSocket } from 'ws';
 
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
@@ -11,6 +12,27 @@ const MAX_PERSIST_ROWS = 1500;
 const MAX_DAILY_FILES = 16;
 const MAX_MONTHLY_FILES = 24;
 const FETCH_TIMEOUT_MS = 18_000;
+const HTTP_BRIDGE_TIMEOUT_MS = 12_000;
+const HTTP_BRIDGE_CACHE_MS = 30_000;
+const HTTP_RESTRICTED_COOLDOWN_MS = 30 * 60_000;
+const HTTP_TRANSIENT_COOLDOWN_MS = 90_000;
+const MAX_HTTP_PAGE_ROWS = 1000;
+const MAX_LIVE_STREAMS = 32;
+const LIVE_IDLE_MS = 12 * 60_000;
+const LIVE_PERSIST_MIN_MS = 45_000;
+const LIVE_RECONNECT_MAX_MS = 30_000;
+const LIVE_WS_HOSTS = [
+  'wss://fstream.binance.com/market/ws',
+  'wss://stream.binancefuture.com/market/ws',
+];
+// Step650.3：先尝试官方文档 REST 主域，再尝试 Binance 官网同路径反向代理；
+// 同一候选触发 429/451/5xx 后单独冷却，不再影响归档、其他候选或实时 WebSocket。
+const HTTP_BRIDGE_CANDIDATES = [
+  { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
+  { id: 'fapi_continuous', base: 'https://fapi.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
+  { id: 'www_klines', base: 'https://www.binance.com', path: '/fapi/v1/klines', continuous: false },
+  { id: 'www_continuous', base: 'https://www.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
+];
 
 const memory = new Map();
 const inflight = new Map();
@@ -23,6 +45,17 @@ const stats = {
   archive_errors: 0,
   last_success_at: 0,
   last_error: '',
+  bridge_requests: 0,
+  bridge_success: 0,
+  bridge_empty: 0,
+  bridge_errors: 0,
+  bridge_rows: 0,
+  bridge_last_success_at: 0,
+  bridge_last_source: '',
+  bridge_last_error: '',
+  live_messages: 0,
+  live_closed_candles: 0,
+  live_last_message_at: 0,
 };
 
 function compact(raw) {
@@ -236,13 +269,332 @@ function parseCsv(csv, symbol, targetInterval, archiveInterval) {
     : normalizeRows(rows, symbol, targetInterval);
 }
 
+
+function parseApiRows(rawRows, symbol, interval, source) {
+  const nowIso = iso(Date.now());
+  const parsed = [];
+  for (const raw of Array.isArray(rawRows) ? rawRows : []) {
+    if (!Array.isArray(raw) || raw.length < 7) continue;
+    const openTime = toMs(raw[0]);
+    const open = finite(raw[1]);
+    const high = finite(raw[2]);
+    const low = finite(raw[3]);
+    const close = finite(raw[4]);
+    if ([openTime, open, high, low, close].some((value) => value === null)) continue;
+    parsed.push({
+      provider: PROVIDER,
+      market_type: MARKET_TYPE,
+      symbol,
+      interval,
+      open_time: iso(openTime),
+      open_time_ms: openTime,
+      close_time: iso(toMs(raw[6]) ?? (openTime + intervalMs(interval) - 1)),
+      open,
+      high,
+      low,
+      close,
+      volume: finite(raw[5]) ?? 0,
+      quote_volume: finite(raw[7]) ?? 0,
+      trade_count: Math.max(0, Math.trunc(finite(raw[8]) ?? 0)),
+      taker_buy_volume: finite(raw[9]),
+      taker_buy_quote_volume: finite(raw[10]),
+      source,
+      cached_at: nowIso,
+    });
+  }
+  return normalizeRows(parsed, symbol, interval, source);
+}
+
+function mergeRows(...groups) {
+  return [...new Map(groups.flat().map((row) => [row.open_time_ms, row])).values()]
+    .sort((a, b) => a.open_time_ms - b.open_time_ms)
+    .slice(-MAX_PERSIST_ROWS);
+}
+
+function isNearNow(endMs, interval) {
+  return endMs >= Date.now() - Math.max(2 * intervalMs(interval), 10 * 60_000);
+}
+
+function expectedCurrentOpen(endMs, interval) {
+  const step = intervalMs(interval);
+  return Math.floor(Math.max(0, endMs - 1) / step) * step;
+}
+
+const bridgeCandidateState = new Map();
+const bridgeResultCache = new Map();
+
+function bridgeCooldown(candidateId) {
+  const state = bridgeCandidateState.get(candidateId);
+  if (!state || state.until <= Date.now()) return null;
+  return state;
+}
+
+function markBridgeFailure(candidate, status, message) {
+  const text = String(message || '').toLowerCase();
+  const restricted = status === 418 || status === 429 || status === 451 ||
+    text.includes('too many requests') || text.includes('banned') || text.includes('restricted');
+  const duration = restricted ? HTTP_RESTRICTED_COOLDOWN_MS : HTTP_TRANSIENT_COOLDOWN_MS;
+  bridgeCandidateState.set(candidate.id, {
+    until: Date.now() + duration,
+    status,
+    reason: restricted ? 'exchange_rate_limit_or_region_block' : 'upstream_unavailable',
+    error: String(message || ''),
+  });
+}
+
+async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.3',
+      },
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      const error = new Error(`${response.status} ${response.statusText} ${text.slice(0, 240)}`.trim());
+      error.status = response.status;
+      throw error;
+    }
+    let payload;
+    try { payload = JSON.parse(text); } catch (_) { throw new Error('bridge_invalid_json'); }
+    if (payload && !Array.isArray(payload) && Number(payload.code) < 0) {
+      const error = new Error(`binance_${payload.code}:${payload.msg || 'unknown_error'}`);
+      error.status = 400;
+      throw error;
+    }
+    return payload;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function bridgeUrl(candidate, symbol, interval, startTime, endTime, limit) {
+  const query = new URLSearchParams({
+    interval,
+    startTime: String(Math.max(0, Math.trunc(startTime))),
+    endTime: String(Math.max(1, Math.trunc(endTime))),
+    limit: String(Math.max(1, Math.min(MAX_HTTP_PAGE_ROWS, limit))),
+  });
+  if (candidate.continuous) {
+    query.set('pair', symbol);
+    query.set('contractType', 'PERPETUAL');
+  } else {
+    query.set('symbol', symbol);
+  }
+  return `${candidate.base}${candidate.path}?${query.toString()}`;
+}
+
+async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows) {
+  if (bridgeCooldown(candidate.id)) return [];
+  const source = candidate.continuous
+    ? `binance_official_public_continuous_kline_current_bridge_${candidate.id}`
+    : `binance_official_public_kline_current_bridge_${candidate.id}`;
+  const result = [];
+  const step = intervalMs(interval);
+  let cursor = startTime;
+  while (cursor < endTime && result.length < maxRows) {
+    const pageLimit = Math.min(MAX_HTTP_PAGE_ROWS, maxRows - result.length);
+    const payload = await fetchJson(bridgeUrl(candidate, symbol, interval, cursor, endTime, pageLimit));
+    const page = parseApiRows(payload, symbol, interval, source)
+      .filter((row) => row.open_time_ms >= cursor && row.open_time_ms < endTime);
+    if (!page.length) break;
+    result.push(...page);
+    const next = page.at(-1).open_time_ms + step;
+    if (next <= cursor) break;
+    cursor = next;
+    if (page.length < pageLimit) break;
+  }
+  return mergeRows(result).slice(-maxRows);
+}
+
+async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxRows) {
+  if (interval === '1s' || startTime >= endTime || maxRows <= 0) return [];
+  const cacheKey = `${symbol}|${interval}|${Math.floor(startTime / intervalMs(interval))}|${Math.floor(endTime / intervalMs(interval))}`;
+  const cached = bridgeResultCache.get(cacheKey);
+  if (cached && Date.now() - cached.loadedAt <= HTTP_BRIDGE_CACHE_MS) return cached.rows;
+  stats.bridge_requests += 1;
+  let lastError = '';
+  for (const candidate of HTTP_BRIDGE_CANDIDATES) {
+    if (bridgeCooldown(candidate.id)) continue;
+    try {
+      const rows = await fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows);
+      if (!rows.length) {
+        stats.bridge_empty += 1;
+        continue;
+      }
+      stats.bridge_success += 1;
+      stats.bridge_rows += rows.length;
+      stats.bridge_last_success_at = Date.now();
+      stats.bridge_last_source = rows.at(-1)?.source || candidate.id;
+      stats.bridge_last_error = '';
+      bridgeCandidateState.delete(candidate.id);
+      bridgeResultCache.set(cacheKey, { rows, loadedAt: Date.now() });
+      return rows;
+    } catch (error) {
+      const message = String(error?.message || error);
+      const status = Number(error?.status || 0);
+      lastError = `${candidate.id}:${message}`;
+      markBridgeFailure(candidate, status, message);
+      stats.bridge_errors += 1;
+    }
+  }
+  stats.bridge_last_error = lastError || 'all_bridge_candidates_cooling_down_or_empty';
+  return [];
+}
+
+const liveStreams = new Map();
+let liveSweepTimer = null;
+
+function liveKey(symbol, interval) {
+  return `${symbol}|${interval}`;
+}
+
+function liveRowFromPayload(payload, symbol, interval) {
+  const kline = payload?.k || payload?.data?.k;
+  if (!kline) return null;
+  return normalizeRows([{
+    open_time_ms: kline.t,
+    close_time_ms: kline.T,
+    open: kline.o,
+    high: kline.h,
+    low: kline.l,
+    close: kline.c,
+    volume: kline.v,
+    quote_volume: kline.q,
+    trade_count: kline.n,
+    taker_buy_volume: kline.V,
+    taker_buy_quote_volume: kline.Q,
+    source: 'binance_official_public_kline_live_bridge',
+    cached_at: iso(Date.now()),
+  }], symbol, interval, 'binance_official_public_kline_live_bridge')[0] || null;
+}
+
+function closeLiveStream(key, reason = 'idle') {
+  const state = liveStreams.get(key);
+  if (!state) return;
+  state.closed = true;
+  clearTimeout(state.reconnectTimer);
+  try {
+    if (state.ws?.readyState === WebSocket.OPEN || state.ws?.readyState === WebSocket.CONNECTING) {
+      state.ws.close(1000, reason);
+    }
+  } catch (_) {}
+  liveStreams.delete(key);
+}
+
+function evictLiveStreamsIfNeeded() {
+  if (liveStreams.size < MAX_LIVE_STREAMS) return;
+  const oldest = [...liveStreams.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess)[0];
+  if (oldest) closeLiveStream(oldest[0], 'capacity');
+}
+
+function mergeLiveRow(symbol, interval, row, closed) {
+  const key = memoryKey(symbol, interval);
+  const current = memory.get(key)?.rows || [];
+  const rows = mergeRows(current, [row]);
+  memory.set(key, { rows, loadedAt: Date.now() });
+  stats.live_messages += 1;
+  stats.live_last_message_at = Date.now();
+  if (closed) stats.live_closed_candles += 1;
+  const state = liveStreams.get(liveKey(symbol, interval));
+  if (!state) return;
+  const shouldPersist = closed || Date.now() - state.lastPersistAt >= LIVE_PERSIST_MIN_MS;
+  if (shouldPersist && rows.length) {
+    state.lastPersistAt = Date.now();
+    persistRows(symbol, interval, rows, 'binance_official_public_archive_plus_current_bridge')
+      .catch((error) => { stats.last_error = String(error?.message || error); });
+  }
+}
+
+function connectLiveStream(state) {
+  if (state.closed) return;
+  const host = LIVE_WS_HOSTS[state.hostIndex % LIVE_WS_HOSTS.length];
+  const stream = `${state.symbol.toLowerCase()}@kline_${state.interval}`;
+  const ws = new WebSocket(`${host}/${stream}`, { handshakeTimeout: 15_000 });
+  state.ws = ws;
+  ws.on('open', () => {
+    state.connected = true;
+    state.openedAt = Date.now();
+    state.lastError = '';
+    state.reconnectAttempt = 0;
+  });
+  ws.on('ping', (data) => { try { ws.pong(data); } catch (_) {} });
+  ws.on('message', (raw) => {
+    state.lastMessageAt = Date.now();
+    try {
+      const payload = JSON.parse(raw.toString());
+      const row = liveRowFromPayload(payload, state.symbol, state.interval);
+      if (!row) return;
+      mergeLiveRow(state.symbol, state.interval, row, Boolean(payload?.k?.x || payload?.data?.k?.x));
+    } catch (error) {
+      state.lastError = String(error?.message || error);
+    }
+  });
+  let reconnectScheduled = false;
+  const reconnect = (error) => {
+    if (reconnectScheduled || state.closed || state.ws !== ws) return;
+    reconnectScheduled = true;
+    state.connected = false;
+    if (error) state.lastError = String(error?.message || error);
+    state.hostIndex = (state.hostIndex + 1) % LIVE_WS_HOSTS.length;
+    state.reconnectAttempt += 1;
+    const delay = Math.min(LIVE_RECONNECT_MAX_MS, 1000 * (2 ** Math.min(5, state.reconnectAttempt)));
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = setTimeout(() => connectLiveStream(state), delay);
+    state.reconnectTimer.unref?.();
+  };
+  ws.on('error', reconnect);
+  ws.on('close', () => reconnect());
+}
+
+function ensureLiveStream(symbol, interval) {
+  if (interval === '1s') return;
+  const key = liveKey(symbol, interval);
+  let state = liveStreams.get(key);
+  if (state) {
+    state.lastAccess = Date.now();
+    return;
+  }
+  evictLiveStreamsIfNeeded();
+  state = {
+    symbol,
+    interval,
+    lastAccess: Date.now(),
+    lastPersistAt: 0,
+    hostIndex: 0,
+    reconnectAttempt: 0,
+    reconnectTimer: null,
+    connected: false,
+    openedAt: 0,
+    lastMessageAt: 0,
+    lastError: '',
+    closed: false,
+    ws: null,
+  };
+  liveStreams.set(key, state);
+  connectLiveStream(state);
+  if (!liveSweepTimer) {
+    liveSweepTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [streamKey, streamState] of liveStreams.entries()) {
+        if (now - streamState.lastAccess > LIVE_IDLE_MS) closeLiveStream(streamKey, 'idle');
+      }
+    }, 60_000);
+    liveSweepTimer.unref?.();
+  }
+}
+
 async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.2' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.3' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -372,7 +724,7 @@ async function restorePersisted(symbol, interval) {
   return rows;
 }
 
-async function persistRows(symbol, interval, rows) {
+async function persistRows(symbol, interval, rows, source = 'binance_official_public_archive_kline_seed') {
   if (!supabaseEnabled() || !rows.length) return;
   const safeRows = rows.slice(-MAX_PERSIST_ROWS);
   const body = [{
@@ -382,7 +734,7 @@ async function persistRows(symbol, interval, rows) {
     quote_asset: snapshotKey(symbol, interval),
     payload: { rows: safeRows },
     row_count: safeRows.length,
-    source: 'binance_official_public_archive_kline_seed',
+    source,
     source_time: safeRows.at(-1)?.open_time || iso(Date.now()),
     updated_at: iso(Date.now()),
   }];
@@ -407,39 +759,70 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
   const safeLimit = Math.max(20, Math.min(MAX_PERSIST_ROWS, Number.parseInt(String(limit), 10) || 500));
   if (!normalizedSymbol) return [];
   const key = memoryKey(normalizedSymbol, normalizedInterval);
+  const step = intervalMs(normalizedInterval);
+  const nearNow = isNearNow(safeEnd, normalizedInterval);
+  const targetOpen = expectedCurrentOpen(safeEnd, normalizedInterval);
   const cached = memory.get(key);
-  if (cached && Date.now() - cached.loadedAt <= CACHE_TTL_MS) {
+  const cachedTail = cached?.rows?.at(-1)?.open_time_ms || 0;
+  if (cached && Date.now() - cached.loadedAt <= CACHE_TTL_MS && (!nearNow || cachedTail >= targetOpen - step)) {
     stats.memory_hits += 1;
+    if (nearNow) ensureLiveStream(normalizedSymbol, normalizedInterval);
     return cached.rows.filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
   }
   const existing = inflight.get(key);
   if (existing) return (await existing).filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
 
   const task = (async () => {
-    let persisted = [];
-    try { persisted = await restorePersisted(normalizedSymbol, normalizedInterval); } catch (error) { stats.last_error = String(error?.message || error); }
-    let archive = [];
-    try { archive = await fetchArchiveRows(normalizedSymbol, normalizedInterval, safeEnd, safeLimit); } catch (error) {
-      stats.archive_errors += 1;
-      stats.last_error = String(error?.message || error);
+    let persisted = cached?.rows || [];
+    if (!persisted.length) {
+      try { persisted = await restorePersisted(normalizedSymbol, normalizedInterval); } catch (error) { stats.last_error = String(error?.message || error); }
     }
-    const merged = [...new Map([...persisted, ...archive].map((row) => [row.open_time_ms, row])).values()]
-      .filter((row) => row.open_time_ms < safeEnd)
-      .sort((a, b) => a.open_time_ms - b.open_time_ms)
-      .slice(-MAX_PERSIST_ROWS);
+    let archive = [];
+    // 已有足够持久/内存历史时，不因“当前日桥接尚未完成”而重复下载同一批归档 ZIP。
+    // 只有历史不足本次 limit，或最后一根比最近完整日更旧时才重新补归档。
+    const latestPersistedOpen = persisted.at(-1)?.open_time_ms || 0;
+    const yesterdayStart = Math.floor((Date.now() - 86_400_000) / 86_400_000) * 86_400_000;
+    const needsArchive = persisted.length < safeLimit || latestPersistedOpen < yesterdayStart;
+    if (needsArchive) {
+      try { archive = await fetchArchiveRows(normalizedSymbol, normalizedInterval, safeEnd, safeLimit); } catch (error) {
+        stats.archive_errors += 1;
+        stats.last_error = String(error?.message || error);
+      }
+    }
+    let merged = mergeRows(persisted, archive).filter((row) => row.open_time_ms < safeEnd);
+    let bridge = [];
+    if (nearNow && normalizedInterval !== '1s') {
+      const lastOpen = merged.at(-1)?.open_time_ms;
+      // 从归档/持久快照最后一根的下一周期开始补到当前；最多补本次请求所需行数并额外留4根校验重叠。
+      const bridgeStart = Math.max(0, lastOpen != null ? lastOpen + step : safeEnd - safeLimit * step);
+      const needed = Math.max(4, Math.min(MAX_PERSIST_ROWS, Math.ceil((safeEnd - bridgeStart) / step) + 4));
+      try { bridge = await fetchCurrentBridgeRows(normalizedSymbol, normalizedInterval, bridgeStart, safeEnd, needed); } catch (error) {
+        stats.bridge_errors += 1;
+        stats.bridge_last_error = String(error?.message || error);
+      }
+      merged = mergeRows(merged, bridge).filter((row) => row.open_time_ms < safeEnd);
+      ensureLiveStream(normalizedSymbol, normalizedInterval);
+    }
     memory.set(key, { rows: merged, loadedAt: Date.now() });
-    if (archive.length) persistRows(normalizedSymbol, normalizedInterval, merged).catch((error) => { stats.last_error = String(error?.message || error); });
+    if (archive.length || bridge.length) {
+      const source = bridge.length
+        ? 'binance_official_public_archive_plus_current_bridge'
+        : 'binance_official_public_archive_kline_seed';
+      persistRows(normalizedSymbol, normalizedInterval, merged, source)
+        .catch((error) => { stats.last_error = String(error?.message || error); });
+    }
     return merged;
   })();
   inflight.set(key, task);
   try {
-    return (await task).slice(-safeLimit);
+    return (await task).filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
   } finally {
     if (inflight.get(key) === task) inflight.delete(key);
   }
 }
 
 export function getBinanceContractKlineSeedHealth() {
+  const now = Date.now();
   return {
     ok: true,
     provider: PROVIDER,
@@ -447,11 +830,41 @@ export function getBinanceContractKlineSeedHealth() {
     cache_entries: memory.size,
     inflight: inflight.size,
     persistence_enabled: supabaseEnabled(),
+    live_stream_count: liveStreams.size,
+    live_streams: [...liveStreams.values()].map((state) => ({
+      symbol: state.symbol,
+      interval: state.interval,
+      connected: state.connected,
+      opened_at: state.openedAt ? iso(state.openedAt) : null,
+      last_message_at: state.lastMessageAt ? iso(state.lastMessageAt) : null,
+      idle_seconds: Math.max(0, Math.round((now - state.lastAccess) / 1000)),
+      last_error: state.lastError || null,
+    })),
+    bridge_candidates: HTTP_BRIDGE_CANDIDATES.map((candidate) => {
+      const state = bridgeCandidateState.get(candidate.id);
+      return {
+        id: candidate.id,
+        cooling_down: Boolean(state && state.until > now),
+        next_allowed_at: state && state.until > now ? iso(state.until) : null,
+        reason: state?.reason || null,
+        last_error: state?.error || null,
+      };
+    }),
     ...stats,
     last_success_at: stats.last_success_at ? iso(stats.last_success_at) : null,
-    source: 'binance_official_public_data_archive_with_persistent_snapshot',
+    bridge_last_success_at: stats.bridge_last_success_at ? iso(stats.bridge_last_success_at) : null,
+    live_last_message_at: stats.live_last_message_at ? iso(stats.live_last_message_at) : null,
+    source: 'binance_official_public_archive_plus_current_http_and_live_websocket_bridge',
     time: iso(Date.now()),
   };
 }
 
-export const _test = { unzipFirstCsv, parseCsv, normalizeRows, aggregateRows };
+export const _test = {
+  unzipFirstCsv,
+  parseCsv,
+  parseApiRows,
+  normalizeRows,
+  aggregateRows,
+  mergeRows,
+  expectedCurrentOpen,
+};
