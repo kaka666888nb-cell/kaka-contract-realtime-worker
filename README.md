@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.5**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.6**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -109,3 +109,19 @@ Step650.5 addresses real-device cases where ARC/BANANAS31 or another cold symbol
 - intraday archive fallback uses bounded daily/monthly searches so new symbols cannot scan 24 empty months and exceed the proxy timeout.
 
 No new SQL, environment variable, Edge Function, Cron task, or dependency is required.
+
+
+## Step650.6 partial-bridge completeness validation
+
+Step650.6 fixes the remaining Render result found in Step650.5 validation: ARC, BANANAS31, and 1000SHIB could return 240 rows but still contain one 71-candle internal gap. The first official bridge candidate returned a non-empty partial result (often only the newest live candle), and the worker incorrectly stopped before trying the exact-symbol Kline candidate.
+
+Step650.6 now:
+
+- validates each candidate against the full requested start/end window;
+- continues to later official candidates when a response is non-empty but partial;
+- merges continuous-Kline and exact-symbol Kline rows by `open_time`;
+- caches a current-day bridge only when it covers the requested start, has no internal gaps, and is at most one interval behind;
+- allows archive fallback when a cold-start bridge is partial;
+- refuses to persist a near-current snapshot unless its recent requested window is continuous.
+
+No synthetic candles, cross-exchange fallback, new SQL, environment variable, Edge Function, Cron task, Flutter dependency, or App file is introduced by Step650.6.
