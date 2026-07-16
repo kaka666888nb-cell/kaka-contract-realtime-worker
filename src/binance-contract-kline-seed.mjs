@@ -11,8 +11,8 @@ const CACHE_TTL_MS = 15 * 60_000;
 const MAX_PERSIST_ROWS = 1500;
 const MAX_DAILY_FILES = 16;
 const MAX_MONTHLY_FILES = 24;
-const FETCH_TIMEOUT_MS = 18_000;
-const HTTP_BRIDGE_TIMEOUT_MS = 12_000;
+const FETCH_TIMEOUT_MS = 8_000;
+const HTTP_BRIDGE_TIMEOUT_MS = 6_000;
 const HTTP_BRIDGE_CACHE_MS = 30_000;
 const HTTP_RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 const HTTP_TRANSIENT_COOLDOWN_MS = 90_000;
@@ -28,10 +28,11 @@ const LIVE_WS_HOSTS = [
 // Step650.4：先尝试官方文档 REST 主域，再尝试 Binance 官网同路径反向代理；
 // 同一候选触发 429/451/5xx 后单独冷却，不再影响归档、其他候选或实时 WebSocket。
 const HTTP_BRIDGE_CANDIDATES = [
-  { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
+  // Step650.5：Render实测连续合约接口可直接返回最新一页，优先它可避免新币先扫描大量归档而超过30秒代理时限。
   { id: 'fapi_continuous', base: 'https://fapi.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
-  { id: 'www_klines', base: 'https://www.binance.com', path: '/fapi/v1/klines', continuous: false },
   { id: 'www_continuous', base: 'https://www.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
+  { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
+  { id: 'www_klines', base: 'https://www.binance.com', path: '/fapi/v1/klines', continuous: false },
 ];
 
 const memory = new Map();
@@ -383,20 +384,38 @@ function bridgeStartForRecentWindow(rows, interval, endMs, limit = MAX_PERSIST_R
 const bridgeCandidateState = new Map();
 const bridgeResultCache = new Map();
 
-function bridgeCooldown(candidateId) {
-  const state = bridgeCandidateState.get(candidateId);
-  if (!state || state.until <= Date.now()) return null;
-  return state;
+function bridgeStateKey(candidateId, symbol = '*') {
+  return `${candidateId}|${symbol || '*'}`;
 }
 
-function markBridgeFailure(candidate, status, message) {
+function activeBridgeState(key) {
+  const state = bridgeCandidateState.get(key);
+  if (!state) return null;
+  if (state.until > Date.now()) return state;
+  bridgeCandidateState.delete(key);
+  return null;
+}
+
+function bridgeCooldown(candidateId, symbol) {
+  // 429/451等区域或限流属于候选域名全局冷却；普通5xx/网络错误只隔离当前交易对。
+  return activeBridgeState(bridgeStateKey(candidateId, '*')) ||
+    activeBridgeState(bridgeStateKey(candidateId, symbol));
+}
+
+function markBridgeFailure(candidate, symbol, status, message) {
   const text = String(message || '').toLowerCase();
   const restricted = status === 418 || status === 429 || status === 451 ||
     text.includes('too many requests') || text.includes('banned') || text.includes('restricted');
+  const transient = status === 0 || status >= 500 ||
+    text.includes('abort') || text.includes('timeout') || text.includes('network') || text.includes('fetch failed');
+  // 400/404等通常是单个新币、旧币或参数不适用于该候选，不允许把候选域名全局冷却。
+  if (!restricted && !transient) return;
   const duration = restricted ? HTTP_RESTRICTED_COOLDOWN_MS : HTTP_TRANSIENT_COOLDOWN_MS;
-  bridgeCandidateState.set(candidate.id, {
+  const scope = restricted ? '*' : symbol;
+  bridgeCandidateState.set(bridgeStateKey(candidate.id, scope), {
     until: Date.now() + duration,
     status,
+    scope,
     reason: restricted ? 'exchange_rate_limit_or_region_block' : 'upstream_unavailable',
     error: String(message || ''),
   });
@@ -449,7 +468,7 @@ function bridgeUrl(candidate, symbol, interval, startTime, endTime, limit) {
 }
 
 async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows) {
-  if (bridgeCooldown(candidate.id)) return [];
+  if (bridgeCooldown(candidate.id, symbol)) return [];
   const source = candidate.continuous
     ? `binance_official_public_continuous_kline_current_bridge_${candidate.id}`
     : `binance_official_public_kline_current_bridge_${candidate.id}`;
@@ -479,7 +498,7 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
   stats.bridge_requests += 1;
   let lastError = '';
   for (const candidate of HTTP_BRIDGE_CANDIDATES) {
-    if (bridgeCooldown(candidate.id)) continue;
+    if (bridgeCooldown(candidate.id, symbol)) continue;
     try {
       const rows = await fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows);
       if (!rows.length) {
@@ -491,14 +510,14 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
       stats.bridge_last_success_at = Date.now();
       stats.bridge_last_source = rows.at(-1)?.source || candidate.id;
       stats.bridge_last_error = '';
-      bridgeCandidateState.delete(candidate.id);
+      bridgeCandidateState.delete(bridgeStateKey(candidate.id, symbol));
       bridgeResultCache.set(cacheKey, { rows, loadedAt: Date.now() });
       return rows;
     } catch (error) {
       const message = String(error?.message || error);
       const status = Number(error?.status || 0);
       lastError = `${candidate.id}:${message}`;
-      markBridgeFailure(candidate, status, message);
+      markBridgeFailure(candidate, symbol, status, message);
       stats.bridge_errors += 1;
     }
   }
@@ -726,15 +745,24 @@ async function fetchArchiveRows(symbol, interval, endMs, limit) {
     dailyCandidates.push(`${DATA_BASE}/daily/klines/${symbol}/${archiveInterval}/${name}`);
     dailyCursor = new Date(dailyCursor.getTime() - 86_400_000);
   }
-  const dailyResults = await mapLimit(dailyCandidates, 4, (url) => loadArchiveFile(url, symbol, interval, archiveInterval));
+  const dailyResults = await mapLimit(dailyCandidates, Math.min(6, dailyCandidates.length), (url) => loadArchiveFile(url, symbol, interval, archiveInterval));
   for (const rows of dailyResults) {
     if (Array.isArray(rows)) collected.push(...rows);
   }
 
-  if (collected.length < targetRows) {
+  // Step650.5：分钟/小时级新币只要最近日包已有数据，就不要继续扫描24个月归档。
+  // 若日包完全为空，再按当前周期实际需要动态检查少量月包，避免冷门币首次请求超过Render 30秒代理时限。
+  const estimatedRowsPerMonth = Math.max(1, Math.floor((30 * 86_400_000) / sourceMs));
+  const monthlyFileCount = Math.max(1, Math.min(
+    MAX_MONTHLY_FILES,
+    Math.ceil(targetRows / estimatedRowsPerMonth) + 2,
+  ));
+  const shouldTryMonthly = collected.length < targetRows &&
+    (sourceMs >= 86_400_000 || collected.length === 0);
+  if (shouldTryMonthly) {
     let monthCursor = previousMonth(monthStartUtc(new Date(Math.min(endMs, Date.now()))));
     const monthlyCandidates = [];
-    for (let i = 0; i < MAX_MONTHLY_FILES; i += 1) {
+    for (let i = 0; i < monthlyFileCount; i += 1) {
       const month = monthText(monthCursor);
       const name = `${symbol}-${archiveInterval}-${month}.zip`;
       monthlyCandidates.push(`${DATA_BASE}/monthly/klines/${symbol}/${archiveInterval}/${name}`);
@@ -841,20 +869,40 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     if (!persisted.length) {
       try { persisted = await restorePersisted(normalizedSymbol, normalizedInterval); } catch (error) { stats.last_error = String(error?.message || error); }
     }
+    let bridge = [];
+    let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
+    // Step650.5：新币/冷门币冷启动先请求官方连续合约最新一页。成功时通常一次就能拿到240根，
+    // 不再先下载多日日包和月包；这样ARC、BANANAS31等不会因超过Render代理30秒而返回502。
+    if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
+      const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
+      try {
+        bridge = await fetchCurrentBridgeRows(
+          normalizedSymbol,
+          normalizedInterval,
+          coldStart,
+          safeEnd,
+          Math.min(MAX_PERSIST_ROWS, safeLimit + 4),
+        );
+      } catch (error) {
+        stats.bridge_errors += 1;
+        stats.bridge_last_error = String(error?.message || error);
+      }
+      merged = mergeRows(merged, bridge).filter((row) => row.open_time_ms < safeEnd);
+    }
+
     let archive = [];
-    // 已有足够持久/内存历史时，不因“当前日桥接尚未完成”而重复下载同一批归档 ZIP。
-    // 只有历史不足本次 limit，或最后一根比最近完整日更旧时才重新补归档。
+    // 连续K线快路径已有真实结果时直接用于首屏；归档只在快路径为空或已有旧持久历史需要补深度时读取。
     const latestPersistedOpen = persisted.at(-1)?.open_time_ms || 0;
     const yesterdayStart = Math.floor((Date.now() - 86_400_000) / 86_400_000) * 86_400_000;
-    const needsArchive = persisted.length < safeLimit || latestPersistedOpen < yesterdayStart;
+    const needsArchive = bridge.length === 0 &&
+      (persisted.length < safeLimit || latestPersistedOpen < yesterdayStart);
     if (needsArchive) {
       try { archive = await fetchArchiveRows(normalizedSymbol, normalizedInterval, safeEnd, safeLimit); } catch (error) {
         stats.archive_errors += 1;
         stats.last_error = String(error?.message || error);
       }
     }
-    let merged = mergeRows(persisted, archive).filter((row) => row.open_time_ms < safeEnd);
-    let bridge = [];
+    merged = mergeRows(merged, archive).filter((row) => row.open_time_ms < safeEnd);
     if (nearNow && normalizedInterval !== '1s') {
       // Step650.4：不能只看最后一根是否已到当前。持久快照可能是“旧归档 + 当前实时一根”，
       // 此时尾部很新但中间仍有大断层。扫描本次最近窗口，从第一个内部缺口开始补齐。
@@ -918,13 +966,23 @@ export function getBinanceContractKlineSeedHealth() {
       last_error: state.lastError || null,
     })),
     bridge_candidates: HTTP_BRIDGE_CANDIDATES.map((candidate) => {
-      const state = bridgeCandidateState.get(candidate.id);
+      const globalState = activeBridgeState(bridgeStateKey(candidate.id, '*'));
+      const scopedStates = [...bridgeCandidateState.entries()]
+        .filter(([key, state]) => key.startsWith(`${candidate.id}|`) && !key.endsWith('|*') && state.until > now)
+        .map(([key, state]) => ({ symbol: key.split('|').at(-1), ...state }));
       return {
         id: candidate.id,
-        cooling_down: Boolean(state && state.until > now),
-        next_allowed_at: state && state.until > now ? iso(state.until) : null,
-        reason: state?.reason || null,
-        last_error: state?.error || null,
+        global_cooling_down: Boolean(globalState),
+        next_allowed_at: globalState ? iso(globalState.until) : null,
+        reason: globalState?.reason || null,
+        last_error: globalState?.error || null,
+        symbol_cooldown_count: scopedStates.length,
+        symbol_cooldowns: scopedStates.slice(0, 12).map((state) => ({
+          symbol: state.symbol,
+          next_allowed_at: iso(state.until),
+          reason: state.reason,
+          last_error: state.error,
+        })),
       };
     }),
     ...stats,
@@ -933,7 +991,7 @@ export function getBinanceContractKlineSeedHealth() {
     gap_repair_last_start_at: stats.gap_repair_last_start_at ? iso(stats.gap_repair_last_start_at) : null,
     gap_repair_last_success_at: stats.gap_repair_last_success_at ? iso(stats.gap_repair_last_success_at) : null,
     live_last_message_at: stats.live_last_message_at ? iso(stats.live_last_message_at) : null,
-    source: 'binance_official_public_archive_plus_gap_aware_current_http_and_live_websocket_bridge',
+    source: 'binance_official_continuous_kline_fast_path_plus_archive_gap_repair_and_live_websocket',
     time: iso(Date.now()),
   };
 }
