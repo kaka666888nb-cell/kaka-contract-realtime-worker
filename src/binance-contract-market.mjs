@@ -680,6 +680,9 @@ export async function getBinanceContractTickers({ symbols = [], waitMs = START_W
   startBinanceContractMarket();
   const wanted = (Array.isArray(symbols) ? symbols : []).map(compact).filter(Boolean);
   let rows = sortedTickerRows(wanted);
+  // Step650.2：全市场快照已经完整时，某个旧/下架/拼写异常符号未命中就是正常空结果。
+  // 不等待、不触发低频REST，也不把它升级成 provider 级故障。
+  if (wanted.length && tickerBySymbol.size >= SNAPSHOT_MIN_TICKER_ROWS) return rows;
   const enough = () => wanted.length ? rows.length >= Math.min(wanted.length, 1) : rows.length >= SNAPSHOT_MIN_TICKER_ROWS;
   if (!enough() && waitMs > 0) {
     await waitForRows(() => {

@@ -4,6 +4,10 @@ import {
   getBinanceContractUniverse,
   startBinanceContractMarket,
 } from './binance-contract-market.mjs';
+import {
+  getBinanceContractKlineSeed,
+  getBinanceContractKlineSeedHealth,
+} from './binance-contract-kline-seed.mjs';
 
 startBinanceContractMarket();
 
@@ -398,9 +402,9 @@ async function tickers(provider, market, wantedSymbols = []) {
   let items = [];
   if (provider === 'binance') {
     if (market === 'contract') {
-      const rows = await getBinanceContractTickers({ symbols: wantedSymbols });
-      if (!rows.length) throw new Error('binance contract ticker snapshot unavailable');
-      return rows;
+      // Step650.2：单个旧/下架符号未命中时返回空数组，不把整个 Binance ticker 路由误判为上游故障，
+      // 更不能因此打开 provider 级熔断，导致同批 BTC/BNB/BCH 等正常交易对一起变成破折号。
+      return getBinanceContractTickers({ symbols: wantedSymbols });
     }
     const payload = await jsonFetch([
       'https://api.binance.com/api/v3/ticker/24hr',
@@ -848,6 +852,13 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   assertProviderMarket(provider, market);
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
+  if (provider === 'binance' && market === 'contract') {
+    // Step650.2：Binance 合约历史K线先读取官方 data.binance.vision 日/月归档并持久化最后正确种子。
+    // Render 所在区域即使 fapi REST 受限，也能在清缓存/新安装后立即得到真实历史蜡烛；
+    // 当前未收盘蜡烛仍由既有官方 WebSocket 实时流更新，不跨平台、不造数据。
+    const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit });
+    if (seedRows.length) return seedRows;
+  }
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
   const sourceInterval = sourceIntervalFor(provider, market, interval);
   const targetMs = intervalMs(interval);
@@ -877,6 +888,10 @@ export async function handleMarketApi(req, res, url) {
   try {
     if (url.pathname === '/api/binance-contract-market-health') {
       send(res, 200, getBinanceContractMarketHealth());
+      return true;
+    }
+    if (url.pathname === '/api/binance-contract-kline-seed-health') {
+      send(res, 200, getBinanceContractKlineSeedHealth());
       return true;
     }
     const provider = providerKey(url.searchParams.get('provider'));
@@ -944,8 +959,8 @@ export async function handleMarketApi(req, res, url) {
         symbol,
         interval,
         rows,
-        source: `${provider}_official_public_kline_render`,
-        cached_at: new Date().toISOString(),
+        source: rows[0]?.source || `${provider}_official_public_kline_render`,
+        cached_at: rows[0]?.cached_at || new Date().toISOString(),
       });
       return true;
     }

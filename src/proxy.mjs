@@ -7,7 +7,7 @@ import { handleContractFunding } from './contract-funding.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650';
+const STEP_VERSION = '650.2';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -24,10 +24,17 @@ const legacyInflight = new Map();
 const legacyCircuit = new Map();
 const LEGACY_MAX_BODY_BYTES = 24 * 1024 * 1024;
 
-function legacyPolicy(pathname) {
-  if (pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
-  if (pathname === '/api/klines') return { freshMs: 45_000, staleMs: 30 * 60_000 };
-  if (pathname === '/api/universe') return { freshMs: 5 * 60_000, staleMs: 7 * 24 * 60 * 60_000 };
+function legacyPolicy(url) {
+  const provider = (url.searchParams.get('provider') || '').toLowerCase();
+  const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
+  const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
+    ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
+  // Step650.2：这三条 Binance 合约路由已分别由 WebSocket 快照或官方数据归档提供，
+  // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
+  if (isBinanceContractSnapshot) return null;
+  if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
+  if (url.pathname === '/api/klines') return { freshMs: 45_000, staleMs: 30 * 60_000 };
+  if (url.pathname === '/api/universe') return { freshMs: 5 * 60_000, staleMs: 7 * 24 * 60 * 60_000 };
   return null;
 }
 
@@ -189,7 +196,7 @@ async function proxyCachedGet(req, res, url, policy) {
 }
 
 function proxyHttp(req, res, url) {
-  const policy = req.method === 'GET' ? legacyPolicy(url.pathname) : null;
+  const policy = req.method === 'GET' ? legacyPolicy(url) : null;
   if (policy) {
     proxyCachedGet(req, res, url, policy).catch(() => {
       if (!res.headersSent) sendCircuitJson(res, { until: Date.now() + 90_000, reason: 'proxy_error' });
@@ -238,6 +245,7 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_scope: 'single_provider_single_symbol',
       contract_funding: '/api/contract-funding',
       binance_contract_market_health: '/api/binance-contract-market-health',
+      binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
       contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
@@ -263,6 +271,9 @@ const server = http.createServer(async (req, res) => {
         binance_contract_market_rest_role: 'low_frequency_metadata_refresh_only',
         binance_contract_market_empty_snapshot_never_overwrites: true,
         binance_contract_market_startup_restore: true,
+        binance_contract_kline_seed_source: 'official_data_archive_daily_monthly',
+        binance_contract_kline_seed_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
+        binance_contract_snapshot_routes_bypass_legacy_rest_circuit: true,
         restricted_cooldown_seconds: 1800,
         transient_cooldown_seconds: 90,
         contract_meta_cache_seconds: 30,
