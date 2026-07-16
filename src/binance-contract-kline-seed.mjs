@@ -28,10 +28,11 @@ const LIVE_WS_HOSTS = [
 // Step650.4：先尝试官方文档 REST 主域，再尝试 Binance 官网同路径反向代理；
 // 同一候选触发 429/451/5xx 后单独冷却，不再影响归档、其他候选或实时 WebSocket。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.5：Render实测连续合约接口可直接返回最新一页，优先它可避免新币先扫描大量归档而超过30秒代理时限。
+  // Step650.6：连续合约接口仍可作为快速候选，但返回非空不等于覆盖完整请求窗口。
+  // 紧接着尝试精确 symbol Kline；若前一候选只返回当前蜡烛，继续合并后续候选直到窗口连续。
   { id: 'fapi_continuous', base: 'https://fapi.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
-  { id: 'www_continuous', base: 'https://www.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
+  { id: 'www_continuous', base: 'https://www.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
   { id: 'www_klines', base: 'https://www.binance.com', path: '/fapi/v1/klines', continuous: false },
 ];
 
@@ -54,6 +55,9 @@ const stats = {
   bridge_last_success_at: 0,
   bridge_last_source: '',
   bridge_last_error: '',
+  bridge_partial_candidates: 0,
+  bridge_complete_candidates: 0,
+  bridge_partial_rows: 0,
   gap_scan_requests: 0,
   gap_repair_requests: 0,
   gap_repair_success: 0,
@@ -429,7 +433,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.4',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.6',
       },
     });
     const text = await response.text();
@@ -467,6 +471,44 @@ function bridgeUrl(candidate, symbol, interval, startTime, endTime, limit) {
   return `${candidate.base}${candidate.path}?${query.toString()}`;
 }
 
+function inspectBridgeWindow(rows, interval, startTime, endTime) {
+  const step = intervalMs(interval);
+  const requestedStart = Math.floor(Math.max(0, startTime) / step) * step;
+  const targetOpen = expectedCurrentOpen(endTime, interval);
+  const sorted = normalizeRows(rows, '', interval)
+    .filter((row) => row.open_time_ms >= requestedStart && row.open_time_ms < endTime)
+    .sort((a, b) => a.open_time_ms - b.open_time_ms);
+
+  let gapCount = 0;
+  let missingIntervals = 0;
+  for (let index = 1; index < sorted.length; index += 1) {
+    const difference = sorted[index].open_time_ms - sorted[index - 1].open_time_ms;
+    if (difference > step) {
+      gapCount += 1;
+      missingIntervals += Math.max(0, Math.round(difference / step) - 1);
+    }
+  }
+
+  const firstOpen = sorted.at(0)?.open_time_ms ?? null;
+  const lastOpen = sorted.at(-1)?.open_time_ms ?? null;
+  const coversStart = firstOpen != null && firstOpen <= requestedStart;
+  const lagIntervals = lastOpen == null
+    ? null
+    : Math.max(0, Math.round((targetOpen - lastOpen) / step));
+
+  return {
+    rows: sorted,
+    row_count: sorted.length,
+    first_open_ms: firstOpen,
+    last_open_ms: lastOpen,
+    covers_start: coversStart,
+    gap_count: gapCount,
+    missing_intervals: missingIntervals,
+    lag_intervals_to_end: lagIntervals,
+    complete: sorted.length > 0 && coversStart && gapCount === 0 && (lagIntervals ?? 999999) <= 1,
+  };
+}
+
 async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows) {
   if (bridgeCooldown(candidate.id, symbol)) return [];
   const source = candidate.continuous
@@ -494,7 +536,13 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
   if (interval === '1s' || startTime >= endTime || maxRows <= 0) return [];
   const cacheKey = `${symbol}|${interval}|${Math.floor(startTime / intervalMs(interval))}|${Math.floor(endTime / intervalMs(interval))}`;
   const cached = bridgeResultCache.get(cacheKey);
-  if (cached && Date.now() - cached.loadedAt <= HTTP_BRIDGE_CACHE_MS) return cached.rows;
+  let combined = [];
+  if (cached && Date.now() - cached.loadedAt <= HTTP_BRIDGE_CACHE_MS) {
+    const cachedCoverage = inspectBridgeWindow(cached.rows, interval, startTime, endTime);
+    if (cachedCoverage.complete) return cached.rows;
+    combined = cached.rows;
+  }
+
   stats.bridge_requests += 1;
   let lastError = '';
   for (const candidate of HTTP_BRIDGE_CANDIDATES) {
@@ -505,14 +553,28 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
         stats.bridge_empty += 1;
         continue;
       }
+
+      combined = mergeRows(combined, rows)
+        .filter((row) => row.open_time_ms >= startTime && row.open_time_ms < endTime)
+        .slice(-maxRows);
+      const coverage = inspectBridgeWindow(combined, interval, startTime, endTime);
+
       stats.bridge_success += 1;
       stats.bridge_rows += rows.length;
       stats.bridge_last_success_at = Date.now();
       stats.bridge_last_source = rows.at(-1)?.source || candidate.id;
       stats.bridge_last_error = '';
       bridgeCandidateState.delete(bridgeStateKey(candidate.id, symbol));
-      bridgeResultCache.set(cacheKey, { rows, loadedAt: Date.now() });
-      return rows;
+
+      if (coverage.complete) {
+        stats.bridge_complete_candidates += 1;
+        bridgeResultCache.set(cacheKey, { rows: combined, loadedAt: Date.now() });
+        return combined;
+      }
+
+      stats.bridge_partial_candidates += 1;
+      stats.bridge_partial_rows += rows.length;
+      bridgeResultCache.delete(cacheKey);
     } catch (error) {
       const message = String(error?.message || error);
       const status = Number(error?.status || 0);
@@ -521,8 +583,17 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
       stats.bridge_errors += 1;
     }
   }
-  stats.bridge_last_error = lastError || 'all_bridge_candidates_cooling_down_or_empty';
-  return [];
+
+  const finalCoverage = inspectBridgeWindow(combined, interval, startTime, endTime);
+  if (finalCoverage.complete) {
+    bridgeResultCache.set(cacheKey, { rows: combined, loadedAt: Date.now() });
+  } else {
+    bridgeResultCache.delete(cacheKey);
+  }
+  stats.bridge_last_error = finalCoverage.complete
+    ? ''
+    : (lastError || 'all_bridge_candidates_cooling_down_empty_or_partial');
+  return combined;
 }
 
 const liveStreams = new Map();
@@ -673,7 +744,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.4' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.6' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -870,9 +941,10 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
       try { persisted = await restorePersisted(normalizedSymbol, normalizedInterval); } catch (error) { stats.last_error = String(error?.message || error); }
     }
     let bridge = [];
+    let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.5：新币/冷门币冷启动先请求官方连续合约最新一页。成功时通常一次就能拿到240根，
-    // 不再先下载多日日包和月包；这样ARC、BANANAS31等不会因超过Render代理30秒而返回502。
+    // Step650.6：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
       try {
@@ -883,6 +955,12 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
           safeEnd,
           Math.min(MAX_PERSIST_ROWS, safeLimit + 4),
         );
+        bridgeWindowComplete = inspectBridgeWindow(
+          bridge,
+          normalizedInterval,
+          coldStart,
+          safeEnd,
+        ).complete;
       } catch (error) {
         stats.bridge_errors += 1;
         stats.bridge_last_error = String(error?.message || error);
@@ -891,10 +969,10 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     }
 
     let archive = [];
-    // 连续K线快路径已有真实结果时直接用于首屏；归档只在快路径为空或已有旧持久历史需要补深度时读取。
+    // partial桥接不能阻止归档补深度。只有当前窗口已经完整连续时，才跳过归档首屏回补。
     const latestPersistedOpen = persisted.at(-1)?.open_time_ms || 0;
     const yesterdayStart = Math.floor((Date.now() - 86_400_000) / 86_400_000) * 86_400_000;
-    const needsArchive = bridge.length === 0 &&
+    const needsArchive = !bridgeWindowComplete &&
       (persisted.length < safeLimit || latestPersistedOpen < yesterdayStart);
     if (needsArchive) {
       try { archive = await fetchArchiveRows(normalizedSymbol, normalizedInterval, safeEnd, safeLimit); } catch (error) {
@@ -929,7 +1007,14 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
       ensureLiveStream(normalizedSymbol, normalizedInterval);
     }
     memory.set(key, { rows: merged, loadedAt: Date.now() });
-    if (archive.length || bridge.length) {
+    const finalCoverage = nearNow
+      ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
+      : null;
+    // Step650.6：临近当前的快照只有在最近窗口连续时才持久化。
+    // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
+    const mayPersist = archive.length || bridge.length;
+    const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
+    if (mayPersist && safeToPersist) {
       const source = bridge.length
         ? 'binance_official_public_archive_plus_current_bridge'
         : 'binance_official_public_archive_kline_seed';
@@ -1006,4 +1091,5 @@ export const _test = {
   expectedCurrentOpen,
   inspectRecentContinuity,
   bridgeStartForRecentWindow,
+  inspectBridgeWindow,
 };
