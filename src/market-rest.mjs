@@ -1,3 +1,12 @@
+import {
+  getBinanceContractMarketHealth,
+  getBinanceContractTickers,
+  getBinanceContractUniverse,
+  startBinanceContractMarket,
+} from './binance-contract-market.mjs';
+
+startBinanceContractMarket();
+
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const CONTRACT_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const COINBASE_BASE_URL = 'https://api.exchange.coinbase.com';
@@ -199,15 +208,19 @@ async function universe(provider, market) {
   assertProviderMarket(provider, market);
   const rows = [];
   if (provider === 'binance') {
-    const payload = await jsonFetch(
-      market === 'contract'
-        ? 'https://fapi.binance.com/fapi/v1/exchangeInfo'
-        : ['https://api.binance.com/api/v3/exchangeInfo', 'https://data-api.binance.vision/api/v3/exchangeInfo'],
-    );
-    for (const item of payload.symbols || []) {
-      if (String(item.status).toUpperCase() !== 'TRADING') continue;
-      if (market === 'contract' && String(item.contractType).toUpperCase() !== 'PERPETUAL') continue;
-      rows.push(marketRow(provider, market, item.symbol, item.baseAsset, item.quoteAsset, item.symbol));
+    if (market === 'contract') {
+      const snapshotRows = await getBinanceContractUniverse({ quote: 'USDT' });
+      if (!snapshotRows.length) throw new Error('binance contract universe snapshot unavailable');
+      rows.push(...snapshotRows);
+    } else {
+      const payload = await jsonFetch([
+        'https://api.binance.com/api/v3/exchangeInfo',
+        'https://data-api.binance.vision/api/v3/exchangeInfo',
+      ]);
+      for (const item of payload.symbols || []) {
+        if (String(item.status).toUpperCase() !== 'TRADING') continue;
+        rows.push(marketRow(provider, market, item.symbol, item.baseAsset, item.quoteAsset, item.symbol));
+      }
     }
   } else if (provider === 'coinbase') {
     const payload = await jsonFetch(`${COINBASE_BASE_URL}/products`);
@@ -384,11 +397,15 @@ async function tickers(provider, market, wantedSymbols = []) {
   }
   let items = [];
   if (provider === 'binance') {
-    const payload = await jsonFetch(
-      market === 'contract'
-        ? 'https://fapi.binance.com/fapi/v1/ticker/24hr'
-        : ['https://api.binance.com/api/v3/ticker/24hr', 'https://data-api.binance.vision/api/v3/ticker/24hr'],
-    );
+    if (market === 'contract') {
+      const rows = await getBinanceContractTickers({ symbols: wantedSymbols });
+      if (!rows.length) throw new Error('binance contract ticker snapshot unavailable');
+      return rows;
+    }
+    const payload = await jsonFetch([
+      'https://api.binance.com/api/v3/ticker/24hr',
+      'https://data-api.binance.vision/api/v3/ticker/24hr',
+    ]);
     items = Array.isArray(payload) ? payload : [];
   } else if (provider === 'okx') {
     const payload = await jsonFetch(
@@ -858,6 +875,10 @@ export async function handleMarketApi(req, res, url) {
     return true;
   }
   try {
+    if (url.pathname === '/api/binance-contract-market-health') {
+      send(res, 200, getBinanceContractMarketHealth());
+      return true;
+    }
     const provider = providerKey(url.searchParams.get('provider'));
     const market = marketKey(url.searchParams.get('market_type') || url.searchParams.get('market'));
     if (!provider) {
@@ -883,9 +904,11 @@ export async function handleMarketApi(req, res, url) {
         total: all.length,
         next_cursor: next < all.length ? String(next) : '',
         has_more: next < all.length,
-        provider_status: 'official_public_ok_render',
-        source: `${provider}_official_public_market_render`,
-        cached_at: new Date().toISOString(),
+        provider_status: provider === 'binance' && market === 'contract'
+          ? 'official_public_websocket_snapshot_ok'
+          : 'official_public_ok_render',
+        source: rows[0]?.source || `${provider}_official_public_market_render`,
+        cached_at: rows[0]?.cached_at || new Date().toISOString(),
       });
       return true;
     }
@@ -899,8 +922,8 @@ export async function handleMarketApi(req, res, url) {
         provider,
         market_type: market,
         rows,
-        source: `${provider}_official_public_ticker_render`,
-        cached_at: new Date().toISOString(),
+        source: rows[0]?.source || `${provider}_official_public_ticker_render`,
+        cached_at: rows[0]?.cached_at || new Date().toISOString(),
       });
       return true;
     }

@@ -7,7 +7,7 @@ import { handleContractFunding } from './contract-funding.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '645';
+const STEP_VERSION = '650';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -25,9 +25,9 @@ const legacyCircuit = new Map();
 const LEGACY_MAX_BODY_BYTES = 24 * 1024 * 1024;
 
 function legacyPolicy(pathname) {
-  if (pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 10 * 60_000 };
+  if (pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
   if (pathname === '/api/klines') return { freshMs: 45_000, staleMs: 30 * 60_000 };
-  if (pathname === '/api/universe') return { freshMs: 5 * 60_000, staleMs: 60 * 60_000 };
+  if (pathname === '/api/universe') return { freshMs: 5 * 60_000, staleMs: 7 * 24 * 60 * 60_000 };
   return null;
 }
 
@@ -237,6 +237,7 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
       contract_liquidation_scope: 'single_provider_single_symbol',
       contract_funding: '/api/contract-funding',
+      binance_contract_market_health: '/api/binance-contract-market-health',
       contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
@@ -257,6 +258,11 @@ const server = http.createServer(async (req, res) => {
         legacy_rest_cache: true,
         legacy_rest_inflight_coalescing: true,
         legacy_rest_circuit_breaker: true,
+        binance_contract_market_transport: 'official_websocket_ticker_bookticker_contract_info',
+        binance_contract_market_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
+        binance_contract_market_rest_role: 'low_frequency_metadata_refresh_only',
+        binance_contract_market_empty_snapshot_never_overwrites: true,
+        binance_contract_market_startup_restore: true,
         restricted_cooldown_seconds: 1800,
         transient_cooldown_seconds: 90,
         contract_meta_cache_seconds: 30,
@@ -348,5 +354,5 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + contract flow + contract depth + single-venue liquidation statistics + five-platform funding listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + single-venue liquidation statistics + five-platform funding listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
