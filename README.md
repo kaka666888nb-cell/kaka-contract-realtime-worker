@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.6**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.7**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -125,3 +125,18 @@ Step650.6 now:
 - refuses to persist a near-current snapshot unless its recent requested window is continuous.
 
 No synthetic candles, cross-exchange fallback, new SQL, environment variable, Edge Function, Cron task, Flutter dependency, or App file is introduced by Step650.6.
+
+
+## Step650.7 shared Binance IP-ban guard and exact-symbol-first bridge
+
+Step650.7 is based on the real Render diagnosis where all four HTTP candidates returned Binance `418 / -1003` and the response included an exact `banned until <epoch-ms>` value.
+
+- the exact-symbol `/fapi/v1/klines` route is attempted before continuous-contract Klines, reducing partial-first duplicate calls;
+- current-day bridge requests are globally serialized with at least 1200 ms between starts, so multiple App prefetches cannot burst from the same Render IP;
+- the first 418/429/451 or explicit IP-ban response opens one shared bridge-wide cooldown and immediately stops the remaining fapi/www candidates;
+- `banned until` is parsed from Binance's response and respected with a safety margin instead of retrying after a fixed 30 minutes;
+- ordinary 5xx/network failures remain isolated to the current candidate and symbol;
+- archive snapshots, non-empty App Klines, and live WebSocket candles continue to be served while the HTTP bridge is cooling down;
+- `/api/binance-contract-kline-seed-health` exposes `bridge_wide_cooldown`, request pacing counters, and parsed-ban diagnostics.
+
+No new SQL, environment variable, Supabase Edge deployment, Cron task, or Flutter dependency is required.
