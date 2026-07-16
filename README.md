@@ -1,6 +1,6 @@
-# Kaka Web3 Step413.2 Contract Realtime Worker
+# Kaka Web3 Contract Realtime Worker
 
-A small Node.js WebSocket relay for Binance USD-M contract Kline streams.
+Current backend version: **Step650.3**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -51,3 +51,22 @@ GET /api/binance-contract-kline-seed-health
 ```
 
 No new environment variable, SQL table, dependency, or Supabase Edge deployment is required after Step650.
+
+## Step650.3 current-day Kline continuity bridge
+
+Step650.3 closes the gap between the last completed Binance public archive day and the current live candle without mixing another exchange or inventing candles:
+
+- completed historical candles continue to come from the official USD-M daily/monthly archive;
+- the missing current-day range is requested from official Binance USD-M Kline/continuous-Kline HTTP candidates, each with its own cooldown so one restricted endpoint cannot disable the others;
+- after an on-demand symbol/interval request, the official Binance Kline WebSocket keeps the current candle and later closed candles fresh;
+- archive, current-day bridge, persisted snapshot, and live rows are merged strictly by `open_time`;
+- `/api/klines` now returns a `coverage` object with row count, internal gap count, missing intervals, lag to the requested end, and `continuous_to_current`;
+- failed bridge candidates never trigger the old provider-wide REST circuit and never replace a non-empty last-known-good snapshot.
+
+Additional diagnostics remain available at:
+
+```text
+GET /api/binance-contract-kline-seed-health
+```
+
+No new SQL table, environment variable, Supabase Edge deployment, Cron task, or Flutter dependency is required. Deploy and validate Render first; only install the Step650.2 App candidate after `coverage.continuous_to_current` is true.
