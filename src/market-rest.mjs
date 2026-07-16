@@ -892,7 +892,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.3：Binance 合约历史K线先读官方日/月归档，再补官方当前日HTTP桥接并启动按需实时K线WebSocket。
+    // Step650.4：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit });
     if (seedRows.length) return seedRows;

@@ -25,7 +25,7 @@ const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/market/ws',
   'wss://stream.binancefuture.com/market/ws',
 ];
-// Step650.3：先尝试官方文档 REST 主域，再尝试 Binance 官网同路径反向代理；
+// Step650.4：先尝试官方文档 REST 主域，再尝试 Binance 官网同路径反向代理；
 // 同一候选触发 429/451/5xx 后单独冷却，不再影响归档、其他候选或实时 WebSocket。
 const HTTP_BRIDGE_CANDIDATES = [
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
@@ -53,6 +53,12 @@ const stats = {
   bridge_last_success_at: 0,
   bridge_last_source: '',
   bridge_last_error: '',
+  gap_scan_requests: 0,
+  gap_repair_requests: 0,
+  gap_repair_success: 0,
+  gap_repair_remaining_gaps: 0,
+  gap_repair_last_start_at: 0,
+  gap_repair_last_success_at: 0,
   live_messages: 0,
   live_closed_candles: 0,
   live_last_message_at: 0,
@@ -320,6 +326,60 @@ function expectedCurrentOpen(endMs, interval) {
   return Math.floor(Math.max(0, endMs - 1) / step) * step;
 }
 
+function inspectRecentContinuity(rows, interval, endMs, limit = MAX_PERSIST_ROWS) {
+  const step = intervalMs(interval);
+  const targetOpen = expectedCurrentOpen(endMs, interval);
+  const safeLimit = Math.max(2, Math.min(MAX_PERSIST_ROWS, Number.parseInt(String(limit), 10) || MAX_PERSIST_ROWS));
+  const sorted = normalizeRows(rows, '', interval)
+    .filter((row) => row.open_time_ms < endMs)
+    .slice(-safeLimit);
+
+  let gapCount = 0;
+  let missingIntervals = 0;
+  let firstMissingOpen = null;
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1].open_time_ms;
+    const current = sorted[index].open_time_ms;
+    const difference = current - previous;
+    if (difference > step) {
+      gapCount += 1;
+      missingIntervals += Math.max(0, Math.round(difference / step) - 1);
+      firstMissingOpen ??= previous + step;
+    }
+  }
+
+  const lastOpen = sorted.at(-1)?.open_time_ms ?? null;
+  const lagIntervals = lastOpen == null
+    ? null
+    : Math.max(0, Math.round((targetOpen - lastOpen) / step));
+
+  if (firstMissingOpen == null && (lastOpen == null || lastOpen < targetOpen - step)) {
+    firstMissingOpen = lastOpen == null
+      ? Math.max(0, targetOpen - ((safeLimit - 1) * step))
+      : lastOpen + step;
+  }
+
+  return {
+    rows: sorted,
+    row_count: sorted.length,
+    gap_count: gapCount,
+    missing_intervals: missingIntervals,
+    first_missing_open_ms: firstMissingOpen,
+    last_open_ms: lastOpen,
+    target_open_ms: targetOpen,
+    lag_intervals_to_end: lagIntervals,
+    continuous_to_current: sorted.length > 0 && gapCount === 0 && (lagIntervals ?? safeLimit) <= 1,
+  };
+}
+
+function bridgeStartForRecentWindow(rows, interval, endMs, limit = MAX_PERSIST_ROWS) {
+  const coverage = inspectRecentContinuity(rows, interval, endMs, limit);
+  if (coverage.first_missing_open_ms != null) return coverage.first_missing_open_ms;
+  return coverage.last_open_ms != null
+    ? coverage.last_open_ms + intervalMs(interval)
+    : Math.max(0, coverage.target_open_ms - ((Math.max(2, limit) - 1) * intervalMs(interval)));
+}
+
 const bridgeCandidateState = new Map();
 const bridgeResultCache = new Map();
 
@@ -350,7 +410,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.3',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.4',
       },
     });
     const text = await response.text();
@@ -594,7 +654,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.3' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.4' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -763,8 +823,12 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
   const nearNow = isNearNow(safeEnd, normalizedInterval);
   const targetOpen = expectedCurrentOpen(safeEnd, normalizedInterval);
   const cached = memory.get(key);
-  const cachedTail = cached?.rows?.at(-1)?.open_time_ms || 0;
-  if (cached && Date.now() - cached.loadedAt <= CACHE_TTL_MS && (!nearNow || cachedTail >= targetOpen - step)) {
+  const cachedCoverage = cached
+    ? inspectRecentContinuity(cached.rows, normalizedInterval, safeEnd, safeLimit)
+    : null;
+  stats.gap_scan_requests += cached ? 1 : 0;
+  if (cached && Date.now() - cached.loadedAt <= CACHE_TTL_MS &&
+      (!nearNow || cachedCoverage?.continuous_to_current === true)) {
     stats.memory_hits += 1;
     if (nearNow) ensureLiveStream(normalizedSymbol, normalizedInterval);
     return cached.rows.filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
@@ -792,15 +856,28 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let merged = mergeRows(persisted, archive).filter((row) => row.open_time_ms < safeEnd);
     let bridge = [];
     if (nearNow && normalizedInterval !== '1s') {
-      const lastOpen = merged.at(-1)?.open_time_ms;
-      // 从归档/持久快照最后一根的下一周期开始补到当前；最多补本次请求所需行数并额外留4根校验重叠。
-      const bridgeStart = Math.max(0, lastOpen != null ? lastOpen + step : safeEnd - safeLimit * step);
-      const needed = Math.max(4, Math.min(MAX_PERSIST_ROWS, Math.ceil((safeEnd - bridgeStart) / step) + 4));
-      try { bridge = await fetchCurrentBridgeRows(normalizedSymbol, normalizedInterval, bridgeStart, safeEnd, needed); } catch (error) {
-        stats.bridge_errors += 1;
-        stats.bridge_last_error = String(error?.message || error);
+      // Step650.4：不能只看最后一根是否已到当前。持久快照可能是“旧归档 + 当前实时一根”，
+      // 此时尾部很新但中间仍有大断层。扫描本次最近窗口，从第一个内部缺口开始补齐。
+      const beforeCoverage = inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit);
+      stats.gap_scan_requests += 1;
+      const bridgeStart = bridgeStartForRecentWindow(merged, normalizedInterval, safeEnd, safeLimit);
+      const needsBridge = !beforeCoverage.continuous_to_current && bridgeStart < safeEnd;
+      if (needsBridge) {
+        stats.gap_repair_requests += 1;
+        stats.gap_repair_last_start_at = bridgeStart;
+        const needed = Math.max(4, Math.min(MAX_PERSIST_ROWS, Math.ceil((safeEnd - bridgeStart) / step) + 4));
+        try { bridge = await fetchCurrentBridgeRows(normalizedSymbol, normalizedInterval, bridgeStart, safeEnd, needed); } catch (error) {
+          stats.bridge_errors += 1;
+          stats.bridge_last_error = String(error?.message || error);
+        }
+        merged = mergeRows(merged, bridge).filter((row) => row.open_time_ms < safeEnd);
+        const afterCoverage = inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit);
+        stats.gap_repair_remaining_gaps = afterCoverage.missing_intervals;
+        if (afterCoverage.continuous_to_current) {
+          stats.gap_repair_success += 1;
+          stats.gap_repair_last_success_at = Date.now();
+        }
       }
-      merged = mergeRows(merged, bridge).filter((row) => row.open_time_ms < safeEnd);
       ensureLiveStream(normalizedSymbol, normalizedInterval);
     }
     memory.set(key, { rows: merged, loadedAt: Date.now() });
@@ -853,8 +930,10 @@ export function getBinanceContractKlineSeedHealth() {
     ...stats,
     last_success_at: stats.last_success_at ? iso(stats.last_success_at) : null,
     bridge_last_success_at: stats.bridge_last_success_at ? iso(stats.bridge_last_success_at) : null,
+    gap_repair_last_start_at: stats.gap_repair_last_start_at ? iso(stats.gap_repair_last_start_at) : null,
+    gap_repair_last_success_at: stats.gap_repair_last_success_at ? iso(stats.gap_repair_last_success_at) : null,
     live_last_message_at: stats.live_last_message_at ? iso(stats.live_last_message_at) : null,
-    source: 'binance_official_public_archive_plus_current_http_and_live_websocket_bridge',
+    source: 'binance_official_public_archive_plus_gap_aware_current_http_and_live_websocket_bridge',
     time: iso(Date.now()),
   };
 }
@@ -867,4 +946,6 @@ export const _test = {
   aggregateRows,
   mergeRows,
   expectedCurrentOpen,
+  inspectRecentContinuity,
+  bridgeStartForRecentWindow,
 };

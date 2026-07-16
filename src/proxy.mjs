@@ -7,7 +7,7 @@ import { handleContractFunding } from './contract-funding.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.3';
+const STEP_VERSION = '650.4';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -29,7 +29,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.3：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+当前日桥接提供，
+  // Step650.4：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+当前日桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -274,6 +274,8 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_seed_source: 'official_data_archive_daily_monthly_plus_current_http_and_live_websocket_bridge',
         binance_contract_kline_seed_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
         binance_contract_kline_current_day_bridge: true,
+        binance_contract_kline_internal_gap_aware_repair: true,
+        binance_contract_kline_memory_fast_path_requires_continuity: true,
         binance_contract_kline_live_bridge_on_demand: true,
         binance_contract_kline_gap_diagnostics: true,
         binance_contract_snapshot_routes_bypass_legacy_rest_circuit: true,
