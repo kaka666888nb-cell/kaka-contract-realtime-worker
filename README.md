@@ -34,3 +34,20 @@ SUPABASE_SERVICE_ROLE_KEY
 ```
 
 Run `sql/step650_app_market_backend_snapshots.sql` in Supabase before deploying Step650.
+
+## Step650.2 ticker isolation and Binance contract Kline seed
+
+Step650.2 fixes two remaining failures found during real-device validation:
+
+- Binance contract `/api/universe`, `/api/tickers`, and `/api/klines` bypass the old provider-wide REST circuit because they now use independent WebSocket snapshots or the official public data archive.
+- A missing/delisted requested ticker returns an empty row for that symbol instead of opening a provider-wide circuit that hides valid BTC/BNB/BCH tickers.
+- Historical Binance contract candles are seeded from official `data.binance.vision` USD-M daily/monthly ZIP archives and persisted in the existing `app_market_backend_snapshots` table (`snapshot_type=klines`).
+- The current live candle continues to use the existing official Binance Kline WebSocket.
+
+Additional health endpoint:
+
+```text
+GET /api/binance-contract-kline-seed-health
+```
+
+No new environment variable, SQL table, dependency, or Supabase Edge deployment is required after Step650.
