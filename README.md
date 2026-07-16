@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.4**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.5**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -94,3 +94,18 @@ coverage.continuous_to_current = true
 ```
 
 No new SQL, environment variable, Supabase Edge deployment, Cron task, Flutter file, or dependency is required.
+
+
+## Step650.5 cold-symbol Kline isolation and non-empty retention
+
+Step650.5 addresses real-device cases where ARC/BANANAS31 or another cold symbol could return HTTP 502, open a provider-wide App cooldown, and later replace an already displayed chart with an empty result.
+
+- Flutter Kline cooldown keys now include provider, market, symbol, and interval.
+- A failed symbol no longer disables BTC/BCH/1000SHIB or other Binance contract charts.
+- Portrait and fullscreen chart refreshes never replace non-empty real rows with an empty response.
+- Render cold starts try the official continuous-Kline latest page before archive downloads.
+- Continuous-Kline candidates are tried first with bounded timeouts.
+- transient bridge cooldown is symbol-scoped; only explicit rate/region restrictions remain candidate-global.
+- intraday archive fallback uses bounded daily/monthly searches so new symbols cannot scan 24 empty months and exceed the proxy timeout.
+
+No new SQL, environment variable, Edge Function, Cron task, or dependency is required.
