@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.3**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.4**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -70,3 +70,27 @@ GET /api/binance-contract-kline-seed-health
 ```
 
 No new SQL table, environment variable, Supabase Edge deployment, Cron task, or Flutter dependency is required. Deploy and validate Render first; only install the Step650.2 App candidate after `coverage.continuous_to_current` is true.
+
+
+## Step650.4 internal-gap-aware current-day repair
+
+Step650.4 fixes a logic defect found by real Render coverage validation. A persisted snapshot could contain completed archive candles and a newly received live candle with a large gap between them. Step650.3 looked only at the newest candle, so it incorrectly started the bridge after that live candle and skipped the internal gap.
+
+Step650.4 now:
+
+- scans the most recent requested candle window for internal missing intervals;
+- bypasses the memory fast path whenever that window is not continuous to the current candle;
+- starts the official current-day HTTP bridge at the first missing interval, not merely after the newest row;
+- rechecks continuity after merging archive, persisted, HTTP bridge, and live WebSocket rows;
+- exposes gap-repair counters and timestamps through `/api/binance-contract-kline-seed-health`.
+
+No synthetic candles or cross-exchange fallback are used. Acceptance remains:
+
+```text
+coverage.gap_count = 0
+coverage.missing_intervals = 0
+coverage.lag_intervals_to_end <= 1
+coverage.continuous_to_current = true
+```
+
+No new SQL, environment variable, Supabase Edge deployment, Cron task, Flutter file, or dependency is required.
