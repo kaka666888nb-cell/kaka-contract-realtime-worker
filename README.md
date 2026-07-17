@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.7**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.8**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -17,7 +17,7 @@ Step650 moves Binance USDS-M perpetual **universe and 24h ticker** traffic away 
 - official all-market book ticker WebSocket: `!bookTicker`
 - official contract info WebSocket: `!contractInfo`
 - Supabase last-known-good snapshots in `app_market_backend_snapshots`
-- REST is retained only as a low-frequency metadata refresh and is guarded by cooldown/single-flight logic
+- as of Step650.8, automatic Binance contract REST metadata refresh is disabled; WebSocket plus the persistent last-known-good snapshot is the only universe/ticker path
 - empty or incomplete snapshots never overwrite a validated non-empty snapshot
 
 Health endpoint:
@@ -140,3 +140,22 @@ Step650.7 is based on the real Render diagnosis where all four HTTP candidates r
 - `/api/binance-contract-kline-seed-health` exposes `bridge_wide_cooldown`, request pacing counters, and parsed-ban diagnostics.
 
 No new SQL, environment variable, Supabase Edge deployment, Cron task, or Flutter dependency is required.
+
+
+## Step650.8 persistent all-caller Binance REST quarantine
+
+Step650.8 addresses the second real Render validation failure: after Step650.7 was deployed, the Kline bridge correctly stopped after the first 418, but the process still had other Binance REST callers and the in-memory Kline ban state was lost across deployment. The shared Render egress IP was therefore banned again before the next Kline validation.
+
+Step650.8 now:
+
+- adds one persistent Binance contract REST guard shared by Kline, funding, contract metadata, position metrics, and legacy contract aggregate-trade callers;
+- stores the exact ban deadline in the existing `app_market_backend_snapshots` table using the allowed `snapshot_type=klines` namespace and a reserved `REST_GUARD:BINANCE_CONTRACT` key so a Render restart/deploy cannot forget it;
+- seeds a one-time migration quarantine through `2026-07-17T20:39:46.570Z`, fifteen minutes beyond the last observed official ban deadline;
+- disables all automatic Binance contract REST universe/ticker refreshes; those datasets continue through official WebSocket streams and the persistent Supabase snapshot;
+- reduces the current-day Kline bridge to one documented exact-symbol endpoint (`/fapi/v1/klines`), with no `www` or continuous-Kline multi-host retry burst;
+- serializes every guarded Binance contract REST request and keeps at least five seconds between request starts;
+- parses both Binance's `banned until` payload and `Retry-After`, then persists the later deadline plus a safety margin;
+- prevents funding/contract-meta/position-metric requests from bypassing the Kline ban guard;
+- continues serving official archive rows, persistent snapshots, and WebSocket data during quarantine; no synthetic or cross-exchange candles are used.
+
+No new SQL table, environment variable, Supabase Edge deployment, Cron task, Flutter dependency, or App file is required. The existing Step650 snapshot table is reused.
