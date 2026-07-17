@@ -1,4 +1,4 @@
-const STEP_VERSION = '645';
+const STEP_VERSION = '650.8.7';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();
@@ -34,6 +34,13 @@ const PERIODS = Object.freeze({
   '7d': { durationMs: 7 * 24 * 60 * 60_000, chartBucketMs: 12 * 60 * 60_000, source: 'hour' },
   '14d': { durationMs: 14 * 24 * 60 * 60_000, chartBucketMs: 24 * 60 * 60_000, source: 'hour' },
 });
+const BINANCE_LIQUIDATION_CONNECT_GAP_MS = 5_000;
+const BINANCE_LIQUIDATION_CONNECT_WINDOW_MS = 5 * 60_000;
+const BINANCE_LIQUIDATION_MAX_CONNECT_ATTEMPTS_5M = 10;
+const binanceLiquidationConnectAttempts = [];
+let binanceLiquidationConnectChain = Promise.resolve();
+let binanceLiquidationLastConnectAt = 0;
+const binanceLiquidationWsStats = { attempts: 0, waits: 0, window_blocks: 0 };
 let WS_CTOR_PROMISE = null;
 
 async function resolveWebSocketCtor() {
@@ -882,7 +889,56 @@ async function handlePayload(feed, raw) {
   feed.lastMessageAt = Date.now();
 }
 
+function pruneBinanceLiquidationConnectAttempts(now = Date.now()) {
+  while (binanceLiquidationConnectAttempts.length && now - binanceLiquidationConnectAttempts[0] >= BINANCE_LIQUIDATION_CONNECT_WINDOW_MS) {
+    binanceLiquidationConnectAttempts.shift();
+  }
+}
+
+async function acquireBinanceLiquidationConnectSlot() {
+  let release;
+  const previous = binanceLiquidationConnectChain;
+  binanceLiquidationConnectChain = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const now = Date.now();
+    pruneBinanceLiquidationConnectAttempts(now);
+    const gapWait = Math.max(0, BINANCE_LIQUIDATION_CONNECT_GAP_MS - (now - binanceLiquidationLastConnectAt));
+    const windowWait = binanceLiquidationConnectAttempts.length >= BINANCE_LIQUIDATION_MAX_CONNECT_ATTEMPTS_5M
+      ? Math.max(0, binanceLiquidationConnectAttempts[0] + BINANCE_LIQUIDATION_CONNECT_WINDOW_MS - now)
+      : 0;
+    const waitMs = Math.max(gapWait, windowWait);
+    if (waitMs > 0) {
+      binanceLiquidationWsStats.waits += 1;
+      if (windowWait > 0) binanceLiquidationWsStats.window_blocks += 1;
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        timer.unref?.();
+      });
+    }
+    binanceLiquidationLastConnectAt = Date.now();
+    binanceLiquidationConnectAttempts.push(binanceLiquidationLastConnectAt);
+    binanceLiquidationWsStats.attempts += 1;
+  } finally {
+    release();
+  }
+}
+
+export function getBinanceLiquidationWsHealth() {
+  pruneBinanceLiquidationConnectAttempts();
+  return {
+    connect_gap_ms: BINANCE_LIQUIDATION_CONNECT_GAP_MS,
+    max_connect_attempts_5m: BINANCE_LIQUIDATION_MAX_CONNECT_ATTEMPTS_5M,
+    connect_attempts_in_window: binanceLiquidationConnectAttempts.length,
+    connect_attempts_total: binanceLiquidationWsStats.attempts,
+    connect_waits: binanceLiquidationWsStats.waits,
+    connect_window_blocks: binanceLiquidationWsStats.window_blocks,
+    production_ws_only: true,
+  };
+}
+
 async function openFeed(feed) {
+  if (feed.provider === 'binance') await acquireBinanceLiquidationConnectSlot();
   const WebSocketCtor = await resolveWebSocketCtor();
   return await new Promise((resolve, reject) => {
     const socket = new WebSocketCtor(websocketUrl(feed));

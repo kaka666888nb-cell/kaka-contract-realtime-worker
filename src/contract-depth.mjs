@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.6';
+const STEP_VERSION = '650.8.7';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -13,9 +13,9 @@ const TRANSIENT_COOLDOWN_MS = 90_000;
 const RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 
 const BINANCE_WS_STATES = new Map();
-const BINANCE_WS_MAX_SYMBOLS = 32;
-const BINANCE_WS_CONNECT_GAP_MS = 1_500;
-const BINANCE_WS_MAX_CONNECT_ATTEMPTS_5M = 60;
+const BINANCE_WS_MAX_SYMBOLS = 24;
+const BINANCE_WS_CONNECT_GAP_MS = 2_000;
+const BINANCE_WS_MAX_CONNECT_ATTEMPTS_5M = 30;
 const BINANCE_WS_CONNECT_ATTEMPTS = [];
 let BINANCE_WS_CONNECT_CHAIN = Promise.resolve();
 let BINANCE_WS_LAST_CONNECT_AT = 0;
@@ -30,7 +30,7 @@ const BINANCE_WS_IDLE_MS = 75_000;
 const BINANCE_WS_ORDERBOOK_STALE_MS = 8_000;
 const BINANCE_WS_TRADES_STALE_MS = 12_000;
 const BINANCE_WS_START_TIMEOUT_MS = 6_000;
-const BINANCE_WS_HOSTS = ['fstream.binance.com', 'stream.binancefuture.com'];
+const BINANCE_WS_HOSTS = ['fstream.binance.com'];
 let BINANCE_WS_CTOR_PROMISE = null;
 
 async function resolveWebSocketCtor() {
@@ -200,9 +200,9 @@ async function acquireBinanceDepthConnectSlot() {
 function binanceStreamUrl(state, view, host) {
   const streamSymbol = state.native.toLowerCase();
   if (view === 'trades') {
-    return `wss://${host}/market/stream?streams=${streamSymbol}@aggTrade`;
+    return `wss://${host}/stream?streams=${streamSymbol}@aggTrade`;
   }
-  return `wss://${host}/public/stream?streams=${streamSymbol}@depth20@100ms`;
+  return `wss://${host}/stream?streams=${streamSymbol}@depth20@100ms`;
 }
 
 function scheduleBinanceReconnect(state, view) {

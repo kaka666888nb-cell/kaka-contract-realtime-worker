@@ -30,21 +30,20 @@ const HTTP_BRIDGE_TIMEOUT_MS = 6_000;
 const HTTP_BRIDGE_CACHE_MS = 30_000;
 const HTTP_TRANSIENT_COOLDOWN_MS = 90_000;
 const MAX_HTTP_PAGE_ROWS = 1000;
-const MAX_LIVE_STREAMS = 32;
+const MAX_LIVE_STREAMS = 24;
 const LIVE_IDLE_MS = 12 * 60_000;
 const LIVE_PERSIST_MIN_MS = 45_000;
 const LIVE_RECONNECT_MAX_MS = 30_000;
-const LIVE_WS_CONNECT_GAP_MS = 2_000;
+const LIVE_WS_CONNECT_GAP_MS = 2_500;
 const LIVE_WS_CONNECT_WINDOW_MS = 5 * 60_000;
-const LIVE_WS_MAX_CONNECT_ATTEMPTS_5M = 60;
+const LIVE_WS_MAX_CONNECT_ATTEMPTS_5M = 30;
 const LIVE_WS_HOSTS = [
-  'wss://fstream.binance.com/market/ws',
-  'wss://stream.binancefuture.com/market/ws',
+  'wss://fstream.binance.com/ws',
 ];
-// Step650.8.6：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// Step650.8.7：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
 // 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.8.6：只保留官方精确交易对 Kline 主端点。
+  // Step650.8.7：只保留官方精确交易对 Kline 主端点。
   // 不再用 continuous/www 连续撞多个候选；一次失败就返回归档/快照/WS，等待共享守卫放行。
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
 ];
@@ -427,7 +426,7 @@ function activeBridgeState(key) {
 }
 
 function bridgeCooldown(candidateId, symbol) {
-  // Step650.8.6：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
+  // Step650.8.7：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
   return isBinanceRestBlocked() ||
     activeBridgeState(bridgeStateKey(candidateId, '*')) ||
     activeBridgeState(bridgeStateKey(candidateId, symbol));
@@ -494,7 +493,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS, symbol = '', i
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.6',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.7',
       },
     });
     const bodyText = await response.text();
@@ -934,7 +933,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.6' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.7' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1190,7 +1189,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.8.6：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8.7：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
@@ -1257,7 +1256,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.8.6：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8.7：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
@@ -1294,6 +1293,8 @@ export function getBinanceContractKlineSeedHealth() {
     archive_global_max_pending: ARCHIVE_GLOBAL_MAX_PENDING,
     persistence_enabled: supabaseEnabled(),
     live_stream_count: liveStreams.size,
+    live_ws_max_streams: MAX_LIVE_STREAMS,
+    production_ws_only: true,
     live_ws_connect_gap_ms: LIVE_WS_CONNECT_GAP_MS,
     live_ws_max_connect_attempts_5m: LIVE_WS_MAX_CONNECT_ATTEMPTS_5M,
     live_ws_connect_attempts_in_window: (() => { pruneLiveWsConnectAttempts(now); return liveWsConnectAttempts.length; })(),

@@ -168,7 +168,7 @@ function secondTradeConfig(provider, market, symbol) {
     return {
       tradeMode: true,
       url: market === 'contract'
-        ? `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@aggTrade`
+        ? `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@aggTrade`
         : `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@aggTrade`,
       subscribe: null,
       parseTrades(raw) {
@@ -526,7 +526,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
     },
   };
   if (isRealtimeSecondInterval(interval) && provider === 'binance' && market === 'contract') return {
-    url: `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}_perpetual@continuousKline_1s`,
+    url: `wss://fstream.binance.com/ws/${symbol.toLowerCase()}_perpetual@continuousKline_1s`,
     subscribe: null,
     parse(raw) {
       const message = JSON.parse(raw.toString());
@@ -541,7 +541,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
   if (usesRestPolling(provider, interval, upstreamInterval)) return { restPoll: true, sourceInterval: upstreamInterval };
   if (provider === 'binance') return {
     url: market === 'contract'
-      ? `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`
+      ? `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`
       : `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`,
     subscribe: null,
     parse(raw) {
@@ -637,8 +637,8 @@ async function upstreamConfig(provider, market, symbol, interval) {
 const BINANCE_SHARED_STREAM_MAX = 64;
 const BINANCE_SHARED_IDLE_MS = 30_000;
 const BINANCE_SHARED_RECONNECT_MAX_MS = 30_000;
-const BINANCE_SHARED_CONNECT_GAP_MS = 1_000;
-const BINANCE_SHARED_MAX_CONNECT_ATTEMPTS_5M = 100;
+const BINANCE_SHARED_CONNECT_GAP_MS = 1_500;
+const BINANCE_SHARED_MAX_CONNECT_ATTEMPTS_5M = 60;
 const BINANCE_SHARED_MAX_TOTAL_CLIENTS = 1000;
 const BINANCE_SHARED_MAX_CLIENTS_PER_STREAM = 250;
 const binanceSharedStreams = new Map();
@@ -985,14 +985,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.6', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.7', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.6',
+      version: '650.8.7',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1117,7 +1117,7 @@ wss.on('connection', async (client, _req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      // Step650.8.6: the WS-only child must never become a second Binance REST
+      // Step650.8.7: the WS-only child must never become a second Binance REST
       // caller. Binance 1s aggregation starts directly from the official aggTrade
       // WebSocket; other providers may still seed from their own public REST.
       if (provider !== 'binance') {
@@ -1174,7 +1174,7 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.6 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.7 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,

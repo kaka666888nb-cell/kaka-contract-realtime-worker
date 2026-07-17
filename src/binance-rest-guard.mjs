@@ -10,9 +10,10 @@ const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 const PROCESS_REST_DISABLED = process.env.KAKA_DISABLE_BINANCE_REST === '1';
 const VALIDATION_ADMIN_KEY = String(process.env.KAKA_BINANCE_VALIDATION_KEY || '').trim();
+const SUPABASE_IO_TIMEOUT_MS = 8_000;
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.6 keeps the observed-ban migration record and requires
+// Step650.8.7 keeps the observed-ban migration record and requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -46,7 +47,7 @@ const VALIDATION_INTERVAL = '15m';
 const VALIDATION_REST_BUDGET = VALIDATION_SEQUENCE.length;
 const VALIDATION_SESSION_TTL_MS = 2 * 60 * 60_000;
 const VALIDATION_RECOVERY_COOLDOWN_MS = 10 * 60_000;
-const GUARD_SCHEMA_VERSION = '650.8.6';
+const GUARD_SCHEMA_VERSION = '650.8.7';
 const VALIDATION_ADMIN_KEY_FINGERPRINT = VALIDATION_ADMIN_KEY
   ? createHash('sha256').update(`kaka-binance-admin-v1:${VALIDATION_ADMIN_KEY}`, 'utf8').digest('hex')
   : '';
@@ -67,7 +68,7 @@ let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.6_migration_guard',
+  source: 'step650.8.7_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -100,6 +101,7 @@ const stats = {
   probe_required_blocks: 0,
   queue_rejections: 0,
   queue_timeouts: 0,
+  queue_release_on_guard_error: 0,
   max_queue_depth: 0,
   restricted_responses: 0,
   ban_until_parsed: 0,
@@ -504,6 +506,7 @@ async function restoreSnapshot() {
   });
   const response = await fetch(`${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}?${query.toString()}`, {
     headers: headers(),
+    signal: AbortSignal.timeout(SUPABASE_IO_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`binance_rest_guard_restore_${response.status}`);
   const payload = await response.json();
@@ -541,6 +544,7 @@ async function persistSnapshot() {
       method: 'POST',
       headers: headers('resolution=merge-duplicates,return=minimal'),
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(SUPABASE_IO_TIMEOUT_MS),
     },
   );
   if (!response.ok) throw new Error(`binance_rest_guard_persist_${response.status}`);
@@ -731,7 +735,16 @@ export async function acquireBinanceRestRequestSlot({
 
   pendingRequests = Math.max(0, pendingRequests - 1);
 
-  persistenceHealthyOrRetry(source);
+  // Step650.8.7: after this caller owns the FIFO node, every guard/persistence
+  // failure must release it. Otherwise one transient Supabase error can leave
+  // requestChain unresolved forever and deadlock all later Binance REST work.
+  try {
+    persistenceHealthyOrRetry(source);
+  } catch (error) {
+    stats.queue_release_on_guard_error += 1;
+    releaseCurrent();
+    throw error;
+  }
   const blockedAfterQueue = activeState();
   if (blockedAfterQueue) {
     stats.blocked_requests += 1;
@@ -770,7 +783,13 @@ export async function acquireBinanceRestRequestSlot({
     await sleep(waitMs);
   }
 
-  persistenceHealthyOrRetry(source);
+  try {
+    persistenceHealthyOrRetry(source);
+  } catch (error) {
+    stats.queue_release_on_guard_error += 1;
+    releaseCurrent();
+    throw error;
+  }
   const blockedAfterWait = activeState();
   if (blockedAfterWait) {
     stats.blocked_requests += 1;
@@ -1068,7 +1087,7 @@ async function runBinanceRestProbeOnce(adminKey) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.6',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.7',
       },
     });
     const bodyText = await response.text();
@@ -1464,6 +1483,7 @@ export function getBinanceRestGuardHealth() {
     validation_recovery_cooldown_ms: VALIDATION_RECOVERY_COOLDOWN_MS,
     validation_allowed_source_prefixes: [...VALIDATION_ALLOWED_SOURCE_PREFIXES],
     persistence_enabled: supabaseEnabled(),
+    persistence_timeout_ms: SUPABASE_IO_TIMEOUT_MS,
     persistence_last_error: lastPersistenceError ? String(lastPersistenceError?.message || lastPersistenceError) : null,
     restore_healthy: initialized && !lastRestoreError,
     restore_last_error: lastRestoreError ? String(lastRestoreError?.message || lastRestoreError) : null,
@@ -1493,4 +1513,72 @@ export const _test = {
   activeState,
   probeGateActive,
   validationOnlyBlocks,
+  forceReadyForQueueTest() {
+    if (process.env.NODE_ENV !== 'test') throw new Error('test_hook_disabled');
+    initialized = true;
+    initPromise = null;
+    lastRestoreError = null;
+    lastPersistenceError = null;
+    requestChain = Promise.resolve();
+    pendingRequests = 0;
+    activeRequest = false;
+    lastRequestStartedAt = 0;
+    state = {
+      ...state,
+      until: 0,
+      status: 200,
+      reason: 'test_ready',
+      source: 'test',
+      error: '',
+      updated_at: Date.now(),
+      probe_required: false,
+      operating_mode: 'normal_guarded',
+      validation_session_hash: '',
+      validation_budget: 0,
+      validation_inflight: null,
+      schema_version: GUARD_SCHEMA_VERSION,
+    };
+  },
+  forceProbeReadyForTest() {
+    if (process.env.NODE_ENV !== 'test') throw new Error('test_hook_disabled');
+    initialized = true;
+    initPromise = null;
+    lastRestoreError = null;
+    lastPersistenceError = null;
+    requestChain = Promise.resolve();
+    pendingRequests = 0;
+    activeRequest = false;
+    lastRequestStartedAt = 0;
+    state = {
+      ...state,
+      until: 0,
+      status: 200,
+      reason: 'test_probe_ready',
+      source: 'test',
+      error: '',
+      updated_at: Date.now(),
+      probe_required: true,
+      operating_mode: 'probe_required',
+      validation_session_hash: '',
+      validation_budget: 0,
+      validation_created_at: 0,
+      validation_expires_at: 0,
+      validation_next_index: 0,
+      validation_inflight: null,
+      validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
+      schema_version: GUARD_SCHEMA_VERSION,
+    };
+  },
+  setPersistenceError(message = 'test_persistence_error') {
+    if (process.env.NODE_ENV !== 'test') throw new Error('test_hook_disabled');
+    lastPersistenceError = new Error(String(message));
+  },
+  clearPersistenceError() {
+    if (process.env.NODE_ENV !== 'test') throw new Error('test_hook_disabled');
+    lastPersistenceError = null;
+  },
+  queueState() {
+    if (process.env.NODE_ENV !== 'test') throw new Error('test_hook_disabled');
+    return { pendingRequests, activeRequest, queue_release_on_guard_error: stats.queue_release_on_guard_error };
+  },
 };

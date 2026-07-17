@@ -90,7 +90,7 @@ function tradeItem(time, price, size, side, sizeMultiplier = 1) {
 function configFor(provider, symbol, quantityMultiplier = 1) {
   if (provider === 'binance') {
     return {
-      url: `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@aggTrade`,
+      url: `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@aggTrade`,
       subscriptions: [],
       parse(raw) {
         const message = JSON.parse(raw.toString());
@@ -198,6 +198,14 @@ const FLOW_HISTOGRAM_STEP = 0.10;
 const FLOW_HISTOGRAM_BINS = Math.ceil((FLOW_HISTOGRAM_MAX_LOG10 - FLOW_HISTOGRAM_MIN_LOG10) / FLOW_HISTOGRAM_STEP);
 const MAX_RECENT_IDS = 3000;
 const MAX_ACTIVE_STATES = 80;
+const BINANCE_FLOW_MAX_STATES = 24;
+const BINANCE_FLOW_CONNECT_GAP_MS = 2_500;
+const BINANCE_FLOW_CONNECT_WINDOW_MS = 5 * 60_000;
+const BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M = 40;
+const binanceFlowConnectAttempts = [];
+let binanceFlowConnectChain = Promise.resolve();
+let binanceFlowLastConnectAt = 0;
+const binanceFlowWsStats = { attempts: 0, waits: 0, window_blocks: 0, capacity_rejections: 0, evictions: 0 };
 const CORE_SYMBOLS = String(process.env.KAKA_FLOW_CORE_SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,DOTUSDT,LTCUSDT')
   .split(',').map(symbolKey).filter((value) => value && value.endsWith('USDT'));
 const CORE_SYMBOL_SET = new Set(CORE_SYMBOLS);
@@ -465,7 +473,7 @@ function scheduleOkxMultiplierRetry(state, reason) {
   state.error = String(reason || 'okx_contract_multiplier_unavailable').slice(0, 180);
   clearTimeout(state.reconnectTimer);
   if (Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) {
-    state.reconnectTimer = setTimeout(() => startStream(state), 30000);
+    state.reconnectTimer = setTimeout(() => startStream(state).catch(() => {}), 30000);
   }
 }
 
@@ -488,76 +496,132 @@ function scheduleGateMultiplierRetry(state, reason) {
   state.error = String(reason || 'gate_contract_multiplier_unavailable').slice(0, 180);
   clearTimeout(state.reconnectTimer);
   if (Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) {
-    state.reconnectTimer = setTimeout(() => startStream(state), 30000);
+    state.reconnectTimer = setTimeout(() => startStream(state).catch(() => {}), 30000);
   }
 }
 
-function startStream(state) {
+function pruneBinanceFlowConnectAttempts(now = Date.now()) {
+  while (binanceFlowConnectAttempts.length && now - binanceFlowConnectAttempts[0] >= BINANCE_FLOW_CONNECT_WINDOW_MS) {
+    binanceFlowConnectAttempts.shift();
+  }
+}
+
+async function acquireBinanceFlowConnectSlot() {
+  let release;
+  const previous = binanceFlowConnectChain;
+  binanceFlowConnectChain = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const now = Date.now();
+    pruneBinanceFlowConnectAttempts(now);
+    const gapWait = Math.max(0, BINANCE_FLOW_CONNECT_GAP_MS - (now - binanceFlowLastConnectAt));
+    const windowWait = binanceFlowConnectAttempts.length >= BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M
+      ? Math.max(0, binanceFlowConnectAttempts[0] + BINANCE_FLOW_CONNECT_WINDOW_MS - now)
+      : 0;
+    const waitMs = Math.max(gapWait, windowWait);
+    if (waitMs > 0) {
+      binanceFlowWsStats.waits += 1;
+      if (windowWait > 0) binanceFlowWsStats.window_blocks += 1;
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        timer.unref?.();
+      });
+    }
+    binanceFlowLastConnectAt = Date.now();
+    binanceFlowConnectAttempts.push(binanceFlowLastConnectAt);
+    binanceFlowWsStats.attempts += 1;
+  } finally {
+    release();
+  }
+}
+
+async function startStream(state) {
   if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
-  clearTimeout(state.reconnectTimer);
-  if (state.provider === 'okx' && !(state.okxContractMultiplier > 0)) {
-    state.status = 'loading_contract_meta';
-    if (!state.okxMultiplierPromise) {
-      state.okxMultiplierPromise = loadOkxContractMultiplier(state)
-        .then(() => {
-          state.okxMultiplierPromise = null;
-          if (states.get(state.key) === state && Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) startStream(state);
-        })
-        .catch((error) => {
-          state.okxMultiplierPromise = null;
-          scheduleOkxMultiplierRetry(state, error?.message || error);
-        });
+  if (state.connectingPromise) return state.connectingPromise;
+  state.connectingPromise = (async () => {
+    clearTimeout(state.reconnectTimer);
+    if (state.provider === 'okx' && !(state.okxContractMultiplier > 0)) {
+      state.status = 'loading_contract_meta';
+      if (!state.okxMultiplierPromise) {
+        state.okxMultiplierPromise = loadOkxContractMultiplier(state)
+          .then(() => {
+            state.okxMultiplierPromise = null;
+            if (states.get(state.key) === state && Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) startStream(state).catch(() => {});
+          })
+          .catch((error) => {
+            state.okxMultiplierPromise = null;
+            scheduleOkxMultiplierRetry(state, error?.message || error);
+          });
+      }
+      return;
     }
-    return;
-  }
-  if (state.provider === 'gate' && !(state.gateQuantoMultiplier > 0)) {
-    state.status = 'loading_contract_meta';
-    if (!state.gateMultiplierPromise) {
-      state.gateMultiplierPromise = loadGateContractMultiplier(state)
-        .then(() => {
-          state.gateMultiplierPromise = null;
-          if (states.get(state.key) === state && Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) startStream(state);
-        })
-        .catch((error) => {
-          state.gateMultiplierPromise = null;
-          scheduleGateMultiplierRetry(state, error?.message || error);
-        });
+    if (state.provider === 'gate' && !(state.gateQuantoMultiplier > 0)) {
+      state.status = 'loading_contract_meta';
+      if (!state.gateMultiplierPromise) {
+        state.gateMultiplierPromise = loadGateContractMultiplier(state)
+          .then(() => {
+            state.gateMultiplierPromise = null;
+            if (states.get(state.key) === state && Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) startStream(state).catch(() => {});
+          })
+          .catch((error) => {
+            state.gateMultiplierPromise = null;
+            scheduleGateMultiplierRetry(state, error?.message || error);
+          });
+      }
+      return;
     }
-    return;
-  }
-  const quantityMultiplier = state.provider === 'okx'
-    ? (state.okxContractMultiplier || 1)
-    : (state.provider === 'gate' ? (state.gateQuantoMultiplier || 1) : 1);
-  const cfg = configFor(state.provider, state.symbol, quantityMultiplier);
-  state.status = 'connecting'; state.error = '';
-  const ws = new WebSocket(cfg.url, { handshakeTimeout: 15000 });
-  state.ws = ws;
-  ws.on('open', () => {
-    state.status = 'open'; state.reconnectAttempt = 0;
-    for (const subscription of cfg.subscriptions) ws.send(JSON.stringify(subscription));
-    clearInterval(state.heartbeatTimer);
-    state.heartbeatTimer = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      try {
-        if (typeof cfg.heartbeat === 'string') ws.send(cfg.heartbeat);
-        else if (cfg.heartbeat) ws.send(JSON.stringify(cfg.heartbeat));
-        else ws.ping();
-      } catch (_) {}
-    }, 20000);
-  });
-  ws.on('message', (raw) => { try { ingest(state, cfg.parse(raw)); } catch (_) {} });
-  const close = (reason) => {
-    if (state.ws !== ws) return;
-    clearInterval(state.heartbeatTimer); state.heartbeatTimer = null; state.ws = null;
-    state.status = 'closed'; state.error = String(reason || 'upstream_closed').slice(0, 180);
+    const quantityMultiplier = state.provider === 'okx'
+      ? (state.okxContractMultiplier || 1)
+      : (state.provider === 'gate' ? (state.gateQuantoMultiplier || 1) : 1);
+    const cfg = configFor(state.provider, state.symbol, quantityMultiplier);
+    state.status = state.provider === 'binance' ? 'connect_queued' : 'connecting';
+    state.error = '';
+    if (state.provider === 'binance') {
+      await acquireBinanceFlowConnectSlot();
+      if (states.get(state.key) !== state || Date.now() - state.lastRequestedAt > IDLE_CLOSE_MS) return;
+      if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
+    }
+    state.status = 'connecting';
+    const ws = new WebSocket(cfg.url, { handshakeTimeout: 15000 });
+    state.ws = ws;
+    ws.on('open', () => {
+      state.status = 'open'; state.reconnectAttempt = 0;
+      for (const subscription of cfg.subscriptions) ws.send(JSON.stringify(subscription));
+      clearInterval(state.heartbeatTimer);
+      state.heartbeatTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try {
+          if (typeof cfg.heartbeat === 'string') ws.send(cfg.heartbeat);
+          else if (cfg.heartbeat) ws.send(JSON.stringify(cfg.heartbeat));
+          else ws.ping();
+        } catch (_) {}
+      }, 20000);
+    });
+    ws.on('message', (raw) => { try { ingest(state, cfg.parse(raw)); } catch (_) {} });
+    const close = (reason) => {
+      if (state.ws !== ws) return;
+      clearInterval(state.heartbeatTimer); state.heartbeatTimer = null; state.ws = null;
+      state.status = 'closed'; state.error = String(reason || 'upstream_closed').slice(0, 180);
+      if (Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) {
+        state.reconnectAttempt += 1;
+        const delay = Math.min(RECONNECT_MAX_MS, 1000 * 2 ** Math.min(5, state.reconnectAttempt));
+        state.reconnectTimer = setTimeout(() => startStream(state).catch(() => {}), delay);
+      }
+    };
+    ws.on('close', (code, reason) => close(`${code}:${reason || ''}`));
+    ws.on('error', (error) => close(error?.message || 'upstream_error'));
+  })().catch((error) => {
+    state.status = 'connect_limited';
+    state.error = String(error?.message || error).slice(0, 180);
     if (Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) {
-      state.reconnectAttempt += 1;
-      const delay = Math.min(RECONNECT_MAX_MS, 1000 * 2 ** Math.min(5, state.reconnectAttempt));
-      state.reconnectTimer = setTimeout(() => startStream(state), delay);
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = setTimeout(() => startStream(state).catch(() => {}), 10_000);
+      state.reconnectTimer.unref?.();
     }
-  };
-  ws.on('close', (code, reason) => close(`${code}:${reason || ''}`));
-  ws.on('error', (error) => close(error?.message || 'upstream_error'));
+  }).finally(() => {
+    state.connectingPromise = null;
+  });
+  return state.connectingPromise;
 }
 
 function closeAndDeleteState(state, reason = 'evicted') {
@@ -573,7 +637,24 @@ function closeAndDeleteState(state, reason = 'evicted') {
 
 function ensureStateCapacity(provider, symbol) {
   const key = `${provider}:${symbol}`;
-  if (states.has(key) || states.size < MAX_ACTIVE_STATES) return;
+  if (states.has(key)) return;
+  if (provider === 'binance') {
+    const binanceStates = [...states.values()].filter((state) => state.provider === 'binance');
+    if (binanceStates.length >= BINANCE_FLOW_MAX_STATES) {
+      const candidates = binanceStates
+        .filter((state) => !CORE_SYMBOL_SET.has(state.symbol))
+        .sort((a, b) => a.lastRequestedAt - b.lastRequestedAt);
+      if (candidates.length) {
+        closeAndDeleteState(candidates[0], 'binance_capacity');
+        binanceFlowWsStats.evictions += 1;
+      }
+    }
+    if ([...states.values()].filter((state) => state.provider === 'binance').length >= BINANCE_FLOW_MAX_STATES) {
+      binanceFlowWsStats.capacity_rejections += 1;
+      throw new Error('binance_flow_ws_capacity_reached');
+    }
+  }
+  if (states.size < MAX_ACTIVE_STATES) return;
   const candidates = [...states.values()]
     .filter((state) => !CORE_SYMBOL_SET.has(state.symbol))
     .sort((a, b) => a.lastRequestedAt - b.lastRequestedAt);
@@ -588,7 +669,7 @@ function getState(provider, symbol) {
     state = {
       key, provider, symbol, openBuckets: new Map(), completedBuckets: new Map(), recentIds: new Set(), waiters: new Set(),
       ws: null, status: 'idle', error: '', lastTradeAt: 0, lastPrice: null, lastRequestedAt: Date.now(), reconnectAttempt: 0,
-      reconnectTimer: null, heartbeatTimer: null,
+      reconnectTimer: null, heartbeatTimer: null, connectingPromise: null,
       metricRows: new Map(), metricLoaded: false, metricLoading: false, metricError: '', metricFetchedAt: 0,
       metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0,
       okxContractMultiplier: null, okxMultiplierPromise: null,
@@ -599,7 +680,7 @@ function getState(provider, symbol) {
   }
   state.lastRequestedAt = Date.now();
   loadPersistedHistory(state).catch(() => {});
-  startStream(state);
+  startStream(state).catch(() => {});
   return state;
 }
 
@@ -649,7 +730,7 @@ async function fetchBinanceJson(url, { headers = {}, timeoutMs = 8000, source = 
   });
   try {
     const response = await fetch(url, {
-      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.6 contract-flow', ...headers },
+      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.7 contract-flow', ...headers },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await response.text();
@@ -1066,7 +1147,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.6: metrics are requested sequentially under the shared governor.
+  // Step650.8.7: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.
@@ -1447,9 +1528,26 @@ function waitForTrades(state,minTrades,waitMs){
   return new Promise((resolve)=>{let timer;const done=()=>{clearTimeout(timer);state.waiters.delete(check);resolve();};const check=()=>{if(count()>=minTrades)done();};state.waiters.add(check);timer=setTimeout(done,waitMs);});
 }
 
+export function getContractFlowHealth() {
+  pruneBinanceFlowConnectAttempts();
+  return {
+    streams: states.size,
+    binance_active_streams: [...states.values()].filter((state) => state.provider === 'binance').length,
+    binance_max_active_streams: BINANCE_FLOW_MAX_STATES,
+    binance_ws_connect_gap_ms: BINANCE_FLOW_CONNECT_GAP_MS,
+    binance_ws_max_connect_attempts_5m: BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,
+    binance_ws_connect_attempts_in_window: binanceFlowConnectAttempts.length,
+    binance_ws_connect_attempts_total: binanceFlowWsStats.attempts,
+    binance_ws_connect_waits: binanceFlowWsStats.waits,
+    binance_ws_connect_window_blocks: binanceFlowWsStats.window_blocks,
+    binance_ws_capacity_rejections: binanceFlowWsStats.capacity_rejections,
+    production_ws_only: true,
+  };
+}
+
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'615.5',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:'650.8.7',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-meta'){
     if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}

@@ -16,6 +16,13 @@ const REST_TRANSIENT_COOLDOWN_MS = 90_000;
 const WS_RECONNECT_MAX_MS = 60_000;
 const WS_STALE_MS = 45_000;
 const START_WAIT_MS = 6_500;
+const WS_CONNECT_GAP_MS = 3_000;
+const WS_CONNECT_WINDOW_MS = 5 * 60_000;
+const WS_MAX_CONNECT_ATTEMPTS_5M = 15;
+const wsConnectAttempts = [];
+let wsConnectChain = Promise.resolve();
+let wsLastConnectAt = 0;
+const wsConnectStats = { attempts: 0, waits: 0, window_blocks: 0 };
 
 const universeBySymbol = new Map();
 const tickerBySymbol = new Map();
@@ -252,32 +259,15 @@ function handleContractInfoMessage(raw) {
 
 const STREAMS = {
   ticker: {
-    urls: [
-      'wss://fstream.binance.com/market/ws/!ticker@arr',
-      'wss://stream.binancefuture.com/market/ws/!ticker@arr',
-      'wss://fstream.binance.com/ws/!ticker@arr',
-      'wss://stream.binancefuture.com/ws/!ticker@arr',
-    ],
+    urls: ['wss://fstream.binance.com/ws/!ticker@arr'],
     handler: handleTickerMessage,
   },
   bookTicker: {
-    urls: [
-      'wss://fstream.binance.com/public/ws/!bookTicker',
-      'wss://stream.binancefuture.com/public/ws/!bookTicker',
-      'wss://fstream.binance.com/market/ws/!bookTicker',
-      'wss://stream.binancefuture.com/market/ws/!bookTicker',
-      'wss://fstream.binance.com/ws/!bookTicker',
-      'wss://stream.binancefuture.com/ws/!bookTicker',
-    ],
+    urls: ['wss://fstream.binance.com/ws/!bookTicker'],
     handler: handleBookTickerMessage,
   },
   contractInfo: {
-    urls: [
-      'wss://fstream.binance.com/market/ws/!contractInfo',
-      'wss://stream.binancefuture.com/market/ws/!contractInfo',
-      'wss://fstream.binance.com/ws/!contractInfo',
-      'wss://stream.binancefuture.com/ws/!contractInfo',
-    ],
+    urls: ['wss://fstream.binance.com/ws/!contractInfo'],
     handler: handleContractInfoMessage,
   },
 };
@@ -294,6 +284,7 @@ function streamStatus(name) {
       openedAt: 0,
       lastMessageAt: 0,
       lastError: '',
+      connectingPromise: null,
     };
     connectionState.set(name, state);
   }
@@ -309,50 +300,93 @@ function scheduleReconnect(name) {
   const delay = Math.min(WS_RECONNECT_MAX_MS, 1_000 * (2 ** Math.min(6, state.attempts - 1)));
   state.reconnectTimer = setTimeout(() => {
     state.reconnectTimer = null;
-    connectStream(name);
+    connectStream(name).catch(() => {});
   }, delay);
   state.reconnectTimer.unref?.();
 }
 
-function connectStream(name) {
+function pruneWsConnectAttempts(now = Date.now()) {
+  while (wsConnectAttempts.length && now - wsConnectAttempts[0] >= WS_CONNECT_WINDOW_MS) {
+    wsConnectAttempts.shift();
+  }
+}
+
+async function acquireMarketWsConnectSlot() {
+  let release;
+  const previous = wsConnectChain;
+  wsConnectChain = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const now = Date.now();
+    pruneWsConnectAttempts(now);
+    const gapWait = Math.max(0, WS_CONNECT_GAP_MS - (now - wsLastConnectAt));
+    const windowWait = wsConnectAttempts.length >= WS_MAX_CONNECT_ATTEMPTS_5M
+      ? Math.max(0, wsConnectAttempts[0] + WS_CONNECT_WINDOW_MS - now)
+      : 0;
+    const waitMs = Math.max(gapWait, windowWait);
+    if (waitMs > 0) {
+      wsConnectStats.waits += 1;
+      if (windowWait > 0) wsConnectStats.window_blocks += 1;
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        timer.unref?.();
+      });
+    }
+    wsLastConnectAt = Date.now();
+    wsConnectAttempts.push(wsLastConnectAt);
+    wsConnectStats.attempts += 1;
+  } finally {
+    release();
+  }
+}
+
+async function connectStream(name) {
   const spec = STREAMS[name];
   if (!spec) return;
   const state = streamStatus(name);
   if (state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState)) return;
-  const url = spec.urls[state.urlIndex % spec.urls.length];
-  state.urlIndex = (state.urlIndex + 1) % spec.urls.length;
-  let socket;
-  try {
-    socket = new WebSocket(url, {
-      handshakeTimeout: 15_000,
-      perMessageDeflate: false,
-      headers: { 'user-agent': 'KakaWeb3-Market-Worker/650' },
-    });
-  } catch (error) {
-    state.lastError = String(error?.message || error);
-    scheduleReconnect(name);
-    return;
-  }
-  state.socket = socket;
-  socket.on('open', () => {
-    state.connected = true;
-    state.attempts = 0;
-    state.openedAt = Date.now();
-    state.lastMessageAt = 0;
-    state.lastError = '';
-  });
-  socket.on('message', (raw) => {
-    state.lastMessageAt = Date.now();
+  if (state.connectingPromise) return state.connectingPromise;
+  state.connectingPromise = (async () => {
+    await acquireMarketWsConnectSlot();
+    if (state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState)) return;
+    const url = spec.urls[state.urlIndex % spec.urls.length];
+    state.urlIndex = (state.urlIndex + 1) % spec.urls.length;
+    let socket;
     try {
-      spec.handler(raw);
+      socket = new WebSocket(url, {
+        handshakeTimeout: 15_000,
+        perMessageDeflate: false,
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.7' },
+      });
     } catch (error) {
       state.lastError = String(error?.message || error);
+      scheduleReconnect(name);
+      return;
     }
+    state.socket = socket;
+    socket.on('open', () => {
+      state.connected = true;
+      state.attempts = 0;
+      state.openedAt = Date.now();
+      state.lastMessageAt = 0;
+      state.lastError = '';
+    });
+    socket.on('message', (raw) => {
+      state.lastMessageAt = Date.now();
+      try {
+        spec.handler(raw);
+      } catch (error) {
+        state.lastError = String(error?.message || error);
+      }
+    });
+    socket.on('error', (error) => {
+      state.lastError = String(error?.message || error);
+    });
+    socket.on('close', () => scheduleReconnect(name));
+  })().finally(() => {
+    state.connectingPromise = null;
   });
-  socket.on('error', (error) => {
-    state.lastError = String(error?.message || error);
-  });
-  socket.on('close', () => scheduleReconnect(name));
+  return state.connectingPromise;
 }
 
 function supabaseEnabled() {
@@ -517,7 +551,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.6：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.7：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }
@@ -546,7 +580,7 @@ export function startBinanceContractMarket() {
   if (started) return;
   started = true;
   restoreSnapshots().finally(() => {
-    for (const name of Object.keys(STREAMS)) connectStream(name);
+    for (const name of Object.keys(STREAMS)) connectStream(name).catch(() => {});
   });
   const watchdog = setInterval(() => {
     const now = Date.now();
@@ -628,6 +662,13 @@ export function getBinanceContractMarketHealth() {
     rest_last_error: restLastError || null,
     persistence_enabled: supabaseEnabled(),
     streams,
+    ws_connect_gap_ms: WS_CONNECT_GAP_MS,
+    ws_max_connect_attempts_5m: WS_MAX_CONNECT_ATTEMPTS_5M,
+    ws_connect_attempts_in_window: (pruneWsConnectAttempts(), wsConnectAttempts.length),
+    ws_connect_attempts_total: wsConnectStats.attempts,
+    ws_connect_waits: wsConnectStats.waits,
+    ws_connect_window_blocks: wsConnectStats.window_blocks,
+    production_ws_only: true,
     source: 'binance_official_public_websocket_with_persistent_snapshot_no_automatic_rest',
     time: new Date().toISOString(),
   };

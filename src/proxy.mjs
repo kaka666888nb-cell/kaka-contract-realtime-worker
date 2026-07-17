@@ -1,8 +1,8 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { handleContractFlow } from './contract-flow.mjs';
+import { getContractFlowHealth, handleContractFlow } from './contract-flow.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
-import { handleContractLiquidation } from './contract-liquidation.mjs';
+import { getBinanceLiquidationWsHealth, handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding } from './contract-funding.mjs';
 import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
 import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
@@ -10,7 +10,7 @@ import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.6';
+const STEP_VERSION = '650.8.7';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: {
@@ -38,7 +38,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.6：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.7：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -280,6 +280,8 @@ const server = http.createServer(async (req, res) => {
       contract_meta: '/api/contract-meta',
       contract_depth: '/api/contract-depth',
       contract_depth_health: getContractDepthHealth(),
+      contract_flow_health: getContractFlowHealth(),
+      binance_liquidation_ws_health: getBinanceLiquidationWsHealth(),
       contract_depth_views: ['orderbook', 'trades'],
       contract_liquidation: '/api/contract-liquidation',
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
@@ -353,8 +355,10 @@ const server = http.createServer(async (req, res) => {
         binance_contract_rest_max_pending_requests: 6,
         binance_contract_rest_max_queue_wait_ms: 25000,
         binance_contract_rest_queue_is_bounded: true,
+        binance_contract_rest_queue_releases_on_guard_error: true,
         binance_contract_rest_persistence_flush_on_restriction: true,
         binance_rest_persistence_failure_blocks_network: true,
+        binance_rest_guard_persistence_timeout_ms: getBinanceRestGuardHealth().persistence_timeout_ms,
         binance_rest_guard_restore_failure_blocks_network: true,
         binance_rest_guard_restore_healthy: getBinanceRestGuardHealth().restore_healthy,
         binance_rest_guard_restore_errors: getBinanceRestGuardHealth().restore_errors,
@@ -384,7 +388,7 @@ const server = http.createServer(async (req, res) => {
         binance_one_second_synthetic_gap_fill: false,
         binance_app_ws_shared_by_market_symbol_interval: true,
         binance_app_ws_max_shared_streams: 64,
-        binance_app_ws_max_connect_attempts_5m: 100,
+        binance_app_ws_max_connect_attempts_5m: Number(realtimeWsHealth?.binance_shared_ws?.max_connect_attempts_5m || 60),
         binance_app_ws_max_total_clients: 1000,
         binance_app_ws_max_clients_per_stream: 250,
         binance_app_ws_trade_1s_shared_aggregator: true,
@@ -397,11 +401,20 @@ const server = http.createServer(async (req, res) => {
         contract_depth_cache_ms: 1200,
         contract_depth_stale_seconds: 20,
         contract_depth_page_visible_only: true,
-        binance_contract_depth_transport: 'websocket_public_depth20_100ms',
-        binance_contract_trades_transport: 'websocket_market_aggTrade',
+        binance_contract_depth_transport: 'official_combined_websocket_depth20_100ms',
+        binance_contract_trades_transport: 'official_combined_websocket_aggTrade',
         binance_contract_rest_disabled_for_depth: true,
-        binance_websocket_endpoint_split_2026: true,
-        binance_websocket_hosts: ['fstream.binance.com', 'stream.binancefuture.com'],
+        binance_websocket_endpoint_split_2026: false,
+        binance_websocket_hosts: ['fstream.binance.com'],
+        binance_websocket_production_only: true,
+        binance_flow_ws_max_active_streams: getContractFlowHealth().binance_max_active_streams,
+        binance_flow_ws_max_connect_attempts_5m: getContractFlowHealth().binance_ws_max_connect_attempts_5m,
+        binance_market_ws_max_connect_attempts_5m: 15,
+        binance_liquidation_ws_max_connect_attempts_5m: getBinanceLiquidationWsHealth().max_connect_attempts_5m,
+        binance_ws_designed_aggregate_connect_attempts_5m: 185,
+        binance_ws_official_ip_connect_attempt_reference_5m: 300,
+        binance_ws_designed_headroom_attempts_5m: 115,
+        binance_ws_designed_max_upstream_connections: 164,
         contract_liquidation_page_visible_polling: true,
         contract_liquidation_memory_aggregation: true,
         contract_liquidation_raw_persistence: false,
@@ -440,7 +453,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // Step650.8.6: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.7: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. The child process is WS-only.
     if (await handleMarketApi(req, res, url)) return;
