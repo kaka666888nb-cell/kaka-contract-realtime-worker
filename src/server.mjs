@@ -644,7 +644,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
 
 const server = http.createServer(async (req, res) => {
   const parsedHttpUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  if (await handleMarketApi(req, res, parsedHttpUrl)) return;
+  if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({

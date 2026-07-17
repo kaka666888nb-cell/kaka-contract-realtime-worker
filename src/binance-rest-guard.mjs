@@ -1,3 +1,6 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const SNAPSHOT_TABLE = 'app_market_backend_snapshots';
@@ -7,7 +10,7 @@ const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.1 keeps the existing 15-minute migration quarantine and then requires
+// Step650.8.2 keeps the existing 15-minute migration quarantine and then requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -25,6 +28,8 @@ const PROBE_TIMEOUT_MS = 6_000;
 const PROBE_URL = 'https://fapi.binance.com/fapi/v1/ping';
 const MIGRATION_STATE_UPDATED_AT_MS = OBSERVED_BAN_UNTIL_MS;
 const VALIDATION_ALLOWED_SOURCE_PREFIXES = ['kline_bridge:'];
+const VALIDATION_REST_BUDGET = 4;
+const validationContext = new AsyncLocalStorage();
 
 let initialized = false;
 let initPromise = null;
@@ -39,7 +44,7 @@ let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.1_migration_guard',
+  source: 'step650.8.2_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -48,6 +53,9 @@ let state = {
   probe_passed_at: 0,
   probe_source: '',
   operating_mode: 'probe_required',
+  validation_session_hash: '',
+  validation_budget: 0,
+  validation_created_at: 0,
 };
 
 const stats = {
@@ -70,6 +78,9 @@ const stats = {
   probes_succeeded: 0,
   probes_restricted: 0,
   probes_failed: 0,
+  validation_session_blocks: 0,
+  validation_budget_exhausted: 0,
+  validation_calls_authorized: 0,
   last_success_at: 0,
   last_success_source: '',
   last_used_weight_1m: null,
@@ -125,6 +136,35 @@ function parseRetryAfterSeconds(value) {
   return Math.max(1, Math.ceil((absolute - Date.now()) / 1000));
 }
 
+function hashValidationToken(value) {
+  return createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
+}
+
+function safeTokenMatches(token, expectedHash) {
+  const actual = Buffer.from(hashValidationToken(token), 'hex');
+  const expected = Buffer.from(String(expectedHash || ''), 'hex');
+  if (actual.length !== 32 || expected.length !== 32) return false;
+  return timingSafeEqual(actual, expected);
+}
+
+function validationSourceAllowed(source = '') {
+  const normalized = String(source || '');
+  return VALIDATION_ALLOWED_SOURCE_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+function currentValidationContext() {
+  return validationContext.getStore() || null;
+}
+
+function validationRequestAuthorized(source = '') {
+  if (state?.operating_mode !== 'validation_only') return false;
+  if (!validationSourceAllowed(source)) return false;
+  if (Number(state?.validation_budget || 0) <= 0) return false;
+  const context = currentValidationContext();
+  if (!context || Number(context.remainingCalls || 0) <= 0) return false;
+  return safeTokenMatches(context.token, state?.validation_session_hash);
+}
+
 function activeState() {
   if (Number(state?.until || 0) > Date.now()) return state;
   return null;
@@ -137,13 +177,19 @@ function probeGateActive() {
 function validationOnlyBlocks(source = '') {
   if (activeState() || state?.probe_required === true) return false;
   if (state?.operating_mode !== 'validation_only') return false;
-  const normalized = String(source || '');
-  return !VALIDATION_ALLOWED_SOURCE_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+  return !validationRequestAuthorized(source);
 }
 
 function normalizedRestoredState(restored, record = null) {
   const restoredUntil = toFiniteMs(restored?.until) || 0;
   const probePassedAt = toFiniteMs(restored?.probe_passed_at) || 0;
+  const validationSessionHash = String(restored?.validation_session_hash || '').toLowerCase();
+  const hasValidationSession = /^[a-f0-9]{64}$/.test(validationSessionHash);
+  const probeRequired = restored?.probe_required !== false || !hasValidationSession;
+  const restoredBudget = Math.max(0, Math.min(
+    VALIDATION_REST_BUDGET,
+    Number.parseInt(String(restored?.validation_budget ?? 0), 10) || 0,
+  ));
   return {
     until: restoredUntil,
     status: Number(restored?.status || 418),
@@ -153,10 +199,13 @@ function normalizedRestoredState(restored, record = null) {
     parsed_ban_until: toFiniteMs(restored?.parsed_ban_until),
     retry_after_seconds: parseRetryAfterSeconds(restored?.retry_after_seconds),
     updated_at: toFiniteMs(restored?.updated_at) || Date.now(),
-    probe_required: restored?.probe_required !== false,
-    probe_passed_at: probePassedAt,
-    probe_source: String(restored?.probe_source || ''),
-    operating_mode: String(restored?.operating_mode || (restored?.probe_required === false ? 'validation_only' : 'probe_required')),
+    probe_required: probeRequired,
+    probe_passed_at: probeRequired ? 0 : probePassedAt,
+    probe_source: probeRequired ? '' : String(restored?.probe_source || ''),
+    operating_mode: probeRequired ? 'probe_required' : 'validation_only',
+    validation_session_hash: probeRequired ? '' : validationSessionHash,
+    validation_budget: probeRequired ? 0 : restoredBudget,
+    validation_created_at: probeRequired ? 0 : (toFiniteMs(restored?.validation_created_at) || probePassedAt),
   };
 }
 
@@ -256,8 +305,12 @@ export function isBinanceRestProbeRequired() {
 
 function guardError(message, code, extra = {}) {
   const error = new Error(message);
-  error.status = 418;
+  // Internal guard decisions must never masquerade as an upstream Binance 418.
+  // Otherwise callers may feed the local gate error back into the restriction
+  // detector and create a false 30-minute/IP-ban cooldown without any network call.
+  error.status = 409;
   error.code = code;
+  error.internalBinanceRestGuard = true;
   Object.assign(error, extra);
   return error;
 }
@@ -288,8 +341,10 @@ export async function acquireBinanceRestRequestSlot({
   }
   if (!probe && validationOnlyBlocks(source)) {
     stats.blocked_requests += 1;
-    throw guardError('binance_rest_validation_only', 'BINANCE_REST_VALIDATION_ONLY', {
-      binanceRestValidationOnly: true,
+    stats.validation_session_blocks += 1;
+    if (Number(state?.validation_budget || 0) <= 0) stats.validation_budget_exhausted += 1;
+    throw guardError('binance_rest_validation_session_required', 'BINANCE_REST_VALIDATION_SESSION_REQUIRED', {
+      binanceRestValidationSessionRequired: true,
       guardState: state,
       source,
     });
@@ -361,9 +416,11 @@ export async function acquireBinanceRestRequestSlot({
 
   if (!probe && validationOnlyBlocks(source)) {
     stats.blocked_requests += 1;
+    stats.validation_session_blocks += 1;
+    if (Number(state?.validation_budget || 0) <= 0) stats.validation_budget_exhausted += 1;
     releaseCurrent();
-    throw guardError('binance_rest_validation_only', 'BINANCE_REST_VALIDATION_ONLY', {
-      binanceRestValidationOnly: true,
+    throw guardError('binance_rest_validation_session_required', 'BINANCE_REST_VALIDATION_SESSION_REQUIRED', {
+      binanceRestValidationSessionRequired: true,
       guardState: state,
       source,
     });
@@ -397,12 +454,37 @@ export async function acquireBinanceRestRequestSlot({
 
   if (!probe && validationOnlyBlocks(source)) {
     stats.blocked_requests += 1;
+    stats.validation_session_blocks += 1;
+    if (Number(state?.validation_budget || 0) <= 0) stats.validation_budget_exhausted += 1;
     releaseCurrent();
-    throw guardError('binance_rest_validation_only', 'BINANCE_REST_VALIDATION_ONLY', {
-      binanceRestValidationOnly: true,
+    throw guardError('binance_rest_validation_session_required', 'BINANCE_REST_VALIDATION_SESSION_REQUIRED', {
+      binanceRestValidationSessionRequired: true,
       guardState: state,
       source,
     });
+  }
+
+  if (!probe && state?.operating_mode === 'validation_only') {
+    const context = currentValidationContext();
+    if (!validationRequestAuthorized(source)) {
+      stats.blocked_requests += 1;
+      stats.validation_session_blocks += 1;
+      if (Number(state?.validation_budget || 0) <= 0) stats.validation_budget_exhausted += 1;
+      releaseCurrent();
+      throw guardError('binance_rest_validation_session_required', 'BINANCE_REST_VALIDATION_SESSION_REQUIRED', {
+        binanceRestValidationSessionRequired: true,
+        guardState: state,
+        source,
+      });
+    }
+    context.remainingCalls = Math.max(0, Number(context.remainingCalls || 0) - 1);
+    state = {
+      ...state,
+      validation_budget: Math.max(0, Number(state.validation_budget || 0) - 1),
+      updated_at: Date.now(),
+    };
+    stats.validation_calls_authorized += 1;
+    queuePersistence();
   }
 
   lastRequestStartedAt = Date.now();
@@ -443,6 +525,9 @@ export function markBinanceRestRestricted({ status = 0, message = '', source = '
     probe_passed_at: 0,
     probe_source: '',
     operating_mode: 'probe_required',
+    validation_session_hash: '',
+    validation_budget: 0,
+    validation_created_at: 0,
   };
   stats.restricted_responses += 1;
   stats.last_error = String(message || 'binance_rest_restricted');
@@ -457,24 +542,33 @@ export function markBinanceRestSuccess({ source = '', usedWeight1m = null, autho
   const weight = Number(usedWeight1m);
   if (Number.isFinite(weight)) stats.last_used_weight_1m = weight;
   stats.last_error = '';
-  if (authorizeProbe) {
-    state = {
-      ...state,
-      until: 0,
-      status: 200,
-      reason: 'post_ban_probe_passed',
-      source: String(source || 'binance_rest_probe'),
-      error: '',
-      parsed_ban_until: null,
-      retry_after_seconds: null,
-      updated_at: Date.now(),
-      probe_required: false,
-      probe_passed_at: Date.now(),
-      probe_source: String(source || 'binance_rest_probe'),
-      operating_mode: 'validation_only',
-    };
-    queuePersistence();
-  }
+  if (!authorizeProbe) return null;
+
+  const validationToken = randomBytes(32).toString('hex');
+  const now = Date.now();
+  state = {
+    ...state,
+    until: 0,
+    status: 200,
+    reason: 'post_ban_probe_passed',
+    source: String(source || 'binance_rest_probe'),
+    error: '',
+    parsed_ban_until: null,
+    retry_after_seconds: null,
+    updated_at: now,
+    probe_required: false,
+    probe_passed_at: now,
+    probe_source: String(source || 'binance_rest_probe'),
+    operating_mode: 'validation_only',
+    validation_session_hash: hashValidationToken(validationToken),
+    validation_budget: VALIDATION_REST_BUDGET,
+    validation_created_at: now,
+  };
+  queuePersistence();
+  return {
+    validation_token: validationToken,
+    validation_budget: VALIDATION_REST_BUDGET,
+  };
 }
 
 async function runBinanceRestProbeOnce() {
@@ -523,7 +617,7 @@ async function runBinanceRestProbeOnce() {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.1',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.2',
       },
     });
     const bodyText = await response.text();
@@ -546,7 +640,7 @@ async function runBinanceRestProbeOnce() {
       throw error;
     }
 
-    markBinanceRestSuccess({
+    const authorization = markBinanceRestSuccess({
       source: 'post_ban_probe',
       usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
       authorizeProbe: true,
@@ -558,6 +652,8 @@ async function runBinanceRestProbeOnce() {
       skipped: false,
       status: response.status,
       used_weight_1m: response.headers.get('x-mbx-used-weight-1m'),
+      validation_token: authorization?.validation_token || null,
+      validation_budget: authorization?.validation_budget || 0,
       guard: getBinanceRestGuardHealth(),
     };
   } catch (error) {
@@ -581,6 +677,41 @@ export function runBinanceRestProbe() {
   return probePromise;
 }
 
+export async function runWithBinanceValidationSession(token, fn, { maxRestCalls = 1 } = {}) {
+  await ensureBinanceRestGuardInitialized();
+  if (activeState()) {
+    throw guardError('binance_rest_blocked', 'BINANCE_REST_BLOCKED', {
+      binanceRestBlocked: true,
+      guardState: state,
+    });
+  }
+  if (state?.probe_required === true || state?.operating_mode !== 'validation_only') {
+    throw guardError('binance_rest_probe_required', 'BINANCE_REST_PROBE_REQUIRED', {
+      binanceRestProbeRequired: true,
+      guardState: state,
+    });
+  }
+  if (!safeTokenMatches(token, state?.validation_session_hash)) {
+    stats.validation_session_blocks += 1;
+    throw guardError('binance_rest_validation_token_invalid', 'BINANCE_REST_VALIDATION_TOKEN_INVALID', {
+      binanceRestValidationTokenInvalid: true,
+      guardState: state,
+    });
+  }
+  if (Number(state?.validation_budget || 0) <= 0) {
+    stats.validation_budget_exhausted += 1;
+    throw guardError('binance_rest_validation_budget_exhausted', 'BINANCE_REST_VALIDATION_BUDGET_EXHAUSTED', {
+      binanceRestValidationBudgetExhausted: true,
+      guardState: state,
+    });
+  }
+  const safeMaxCalls = Math.max(1, Math.min(1, Number.parseInt(String(maxRestCalls), 10) || 1));
+  return validationContext.run({
+    token: String(token || ''),
+    remainingCalls: safeMaxCalls,
+  }, fn);
+}
+
 export function getBinanceRestGuardHealth() {
   const active = activeState();
   return {
@@ -599,6 +730,10 @@ export function getBinanceRestGuardHealth() {
     probe_source: state?.probe_source || null,
     operating_mode: state?.operating_mode || null,
     validation_only: state?.operating_mode === 'validation_only',
+    validation_session_required: state?.operating_mode === 'validation_only',
+    validation_budget_remaining: Math.max(0, Number(state?.validation_budget || 0)),
+    validation_session_hash_prefix: state?.validation_session_hash ? String(state.validation_session_hash).slice(0, 12) : null,
+    validation_created_at: state?.validation_created_at ? iso(state.validation_created_at) : null,
     validation_allowed_source_prefixes: [...VALIDATION_ALLOWED_SOURCE_PREFIXES],
     persistence_enabled: supabaseEnabled(),
     initialized,

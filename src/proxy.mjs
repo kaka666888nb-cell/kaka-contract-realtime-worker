@@ -5,13 +5,19 @@ import { handleContractDepth } from './contract-depth.mjs';
 import { handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding } from './contract-funding.mjs';
 import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
+import { handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.1';
+const STEP_VERSION = '650.8.2';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
-  env: { ...process.env, PORT: String(CHILD_PORT) },
+  env: {
+    ...process.env,
+    PORT: String(CHILD_PORT),
+    KAKA_DISABLE_MARKET_API: '1',
+    KAKA_DISABLE_BINANCE_MARKET_START: '1',
+  },
   stdio: 'inherit',
 });
 
@@ -30,7 +36,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.1：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.2：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -282,12 +288,18 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_http_min_request_gap_ms: 10000,
         binance_contract_kline_parse_official_ban_until: true,
         binance_contract_rest_guard_persistent_snapshot: true,
+        binance_rest_guard_process_scope: 'single_parent_process',
+        legacy_child_market_api_enabled: false,
         binance_rest_guard_all_callers: ['contract_kline','contract_funding','contract_meta','position_metrics','legacy_contract_agg_trades','spot_universe','spot_ticker','spot_kline','spot_agg_trades'],
         binance_contract_rest_migration_quarantine_until: '2026-07-17T20:39:46.570Z',
         binance_contract_rest_multi_host_retry_disabled: true,
         binance_contract_rest_post_ban_probe_required: true,
         binance_contract_rest_normal_callers_blocked_until_probe: true,
-        binance_rest_validation_mode_after_probe: 'kline_bridge_only_until_staged_validation_passes',
+        binance_rest_validation_mode_after_probe: 'token_locked_kline_bridge_only_until_staged_validation_passes',
+        binance_rest_validation_token_required: true,
+        binance_rest_validation_session_budget: 4,
+        binance_rest_validation_max_calls_per_api_request: 1,
+        binance_internal_guard_error_never_treated_as_upstream_418: true,
         binance_spot_rest_uses_same_shared_guard: true,
         binance_contract_rest_max_pending_requests: 6,
         binance_contract_rest_max_queue_wait_ms: 25000,
@@ -339,6 +351,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // Step650.8.2: all HTTP market endpoints run in the parent process so Binance
+    // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
+    // in-memory guard and one bounded queue. The child process is WS-only.
+    if (await handleMarketApi(req, res, url)) return;
     if (await handleContractDepth(req, res, url)) return;
     if (await handleContractFunding(req, res, url)) return;
     if (await handleContractLiquidation(req, res, url)) return;

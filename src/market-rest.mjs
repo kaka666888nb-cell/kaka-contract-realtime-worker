@@ -14,9 +14,12 @@ import {
   markBinanceRestRestricted,
   markBinanceRestSuccess,
   runBinanceRestProbe,
+  runWithBinanceValidationSession,
 } from './binance-rest-guard.mjs';
 
-startBinanceContractMarket();
+if (process.env.KAKA_DISABLE_BINANCE_MARKET_START !== '1') {
+  startBinanceContractMarket();
+}
 
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const CONTRACT_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -244,7 +247,7 @@ async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_mark
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Market-Worker/650.8.1',
+        'user-agent': 'KakaWeb3-Market-Worker/650.8.2',
       },
     });
     const bodyText = await response.text();
@@ -943,7 +946,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.1：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.2：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit });
     if (seedRows.length) return seedRows;
@@ -987,7 +990,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await runBinanceRestProbe();
       send(res, 200, {
         ok: true,
-        version: '650.8.1',
+        version: '650.8.2',
         probe: result,
         cached_at: new Date().toISOString(),
       });
@@ -1050,7 +1053,14 @@ export async function handleMarketApi(req, res, url) {
         send(res, 400, { ok: false, error: 'symbol required' });
         return true;
       }
-      const rows = await fetchMarketKlines(provider, market, symbol, interval, end, limit);
+      const validationToken = String(req.headers['x-kaka-validation-token'] || '').trim();
+      const rows = provider === 'binance' && market === 'contract' && validationToken
+        ? await runWithBinanceValidationSession(
+            validationToken,
+            () => fetchMarketKlines(provider, market, symbol, interval, end, limit),
+            { maxRestCalls: 1 },
+          )
+        : await fetchMarketKlines(provider, market, symbol, interval, end, limit);
       send(res, 200, {
         ok: true,
         provider,
