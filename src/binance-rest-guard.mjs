@@ -12,7 +12,7 @@ const PROCESS_REST_DISABLED = process.env.KAKA_DISABLE_BINANCE_REST === '1';
 const VALIDATION_ADMIN_KEY = String(process.env.KAKA_BINANCE_VALIDATION_KEY || '').trim();
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.5 keeps the observed-ban migration record and requires
+// Step650.8.6 keeps the observed-ban migration record and requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -46,7 +46,7 @@ const VALIDATION_INTERVAL = '15m';
 const VALIDATION_REST_BUDGET = VALIDATION_SEQUENCE.length;
 const VALIDATION_SESSION_TTL_MS = 2 * 60 * 60_000;
 const VALIDATION_RECOVERY_COOLDOWN_MS = 10 * 60_000;
-const GUARD_SCHEMA_VERSION = '650.8.5';
+const GUARD_SCHEMA_VERSION = '650.8.6';
 const VALIDATION_ADMIN_KEY_FINGERPRINT = VALIDATION_ADMIN_KEY
   ? createHash('sha256').update(`kaka-binance-admin-v1:${VALIDATION_ADMIN_KEY}`, 'utf8').digest('hex')
   : '';
@@ -61,12 +61,13 @@ let activeRequest = false;
 let persistPromise = Promise.resolve();
 let probePromise = null;
 let lastPersistenceError = null;
+let lastRestoreError = null;
 
 let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.5_migration_guard',
+  source: 'step650.8.6_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -87,6 +88,9 @@ let state = {
 
 const stats = {
   initialized_at: 0,
+  restore_attempts: 0,
+  restore_success: 0,
+  restore_errors: 0,
   restored_from_snapshot: 0,
   snapshot_persist_success: 0,
   snapshot_persist_errors: 0,
@@ -580,10 +584,26 @@ export async function ensureBinanceRestGuardInitialized() {
   }
   if (initPromise) return initPromise;
   initPromise = (async () => {
+    stats.restore_attempts += 1;
     try {
       await restoreSnapshot();
+      lastRestoreError = null;
+      stats.restore_success += 1;
     } catch (error) {
+      lastRestoreError = error;
+      stats.restore_errors += 1;
       stats.last_error = String(error?.message || error);
+      // Fail closed: never persist the local fallback over a possibly newer
+      // remote ban/validation state, and never allow Binance REST until the
+      // durable guard snapshot has been read successfully.
+      throw guardError(
+        'binance_rest_guard_restore_failed',
+        'BINANCE_REST_GUARD_RESTORE_FAILED',
+        {
+          binanceRestGuardRestoreFailed: true,
+          cause: String(error?.message || error),
+        },
+      );
     }
     initialized = true;
     stats.initialized_at = Date.now();
@@ -1048,7 +1068,7 @@ async function runBinanceRestProbeOnce(adminKey) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.5',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.6',
       },
     });
     const bodyText = await response.text();
@@ -1445,6 +1465,8 @@ export function getBinanceRestGuardHealth() {
     validation_allowed_source_prefixes: [...VALIDATION_ALLOWED_SOURCE_PREFIXES],
     persistence_enabled: supabaseEnabled(),
     persistence_last_error: lastPersistenceError ? String(lastPersistenceError?.message || lastPersistenceError) : null,
+    restore_healthy: initialized && !lastRestoreError,
+    restore_last_error: lastRestoreError ? String(lastRestoreError?.message || lastRestoreError) : null,
     initialized,
     min_request_gap_ms: MIN_REQUEST_GAP_MS,
     max_pending_requests: MAX_PENDING_REQUESTS,

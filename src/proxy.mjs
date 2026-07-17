@@ -10,7 +10,7 @@ import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.5';
+const STEP_VERSION = '650.8.6';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: {
@@ -38,7 +38,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.5：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.6：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -355,6 +355,10 @@ const server = http.createServer(async (req, res) => {
         binance_contract_rest_queue_is_bounded: true,
         binance_contract_rest_persistence_flush_on_restriction: true,
         binance_rest_persistence_failure_blocks_network: true,
+        binance_rest_guard_restore_failure_blocks_network: true,
+        binance_rest_guard_restore_healthy: getBinanceRestGuardHealth().restore_healthy,
+        binance_rest_guard_restore_errors: getBinanceRestGuardHealth().restore_errors,
+        binance_validation_reset_method: 'POST',
         binance_contract_kline_partial_snapshot_never_persists: true,
         binance_contract_kline_current_day_bridge: true,
         binance_contract_kline_internal_gap_aware_repair: true,
@@ -436,7 +440,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // Step650.8.5: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.6: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. The child process is WS-only.
     if (await handleMarketApi(req, res, url)) return;

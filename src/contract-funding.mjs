@@ -4,7 +4,7 @@ import {
 } from './binance-rest-guard.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.5';
+const VERSION = '650.8.6';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -128,7 +128,7 @@ async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_fundin
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.5 contract-funding',
+        'user-agent': 'KakaWeb3/650.8.6 contract-funding',
       },
     });
     const text = await response.text();
