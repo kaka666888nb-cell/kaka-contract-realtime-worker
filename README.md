@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.8.6**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.8.7**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -216,9 +216,9 @@ Step650.8.3 also removes the former parent/child split-brain risk. Market HTTP e
 - Persistence queue failures are surfaced by `flushBinanceRestGuardPersistence()` instead of being silently treated as success.
 
 
-## Step650.8.6 completed Binance guard, shared streams, and staged release
+## Step650.8.7 completed Binance guard, shared streams, and staged release
 
-Step650.8.6 is the first candidate that closes the full Binance safety loop rather than only delaying the next request.
+Step650.8.7 is the first candidate that closes the full Binance safety loop rather than only delaying the next request.
 
 - The persisted guard has three explicit modes: `probe_required`, `validation_only`, and `normal_guarded`. Four successful 15-minute exact-symbol validations move the worker into bounded normal operation; any restriction, unsafe weight, missing weight header, persistence failure, restart with an uncertain in-flight call, or administrator-key rotation fails closed and returns to `probe_required`.
 - Binance `403` WAF responses are handled together with `418`, `429`, and `451`, using the official ban deadline or `Retry-After` plus a safety margin.
@@ -233,10 +233,10 @@ Step650.8.6 is the first candidate that closes the full Binance safety loop rath
 - One-second candles are emitted only for seconds that contain official trades. Empty seconds are not fabricated as zero-volume OHLC candles.
 - The WebSocket-only child process cannot issue Binance REST, and the parent health endpoint reports the same guard that actually sends Binance REST.
 
-Step650.8.6 reuses the existing `app_market_backend_snapshots` table and the existing Render environment variables. It requires no SQL migration, Supabase Edge deployment, Cron change, App file, Flutter dependency, or `flutter clean`.
+Step650.8.7 reuses the existing `app_market_backend_snapshots` table and the existing Render environment variables. It requires no SQL migration, Supabase Edge deployment, Cron change, App file, Flutter dependency, or `flutter clean`.
 
 
-## Step650.8.6 validation recovery and Kline WS pacing
+## Step650.8.7 validation recovery and Kline WS pacing
 
 - Validation sessions expire after two hours and require a fresh probe.
 - An authenticated local reset endpoint clears stranded validation state without calling Binance.
@@ -244,9 +244,14 @@ Step650.8.6 reuses the existing `app_market_backend_snapshots` table and the exi
 - On-demand Binance Kline WebSocket connection attempts are globally paced and capped at 60 per five minutes.
 
 
-## Step650.8.6 restore fail-closed and reset-route correction
+## Step650.8.7 restore fail-closed and reset-route correction
 
 - Binance REST guard startup now fails closed when the Supabase guard snapshot cannot be restored; it does not overwrite a possibly newer remote ban/session state with a local fallback.
 - Guard health exposes restore attempts/success/errors and the last restore error.
 - The authenticated validation reset endpoint now correctly accepts POST, matching the recovery scripts; GET is rejected.
 - Phase-1 recovery attempts a remote reset whenever the probe may have reached Render, including a lost client response after a successful server-side probe.
+
+
+## Step650.8.7 final Binance queue and aggregate WebSocket audit
+
+This release fixes FIFO release on post-queue persistence failures, removes production fallback to Binance Futures testnet/undocumented WebSocket paths, and caps the designed aggregate Binance WebSocket connection-attempt budget at 185 per five minutes across all modules. Validation scripts preserve existing sessions and perform authenticated no-Binance recovery on failure.
