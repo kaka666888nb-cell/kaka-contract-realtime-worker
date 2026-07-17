@@ -651,7 +651,7 @@ async function fetchBinanceJson(url, { headers = {}, timeoutMs = 8000, source = 
   });
   try {
     const response = await fetch(url, {
-      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.2 contract-flow', ...headers },
+      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.3 contract-flow', ...headers },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await response.text();

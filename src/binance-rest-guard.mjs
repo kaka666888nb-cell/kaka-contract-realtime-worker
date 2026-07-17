@@ -8,9 +8,11 @@ const SNAPSHOT_TYPE = 'klines';
 const SNAPSHOT_KEY = 'REST_GUARD:BINANCE_CONTRACT';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+const PROCESS_REST_DISABLED = process.env.KAKA_DISABLE_BINANCE_REST === '1';
+const VALIDATION_ADMIN_KEY = String(process.env.KAKA_BINANCE_VALIDATION_KEY || '').trim();
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.2 keeps the existing 15-minute migration quarantine and then requires
+// Step650.8.3 keeps the existing 15-minute migration quarantine and then requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -26,9 +28,17 @@ const MAX_PENDING_REQUESTS = 6;
 const DEFAULT_MAX_QUEUE_WAIT_MS = 25_000;
 const PROBE_TIMEOUT_MS = 6_000;
 const PROBE_URL = 'https://fapi.binance.com/fapi/v1/ping';
+// Fail closed if the first post-ban response does not expose a low shared-IP
+// request weight. This is deliberately far below Binance's normal capacity; the
+// purpose of the probe is safety verification, not throughput.
+const PROBE_MAX_USED_WEIGHT_1M = 100;
+const PROBE_UNSAFE_COOLDOWN_MS = 10 * 60_000;
 const MIGRATION_STATE_UPDATED_AT_MS = OBSERVED_BAN_UNTIL_MS;
 const VALIDATION_ALLOWED_SOURCE_PREFIXES = ['kline_bridge:'];
-const VALIDATION_REST_BUDGET = 4;
+const VALIDATION_SEQUENCE = ['1000SHIBUSDT', 'ARCUSDT', 'BANANAS31USDT', 'BCHUSDT'];
+const VALIDATION_INTERVAL = '15m';
+const VALIDATION_REST_BUDGET = VALIDATION_SEQUENCE.length;
+const GUARD_SCHEMA_VERSION = '650.8.3';
 const validationContext = new AsyncLocalStorage();
 
 let initialized = false;
@@ -39,12 +49,13 @@ let pendingRequests = 0;
 let activeRequest = false;
 let persistPromise = Promise.resolve();
 let probePromise = null;
+let lastPersistenceError = null;
 
 let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.2_migration_guard',
+  source: 'step650.8.3_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -56,6 +67,8 @@ let state = {
   validation_session_hash: '',
   validation_budget: 0,
   validation_created_at: 0,
+  validation_next_index: 0,
+  schema_version: GUARD_SCHEMA_VERSION,
 };
 
 const stats = {
@@ -81,6 +94,12 @@ const stats = {
   validation_session_blocks: 0,
   validation_budget_exhausted: 0,
   validation_calls_authorized: 0,
+  validation_sequence_blocks: 0,
+  validation_admin_auth_failures: 0,
+  probe_weight_missing: 0,
+  probe_weight_unsafe: 0,
+  probe_state_persist_failures: 0,
+  validation_state_persist_failures: 0,
   last_success_at: 0,
   last_success_source: '',
   last_used_weight_1m: null,
@@ -96,7 +115,7 @@ function sleep(ms) {
 }
 
 function supabaseEnabled() {
-  return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+  return !PROCESS_REST_DISABLED && Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 }
 
 function headers(prefer = '') {
@@ -147,6 +166,31 @@ function safeTokenMatches(token, expectedHash) {
   return timingSafeEqual(actual, expected);
 }
 
+function safeAdminKeyMatches(value) {
+  if (!VALIDATION_ADMIN_KEY || !value) return false;
+  const actual = Buffer.from(hashValidationToken(value), 'hex');
+  const expected = Buffer.from(hashValidationToken(VALIDATION_ADMIN_KEY), 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export function isBinanceValidationAdminConfigured() {
+  return VALIDATION_ADMIN_KEY.length >= 32;
+}
+
+export function isBinanceValidationAdminAuthorized(value) {
+  const ok = isBinanceValidationAdminConfigured() && safeAdminKeyMatches(String(value || '').trim());
+  if (!ok) stats.validation_admin_auth_failures += 1;
+  return ok;
+}
+
+function expectedValidationSymbol(index = Number(state?.validation_next_index || 0)) {
+  return VALIDATION_SEQUENCE[index] || null;
+}
+
+function validationSourceFor(symbol, interval) {
+  return `kline_bridge:fapi_klines:${String(symbol || '').toUpperCase()}:${String(interval || '')}`;
+}
+
 function validationSourceAllowed(source = '') {
   const normalized = String(source || '');
   return VALIDATION_ALLOWED_SOURCE_PREFIXES.some((prefix) => normalized.startsWith(prefix));
@@ -162,7 +206,9 @@ function validationRequestAuthorized(source = '') {
   if (Number(state?.validation_budget || 0) <= 0) return false;
   const context = currentValidationContext();
   if (!context || Number(context.remainingCalls || 0) <= 0) return false;
-  return safeTokenMatches(context.token, state?.validation_session_hash);
+  if (!safeTokenMatches(context.token, state?.validation_session_hash)) return false;
+  if (String(source) !== String(context.expectedSource || '')) return false;
+  return String(context.symbol || '') === String(expectedValidationSymbol() || '');
 }
 
 function activeState() {
@@ -184,7 +230,8 @@ function normalizedRestoredState(restored, record = null) {
   const restoredUntil = toFiniteMs(restored?.until) || 0;
   const probePassedAt = toFiniteMs(restored?.probe_passed_at) || 0;
   const validationSessionHash = String(restored?.validation_session_hash || '').toLowerCase();
-  const hasValidationSession = /^[a-f0-9]{64}$/.test(validationSessionHash);
+  const schemaMatches = String(restored?.schema_version || '') === GUARD_SCHEMA_VERSION;
+  const hasValidationSession = schemaMatches && /^[a-f0-9]{64}$/.test(validationSessionHash);
   const probeRequired = restored?.probe_required !== false || !hasValidationSession;
   const restoredBudget = Math.max(0, Math.min(
     VALIDATION_REST_BUDGET,
@@ -206,6 +253,11 @@ function normalizedRestoredState(restored, record = null) {
     validation_session_hash: probeRequired ? '' : validationSessionHash,
     validation_budget: probeRequired ? 0 : restoredBudget,
     validation_created_at: probeRequired ? 0 : (toFiniteMs(restored?.validation_created_at) || probePassedAt),
+    validation_next_index: probeRequired ? 0 : Math.max(0, Math.min(
+      VALIDATION_SEQUENCE.length,
+      Number.parseInt(String(restored?.validation_next_index ?? 0), 10) || 0,
+    )),
+    schema_version: GUARD_SCHEMA_VERSION,
   };
 }
 
@@ -261,6 +313,7 @@ async function persistSnapshot() {
     },
   );
   if (!response.ok) throw new Error(`binance_rest_guard_persist_${response.status}`);
+  lastPersistenceError = null;
   stats.snapshot_persist_success += 1;
 }
 
@@ -269,18 +322,35 @@ function queuePersistence() {
     .catch(() => {})
     .then(() => persistSnapshot())
     .catch((error) => {
+      lastPersistenceError = error;
       stats.snapshot_persist_errors += 1;
       stats.last_error = String(error?.message || error);
     });
   return persistPromise;
 }
 
+async function persistSnapshotStrict() {
+  const operation = persistPromise
+    .catch(() => {})
+    .then(() => persistSnapshot());
+  persistPromise = operation.catch((error) => {
+    lastPersistenceError = error;
+  });
+  return operation;
+}
+
 export async function flushBinanceRestGuardPersistence() {
   await persistPromise.catch(() => {});
+  if (lastPersistenceError) throw lastPersistenceError;
 }
 
 export async function ensureBinanceRestGuardInitialized() {
   if (initialized) return;
+  if (PROCESS_REST_DISABLED) {
+    initialized = true;
+    stats.initialized_at = Date.now();
+    return;
+  }
   if (initPromise) return initPromise;
   initPromise = (async () => {
     try {
@@ -321,6 +391,14 @@ export async function acquireBinanceRestRequestSlot({
   maxQueueWaitMs = DEFAULT_MAX_QUEUE_WAIT_MS,
 } = {}) {
   await ensureBinanceRestGuardInitialized();
+
+  if (PROCESS_REST_DISABLED) {
+    stats.blocked_requests += 1;
+    throw guardError('binance_rest_disabled_in_child_process', 'BINANCE_REST_PROCESS_DISABLED', {
+      binanceRestProcessDisabled: true,
+      source,
+    });
+  }
 
   const blockedBeforeQueue = activeState();
   if (blockedBeforeQueue) {
@@ -481,10 +559,40 @@ export async function acquireBinanceRestRequestSlot({
     state = {
       ...state,
       validation_budget: Math.max(0, Number(state.validation_budget || 0) - 1),
+      validation_next_index: Math.min(
+        VALIDATION_SEQUENCE.length,
+        Number(state.validation_next_index || 0) + 1,
+      ),
       updated_at: Date.now(),
+      schema_version: GUARD_SCHEMA_VERSION,
     };
     stats.validation_calls_authorized += 1;
-    queuePersistence();
+
+    // Persist the consumed validation budget and next symbol before the real
+    // Binance request leaves the process. If Render crashes after the upstream
+    // call starts, a restart must not replay the same validation request.
+    if (!supabaseEnabled()) {
+      stats.validation_state_persist_failures += 1;
+      releaseCurrent();
+      throw guardError(
+        'binance_validation_persistence_required',
+        'BINANCE_VALIDATION_PERSISTENCE_REQUIRED',
+        { binanceValidationPersistenceRequired: true, source },
+      );
+    }
+    try {
+      await persistSnapshotStrict();
+    } catch (error) {
+      stats.snapshot_persist_errors += 1;
+      stats.validation_state_persist_failures += 1;
+      stats.last_error = String(error?.message || error);
+      releaseCurrent();
+      throw guardError(
+        'binance_validation_state_persist_failed',
+        'BINANCE_VALIDATION_STATE_PERSIST_FAILED',
+        { binanceValidationStatePersistFailed: true, source },
+      );
+    }
   }
 
   lastRequestStartedAt = Date.now();
@@ -528,6 +636,8 @@ export function markBinanceRestRestricted({ status = 0, message = '', source = '
     validation_session_hash: '',
     validation_budget: 0,
     validation_created_at: 0,
+    validation_next_index: 0,
+    schema_version: GUARD_SCHEMA_VERSION,
   };
   stats.restricted_responses += 1;
   stats.last_error = String(message || 'binance_rest_restricted');
@@ -563,16 +673,82 @@ export function markBinanceRestSuccess({ source = '', usedWeight1m = null, autho
     validation_session_hash: hashValidationToken(validationToken),
     validation_budget: VALIDATION_REST_BUDGET,
     validation_created_at: now,
+    validation_next_index: 0,
+    schema_version: GUARD_SCHEMA_VERSION,
   };
-  queuePersistence();
   return {
     validation_token: validationToken,
     validation_budget: VALIDATION_REST_BUDGET,
   };
 }
 
-async function runBinanceRestProbeOnce() {
+async function persistProbeStateOrFail({ reason = 'probe_state_persist_failed' } = {}) {
+  if (!supabaseEnabled()) {
+    stats.probe_state_persist_failures += 1;
+    throw guardError(
+      'binance_probe_persistence_required',
+      'BINANCE_PROBE_PERSISTENCE_REQUIRED',
+      { binanceProbePersistenceRequired: true },
+    );
+  }
+  try {
+    await persistSnapshotStrict();
+  } catch (error) {
+    stats.snapshot_persist_errors += 1;
+    stats.probe_state_persist_failures += 1;
+    stats.last_error = String(error?.message || error);
+    throw guardError(reason, 'BINANCE_PROBE_STATE_PERSIST_FAILED', {
+      binanceProbeStatePersistFailed: true,
+    });
+  }
+}
+
+function putProbeBackBehindLocalCooldown(reason, message = '') {
+  const now = Date.now();
+  state = {
+    ...state,
+    until: now + PROBE_UNSAFE_COOLDOWN_MS,
+    status: 200,
+    reason,
+    source: 'post_ban_probe',
+    error: String(message || reason),
+    parsed_ban_until: null,
+    retry_after_seconds: null,
+    updated_at: now,
+    probe_required: true,
+    probe_passed_at: 0,
+    probe_source: '',
+    operating_mode: 'probe_required',
+    validation_session_hash: '',
+    validation_budget: 0,
+    validation_created_at: 0,
+    validation_next_index: 0,
+    schema_version: GUARD_SCHEMA_VERSION,
+  };
+}
+
+async function runBinanceRestProbeOnce(adminKey) {
   await ensureBinanceRestGuardInitialized();
+  if (PROCESS_REST_DISABLED) {
+    throw guardError('binance_rest_probe_disabled_in_child_process', 'BINANCE_REST_PROCESS_DISABLED', {
+      binanceRestProcessDisabled: true,
+    });
+  }
+  if (!isBinanceValidationAdminConfigured()) {
+    throw guardError('binance_validation_admin_key_not_configured', 'BINANCE_VALIDATION_ADMIN_KEY_NOT_CONFIGURED', {
+      binanceValidationAdminKeyNotConfigured: true,
+    });
+  }
+  if (!isBinanceValidationAdminAuthorized(adminKey)) {
+    throw guardError('binance_validation_admin_key_invalid', 'BINANCE_VALIDATION_ADMIN_KEY_INVALID', {
+      binanceValidationAdminKeyInvalid: true,
+    });
+  }
+  if (!supabaseEnabled()) {
+    throw guardError('binance_probe_persistence_required', 'BINANCE_PROBE_PERSISTENCE_REQUIRED', {
+      binanceProbePersistenceRequired: true,
+    });
+  }
   const blocked = activeState();
   if (blocked) {
     throw guardError(`binance_rest_blocked_until:${blocked.until}`, 'BINANCE_REST_BLOCKED', {
@@ -617,7 +793,7 @@ async function runBinanceRestProbeOnce() {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.2',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.3',
       },
     });
     const bodyText = await response.text();
@@ -640,18 +816,47 @@ async function runBinanceRestProbeOnce() {
       throw error;
     }
 
+    const rawUsedWeight = response.headers.get('x-mbx-used-weight-1m');
+    const usedWeight = rawUsedWeight == null || String(rawUsedWeight).trim() === ''
+      ? Number.NaN
+      : Number(rawUsedWeight);
+    if (!Number.isFinite(usedWeight)) {
+      stats.probe_weight_missing += 1;
+      putProbeBackBehindLocalCooldown('post_ban_probe_weight_header_missing');
+      await persistProbeStateOrFail({ reason: 'binance_probe_weight_state_persist_failed' });
+      throw guardError('binance_probe_weight_header_missing', 'BINANCE_PROBE_WEIGHT_HEADER_MISSING', {
+        binanceProbeWeightHeaderMissing: true,
+      });
+    }
+    if (usedWeight > PROBE_MAX_USED_WEIGHT_1M) {
+      stats.probe_weight_unsafe += 1;
+      putProbeBackBehindLocalCooldown('post_ban_probe_weight_unsafe', `used_weight_1m:${usedWeight}`);
+      await persistProbeStateOrFail({ reason: 'binance_probe_weight_state_persist_failed' });
+      throw guardError('binance_probe_weight_unsafe', 'BINANCE_PROBE_WEIGHT_UNSAFE', {
+        binanceProbeWeightUnsafe: true,
+        usedWeight1m: usedWeight,
+        maxUsedWeight1m: PROBE_MAX_USED_WEIGHT_1M,
+      });
+    }
+
     const authorization = markBinanceRestSuccess({
       source: 'post_ban_probe',
-      usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
+      usedWeight1m: usedWeight,
       authorizeProbe: true,
     });
+    try {
+      await persistProbeStateOrFail();
+    } catch (error) {
+      putProbeBackBehindLocalCooldown('post_ban_probe_state_not_durable', String(error?.message || error));
+      throw error;
+    }
     stats.probes_succeeded += 1;
-    await flushBinanceRestGuardPersistence();
     return {
       ok: true,
       skipped: false,
       status: response.status,
-      used_weight_1m: response.headers.get('x-mbx-used-weight-1m'),
+      used_weight_1m: usedWeight,
+      max_safe_used_weight_1m: PROBE_MAX_USED_WEIGHT_1M,
       validation_token: authorization?.validation_token || null,
       validation_budget: authorization?.validation_budget || 0,
       guard: getBinanceRestGuardHealth(),
@@ -669,16 +874,45 @@ async function runBinanceRestProbeOnce() {
 }
 
 
-export function runBinanceRestProbe() {
+export function runBinanceRestProbe(adminKey) {
+  if (!isBinanceValidationAdminConfigured()) {
+    return Promise.reject(guardError(
+      'binance_validation_admin_key_not_configured',
+      'BINANCE_VALIDATION_ADMIN_KEY_NOT_CONFIGURED',
+      { binanceValidationAdminKeyNotConfigured: true },
+    ));
+  }
+  if (!isBinanceValidationAdminAuthorized(adminKey)) {
+    return Promise.reject(guardError(
+      'binance_validation_admin_key_invalid',
+      'BINANCE_VALIDATION_ADMIN_KEY_INVALID',
+      { binanceValidationAdminKeyInvalid: true },
+    ));
+  }
   if (probePromise) return probePromise;
-  probePromise = runBinanceRestProbeOnce().finally(() => {
+  probePromise = runBinanceRestProbeOnce(adminKey).finally(() => {
     probePromise = null;
   });
   return probePromise;
 }
 
-export async function runWithBinanceValidationSession(token, fn, { maxRestCalls = 1 } = {}) {
+export async function runWithBinanceValidationSession(
+  token,
+  fn,
+  {
+    maxRestCalls = 1,
+    provider = '',
+    market = '',
+    symbol = '',
+    interval = '',
+  } = {},
+) {
   await ensureBinanceRestGuardInitialized();
+  if (PROCESS_REST_DISABLED) {
+    throw guardError('binance_rest_disabled_in_child_process', 'BINANCE_REST_PROCESS_DISABLED', {
+      binanceRestProcessDisabled: true,
+    });
+  }
   if (activeState()) {
     throw guardError('binance_rest_blocked', 'BINANCE_REST_BLOCKED', {
       binanceRestBlocked: true,
@@ -705,10 +939,37 @@ export async function runWithBinanceValidationSession(token, fn, { maxRestCalls 
       guardState: state,
     });
   }
+
+  const normalizedProvider = String(provider || '').toLowerCase();
+  const normalizedMarket = String(market || '').toLowerCase();
+  const normalizedSymbol = String(symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const normalizedInterval = String(interval || '');
+  const expectedSymbol = expectedValidationSymbol();
+  const sequenceMatches =
+    normalizedProvider === 'binance' &&
+    normalizedMarket === 'contract' &&
+    normalizedInterval === VALIDATION_INTERVAL &&
+    normalizedSymbol === expectedSymbol;
+
+  if (!sequenceMatches) {
+    stats.validation_sequence_blocks += 1;
+    throw guardError('binance_rest_validation_sequence_mismatch', 'BINANCE_REST_VALIDATION_SEQUENCE_MISMATCH', {
+      binanceRestValidationSequenceMismatch: true,
+      expectedSymbol,
+      expectedInterval: VALIDATION_INTERVAL,
+      requestedSymbol: normalizedSymbol,
+      requestedInterval: normalizedInterval,
+      guardState: state,
+    });
+  }
+
   const safeMaxCalls = Math.max(1, Math.min(1, Number.parseInt(String(maxRestCalls), 10) || 1));
   return validationContext.run({
     token: String(token || ''),
     remainingCalls: safeMaxCalls,
+    symbol: normalizedSymbol,
+    interval: normalizedInterval,
+    expectedSource: validationSourceFor(normalizedSymbol, normalizedInterval),
   }, fn);
 }
 
@@ -732,10 +993,20 @@ export function getBinanceRestGuardHealth() {
     validation_only: state?.operating_mode === 'validation_only',
     validation_session_required: state?.operating_mode === 'validation_only',
     validation_budget_remaining: Math.max(0, Number(state?.validation_budget || 0)),
+    validation_sequence: [...VALIDATION_SEQUENCE],
+    validation_interval: VALIDATION_INTERVAL,
+    validation_next_index: Math.max(0, Number(state?.validation_next_index || 0)),
+    validation_next_symbol: expectedValidationSymbol(),
+    validation_admin_key_configured: isBinanceValidationAdminConfigured(),
+    probe_max_used_weight_1m: PROBE_MAX_USED_WEIGHT_1M,
+    probe_unsafe_cooldown_ms: PROBE_UNSAFE_COOLDOWN_MS,
+    process_rest_disabled: PROCESS_REST_DISABLED,
+    guard_schema_version: GUARD_SCHEMA_VERSION,
     validation_session_hash_prefix: state?.validation_session_hash ? String(state.validation_session_hash).slice(0, 12) : null,
     validation_created_at: state?.validation_created_at ? iso(state.validation_created_at) : null,
     validation_allowed_source_prefixes: [...VALIDATION_ALLOWED_SOURCE_PREFIXES],
     persistence_enabled: supabaseEnabled(),
+    persistence_last_error: lastPersistenceError ? String(lastPersistenceError?.message || lastPersistenceError) : null,
     initialized,
     min_request_gap_ms: MIN_REQUEST_GAP_MS,
     max_pending_requests: MAX_PENDING_REQUESTS,
@@ -750,8 +1021,9 @@ export function getBinanceRestGuardHealth() {
   };
 }
 
-// Restore immediately, but never block module loading or server startup.
-ensureBinanceRestGuardInitialized().catch(() => {});
+// Restore immediately in the parent REST process, but never let the WS-only child
+// become a second persistence writer or a second Binance REST caller.
+if (!PROCESS_REST_DISABLED) ensureBinanceRestGuardInitialized().catch(() => {});
 
 export const _test = {
   parseBinanceBanUntil,

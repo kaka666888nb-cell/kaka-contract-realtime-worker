@@ -517,7 +517,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.2：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.3：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }

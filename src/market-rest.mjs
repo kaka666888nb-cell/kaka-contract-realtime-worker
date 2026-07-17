@@ -13,6 +13,8 @@ import {
   flushBinanceRestGuardPersistence,
   markBinanceRestRestricted,
   markBinanceRestSuccess,
+  isBinanceValidationAdminAuthorized,
+  isBinanceValidationAdminConfigured,
   runBinanceRestProbe,
   runWithBinanceValidationSession,
 } from './binance-rest-guard.mjs';
@@ -247,7 +249,7 @@ async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_mark
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Market-Worker/650.8.2',
+        'user-agent': 'KakaWeb3-Market-Worker/650.8.3',
       },
     });
     const bodyText = await response.text();
@@ -941,14 +943,14 @@ async function fetchSecondMarketKlines(provider, market, symbol, end, limit) {
   return aggregateTradesToSecondRows(trades, provider, market, symbol, end, limit);
 }
 
-export async function fetchMarketKlines(provider, market, symbol, interval, end, limit) {
+export async function fetchMarketKlines(provider, market, symbol, interval, end, limit, options = {}) {
   assertProviderMarket(provider, market);
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.2：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.3：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
-    const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit });
+    const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true });
     if (seedRows.length) return seedRows;
   }
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
@@ -968,7 +970,7 @@ export async function handleMarketApi(req, res, url) {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
       'access-control-allow-methods': 'GET, OPTIONS',
-      'access-control-allow-headers': 'content-type',
+      'access-control-allow-headers': 'content-type, x-kaka-admin-key, x-kaka-validation-token',
     });
     res.end();
     return true;
@@ -987,10 +989,19 @@ export async function handleMarketApi(req, res, url) {
       return true;
     }
     if (url.pathname === '/api/binance-contract-rest-probe') {
-      const result = await runBinanceRestProbe();
+      const adminKey = String(req.headers['x-kaka-admin-key'] || '').trim();
+      if (!isBinanceValidationAdminConfigured()) {
+        send(res, 503, { ok: false, error: 'validation admin key not configured' });
+        return true;
+      }
+      if (!isBinanceValidationAdminAuthorized(adminKey)) {
+        send(res, 403, { ok: false, error: 'validation admin key invalid' });
+        return true;
+      }
+      const result = await runBinanceRestProbe(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.2',
+        version: '650.8.3',
         probe: result,
         cached_at: new Date().toISOString(),
       });
@@ -1057,8 +1068,22 @@ export async function handleMarketApi(req, res, url) {
       const rows = provider === 'binance' && market === 'contract' && validationToken
         ? await runWithBinanceValidationSession(
             validationToken,
-            () => fetchMarketKlines(provider, market, symbol, interval, end, limit),
-            { maxRestCalls: 1 },
+            () => fetchMarketKlines(
+              provider,
+              market,
+              symbol,
+              interval,
+              end,
+              limit,
+              { forceRestValidation: true },
+            ),
+            {
+              maxRestCalls: 1,
+              provider,
+              market,
+              symbol,
+              interval,
+            },
           )
         : await fetchMarketKlines(provider, market, symbol, interval, end, limit);
       send(res, 200, {

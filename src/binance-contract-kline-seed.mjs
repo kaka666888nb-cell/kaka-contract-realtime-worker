@@ -33,10 +33,10 @@ const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/market/ws',
   'wss://stream.binancefuture.com/market/ws',
 ];
-// Step650.8.2：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// Step650.8.3：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
 // 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.8.2：只保留官方精确交易对 Kline 主端点。
+  // Step650.8.3：只保留官方精确交易对 Kline 主端点。
   // 不再用 continuous/www 连续撞多个候选；一次失败就返回归档/快照/WS，等待共享守卫放行。
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
 ];
@@ -410,7 +410,7 @@ function activeBridgeState(key) {
 }
 
 function bridgeCooldown(candidateId, symbol) {
-  // Step650.8.2：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
+  // Step650.8.3：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
   return isBinanceRestBlocked() ||
     activeBridgeState(bridgeStateKey(candidateId, '*')) ||
     activeBridgeState(bridgeStateKey(candidateId, symbol));
@@ -449,10 +449,14 @@ async function markBridgeFailure(candidate, symbol, status, message, retryAfterS
   return { restricted: false, transient: true, until };
 }
 
-async function waitForBridgeRequestSlot() {
+function bridgeGuardSource(symbol, interval) {
+  return `kline_bridge:fapi_klines:${String(symbol || '').toUpperCase()}:${String(interval || '')}`;
+}
+
+async function waitForBridgeRequestSlot(symbol, interval) {
   const before = getBinanceRestGuardHealth();
   const release = await acquireBinanceRestRequestSlot({
-    source: 'kline_bridge:fapi_klines',
+    source: bridgeGuardSource(symbol, interval),
     maxQueueWaitMs: 20_000,
   });
   const after = getBinanceRestGuardHealth();
@@ -463,8 +467,8 @@ async function waitForBridgeRequestSlot() {
   return release;
 }
 
-async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
-  const release = await waitForBridgeRequestSlot();
+async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS, symbol = '', interval = '') {
+  const release = await waitForBridgeRequestSlot(symbol, interval);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -472,7 +476,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.2',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.3',
       },
     });
     const bodyText = await response.text();
@@ -491,7 +495,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
       error.status = 400;
       throw error;
     }
-    markBinanceRestSuccess({ source: 'kline_bridge:fapi_klines', usedWeight1m: usedWeight });
+    markBinanceRestSuccess({ source: bridgeGuardSource(symbol, interval), usedWeight1m: usedWeight });
     return payload;
   } finally {
     clearTimeout(timer);
@@ -564,7 +568,7 @@ async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endT
   while (cursor < endTime && result.length < maxRows) {
     if (bridgeCooldown(candidate.id, symbol)) break;
     const pageLimit = Math.min(MAX_HTTP_PAGE_ROWS, maxRows - result.length);
-    const payload = await fetchJson(bridgeUrl(candidate, symbol, interval, cursor, endTime, pageLimit));
+    const payload = await fetchJson(bridgeUrl(candidate, symbol, interval, cursor, endTime, pageLimit), HTTP_BRIDGE_TIMEOUT_MS, symbol, interval);
     const page = parseApiRows(payload, symbol, interval, source)
       .filter((row) => row.open_time_ms >= cursor && row.open_time_ms < endTime);
     if (!page.length) break;
@@ -577,10 +581,10 @@ async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endT
   return mergeRows(result).slice(-maxRows);
 }
 
-async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxRows) {
+async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxRows, { bypassCache = false } = {}) {
   if (interval === '1s' || startTime >= endTime || maxRows <= 0) return [];
   const cacheKey = `${symbol}|${interval}|${Math.floor(startTime / intervalMs(interval))}|${Math.floor(endTime / intervalMs(interval))}`;
-  const cached = bridgeResultCache.get(cacheKey);
+  const cached = bypassCache ? null : bridgeResultCache.get(cacheKey);
   let combined = [];
   if (cached && Date.now() - cached.loadedAt <= HTTP_BRIDGE_CACHE_MS) {
     const cachedCoverage = inspectBridgeWindow(cached.rows, interval, startTime, endTime);
@@ -756,7 +760,7 @@ function connectLiveStream(state) {
 }
 
 function ensureLiveStream(symbol, interval) {
-  if (interval === '1s') return;
+  if (process.env.KAKA_DISABLE_BINANCE_LIVE_WS === '1' || interval === '1s') return;
   const key = liveKey(symbol, interval);
   let state = liveStreams.get(key);
   if (state) {
@@ -798,7 +802,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.2' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.3' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -964,7 +968,7 @@ async function persistRows(symbol, interval, rows, source = 'binance_official_pu
   if (!response.ok) throw new Error(`snapshot_persist_${response.status}`);
 }
 
-export async function getBinanceContractKlineSeed({ symbol, interval = '15m', end = Date.now(), limit = 500 } = {}) {
+export async function getBinanceContractKlineSeed({ symbol, interval = '15m', end = Date.now(), limit = 500, forceRestValidation = false } = {}) {
   stats.requests += 1;
   const normalizedSymbol = compact(symbol);
   const normalizedInterval = normalizeInterval(interval);
@@ -975,6 +979,39 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
   const step = intervalMs(normalizedInterval);
   const nearNow = isNearNow(safeEnd, normalizedInterval);
   const targetOpen = expectedCurrentOpen(safeEnd, normalizedInterval);
+
+  if (forceRestValidation === true) {
+    if (normalizedInterval !== '15m') return [];
+    const validationStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
+    const rows = await fetchCurrentBridgeRows(
+      normalizedSymbol,
+      normalizedInterval,
+      validationStart,
+      safeEnd,
+      safeLimit,
+      { bypassCache: true },
+    );
+    const coverage = inspectBridgeWindow(
+      rows,
+      normalizedInterval,
+      validationStart,
+      safeEnd,
+    );
+    if (coverage.complete) {
+      const merged = mergeRows(rows).filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
+      memory.set(key, { rows: merged, loadedAt: Date.now() });
+      ensureLiveStream(normalizedSymbol, normalizedInterval);
+      persistRows(
+        normalizedSymbol,
+        normalizedInterval,
+        merged,
+        'binance_official_public_exact_validation_kline',
+      ).catch((error) => { stats.last_error = String(error?.message || error); });
+      return merged;
+    }
+    return rows.filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
+  }
+
   const cached = memory.get(key);
   const cachedCoverage = cached
     ? inspectRecentContinuity(cached.rows, normalizedInterval, safeEnd, safeLimit)
@@ -997,7 +1034,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.8.2：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8.3：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
@@ -1064,7 +1101,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.8.2：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8.3：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;

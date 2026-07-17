@@ -769,11 +769,16 @@ wss.on('connection', async (client, _req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      fetchMarketKlines(provider, market, symbol, '1s', Date.now(), 500)
-        .then((historyRows) => secondAggregator?.seedRows(historyRows))
-        .catch(() => {
-          // 某平台最近成交历史暂不可用时继续实时流，不跨平台回落。
-        });
+      // Step650.8.3: the WS-only child must never become a second Binance REST
+      // caller. Binance 1s aggregation starts directly from the official aggTrade
+      // WebSocket; other providers may still seed from their own public REST.
+      if (provider !== 'binance') {
+        fetchMarketKlines(provider, market, symbol, '1s', Date.now(), 500)
+          .then((historyRows) => secondAggregator?.seedRows(historyRows))
+          .catch(() => {
+            // 某平台最近成交历史暂不可用时继续实时流，不跨平台回落。
+          });
+      }
     }
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({
