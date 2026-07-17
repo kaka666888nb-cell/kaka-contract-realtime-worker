@@ -641,7 +641,14 @@ const BINANCE_SHARED_CONNECT_GAP_MS = 1_500;
 const BINANCE_SHARED_MAX_CONNECT_ATTEMPTS_5M = 60;
 const BINANCE_SHARED_MAX_TOTAL_CLIENTS = 1000;
 const BINANCE_SHARED_MAX_CLIENTS_PER_STREAM = 250;
+const BINANCE_SHARED_MAX_CLIENT_BUFFERED_BYTES = 1_000_000;
+const BINANCE_SHARED_MAX_CLIENTS_PER_IP = 50;
+const BINANCE_SHARED_MAX_STREAMS_PER_IP = 16;
+const BINANCE_SHARED_MAX_CONNECT_ATTEMPTS_PER_IP_1M = 60;
 const binanceSharedStreams = new Map();
+const binanceClientsByIp = new Map();
+const binanceStreamsByIp = new Map();
+const binanceConnectAttemptsByIp = new Map();
 const binanceConnectAttempts = [];
 let binanceConnectChain = Promise.resolve();
 let binanceLastConnectAt = 0;
@@ -654,6 +661,9 @@ const binanceSharedStats = {
   connect_rate_rejections: 0,
   upstream_messages: 0,
   downstream_messages: 0,
+  slow_client_disconnects: 0,
+  downstream_ip_capacity_rejections: 0,
+  downstream_ip_rate_rejections: 0,
   last_error: '',
 };
 
@@ -663,6 +673,11 @@ function binanceSharedStreamKey(market, symbol, interval) {
 
 function sendWsSafe(client, payload) {
   if (client?.readyState !== WebSocket.OPEN) return false;
+  if (Number(client.bufferedAmount || 0) > BINANCE_SHARED_MAX_CLIENT_BUFFERED_BYTES) {
+    binanceSharedStats.slow_client_disconnects += 1;
+    try { client.close(1013, 'slow client'); } catch (_) {}
+    return false;
+  }
   try {
     client.send(payload);
     return true;
@@ -964,6 +979,12 @@ function binanceSharedWsHealth() {
     total_clients: totalBinanceSharedClients(),
     max_total_clients: BINANCE_SHARED_MAX_TOTAL_CLIENTS,
     max_clients_per_stream: BINANCE_SHARED_MAX_CLIENTS_PER_STREAM,
+    max_client_buffered_bytes: BINANCE_SHARED_MAX_CLIENT_BUFFERED_BYTES,
+    official_production_hosts: ['fstream.binance.com', 'stream.binance.com:9443'],
+    max_clients_per_ip: BINANCE_SHARED_MAX_CLIENTS_PER_IP,
+    max_streams_per_ip: BINANCE_SHARED_MAX_STREAMS_PER_IP,
+    max_connect_attempts_per_ip_1m: BINANCE_SHARED_MAX_CONNECT_ATTEMPTS_PER_IP_1M,
+    tracked_downstream_ips: binanceClientsByIp.size,
     connect_attempts_5m: binanceConnectAttempts.length,
     max_connect_attempts_5m: BINANCE_SHARED_MAX_CONNECT_ATTEMPTS_5M,
     connect_gap_ms: BINANCE_SHARED_CONNECT_GAP_MS,
@@ -985,14 +1006,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.7', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.8', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.7',
+      version: '650.8.8',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1028,7 +1049,62 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req, url));
 });
 
-wss.on('connection', async (client, _req, parsedUrl) => {
+function downstreamClientIp(req) {
+  // Render documents that the first X-Forwarded-For entry is the real client
+  // address. Use that platform-normalized value for downstream connection caps.
+  const forwarded = String(req?.headers?.['x-forwarded-for'] || '')
+    .split(',')
+    .map((part) => part.trim())
+    .find(Boolean) || '';
+  return forwarded || String(req?.socket?.remoteAddress || 'unknown');
+}
+
+function pruneDownstreamIpAttempts(ip) {
+  const cutoff = Date.now() - 60_000;
+  const attempts = binanceConnectAttemptsByIp.get(ip) || [];
+  while (attempts.length && attempts[0] < cutoff) attempts.shift();
+  if (attempts.length) binanceConnectAttemptsByIp.set(ip, attempts);
+  else binanceConnectAttemptsByIp.delete(ip);
+  return attempts;
+}
+
+function registerBinanceDownstreamClient(client, req, streamKey) {
+  const ip = downstreamClientIp(req);
+  const attempts = pruneDownstreamIpAttempts(ip);
+  if (attempts.length >= BINANCE_SHARED_MAX_CONNECT_ATTEMPTS_PER_IP_1M) {
+    binanceSharedStats.downstream_ip_rate_rejections += 1;
+    return { ok: false, reason: 'binance downstream IP rate limit' };
+  }
+  attempts.push(Date.now());
+  binanceConnectAttemptsByIp.set(ip, attempts);
+  const clients = Number(binanceClientsByIp.get(ip) || 0);
+  const streams = binanceStreamsByIp.get(ip) || new Map();
+  if (clients >= BINANCE_SHARED_MAX_CLIENTS_PER_IP || (!streams.has(streamKey) && streams.size >= BINANCE_SHARED_MAX_STREAMS_PER_IP)) {
+    binanceSharedStats.downstream_ip_capacity_rejections += 1;
+    return { ok: false, reason: 'binance downstream IP capacity' };
+  }
+  binanceClientsByIp.set(ip, clients + 1);
+  streams.set(streamKey, Number(streams.get(streamKey) || 0) + 1);
+  binanceStreamsByIp.set(ip, streams);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    const nextClients = Math.max(0, Number(binanceClientsByIp.get(ip) || 0) - 1);
+    if (nextClients) binanceClientsByIp.set(ip, nextClients); else binanceClientsByIp.delete(ip);
+    const currentStreams = binanceStreamsByIp.get(ip);
+    if (currentStreams) {
+      const count = Math.max(0, Number(currentStreams.get(streamKey) || 0) - 1);
+      if (count) currentStreams.set(streamKey, count); else currentStreams.delete(streamKey);
+      if (currentStreams.size) binanceStreamsByIp.set(ip, currentStreams); else binanceStreamsByIp.delete(ip);
+    }
+  };
+  client.once('close', release);
+  client.once('error', release);
+  return { ok: true, ip };
+}
+
+wss.on('connection', async (client, req, parsedUrl) => {
   const provider = providerKey(parsedUrl.searchParams.get('provider'));
   const symbol = symbolKey(parsedUrl.searchParams.get('symbol'));
   const interval = parsedUrl.searchParams.get('interval') || '15m';
@@ -1047,6 +1123,15 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   }
 
   if (provider === 'binance') {
+    const downstream = registerBinanceDownstreamClient(
+      client,
+      req,
+      binanceSharedStreamKey(market, symbol, interval),
+    );
+    if (!downstream.ok) {
+      client.close(1013, downstream.reason);
+      return;
+    }
     await attachBinanceSharedClient(client, market, symbol, interval, cfg);
     return;
   }
@@ -1117,7 +1202,7 @@ wss.on('connection', async (client, _req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      // Step650.8.7: the WS-only child must never become a second Binance REST
+      // Step650.8.8: the WS-only child must never become a second Binance REST
       // caller. Binance 1s aggregation starts directly from the official aggTrade
       // WebSocket; other providers may still seed from their own public REST.
       if (provider !== 'binance') {
@@ -1174,7 +1259,7 @@ wss.on('connection', async (client, _req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.7 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.8 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,

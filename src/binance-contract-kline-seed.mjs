@@ -27,6 +27,7 @@ const ARCHIVE_GLOBAL_QUEUE_WAIT_MS = 20_000;
 const ARCHIVE_FILE_CACHE_MS = 30 * 60_000;
 const ARCHIVE_FILE_CACHE_MAX = 64;
 const HTTP_BRIDGE_TIMEOUT_MS = 6_000;
+const SNAPSHOT_IO_TIMEOUT_MS = 8_000;
 const HTTP_BRIDGE_CACHE_MS = 30_000;
 const HTTP_TRANSIENT_COOLDOWN_MS = 90_000;
 const MAX_HTTP_PAGE_ROWS = 1000;
@@ -40,10 +41,10 @@ const LIVE_WS_MAX_CONNECT_ATTEMPTS_5M = 30;
 const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/ws',
 ];
-// Step650.8.7：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// Step650.8.8：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
 // 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.8.7：只保留官方精确交易对 Kline 主端点。
+  // Step650.8.8：只保留官方精确交易对 Kline 主端点。
   // 不再用 continuous/www 连续撞多个候选；一次失败就返回归档/快照/WS，等待共享守卫放行。
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
 ];
@@ -426,7 +427,7 @@ function activeBridgeState(key) {
 }
 
 function bridgeCooldown(candidateId, symbol) {
-  // Step650.8.7：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
+  // Step650.8.8：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
   return isBinanceRestBlocked() ||
     activeBridgeState(bridgeStateKey(candidateId, '*')) ||
     activeBridgeState(bridgeStateKey(candidateId, symbol));
@@ -470,11 +471,12 @@ function bridgeGuardSource(symbol, interval) {
   return `kline_bridge:fapi_klines:${String(symbol || '').toUpperCase()}:${String(interval || '')}`;
 }
 
-async function waitForBridgeRequestSlot(symbol, interval) {
+async function waitForBridgeRequestSlot(symbol, interval, signal = null) {
   const before = getBinanceRestGuardHealth();
   const release = await acquireBinanceRestRequestSlot({
     source: bridgeGuardSource(symbol, interval),
     maxQueueWaitMs: 20_000,
+    signal,
   });
   const after = getBinanceRestGuardHealth();
   if (Number(after.request_slot_waits || 0) > Number(before.request_slot_waits || 0)) {
@@ -484,16 +486,19 @@ async function waitForBridgeRequestSlot(symbol, interval) {
   return release;
 }
 
-async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS, symbol = '', interval = '') {
-  const release = await waitForBridgeRequestSlot(symbol, interval);
+async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS, symbol = '', interval = '', signal = null) {
+  const release = await waitForBridgeRequestSlot(symbol, interval, signal);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    // Once the REST request starts, always read and classify the upstream response.
+    // Aborting on a downstream disconnect could hide a real 403/418/429 response
+    // after Binance already received the request. Client abort only cancels before start.
     const response = await fetch(url, {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.7',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.8',
       },
     });
     const bodyText = await response.text();
@@ -584,7 +589,7 @@ function inspectBridgeWindow(rows, interval, startTime, endTime) {
   };
 }
 
-async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows) {
+async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows, requestContext = null) {
   if (bridgeCooldown(candidate.id, symbol)) return [];
   const source = candidate.continuous
     ? `binance_official_public_continuous_kline_current_bridge_${candidate.id}`
@@ -594,8 +599,10 @@ async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endT
   let cursor = startTime;
   while (cursor < endTime && result.length < maxRows) {
     if (bridgeCooldown(candidate.id, symbol)) break;
+    if (requestContext && requestContext.restCallsUsed >= requestContext.maxRestCalls) break;
     const pageLimit = Math.min(MAX_HTTP_PAGE_ROWS, maxRows - result.length);
-    const payload = await fetchJson(bridgeUrl(candidate, symbol, interval, cursor, endTime, pageLimit), HTTP_BRIDGE_TIMEOUT_MS, symbol, interval);
+    if (requestContext) requestContext.restCallsUsed += 1;
+    const payload = await fetchJson(bridgeUrl(candidate, symbol, interval, cursor, endTime, pageLimit), HTTP_BRIDGE_TIMEOUT_MS, symbol, interval, requestContext?.signal || null);
     const page = parseApiRows(payload, symbol, interval, source)
       .filter((row) => row.open_time_ms >= cursor && row.open_time_ms < endTime);
     if (!page.length) break;
@@ -608,7 +615,7 @@ async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endT
   return mergeRows(result).slice(-maxRows);
 }
 
-async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxRows, { bypassCache = false } = {}) {
+async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxRows, { bypassCache = false, signal = null, requestContext = null } = {}) {
   if (interval === '1s' || startTime >= endTime || maxRows <= 0) return [];
   const cacheKey = `${symbol}|${interval}|${Math.floor(startTime / intervalMs(interval))}|${Math.floor(endTime / intervalMs(interval))}`;
   const cached = bypassCache ? null : bridgeResultCache.get(cacheKey);
@@ -624,7 +631,7 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
   for (const candidate of HTTP_BRIDGE_CANDIDATES) {
     if (bridgeCooldown(candidate.id, symbol)) continue;
     try {
-      const rows = await fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows);
+      const rows = await fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows, requestContext || { restCallsUsed: 0, maxRestCalls: 1, signal });
       if (!rows.length) {
         stats.bridge_empty += 1;
         continue;
@@ -933,7 +940,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.7' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.8' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1087,6 +1094,7 @@ async function restorePersisted(symbol, interval) {
       authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       accept: 'application/json',
     },
+    signal: AbortSignal.timeout(SNAPSHOT_IO_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`snapshot_restore_${response.status}`);
   const payload = await response.json();
@@ -1119,11 +1127,12 @@ async function persistRows(symbol, interval, rows, source = 'binance_official_pu
       prefer: 'resolution=merge-duplicates,return=minimal',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SNAPSHOT_IO_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`snapshot_persist_${response.status}`);
 }
 
-export async function getBinanceContractKlineSeed({ symbol, interval = '15m', end = Date.now(), limit = 500, forceRestValidation = false } = {}) {
+export async function getBinanceContractKlineSeed({ symbol, interval = '15m', end = Date.now(), limit = 500, forceRestValidation = false, signal = null, maxRestCalls = 1 } = {}) {
   stats.requests += 1;
   const normalizedSymbol = compact(symbol);
   const normalizedInterval = normalizeInterval(interval);
@@ -1136,7 +1145,8 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
   const targetOpen = expectedCurrentOpen(safeEnd, normalizedInterval);
 
   if (forceRestValidation === true) {
-    if (normalizedInterval !== '15m') return [];
+    if (normalizedInterval !== '15m' || safeLimit !== 240 || !nearNow) return [];
+    const requestContext = { restCallsUsed: 0, maxRestCalls: 1, signal };
     const validationStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
     const rows = await fetchCurrentBridgeRows(
       normalizedSymbol,
@@ -1144,7 +1154,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
       validationStart,
       safeEnd,
       safeLimit,
-      { bypassCache: true },
+      { bypassCache: true, signal, requestContext },
     );
     const coverage = inspectBridgeWindow(
       rows,
@@ -1156,12 +1166,12 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
       const merged = mergeRows(rows).filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
       memory.set(key, { rows: merged, loadedAt: Date.now() });
       ensureLiveStream(normalizedSymbol, normalizedInterval);
-      persistRows(
+      await persistRows(
         normalizedSymbol,
         normalizedInterval,
         merged,
         'binance_official_public_exact_validation_kline',
-      ).catch((error) => { stats.last_error = String(error?.message || error); });
+      );
       return merged;
     }
     return rows.filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
@@ -1182,6 +1192,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
   if (existing) return (await existing).filter((row) => row.open_time_ms < safeEnd).slice(-safeLimit);
 
   const task = (async () => {
+    const requestContext = { restCallsUsed: 0, maxRestCalls: Math.max(0, Math.min(1, Number.parseInt(String(maxRestCalls), 10) || 1)), signal };
     let persisted = cached?.rows || [];
     if (!persisted.length) {
       try { persisted = await restorePersisted(normalizedSymbol, normalizedInterval); } catch (error) { stats.last_error = String(error?.message || error); }
@@ -1189,7 +1200,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.8.7：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8.8：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
@@ -1199,7 +1210,8 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
           normalizedInterval,
           coldStart,
           safeEnd,
-          Math.min(MAX_PERSIST_ROWS, safeLimit + 4),
+          Math.min(MAX_HTTP_PAGE_ROWS, safeLimit),
+          { signal, requestContext },
         );
         bridgeWindowComplete = inspectBridgeWindow(
           bridge,
@@ -1238,7 +1250,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
         stats.gap_repair_requests += 1;
         stats.gap_repair_last_start_at = bridgeStart;
         const needed = Math.max(4, Math.min(MAX_PERSIST_ROWS, Math.ceil((safeEnd - bridgeStart) / step) + 4));
-        try { bridge = await fetchCurrentBridgeRows(normalizedSymbol, normalizedInterval, bridgeStart, safeEnd, needed); } catch (error) {
+        try { bridge = await fetchCurrentBridgeRows(normalizedSymbol, normalizedInterval, bridgeStart, safeEnd, Math.min(MAX_HTTP_PAGE_ROWS, needed), { signal, requestContext }); } catch (error) {
           stats.bridge_errors += 1;
           stats.bridge_last_error = String(error?.message || error);
         }
@@ -1256,7 +1268,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.8.7：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8.8：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
@@ -1291,6 +1303,8 @@ export function getBinanceContractKlineSeedHealth() {
     archive_inflight_entries: archiveFileInflight.size,
     archive_global_max_active: ARCHIVE_GLOBAL_MAX_ACTIVE,
     archive_global_max_pending: ARCHIVE_GLOBAL_MAX_PENDING,
+    snapshot_io_timeout_ms: SNAPSHOT_IO_TIMEOUT_MS,
+    max_bridge_rest_calls_per_api_request: 1,
     persistence_enabled: supabaseEnabled(),
     live_stream_count: liveStreams.size,
     live_ws_max_streams: MAX_LIVE_STREAMS,

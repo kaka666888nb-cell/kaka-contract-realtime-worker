@@ -300,7 +300,7 @@ async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_mark
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Market-Worker/650.8.7',
+        'user-agent': 'KakaWeb3-Market-Worker/650.8.8',
       },
     });
     const bodyText = await response.text();
@@ -946,7 +946,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  // Step650.8.7: only seconds with real official trades become candles.
+  // Step650.8.8: only seconds with real official trades become candles.
   // Empty seconds remain absent; timeline rendering may visually carry the last
   // price, but the API never fabricates zero-volume OHLC rows.
   return [...buckets.values()]
@@ -969,9 +969,9 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.7：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.8：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
-    const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true });
+    const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
     if (seedRows.length) return seedRows;
   }
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
@@ -1038,6 +1038,10 @@ export async function handleMarketApi(req, res, url) {
     });
     return true;
   }
+  const requestController = new AbortController();
+  const abortRequest = () => { if (!res.writableEnded && !requestController.signal.aborted) requestController.abort(); };
+  req.once('aborted', abortRequest);
+  res.once('close', abortRequest);
   try {
     if (url.pathname === '/api/binance-contract-market-health') {
       send(res, 200, getBinanceContractMarketHealth());
@@ -1062,7 +1066,7 @@ export async function handleMarketApi(req, res, url) {
       });
       send(res, 200, {
         ok: true,
-        version: '650.8.7',
+        version: '650.8.8',
         reset: true,
         guard,
         cached_at: new Date().toISOString(),
@@ -1082,7 +1086,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await runBinanceRestProbe(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.7',
+        version: '650.8.8',
         probe: result,
         cached_at: new Date().toISOString(),
       });
@@ -1139,14 +1143,20 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/klines') {
       const symbol = compact(url.searchParams.get('symbol'));
       const interval = url.searchParams.get('interval') || '15m';
-      const end = clamp(url.searchParams.get('end_time'), 1, Number.MAX_SAFE_INTEGER, Date.now());
-      const limit = clamp(url.searchParams.get('limit'), 20, 1000, 1000);
+      const validationToken = String(req.headers['x-kaka-validation-token'] || '').trim();
+      const validationRequest = provider === 'binance' && market === 'contract' && Boolean(validationToken);
+      const endTimeProvided = url.searchParams.has('end_time');
+      const requestedLimit = clamp(url.searchParams.get('limit'), 20, 1000, 1000);
+      const end = validationRequest ? Date.now() : clamp(url.searchParams.get('end_time'), 1, Number.MAX_SAFE_INTEGER, Date.now());
+      const limit = validationRequest ? 240 : requestedLimit;
       if (!symbol) {
         send(res, 400, { ok: false, error: 'symbol required' });
         return true;
       }
-      const validationToken = String(req.headers['x-kaka-validation-token'] || '').trim();
-      const validationRequest = provider === 'binance' && market === 'contract' && Boolean(validationToken);
+      if (validationRequest && (requestedLimit !== 240 || endTimeProvided)) {
+        send(res, 409, { ok: false, error: 'validation requires limit=240 and no end_time', rows: [] });
+        return true;
+      }
       const rows = validationRequest
         ? await runWithBinanceValidationSession(
             validationToken,
@@ -1157,7 +1167,7 @@ export async function handleMarketApi(req, res, url) {
               interval,
               end,
               limit,
-              { forceRestValidation: true },
+              { forceRestValidation: true, signal: requestController.signal },
             ),
             {
               maxRestCalls: 1,
@@ -1165,9 +1175,11 @@ export async function handleMarketApi(req, res, url) {
               market,
               symbol,
               interval,
+              limit,
+              endTimeProvided,
             },
           )
-        : await fetchMarketKlines(provider, market, symbol, interval, end, limit);
+        : await fetchMarketKlines(provider, market, symbol, interval, end, limit, { signal: requestController.signal });
       const coverage = klineCoverage(rows, interval, end);
       if (validationRequest) {
         const validationPassed =
@@ -1209,6 +1221,9 @@ export async function handleMarketApi(req, res, url) {
       : (message.includes('not supported') || message.includes('unsupported provider') ? 400 : 502);
     send(res, status, { ok: false, error: message, rows: [], cached_at: new Date().toISOString() });
     return true;
+  } finally {
+    req.removeListener('aborted', abortRequest);
+    res.removeListener('close', abortRequest);
   }
 }
 

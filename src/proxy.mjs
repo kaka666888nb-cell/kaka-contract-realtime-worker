@@ -4,13 +4,14 @@ import { getContractFlowHealth, handleContractFlow } from './contract-flow.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
 import { getBinanceLiquidationWsHealth, handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding } from './contract-funding.mjs';
-import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
+import { beginBinanceRestShutdown, getBinanceRestGuardHealth, runWithBinanceRequestSignal } from './binance-rest-guard.mjs';
 import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
 import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.7';
+const STEP_VERSION = '650.8.8';
+let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: {
@@ -24,6 +25,7 @@ const child = spawn(process.execPath, ['src/server.mjs'], {
 });
 
 child.on('exit', (code, signal) => {
+  if (shuttingDown) return;
   console.error(`[Step${STEP_VERSION}] legacy worker exited code=${code} signal=${signal || ''}`);
   process.exit(code || 1);
 });
@@ -38,7 +40,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.7：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.8：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -328,6 +330,23 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_parse_official_ban_until: true,
         binance_contract_rest_guard_persistent_snapshot: true,
         binance_rest_guard_process_scope: 'single_parent_process',
+        binance_validation_limit: 240,
+        binance_validation_end_time_client_controlled: false,
+        binance_probe_reset_race_cancelled_by_epoch: true,
+        binance_duplicate_probe_token_sharing: false,
+        binance_client_abort_blocks_queued_rest: true,
+        binance_kline_snapshot_persisted_before_validation_advance: true,
+        binance_kline_snapshot_io_timeout_ms: 8000,
+        binance_max_bridge_rest_calls_per_api_request: 1,
+        binance_rest_single_instance_required: true,
+        binance_rest_multi_instance_supported: false,
+        binance_rest_single_instance_healthy: getBinanceRestGuardHealth().single_instance_rest_healthy,
+        binance_rest_render_instance_count: getBinanceRestGuardHealth().render_instance_count,
+        binance_rest_render_discovery_api: getBinanceRestGuardHealth().render_discovery_api,
+        binance_rest_render_discovery_timeout_ms: getBinanceRestGuardHealth().render_discovery_timeout_ms,
+        binance_rest_instance_startup_grace_ms: getBinanceRestGuardHealth().render_instance_startup_rest_grace_ms,
+        binance_rest_instance_check_forced_before_every_request: getBinanceRestGuardHealth().instance_check_forced_before_every_rest,
+        binance_rest_shutdown_blocks_new_requests: true,
         legacy_child_market_api_enabled: false,
         legacy_child_binance_rest_enabled: false,
         binance_rest_guard_all_callers: ['contract_kline','contract_funding','contract_meta','position_metrics','legacy_contract_agg_trades','spot_universe','spot_ticker','spot_kline','spot_agg_trades'],
@@ -391,6 +410,11 @@ const server = http.createServer(async (req, res) => {
         binance_app_ws_max_connect_attempts_5m: Number(realtimeWsHealth?.binance_shared_ws?.max_connect_attempts_5m || 60),
         binance_app_ws_max_total_clients: 1000,
         binance_app_ws_max_clients_per_stream: 250,
+        binance_app_ws_max_client_buffered_bytes: Number(realtimeWsHealth?.binance_shared_ws?.max_client_buffered_bytes || 1000000),
+        binance_app_ws_max_clients_per_ip: Number(realtimeWsHealth?.binance_shared_ws?.max_clients_per_ip || 50),
+        binance_app_ws_max_streams_per_ip: Number(realtimeWsHealth?.binance_shared_ws?.max_streams_per_ip || 16),
+        binance_app_ws_max_connect_attempts_per_ip_1m: Number(realtimeWsHealth?.binance_shared_ws?.max_connect_attempts_per_ip_1m || 60),
+        binance_app_ws_client_ip_source: 'render_x_forwarded_for_first_entry',
         binance_app_ws_trade_1s_shared_aggregator: true,
         binance_depth_ws_max_symbols: getContractDepthHealth().binance_ws_max_symbols,
         binance_depth_ws_connect_gap_ms: getContractDepthHealth().binance_ws_connect_gap_ms,
@@ -405,7 +429,7 @@ const server = http.createServer(async (req, res) => {
         binance_contract_trades_transport: 'official_combined_websocket_aggTrade',
         binance_contract_rest_disabled_for_depth: true,
         binance_websocket_endpoint_split_2026: false,
-        binance_websocket_hosts: ['fstream.binance.com'],
+        binance_websocket_hosts: ['fstream.binance.com', 'stream.binance.com:9443'],
         binance_websocket_production_only: true,
         binance_flow_ws_max_active_streams: getContractFlowHealth().binance_max_active_streams,
         binance_flow_ws_max_connect_attempts_5m: getContractFlowHealth().binance_ws_max_connect_attempts_5m,
@@ -452,21 +476,35 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  const requestAbortController = new AbortController();
+  const abortQueuedWork = () => {
+    if (!res.writableEnded && !requestAbortController.signal.aborted) requestAbortController.abort();
+  };
+  req.once('aborted', abortQueuedWork);
+  res.once('close', abortQueuedWork);
   try {
-    // Step650.8.7: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.8: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
-    // in-memory guard and one bounded queue. The child process is WS-only.
-    if (await handleMarketApi(req, res, url)) return;
-    if (await handleContractDepth(req, res, url)) return;
-    if (await handleContractFunding(req, res, url)) return;
-    if (await handleContractLiquidation(req, res, url)) return;
-    if (await handleContractFlow(req, res, url)) return;
+    // in-memory guard and one bounded queue. A disconnected client can cancel only
+    // queued/paced work; an already-started upstream request is still fully observed.
+    const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
+      if (await handleMarketApi(req, res, url)) return true;
+      if (await handleContractDepth(req, res, url)) return true;
+      if (await handleContractFunding(req, res, url)) return true;
+      if (await handleContractLiquidation(req, res, url)) return true;
+      if (await handleContractFlow(req, res, url)) return true;
+      return false;
+    });
+    if (handled) return;
   } catch (error) {
     if (!res.headersSent) {
       res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: false, error: String(error?.message || error) }));
     }
     return;
+  } finally {
+    req.removeListener('aborted', abortQueuedWork);
+    res.removeListener('close', abortQueuedWork);
   }
   proxyHttp(req, res, url);
 });
@@ -500,12 +538,18 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 function shutdown(signal) {
-  console.log(`[Step${STEP_VERSION}] shutdown ${signal}`);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  beginBinanceRestShutdown(`shutdown:${signal}`);
+  console.log(`[Step${STEP_VERSION}] shutdown ${signal}; new Binance REST blocked immediately`);
   server.close(() => {
     child.kill('SIGTERM');
     process.exit(0);
   });
-  setTimeout(() => process.exit(0), 5000).unref();
+  setTimeout(() => {
+    try { child.kill('SIGTERM'); } catch (_) {}
+    process.exit(0);
+  }, 5000).unref();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
