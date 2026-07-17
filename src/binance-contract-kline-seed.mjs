@@ -2,6 +2,7 @@ import { inflateRawSync } from 'node:zlib';
 import { WebSocket } from 'ws';
 import {
   acquireBinanceRestRequestSlot,
+  flushBinanceRestGuardPersistence,
   getBinanceRestGuardHealth,
   isBinanceRestBlocked,
   markBinanceRestRestricted,
@@ -32,10 +33,10 @@ const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/market/ws',
   'wss://stream.binancefuture.com/market/ws',
 ];
-// Step650.8：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// Step650.8.1：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
 // 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.8：只保留官方精确交易对 Kline 主端点。
+  // Step650.8.1：只保留官方精确交易对 Kline 主端点。
   // 不再用 continuous/www 连续撞多个候选；一次失败就返回归档/快照/WS，等待共享守卫放行。
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
 ];
@@ -409,13 +410,13 @@ function activeBridgeState(key) {
 }
 
 function bridgeCooldown(candidateId, symbol) {
-  // Step650.8：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
+  // Step650.8.1：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
   return isBinanceRestBlocked() ||
     activeBridgeState(bridgeStateKey(candidateId, '*')) ||
     activeBridgeState(bridgeStateKey(candidateId, symbol));
 }
 
-function markBridgeFailure(candidate, symbol, status, message, retryAfterSeconds = null) {
+async function markBridgeFailure(candidate, symbol, status, message, retryAfterSeconds = null) {
   const lower = String(message || '').toLowerCase();
   const restricted = status === 418 || status === 429 || status === 451 ||
     lower.includes('too many requests') || lower.includes('banned') || lower.includes('restricted');
@@ -433,6 +434,7 @@ function markBridgeFailure(candidate, symbol, status, message, retryAfterSeconds
       source: `kline_bridge:${candidate.id}`,
       retryAfterSeconds,
     });
+    await flushBinanceRestGuardPersistence();
     return { restricted: true, transient: false, until: Number(guard?.until || 0) };
   }
 
@@ -449,7 +451,10 @@ function markBridgeFailure(candidate, symbol, status, message, retryAfterSeconds
 
 async function waitForBridgeRequestSlot() {
   const before = getBinanceRestGuardHealth();
-  const release = await acquireBinanceRestRequestSlot();
+  const release = await acquireBinanceRestRequestSlot({
+    source: 'kline_bridge:fapi_klines',
+    maxQueueWaitMs: 20_000,
+  });
   const after = getBinanceRestGuardHealth();
   if (Number(after.request_slot_waits || 0) > Number(before.request_slot_waits || 0)) {
     stats.bridge_rate_limiter_waits += 1;
@@ -467,7 +472,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.8',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.1',
       },
     });
     const bodyText = await response.text();
@@ -621,7 +626,7 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
       lastError = `${candidate.id}:${message}`;
       const failure = error?.binanceRestBlocked === true
         ? { restricted: true, transient: false, until: Number(error?.guardState?.until || 0) }
-        : markBridgeFailure(candidate, symbol, status, message, error?.retryAfterSeconds);
+        : await markBridgeFailure(candidate, symbol, status, message, error?.retryAfterSeconds);
       stats.bridge_errors += 1;
       // 418/429/451/IP ban属于同一Render出口IP，不再继续轰炸其余fapi/www候选。
       if (failure.restricted || error?.binanceRestBlocked === true) {
@@ -791,7 +796,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.1' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -990,7 +995,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.8：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8.1：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
@@ -1057,7 +1062,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.8：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8.1：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
@@ -1136,7 +1141,7 @@ export function getBinanceContractKlineSeedHealth() {
     })(),
     shared_binance_rest_guard: getBinanceRestGuardHealth(),
     bridge_min_request_gap_ms: getBinanceRestGuardHealth().min_request_gap_ms,
-    source: 'binance_single_exact_symbol_rest_persisted_guard_archive_gap_repair_live_websocket',
+    source: 'binance_single_exact_symbol_rest_probe_gate_bounded_queue_archive_gap_repair_live_websocket',
     time: iso(Date.now()),
   };
 }

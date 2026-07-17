@@ -1,11 +1,12 @@
 import {
   acquireBinanceRestRequestSlot,
+  flushBinanceRestGuardPersistence,
   markBinanceRestRestricted,
   markBinanceRestSuccess,
 } from './binance-rest-guard.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8';
+const VERSION = '650.8.1';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -117,8 +118,11 @@ async function fetchJson(url, timeoutMs = 8000) {
   }
 }
 
-async function fetchBinanceJson(url, timeoutMs = 8000) {
-  const release = await acquireBinanceRestRequestSlot();
+async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_funding') {
+  const release = await acquireBinanceRestRequestSlot({
+    source,
+    maxQueueWaitMs: 20_000,
+  });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -126,7 +130,7 @@ async function fetchBinanceJson(url, timeoutMs = 8000) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8 contract-funding',
+        'user-agent': 'KakaWeb3/650.8.1 contract-funding',
       },
     });
     const text = await response.text();
@@ -136,16 +140,17 @@ async function fetchBinanceJson(url, timeoutMs = 8000) {
         markBinanceRestRestricted({
           status: response.status,
           message,
-          source: 'contract_funding',
+          source,
           retryAfterSeconds: response.headers.get('retry-after'),
         });
+        await flushBinanceRestGuardPersistence();
       }
       const error = new Error(message);
       error.status = response.status;
       throw error;
     }
     markBinanceRestSuccess({
-      source: 'contract_funding',
+      source,
       usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
     });
     return JSON.parse(text);
@@ -159,9 +164,9 @@ async function fetchBinancePair(currentUrl, historyUrl) {
   let currentRaw = null;
   let historyRaw = null;
   const warnings = [];
-  try { currentRaw = await fetchBinanceJson(currentUrl); }
+  try { currentRaw = await fetchBinanceJson(currentUrl, 8000, 'funding:current'); }
   catch (error) { warnings.push(`current:${error?.message || error}`); }
-  try { historyRaw = await fetchBinanceJson(historyUrl); }
+  try { historyRaw = await fetchBinanceJson(historyUrl, 8000, 'funding:history'); }
   catch (error) { warnings.push(`history:${error?.message || error}`); }
   if (currentRaw == null && historyRaw == null) throw new Error(warnings.join(';') || 'binance_funding_unavailable');
   return { currentRaw, historyRaw, warnings };

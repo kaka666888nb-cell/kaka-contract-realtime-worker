@@ -8,7 +8,7 @@ import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8';
+const STEP_VERSION = '650.8.1';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -30,7 +30,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.1：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -247,6 +247,7 @@ const server = http.createServer(async (req, res) => {
       contract_funding: '/api/contract-funding',
       binance_contract_market_health: '/api/binance-contract-market-health',
       binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
+      binance_contract_rest_probe: '/api/binance-contract-rest-probe',
       binance_rest_guard: getBinanceRestGuardHealth(),
       contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
@@ -278,12 +279,20 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_partial_candidate_validation: true,
         binance_contract_kline_shared_ip_ban_guard: true,
         binance_contract_kline_single_official_rest_candidate: 'fapi_v1_klines',
-        binance_contract_kline_http_min_request_gap_ms: 5000,
+        binance_contract_kline_http_min_request_gap_ms: 10000,
         binance_contract_kline_parse_official_ban_until: true,
         binance_contract_rest_guard_persistent_snapshot: true,
-        binance_contract_rest_guard_all_callers: ['kline','funding','contract_meta','position_metrics','legacy_contract_agg_trades'],
+        binance_rest_guard_all_callers: ['contract_kline','contract_funding','contract_meta','position_metrics','legacy_contract_agg_trades','spot_universe','spot_ticker','spot_kline','spot_agg_trades'],
         binance_contract_rest_migration_quarantine_until: '2026-07-17T20:39:46.570Z',
         binance_contract_rest_multi_host_retry_disabled: true,
+        binance_contract_rest_post_ban_probe_required: true,
+        binance_contract_rest_normal_callers_blocked_until_probe: true,
+        binance_rest_validation_mode_after_probe: 'kline_bridge_only_until_staged_validation_passes',
+        binance_spot_rest_uses_same_shared_guard: true,
+        binance_contract_rest_max_pending_requests: 6,
+        binance_contract_rest_max_queue_wait_ms: 25000,
+        binance_contract_rest_queue_is_bounded: true,
+        binance_contract_rest_persistence_flush_on_restriction: true,
         binance_contract_kline_partial_snapshot_never_persists: true,
         binance_contract_kline_current_day_bridge: true,
         binance_contract_kline_internal_gap_aware_repair: true,
@@ -291,7 +300,7 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_live_bridge_on_demand: true,
         binance_contract_kline_gap_diagnostics: true,
         binance_contract_snapshot_routes_bypass_legacy_rest_circuit: true,
-        binance_contract_kline_cold_start: 'guarded_single_exact_symbol_then_bounded_archive_gap_repair',
+        binance_contract_kline_cold_start: 'post_ban_probe_then_guarded_single_exact_symbol_then_bounded_archive_gap_repair',
         binance_contract_kline_failure_scope: 'symbol_interval_isolated',
         restricted_cooldown_policy: 'official_ban_until_or_retry_after_plus_90_seconds',
         transient_cooldown_seconds: 90,
