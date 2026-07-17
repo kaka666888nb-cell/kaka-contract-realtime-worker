@@ -10,11 +10,11 @@ import {
 } from './binance-contract-kline-seed.mjs';
 import {
   acquireBinanceRestRequestSlot,
-  flushBinanceRestGuardPersistence,
-  markBinanceRestRestricted,
-  markBinanceRestSuccess,
+  completeBinanceValidationCall,
+  failBinanceValidationCall,
   isBinanceValidationAdminAuthorized,
   isBinanceValidationAdminConfigured,
+  observeBinanceRestResponse,
   runBinanceRestProbe,
   runWithBinanceValidationSession,
 } from './binance-rest-guard.mjs';
@@ -28,6 +28,56 @@ const CONTRACT_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']
 const COINBASE_BASE_URL = 'https://api.exchange.coinbase.com';
 const coinbaseTickerCache = new Map();
 const COINBASE_TICKER_TTL_MS = 5_000;
+const BINANCE_SHARED_CACHE_MAX = 256;
+const binanceSharedCache = new Map();
+const binanceSharedInflight = new Map();
+const binanceMarketRestStats = {
+  cache_hits: 0,
+  inflight_hits: 0,
+  cache_misses: 0,
+  cache_evictions: 0,
+};
+
+function pruneBinanceSharedCache() {
+  const now = Date.now();
+  for (const [key, entry] of binanceSharedCache.entries()) {
+    if (Number(entry?.expiresAt || 0) <= now) binanceSharedCache.delete(key);
+  }
+  while (binanceSharedCache.size > BINANCE_SHARED_CACHE_MAX) {
+    const oldest = binanceSharedCache.keys().next().value;
+    if (oldest == null) break;
+    binanceSharedCache.delete(oldest);
+    binanceMarketRestStats.cache_evictions += 1;
+  }
+}
+
+async function sharedBinanceResult(key, ttlMs, loader) {
+  pruneBinanceSharedCache();
+  const cached = binanceSharedCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    binanceMarketRestStats.cache_hits += 1;
+    return cached.value;
+  }
+  const running = binanceSharedInflight.get(key);
+  if (running) {
+    binanceMarketRestStats.inflight_hits += 1;
+    return await running;
+  }
+  binanceMarketRestStats.cache_misses += 1;
+  const task = Promise.resolve().then(loader);
+  binanceSharedInflight.set(key, task);
+  try {
+    const value = await task;
+    binanceSharedCache.set(key, {
+      value,
+      expiresAt: Date.now() + Math.max(500, Number(ttlMs) || 0),
+    });
+    pruneBinanceSharedCache();
+    return value;
+  } finally {
+    if (binanceSharedInflight.get(key) === task) binanceSharedInflight.delete(key);
+  }
+}
 
 function providerKey(raw) {
   const value = String(raw || '').trim().toLowerCase().replaceAll('gate.io', 'gate');
@@ -249,32 +299,19 @@ async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_mark
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Market-Worker/650.8.3',
+        'user-agent': 'KakaWeb3-Market-Worker/650.8.4',
       },
     });
     const bodyText = await response.text();
+    const observation = await observeBinanceRestResponse({ response, bodyText, source });
     if (!response.ok) {
-      const message = `${response.status} ${response.statusText} ${bodyText.slice(0, 240)}`.trim();
-      if ([418, 429, 451].includes(response.status) || /too many requests|banned until|restricted/i.test(bodyText)) {
-        markBinanceRestRestricted({
-          status: response.status,
-          message,
-          source,
-          retryAfterSeconds: response.headers.get('retry-after'),
-        });
-        await flushBinanceRestGuardPersistence();
-      }
-      const error = new Error(message);
+      const error = new Error(observation.message || `${response.status} ${response.statusText}`);
       error.status = response.status;
       throw error;
     }
-    markBinanceRestSuccess({
-      source,
-      usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
-    });
     if (!bodyText) return null;
     try { return JSON.parse(bodyText); }
-    catch (_) { throw new Error(`invalid JSON from Binance contract upstream: ${bodyText.slice(0, 240)}`); }
+    catch (_) { throw new Error(`invalid JSON from Binance upstream: ${bodyText.slice(0, 240)}`); }
   } finally {
     clearTimeout(timer);
     release();
@@ -312,10 +349,14 @@ async function universe(provider, market) {
       if (!snapshotRows.length) throw new Error('binance contract universe snapshot unavailable');
       rows.push(...snapshotRows);
     } else {
-      const payload = await binanceRestJsonFetch(
-        'https://api.binance.com/api/v3/exchangeInfo',
-        15_000,
+      const payload = await sharedBinanceResult(
         'spot_universe:exchange_info',
+        6 * 60 * 60_000,
+        () => binanceRestJsonFetch(
+          'https://data-api.binance.vision/api/v3/exchangeInfo',
+          15_000,
+          'spot_universe:exchange_info',
+        ),
       );
       for (const item of payload.symbols || []) {
         if (String(item.status).toUpperCase() !== 'TRADING') continue;
@@ -502,10 +543,14 @@ async function tickers(provider, market, wantedSymbols = []) {
       // 更不能因此打开 provider 级熔断，导致同批 BTC/BNB/BCH 等正常交易对一起变成破折号。
       return getBinanceContractTickers({ symbols: wantedSymbols });
     }
-    const payload = await binanceRestJsonFetch(
-      'https://api.binance.com/api/v3/ticker/24hr',
-      15_000,
+    const payload = await sharedBinanceResult(
       'spot_ticker:24hr_all',
+      10_000,
+      () => binanceRestJsonFetch(
+        'https://data-api.binance.vision/api/v3/ticker/24hr',
+        15_000,
+        'spot_ticker:24hr_all',
+      ),
     );
     items = Array.isArray(payload) ? payload : [];
   } else if (provider === 'okx') {
@@ -658,7 +703,7 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
   if (provider === 'binance') {
     const base = market === 'contract'
       ? 'https://fapi.binance.com/fapi/v1/klines'
-      : 'https://api.binance.com/api/v3/klines';
+      : 'https://data-api.binance.vision/api/v3/klines';
     const url = `${base}?symbol=${symbol}&interval=${encodeURIComponent(interval)}&endTime=${end}&limit=${Math.min(1500, limit)}`;
     const payload = market === 'contract'
       ? await binanceRestJsonFetch(url, 15_000, 'legacy_contract_kline')
@@ -787,10 +832,11 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
   if (provider === 'binance') {
     const base = market === 'contract'
       ? 'https://fapi.binance.com/fapi/v1/aggTrades'
-      : 'https://api.binance.com/api/v3/aggTrades';
+      : 'https://data-api.binance.vision/api/v3/aggTrades';
     let beforeId = null;
     let pages = 0;
-    while (trades.length < wanted && pages < 6) {
+    const maxPages = 1; // One bounded REST page; realtime seconds continue over shared WebSocket.
+    while (trades.length < wanted && pages < maxPages) {
       const pageLimit = Math.min(1000, Math.max(100, wanted - trades.length));
       let url;
       if (beforeId == null) {
@@ -899,38 +945,12 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  const actual = [...buckets.values()].sort((a, b) => a.open_time_ms - b.open_time_ms);
-  if (!actual.length) return [];
-  const output = [];
-  let previous = actual[0];
-  output.push(previous);
-  for (let index = 1; index < actual.length; index++) {
-    const next = actual[index];
-    let cursor = previous.open_time_ms + 1000;
-    while (cursor < next.open_time_ms && output.length < limit * 2) {
-      output.push({
-        provider,
-        market_type: market,
-        symbol,
-        interval: '1s',
-        open_time: new Date(cursor).toISOString(),
-        open_time_ms: cursor,
-        close_time: new Date(cursor + 999).toISOString(),
-        open: previous.close,
-        high: previous.close,
-        low: previous.close,
-        close: previous.close,
-        volume: 0,
-        quote_volume: 0,
-        trade_count: 0,
-        source: `${provider}_official_public_trade_1s_gap_fill_render`,
-      });
-      cursor += 1000;
-    }
-    output.push(next);
-    previous = next;
-  }
-  return output.slice(-limit);
+  // Step650.8.4: only seconds with real official trades become candles.
+  // Empty seconds remain absent; timeline rendering may visually carry the last
+  // price, but the API never fabricates zero-volume OHLC rows.
+  return [...buckets.values()]
+    .sort((a, b) => a.open_time_ms - b.open_time_ms)
+    .slice(-limit);
 }
 
 async function fetchSecondMarketKlines(provider, market, symbol, end, limit) {
@@ -948,12 +968,32 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.3：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.4：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true });
     if (seedRows.length) return seedRows;
   }
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
+  if (provider === 'binance' && market === 'spot') {
+    const step = intervalMs(interval);
+    const endBucket = Math.floor(Math.max(1, Number(end || Date.now())) / step) * step;
+    const ttlMs = Math.max(1_000, Math.min(30_000, Math.floor(step / 4)));
+    const key = `spot_kline:${symbol}:${interval}:${limit}:${endBucket}`;
+    return await sharedBinanceResult(
+      key,
+      ttlMs,
+      async () => {
+        const sourceInterval = sourceIntervalFor(provider, market, interval);
+        const targetMs = intervalMs(interval);
+        const sourceMs = intervalMs(sourceInterval);
+        const factor = Math.max(1, Math.ceil(targetMs / sourceMs));
+        const sourceLimit = Math.min(5000, limit * factor + factor * 4);
+        const sourceRows = await fetchNativeMarketKlines(provider, market, symbol, sourceInterval, endBucket + step - 1, sourceLimit);
+        if (sourceInterval === interval) return sourceRows.slice(-limit);
+        return aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
+      },
+    );
+  }
   const sourceInterval = sourceIntervalFor(provider, market, interval);
   const targetMs = intervalMs(interval);
   const sourceMs = intervalMs(sourceInterval);
@@ -964,13 +1004,26 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   return aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
 }
 
+export function getBinanceMarketRestHealth() {
+  pruneBinanceSharedCache();
+  return {
+    spot_market_data_host: 'data-api.binance.vision',
+    shared_cache_entries: binanceSharedCache.size,
+    shared_inflight_entries: binanceSharedInflight.size,
+    shared_cache_max: BINANCE_SHARED_CACHE_MAX,
+    contract_second_history_max_rest_pages: 1,
+    synthetic_one_second_candles: false,
+    ...binanceMarketRestStats,
+  };
+}
+
 export async function handleMarketApi(req, res, url) {
   if (!url.pathname.startsWith('/api/')) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
       'access-control-allow-methods': 'GET, OPTIONS',
-      'access-control-allow-headers': 'content-type, x-kaka-admin-key, x-kaka-validation-token',
+      'access-control-allow-headers': 'content-type',
     });
     res.end();
     return true;
@@ -1001,7 +1054,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await runBinanceRestProbe(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.3',
+        version: '650.8.4',
         probe: result,
         cached_at: new Date().toISOString(),
       });
@@ -1065,7 +1118,8 @@ export async function handleMarketApi(req, res, url) {
         return true;
       }
       const validationToken = String(req.headers['x-kaka-validation-token'] || '').trim();
-      const rows = provider === 'binance' && market === 'contract' && validationToken
+      const validationRequest = provider === 'binance' && market === 'contract' && Boolean(validationToken);
+      const rows = validationRequest
         ? await runWithBinanceValidationSession(
             validationToken,
             () => fetchMarketKlines(
@@ -1086,6 +1140,25 @@ export async function handleMarketApi(req, res, url) {
             },
           )
         : await fetchMarketKlines(provider, market, symbol, interval, end, limit);
+      const coverage = klineCoverage(rows, interval, end);
+      if (validationRequest) {
+        const validationPassed =
+          rows.length === limit &&
+          coverage.gap_count === 0 &&
+          coverage.missing_intervals === 0 &&
+          coverage.lag_intervals_to_end <= 1 &&
+          coverage.continuous_to_current === true;
+        if (validationPassed) {
+          await completeBinanceValidationCall({ token: validationToken, symbol, interval });
+        } else {
+          await failBinanceValidationCall({
+            token: validationToken,
+            symbol,
+            interval,
+            reason: `coverage_failed:rows=${rows.length};gaps=${coverage.gap_count};missing=${coverage.missing_intervals};lag=${coverage.lag_intervals_to_end}`,
+          });
+        }
+      }
       send(res, 200, {
         ok: true,
         provider,
@@ -1093,7 +1166,7 @@ export async function handleMarketApi(req, res, url) {
         symbol,
         interval,
         rows,
-        coverage: klineCoverage(rows, interval, end),
+        coverage,
         source: rows.at(-1)?.source || rows[0]?.source || `${provider}_official_public_kline_render`,
         cached_at: rows.at(-1)?.cached_at || rows[0]?.cached_at || new Date().toISOString(),
       });
@@ -1102,9 +1175,16 @@ export async function handleMarketApi(req, res, url) {
     send(res, 404, { ok: false, error: 'unknown market api' });
     return true;
   } catch (error) {
-    const message = String(error);
-    const status = message.includes('not supported') || message.includes('unsupported provider') ? 400 : 502;
+    const message = String(error?.message || error);
+    const status = error?.internalBinanceRestGuard
+      ? 409
+      : (message.includes('not supported') || message.includes('unsupported provider') ? 400 : 502);
     send(res, status, { ok: false, error: message, rows: [], cached_at: new Date().toISOString() });
     return true;
   }
 }
+
+export const _test = {
+  aggregateTradesToSecondRows,
+  klineCoverage,
+};

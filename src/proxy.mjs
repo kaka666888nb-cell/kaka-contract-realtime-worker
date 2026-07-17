@@ -1,15 +1,15 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { handleContractFlow } from './contract-flow.mjs';
-import { handleContractDepth } from './contract-depth.mjs';
+import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
 import { handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding } from './contract-funding.mjs';
 import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
-import { handleMarketApi } from './market-rest.mjs';
+import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.3';
+const STEP_VERSION = '650.8.4';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: {
@@ -37,7 +37,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.3：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.4：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -54,7 +54,7 @@ function circuitKey(url) {
 
 function isRestrictedFailure(statusCode, bodyText) {
   const text = String(bodyText || '').toLowerCase();
-  return statusCode === 418 || statusCode === 429 || statusCode === 451 ||
+  return statusCode === 403 || statusCode === 418 || statusCode === 429 || statusCode === 451 ||
     text.includes('way too many requests') ||
     (text.includes('ip(') && text.includes('banned until')) ||
     text.includes('too many requests');
@@ -62,7 +62,7 @@ function isRestrictedFailure(statusCode, bodyText) {
 
 function isUpstreamFailure(statusCode, bodyText) {
   const text = String(bodyText || '').toLowerCase();
-  return statusCode >= 500 || statusCode === 408 || statusCode === 418 || statusCode === 429 || statusCode === 451 ||
+  return statusCode >= 500 || statusCode === 408 || statusCode === 403 || statusCode === 418 || statusCode === 429 || statusCode === 451 ||
     text.includes('502') || text.includes('bad gateway') || text.includes('legacy_worker_unavailable');
 }
 
@@ -230,9 +230,40 @@ function proxyHttp(req, res, url) {
   req.pipe(upstream);
 }
 
+
+function fetchChildJson(pathname, timeoutMs = 4_000) {
+  return new Promise((resolve, reject) => {
+    const request = http.get({
+      hostname: '127.0.0.1',
+      port: CHILD_PORT,
+      path: pathname,
+      headers: { accept: 'application/json' },
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        if ((response.statusCode || 500) >= 400) {
+          reject(new Error(`child_health_${response.statusCode}:${text.slice(0, 160)}`));
+          return;
+        }
+        try { resolve(JSON.parse(text)); }
+        catch (_) { reject(new Error('child_health_invalid_json')); }
+      });
+    });
+    request.setTimeout(timeoutMs, () => request.destroy(new Error('child_health_timeout')));
+    request.on('error', reject);
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (url.pathname === '/health') {
+    const realtimeWsHealth = await fetchChildJson('/ws-health').catch((error) => ({
+      ok: false,
+      error: String(error?.message || error),
+      binance_shared_ws: null,
+    }));
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(JSON.stringify({
       ok: true,
@@ -247,6 +278,7 @@ const server = http.createServer(async (req, res) => {
       contract_flow_warm: '/api/contract-flow/warm',
       contract_meta: '/api/contract-meta',
       contract_depth: '/api/contract-depth',
+      contract_depth_health: getContractDepthHealth(),
       contract_depth_views: ['orderbook', 'trades'],
       contract_liquidation: '/api/contract-liquidation',
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
@@ -256,6 +288,8 @@ const server = http.createServer(async (req, res) => {
       binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
       binance_contract_rest_probe: '/api/binance-contract-rest-probe',
       binance_rest_guard: getBinanceRestGuardHealth(),
+      binance_market_rest_health: getBinanceMarketRestHealth(),
+      realtime_ws_health: realtimeWsHealth,
       contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
@@ -315,6 +349,7 @@ const server = http.createServer(async (req, res) => {
         binance_contract_rest_max_queue_wait_ms: 25000,
         binance_contract_rest_queue_is_bounded: true,
         binance_contract_rest_persistence_flush_on_restriction: true,
+        binance_rest_persistence_failure_blocks_network: true,
         binance_contract_kline_partial_snapshot_never_persists: true,
         binance_contract_kline_current_day_bridge: true,
         binance_contract_kline_internal_gap_aware_repair: true,
@@ -324,6 +359,27 @@ const server = http.createServer(async (req, res) => {
         binance_contract_snapshot_routes_bypass_legacy_rest_circuit: true,
         binance_contract_kline_cold_start: 'post_ban_probe_then_guarded_single_exact_symbol_then_bounded_archive_gap_repair',
         binance_contract_kline_failure_scope: 'symbol_interval_isolated',
+        binance_rest_operating_modes: ['probe_required','validation_only','normal_guarded'],
+        binance_rest_admin_key_rotation_invalidates_sessions: true,
+        binance_rest_restricted_statuses: [403,418,429,451],
+        binance_rest_success_weight_checked_on_every_response: true,
+        binance_rest_normal_max_used_weight_1m: getBinanceRestGuardHealth().normal_max_used_weight_1m,
+        binance_rest_validation_max_used_weight_1m: getBinanceRestGuardHealth().validation_max_used_weight_1m,
+        binance_spot_market_data_host: 'data-api.binance.vision',
+        binance_spot_rest_shared_cache: true,
+        binance_contract_second_history_max_rest_pages: 1,
+        binance_archive_global_max_active: 3,
+        binance_archive_global_max_pending: 12,
+        binance_one_second_synthetic_gap_fill: false,
+        binance_app_ws_shared_by_market_symbol_interval: true,
+        binance_app_ws_max_shared_streams: 64,
+        binance_app_ws_max_connect_attempts_5m: 100,
+        binance_app_ws_max_total_clients: 1000,
+        binance_app_ws_max_clients_per_stream: 250,
+        binance_app_ws_trade_1s_shared_aggregator: true,
+        binance_depth_ws_max_symbols: getContractDepthHealth().binance_ws_max_symbols,
+        binance_depth_ws_connect_gap_ms: getContractDepthHealth().binance_ws_connect_gap_ms,
+        binance_depth_ws_max_connect_attempts_5m: getContractDepthHealth().binance_ws_max_connect_attempts_5m,
         restricted_cooldown_policy: 'official_ban_until_or_retry_after_plus_90_seconds',
         transient_cooldown_seconds: 90,
         contract_meta_cache_seconds: 30,
@@ -360,8 +416,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/api/realtime-ws-health') {
+    try {
+      const payload = await fetchChildJson('/ws-health');
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(payload));
+    } catch (error) {
+      res.writeHead(503, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: String(error?.message || error) }));
+    }
+    return;
+  }
+
   try {
-    // Step650.8.3: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.4: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. The child process is WS-only.
     if (await handleMarketApi(req, res, url)) return;

@@ -1,4 +1,4 @@
-const STEP_VERSION = '639.1';
+const STEP_VERSION = '650.8.4';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -13,6 +13,19 @@ const TRANSIENT_COOLDOWN_MS = 90_000;
 const RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 
 const BINANCE_WS_STATES = new Map();
+const BINANCE_WS_MAX_SYMBOLS = 32;
+const BINANCE_WS_CONNECT_GAP_MS = 1_500;
+const BINANCE_WS_MAX_CONNECT_ATTEMPTS_5M = 60;
+const BINANCE_WS_CONNECT_ATTEMPTS = [];
+let BINANCE_WS_CONNECT_CHAIN = Promise.resolve();
+let BINANCE_WS_LAST_CONNECT_AT = 0;
+const BINANCE_WS_STATS = {
+  capacity_rejections: 0,
+  evictions: 0,
+  reconnects: 0,
+  connect_rate_waits: 0,
+  connect_rate_rejections: 0,
+};
 const BINANCE_WS_IDLE_MS = 75_000;
 const BINANCE_WS_ORDERBOOK_STALE_MS = 8_000;
 const BINANCE_WS_TRADES_STALE_MS = 12_000;
@@ -78,6 +91,29 @@ function binanceWsState(symbol) {
   const native = providerSymbol('binance', symbol);
   let state = BINANCE_WS_STATES.get(native);
   if (!state) {
+    if (BINANCE_WS_STATES.size >= BINANCE_WS_MAX_SYMBOLS) {
+      const now = Date.now();
+      for (const [key, candidate] of BINANCE_WS_STATES.entries()) {
+        const lastAccess = Math.max(
+          Number(candidate.orderbookLastAccessAt || 0),
+          Number(candidate.tradesLastAccessAt || 0),
+        );
+        if (lastAccess === 0 || now - lastAccess > BINANCE_WS_IDLE_MS) {
+          candidate.manuallyClosing = true;
+          closeBinanceView(candidate, 'orderbook');
+          closeBinanceView(candidate, 'trades');
+          BINANCE_WS_STATES.delete(key);
+          BINANCE_WS_STATS.evictions += 1;
+          break;
+        }
+      }
+    }
+    if (BINANCE_WS_STATES.size >= BINANCE_WS_MAX_SYMBOLS) {
+      BINANCE_WS_STATS.capacity_rejections += 1;
+      const error = new Error('binance_depth_ws_capacity_reached');
+      error.cooldownMs = 5_000;
+      throw error;
+    }
     state = {
       native,
       orderbookConnection: emptyBinanceConnection(),
@@ -129,6 +165,38 @@ function rejectBinanceWaiters(state, view, error) {
   }
 }
 
+function pruneBinanceDepthConnectAttempts() {
+  const cutoff = Date.now() - 5 * 60_000;
+  while (BINANCE_WS_CONNECT_ATTEMPTS.length && BINANCE_WS_CONNECT_ATTEMPTS[0] < cutoff) {
+    BINANCE_WS_CONNECT_ATTEMPTS.shift();
+  }
+}
+
+async function acquireBinanceDepthConnectSlot() {
+  let release;
+  const previous = BINANCE_WS_CONNECT_CHAIN;
+  BINANCE_WS_CONNECT_CHAIN = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    pruneBinanceDepthConnectAttempts();
+    if (BINANCE_WS_CONNECT_ATTEMPTS.length >= BINANCE_WS_MAX_CONNECT_ATTEMPTS_5M) {
+      BINANCE_WS_STATS.connect_rate_rejections += 1;
+      const error = new Error('binance_depth_ws_connect_rate_limited');
+      error.cooldownMs = 10_000;
+      throw error;
+    }
+    const waitMs = Math.max(0, BINANCE_WS_CONNECT_GAP_MS - (Date.now() - BINANCE_WS_LAST_CONNECT_AT));
+    if (waitMs > 0) {
+      BINANCE_WS_STATS.connect_rate_waits += 1;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    BINANCE_WS_LAST_CONNECT_AT = Date.now();
+    BINANCE_WS_CONNECT_ATTEMPTS.push(BINANCE_WS_LAST_CONNECT_AT);
+  } finally {
+    release();
+  }
+}
+
 function binanceStreamUrl(state, view, host) {
   const streamSymbol = state.native.toLowerCase();
   if (view === 'trades') {
@@ -143,6 +211,7 @@ function scheduleBinanceReconnect(state, view) {
   if (state.manuallyClosing || connection.reconnectTimer || Date.now() - lastAccessAt > BINANCE_WS_IDLE_MS) return;
   const delay = Math.min(15_000, 800 * (2 ** Math.min(connection.reconnectAttempt, 5)));
   connection.reconnectAttempt += 1;
+  BINANCE_WS_STATS.reconnects += 1;
   connection.reconnectTimer = setTimeout(() => {
     connection.reconnectTimer = null;
     ensureBinanceWs(state, view).catch(() => {});
@@ -241,6 +310,7 @@ async function ensureBinanceWs(state, view) {
       const index = (connection.hostIndex + offset) % BINANCE_WS_HOSTS.length;
       const host = BINANCE_WS_HOSTS[index];
       try {
+        await acquireBinanceDepthConnectSlot();
         const socket = await openBinanceSocket(WebSocketCtor, state, view, host);
         connection.socket = socket;
         connection.hostIndex = index;
@@ -391,10 +461,12 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
 
 function restrictedFailure(statusCode, text) {
   const lower = String(text || '').toLowerCase();
-  return statusCode === 418 || statusCode === 429 || statusCode === 451 ||
+  return statusCode === 403 || statusCode === 418 || statusCode === 429 || statusCode === 451 ||
     lower.includes('too many requests') ||
     (lower.includes('ip(') && lower.includes('banned')) ||
-    lower.includes('restricted location');
+    lower.includes('restricted location') ||
+    lower.includes('waf') ||
+    lower.includes('cloudfront');
 }
 
 function openCircuit(key, error) {
@@ -781,6 +853,26 @@ async function resolveCached(provider, view, symbol, limit) {
     }
     throw error;
   }
+}
+
+
+export function getContractDepthHealth() {
+  pruneBinanceDepthConnectAttempts();
+  return {
+    ok: true,
+    version: STEP_VERSION,
+    binance_ws_symbols: BINANCE_WS_STATES.size,
+    binance_ws_max_symbols: BINANCE_WS_MAX_SYMBOLS,
+    binance_ws_connect_gap_ms: BINANCE_WS_CONNECT_GAP_MS,
+    binance_ws_connect_attempts_5m: BINANCE_WS_CONNECT_ATTEMPTS.length,
+    binance_ws_max_connect_attempts_5m: BINANCE_WS_MAX_CONNECT_ATTEMPTS_5M,
+    binance_ws_connections: [...BINANCE_WS_STATES.values()].reduce((sum, state) => {
+      return sum +
+        (wsReady(state.orderbookConnection?.socket) ? 1 : 0) +
+        (wsReady(state.tradesConnection?.socket) ? 1 : 0);
+    }, 0),
+    ...BINANCE_WS_STATS,
+  };
 }
 
 export async function handleContractDepth(req, res, url) {

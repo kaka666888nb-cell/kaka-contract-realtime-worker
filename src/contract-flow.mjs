@@ -1,9 +1,7 @@
 import { WebSocket } from 'ws';
 import {
   acquireBinanceRestRequestSlot,
-  flushBinanceRestGuardPersistence,
-  markBinanceRestRestricted,
-  markBinanceRestSuccess,
+  observeBinanceRestResponse,
 } from './binance-rest-guard.mjs';
 
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -651,29 +649,16 @@ async function fetchBinanceJson(url, { headers = {}, timeoutMs = 8000, source = 
   });
   try {
     const response = await fetch(url, {
-      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.3 contract-flow', ...headers },
+      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.4 contract-flow', ...headers },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await response.text();
+    const observation = await observeBinanceRestResponse({ response, bodyText: text, source });
     if (!response.ok) {
-      const message = `upstream_${response.status}:${text.slice(0, 240)}`;
-      if ([418, 429, 451].includes(response.status) || /too many requests|banned until|restricted/i.test(text)) {
-        markBinanceRestRestricted({
-          status: response.status,
-          message,
-          source,
-          retryAfterSeconds: response.headers.get('retry-after'),
-        });
-        await flushBinanceRestGuardPersistence();
-      }
-      const error = new Error(message);
+      const error = new Error(observation.message || `upstream_${response.status}`);
       error.status = response.status;
       throw error;
     }
-    markBinanceRestSuccess({
-      source,
-      usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
-    });
     try { return text.trim() ? JSON.parse(text) : null; }
     catch (_) { throw new Error(`upstream_invalid_json:${text.slice(0, 160)}`); }
   } finally {
@@ -884,7 +869,7 @@ async function getContractMeta(provider, symbol) {
       } catch (error) {
         const message = String(error?.message || error).slice(0, 700);
         entry.error = message;
-        const restricted = /upstream_(418|429|451)|banned|too many requests|restricted|cloudfront/i.test(message);
+        const restricted = /upstream_(403|418|429|451)|banned|too many requests|restricted|waf|cloudfront/i.test(message);
         entry.cooldownUntil = Date.now() + (restricted ? CONTRACT_META_RESTRICTED_RETRY_MS : CONTRACT_META_RETRY_MS);
         if (entry.value && Date.now() - entry.fetchedAt <= CONTRACT_META_STALE_MS) {
           return { ...entry.value, stale: true, meta_error: message };
@@ -1081,14 +1066,28 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8：四个指标请求仍可并行进入本地队列，但共享守卫会严格串行、保持10秒间隔并限制队列长度。
-  // 第一个418/429会持久封锁后续排队项，它们不会继续命中币安。
-  const settled = await Promise.allSettled([
-    fetchBinanceJson(`${host}/futures/data/openInterestHist?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500, source: 'position_metrics:open_interest' }),
-    fetchBinanceJson(`${host}/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500, source: 'position_metrics:global_ratio' }),
-    fetchBinanceJson(`${host}/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500, source: 'position_metrics:top_account_ratio' }),
-    fetchBinanceJson(`${host}/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500, source: 'position_metrics:top_position_ratio' }),
-  ]);
+  // Step650.8.4: metrics are requested sequentially under the shared governor.
+  // This avoids filling a bounded queue with four calls that must already wait
+  // ten seconds between starts. A restricted or unsafe-weight response stops the
+  // remaining calls before they touch Binance.
+  const metricRequests = [
+    [`${host}/futures/data/openInterestHist?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, 'position_metrics:open_interest'],
+    [`${host}/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, 'position_metrics:global_ratio'],
+    [`${host}/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, 'position_metrics:top_account_ratio'],
+    [`${host}/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, 'position_metrics:top_position_ratio'],
+  ];
+  const settled = [];
+  for (const [url, source] of metricRequests) {
+    try {
+      settled.push({ status: 'fulfilled', value: await fetchBinanceJson(url, { headers, timeoutMs: 6500, source }) });
+    } catch (error) {
+      settled.push({ status: 'rejected', reason: error });
+      if (error?.internalBinanceRestGuard || [403, 418, 429, 451].includes(Number(error?.status || 0))) break;
+    }
+  }
+  while (settled.length < metricRequests.length) {
+    settled.push({ status: 'rejected', reason: new Error('binance_metrics_skipped_by_shared_guard') });
+  }
   if (!settled.some((item) => item.status === 'fulfilled')) {
     throw new Error(settled.map((item) => item.status === 'rejected' ? item.reason?.message : '').join(' | ') || 'binance_metrics_unavailable');
   }
@@ -1351,7 +1350,7 @@ async function fetchVenueMetrics(state) {
         state.metricError = message;
         state.metricFetchedAt = Date.now();
         state.metricPartialRetryCount = Math.min(3, state.metricPartialRetryCount + 1);
-        const restricted = /upstream_(418|429|451)|banned|restricted|cloudfront/i.test(message);
+        const restricted = /upstream_(403|418|429|451)|banned|restricted|waf|cloudfront/i.test(message);
         state.metricCooldownUntil = Date.now() + (restricted ? 30 * 60 * 1000 : 5 * 60 * 1000);
       }
     })().finally(() => { state.metricFetchPromise = null; });

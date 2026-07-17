@@ -1,12 +1,10 @@
 import {
   acquireBinanceRestRequestSlot,
-  flushBinanceRestGuardPersistence,
-  markBinanceRestRestricted,
-  markBinanceRestSuccess,
+  observeBinanceRestResponse,
 } from './binance-rest-guard.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.3';
+const VERSION = '650.8.4';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -130,35 +128,23 @@ async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_fundin
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.3 contract-funding',
+        'user-agent': 'KakaWeb3/650.8.4 contract-funding',
       },
     });
     const text = await response.text();
+    const observation = await observeBinanceRestResponse({ response, bodyText: text, source });
     if (!response.ok) {
-      const message = `HTTP_${response.status}:${text.slice(0, 240)}`;
-      if ([418, 429, 451].includes(response.status) || /too many requests|banned until|restricted/i.test(text)) {
-        markBinanceRestRestricted({
-          status: response.status,
-          message,
-          source,
-          retryAfterSeconds: response.headers.get('retry-after'),
-        });
-        await flushBinanceRestGuardPersistence();
-      }
-      const error = new Error(message);
+      const error = new Error(observation.message || `HTTP_${response.status}`);
       error.status = response.status;
       throw error;
     }
-    markBinanceRestSuccess({
-      source,
-      usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
-    });
     return JSON.parse(text);
   } finally {
     clearTimeout(timer);
     release();
   }
 }
+
 
 async function fetchBinancePair(currentUrl, historyUrl) {
   let currentRaw = null;
