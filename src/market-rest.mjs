@@ -12,6 +12,7 @@ import {
   acquireBinanceRestRequestSlot,
   completeBinanceValidationCall,
   failBinanceValidationCall,
+  getBinanceRestGuardHealth,
   isBinanceValidationAdminAuthorized,
   isBinanceValidationAdminConfigured,
   observeBinanceRestResponse,
@@ -300,7 +301,7 @@ async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_mark
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Market-Worker/650.8.9',
+        'user-agent': 'KakaWeb3-Market-Worker/650.8.10',
       },
     });
     const bodyText = await response.text();
@@ -946,7 +947,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  // Step650.8.9: only seconds with real official trades become candles.
+  // Step650.8.10: only seconds with real official trades become candles.
   // Empty seconds remain absent; timeline rendering may visually carry the last
   // price, but the API never fabricates zero-volume OHLC rows.
   return [...buckets.values()]
@@ -969,7 +970,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.9：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.10：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
     if (seedRows.length) return seedRows;
@@ -1066,7 +1067,7 @@ export async function handleMarketApi(req, res, url) {
       });
       send(res, 200, {
         ok: true,
-        version: '650.8.9',
+        version: '650.8.10',
         reset: true,
         guard,
         cached_at: new Date().toISOString(),
@@ -1086,7 +1087,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await runBinanceRestProbe(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.9',
+        version: '650.8.10',
         probe: result,
         cached_at: new Date().toISOString(),
       });
@@ -1219,7 +1220,32 @@ export async function handleMarketApi(req, res, url) {
     const status = error?.internalBinanceRestGuard
       ? 409
       : (message.includes('not supported') || message.includes('unsupported provider') ? 400 : 502);
-    send(res, status, { ok: false, error: message, rows: [], cached_at: new Date().toISOString() });
+    const guard = error?.internalBinanceRestGuard ? getBinanceRestGuardHealth() : null;
+    send(res, status, {
+      ok: false,
+      error: message,
+      error_code: error?.code || null,
+      used_weight_1m: Number.isFinite(Number(error?.usedWeight1m))
+        ? Number(error.usedWeight1m)
+        : (guard?.last_probe_used_weight_1m ?? null),
+      max_safe_used_weight_1m: Number.isFinite(Number(error?.maxUsedWeight1m))
+        ? Number(error.maxUsedWeight1m)
+        : (guard?.last_probe_max_used_weight_1m ?? null),
+      guard: guard ? {
+        active: guard.active,
+        next_allowed_at: guard.next_allowed_at,
+        reason: guard.reason,
+        operating_mode: guard.operating_mode,
+        last_probe_at: guard.last_probe_at,
+        last_probe_http_status: guard.last_probe_http_status,
+        last_probe_raw_weight_1m: guard.last_probe_raw_weight_1m,
+        last_probe_used_weight_1m: guard.last_probe_used_weight_1m,
+        last_probe_max_used_weight_1m: guard.last_probe_max_used_weight_1m,
+        last_probe_weight_safe: guard.last_probe_weight_safe,
+      } : null,
+      rows: [],
+      cached_at: new Date().toISOString(),
+    });
     return true;
   } finally {
     req.removeListener('aborted', abortRequest);

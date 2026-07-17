@@ -24,7 +24,7 @@ const INSTANCE_STARTUP_REST_GRACE_MS = process.env.NODE_ENV === 'test'
 const PROCESS_STARTED_AT = Date.now();
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.9 keeps the observed-ban migration record and requires
+// Step650.8.10 keeps the observed-ban migration record and requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -46,11 +46,17 @@ const PROBE_URL = 'https://fapi.binance.com/fapi/v1/ping';
 // Fail closed if the first post-ban response does not expose a low shared-IP
 // request weight. This is deliberately far below Binance's normal capacity; the
 // purpose of the probe is safety verification, not throughput.
-const PROBE_MAX_USED_WEIGHT_1M = 100;
+const BINANCE_PUBLISHED_REQUEST_WEIGHT_LIMIT_1M = 2400;
+// Step650.8.10: the prior fixed value 100 was only 4.2% of Binance's current
+// published USD-M Futures IP request-weight limit and repeatedly rejected a healthy
+// HTTP 200 shared-egress response before any Kline request. Keep a large safety
+// margin instead of disabling the check: probe at 50%, validation at 62.5%, and
+// normal guarded traffic at 75% of the published 2400/min limit.
+const PROBE_MAX_USED_WEIGHT_1M = 1200;
 const PROBE_UNSAFE_COOLDOWN_MS = 10 * 60_000;
 const NORMAL_UNSAFE_COOLDOWN_MS = 10 * 60_000;
-const VALIDATION_MAX_USED_WEIGHT_1M = 150;
-const NORMAL_MAX_USED_WEIGHT_1M = 600;
+const VALIDATION_MAX_USED_WEIGHT_1M = 1500;
+const NORMAL_MAX_USED_WEIGHT_1M = 1800;
 const MIGRATION_STATE_UPDATED_AT_MS = OBSERVED_BAN_UNTIL_MS;
 const VALIDATION_ALLOWED_SOURCE_PREFIXES = ['kline_bridge:'];
 const VALIDATION_SEQUENCE = ['1000SHIBUSDT', 'ARCUSDT', 'BANANAS31USDT', 'BCHUSDT'];
@@ -59,7 +65,7 @@ const VALIDATION_LIMIT = 240;
 const VALIDATION_REST_BUDGET = VALIDATION_SEQUENCE.length;
 const VALIDATION_SESSION_TTL_MS = 2 * 60 * 60_000;
 const VALIDATION_RECOVERY_COOLDOWN_MS = 10 * 60_000;
-const GUARD_SCHEMA_VERSION = '650.8.9';
+const GUARD_SCHEMA_VERSION = '650.8.10';
 const VALIDATION_ADMIN_KEY_VALID = /^[a-f0-9]{64}$/i.test(VALIDATION_ADMIN_KEY);
 const VALIDATION_ADMIN_KEY_FINGERPRINT = VALIDATION_ADMIN_KEY_VALID
   ? createHash('sha256').update(`kaka-binance-admin-v1:${VALIDATION_ADMIN_KEY}`, 'utf8').digest('hex')
@@ -93,7 +99,7 @@ let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.9_migration_guard',
+  source: 'step650.8.10_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -110,6 +116,12 @@ let state = {
   validation_inflight: null,
   validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
   validation_control_epoch: 0,
+  last_probe_at: 0,
+  last_probe_http_status: null,
+  last_probe_raw_weight_1m: null,
+  last_probe_used_weight_1m: null,
+  last_probe_max_used_weight_1m: PROBE_MAX_USED_WEIGHT_1M,
+  last_probe_weight_safe: null,
   schema_version: GUARD_SCHEMA_VERSION,
 };
 
@@ -689,6 +701,22 @@ function normalizedRestoredState(restored, record = null) {
     validation_inflight: operatingMode === 'validation_only' ? validationInflight : null,
     validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
     validation_control_epoch: restoredControlEpoch,
+    last_probe_at: toFiniteMs(restored?.last_probe_at) || 0,
+    last_probe_http_status: Number.isFinite(Number(restored?.last_probe_http_status))
+      ? Number(restored.last_probe_http_status)
+      : null,
+    last_probe_raw_weight_1m: restored?.last_probe_raw_weight_1m == null
+      ? null
+      : String(restored.last_probe_raw_weight_1m),
+    last_probe_used_weight_1m: Number.isFinite(Number(restored?.last_probe_used_weight_1m))
+      ? Number(restored.last_probe_used_weight_1m)
+      : null,
+    last_probe_max_used_weight_1m: Number.isFinite(Number(restored?.last_probe_max_used_weight_1m))
+      ? Number(restored.last_probe_max_used_weight_1m)
+      : PROBE_MAX_USED_WEIGHT_1M,
+    last_probe_weight_safe: typeof restored?.last_probe_weight_safe === 'boolean'
+      ? restored.last_probe_weight_safe
+      : null,
     schema_version: GUARD_SCHEMA_VERSION,
   };
 }
@@ -975,7 +1003,7 @@ export async function acquireBinanceRestRequestSlot({
   try { throwIfRestShuttingDown(source); } catch (error) { releaseCurrent(); throw error; }
   try { throwIfAborted(effectiveSignal, source); } catch (error) { releaseCurrent(); throw error; }
 
-  // Step650.8.9: after this caller owns the FIFO node, every guard/persistence
+  // Step650.8.10: after this caller owns the FIFO node, every guard/persistence
   // failure must release it. Otherwise one transient Supabase error can leave
   // requestChain unresolved forever and deadlock all later Binance REST work.
   try {
@@ -1172,6 +1200,7 @@ export function markBinanceRestRestricted({ status = 0, message = '', source = '
     retryUntil + BAN_SAFETY_MS,
   );
   state = {
+    ...state,
     until,
     status: Number(status || 418),
     reason: 'exchange_rate_limit_or_region_block',
@@ -1290,6 +1319,28 @@ function putProbeBackBehindLocalCooldown(reason, message = '') {
   };
 }
 
+function recordProbeTelemetry({
+  status = null,
+  rawWeight = null,
+  usedWeight = null,
+  weightSafe = null,
+} = {}) {
+  const now = Date.now();
+  const numericWeight = Number(usedWeight);
+  if (Number.isFinite(numericWeight)) stats.last_used_weight_1m = numericWeight;
+  state = {
+    ...state,
+    last_probe_at: now,
+    last_probe_http_status: Number.isFinite(Number(status)) ? Number(status) : null,
+    last_probe_raw_weight_1m: rawWeight == null ? null : String(rawWeight),
+    last_probe_used_weight_1m: Number.isFinite(numericWeight) ? numericWeight : null,
+    last_probe_max_used_weight_1m: PROBE_MAX_USED_WEIGHT_1M,
+    last_probe_weight_safe: typeof weightSafe === 'boolean' ? weightSafe : null,
+    updated_at: now,
+    schema_version: GUARD_SCHEMA_VERSION,
+  };
+}
+
 async function runBinanceRestProbeOnce(adminKey) {
   await ensureBinanceRestGuardInitialized();
   await expireValidationSessionIfNeeded('post_ban_probe');
@@ -1366,11 +1417,17 @@ async function runBinanceRestProbeOnce(adminKey) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.9',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.10',
       },
     });
     const bodyText = await response.text();
     if (!response.ok) {
+      recordProbeTelemetry({
+        status: response.status,
+        rawWeight: response.headers.get('x-mbx-used-weight-1m'),
+        usedWeight: response.headers.get('x-mbx-used-weight-1m'),
+        weightSafe: false,
+      });
       const message = `${response.status} ${response.statusText} ${bodyText.slice(0, 360)}`.trim();
       if (isBinanceRestrictedResponse(response.status, bodyText)) {
         stats.probes_restricted += 1;
@@ -1396,6 +1453,12 @@ async function runBinanceRestProbeOnce(adminKey) {
     const usedWeight = rawUsedWeight == null || String(rawUsedWeight).trim() === ''
       ? Number.NaN
       : Number(rawUsedWeight);
+    recordProbeTelemetry({
+      status: response.status,
+      rawWeight: rawUsedWeight,
+      usedWeight,
+      weightSafe: Number.isFinite(usedWeight) ? usedWeight <= PROBE_MAX_USED_WEIGHT_1M : false,
+    });
     if (!Number.isFinite(usedWeight)) {
       stats.probe_weight_missing += 1;
       putProbeBackBehindLocalCooldown('post_ban_probe_weight_header_missing');
@@ -1406,7 +1469,7 @@ async function runBinanceRestProbeOnce(adminKey) {
     }
     if (usedWeight > PROBE_MAX_USED_WEIGHT_1M) {
       stats.probe_weight_unsafe += 1;
-      putProbeBackBehindLocalCooldown('post_ban_probe_weight_unsafe', `used_weight_1m:${usedWeight}`);
+      putProbeBackBehindLocalCooldown('post_ban_probe_weight_unsafe', `used_weight_1m:${usedWeight};max:${PROBE_MAX_USED_WEIGHT_1M};published_limit:${BINANCE_PUBLISHED_REQUEST_WEIGHT_LIMIT_1M}`);
       await persistProbeStateOrFail({ reason: 'binance_probe_weight_state_persist_failed' });
       throw guardError('binance_probe_weight_unsafe', 'BINANCE_PROBE_WEIGHT_UNSAFE', {
         binanceProbeWeightUnsafe: true,
@@ -1808,6 +1871,13 @@ export function getBinanceRestGuardHealth() {
       interval: state.validation_inflight.interval,
       started_at: iso(state.validation_inflight.started_at),
     } : null,
+    binance_published_request_weight_limit_1m: BINANCE_PUBLISHED_REQUEST_WEIGHT_LIMIT_1M,
+    last_probe_at: state?.last_probe_at ? iso(state.last_probe_at) : null,
+    last_probe_http_status: state?.last_probe_http_status ?? null,
+    last_probe_raw_weight_1m: state?.last_probe_raw_weight_1m ?? null,
+    last_probe_used_weight_1m: state?.last_probe_used_weight_1m ?? null,
+    last_probe_max_used_weight_1m: state?.last_probe_max_used_weight_1m ?? PROBE_MAX_USED_WEIGHT_1M,
+    last_probe_weight_safe: state?.last_probe_weight_safe ?? null,
     probe_max_used_weight_1m: PROBE_MAX_USED_WEIGHT_1M,
     validation_max_used_weight_1m: VALIDATION_MAX_USED_WEIGHT_1M,
     normal_max_used_weight_1m: NORMAL_MAX_USED_WEIGHT_1M,
