@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.8.2**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.8.3**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -161,14 +161,14 @@ Step650.8 now:
 No new SQL table, environment variable, Supabase Edge deployment, Cron task, Flutter dependency, or App file is required. The existing Step650 snapshot table is reused.
 
 
-## Step650.8.2 post-ban probe gate and bounded Binance REST queue
+## Step650.8.3 post-ban probe gate and bounded Binance REST queue
 
 A full static audit of Step650.8 found two remaining production risks before the next real Binance validation:
 
 1. once the time-based quarantine expired, any normal page request (funding, contract metadata, position metrics, legacy aggregate trades, or Kline) could become the first post-ban REST caller before the controlled validation script;
 2. the shared FIFO was serialized but unbounded, so many different users/symbols could leave stale requests queued after their HTTP clients had already gone away.
 
-Step650.8.2 closes both gaps:
+Step650.8.3 closes both gaps:
 
 - after the quarantine expires, **all normal Binance USD-M REST callers remain blocked** until one explicit low-weight `GET /api/binance-contract-rest-probe` succeeds against official `/fapi/v1/ping`;
 - the probe is the only caller allowed through the post-ban gate; a new 418/429/451 immediately persists the exact deadline and no Kline or secondary symbol is requested;
@@ -182,16 +182,35 @@ Step650.8.2 closes both gaps:
 No App file, SQL migration, Supabase Edge Function, Cron job, environment variable, or new dependency is required.
 
 
-### Step650.8.2 validation-only gate
+### Step650.8.3 validation-only gate
 
 The audit was extended to Binance spot REST calls in the same Render process. All current Binance spot and contract REST call sites now enter the same persistent guard. After the low-weight probe succeeds, the guard remains in `validation_only` mode: only the exact-symbol Kline bridge source is allowed. Spot universe/ticker/Kline/trades, funding, contract metadata, position metrics, and legacy contract REST remain blocked until staged Kline validation has passed and a later reviewed release explicitly enables them. This prevents background users or open pages from competing with the controlled post-ban test.
 
 
-## Step650.8.2 validation session lock
+## Step650.8.3 validation session lock
 
-Step650.8.2 hardens the post-ban validation window so an ordinary App request or another caller cannot consume the first post-probe Binance REST slot. The explicit probe now returns a random validation token. Only a request carrying that token can authorize a Binance contract Kline REST bridge while the worker is in `validation_only` mode. Each validation API request is limited to one outbound Binance REST call, and the whole validation session has a four-call budget: one for 1000SHIB in phase 1 and three for ARC, BANANAS31, and BCH in phase 2. Tokenless App traffic can still read archive, WebSocket, memory, and persistent snapshots, but it cannot start Binance REST during validation.
+Step650.8.3 hardens the post-ban validation window so an ordinary App request or another caller cannot consume the first post-probe Binance REST slot. The explicit probe now returns a random validation token. Only a request carrying that token can authorize a Binance contract Kline REST bridge while the worker is in `validation_only` mode. Each validation API request is limited to one outbound Binance REST call, and the whole validation session has a four-call budget: one for 1000SHIB in phase 1 and three for ARC, BANANAS31, and BCH in phase 2. Tokenless App traffic can still read archive, WebSocket, memory, and persistent snapshots, but it cannot start Binance REST during validation.
 
 Health output exposes only a short hash prefix and the remaining budget; it never exposes the raw validation token.
 
 
-Step650.8.2 also removes the former parent/child split-brain risk. Market HTTP endpoints now execute in the parent process together with contract funding/flow/metrics, while the legacy child is restricted to WebSocket relay duties. `/health`, the explicit probe, Binance Spot REST, Binance Contract REST, and Kline validation therefore observe the same in-memory queue and restriction state immediately. Internal gate errors use a non-418 status and cannot be mistaken for a new Binance IP ban.
+Step650.8.3 also removes the former parent/child split-brain risk. Market HTTP endpoints now execute in the parent process together with contract funding/flow/metrics, while the legacy child is restricted to WebSocket relay duties. `/health`, the explicit probe, Binance Spot REST, Binance Contract REST, and Kline validation therefore observe the same in-memory queue and restriction state immediately. Internal gate errors use a non-418 status and cannot be mistaken for a new Binance IP ban.
+
+
+## Step650.8.3 Binance validation hardening
+
+- `KAKA_BINANCE_VALIDATION_KEY` is required before the public validation probe route can send any Binance REST request.
+- The child WebSocket worker runs with `KAKA_DISABLE_BINANCE_REST=1`; it cannot restore/persist the Binance guard or send Binance REST.
+- Binance 1-second streams seed only from the official aggTrade WebSocket in the child.
+- Staged validation is server-side locked to `1000SHIBUSDT -> ARCUSDT -> BANANAS31USDT -> BCHUSDT`, all at `15m`.
+- A validation request forces exactly one direct `/fapi/v1/klines` page and cannot reuse a memory bridge cache.
+
+- Validation budget and next-symbol state are persisted successfully before each real Binance validation request leaves the process.
+
+### Step650.8.3 final Binance safety audit additions
+
+- The post-ban probe requires working Supabase guard persistence before it can touch Binance.
+- A successful probe state is durably persisted before the validation token is returned.
+- Each validation budget decrement and next-symbol transition is durably persisted before the corresponding Binance Kline request leaves the process.
+- The probe must include a numeric `x-mbx-used-weight-1m` response header no greater than the conservative threshold `100`; a missing or higher value issues no validation token, sends no Kline request, and enters a local ten-minute safety cooldown.
+- Persistence queue failures are surfaced by `flushBinanceRestGuardPersistence()` instead of being silently treated as success.
