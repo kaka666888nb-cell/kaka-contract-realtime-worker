@@ -9,7 +9,8 @@ const SNAPSHOT_TYPE = 'klines';
 const SNAPSHOT_KEY = 'REST_GUARD:BINANCE_CONTRACT';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
-const PROCESS_REST_DISABLED = process.env.KAKA_DISABLE_BINANCE_REST === '1';
+// Step650.8.11: Render must never call Binance REST directly. Historical contract Klines use the authenticated Supabase Edge relay; all legacy Binance REST callers fail closed before network.
+const PROCESS_REST_DISABLED = true;
 const VALIDATION_ADMIN_KEY = String(process.env.KAKA_BINANCE_VALIDATION_KEY || '').trim();
 const SUPABASE_IO_TIMEOUT_MS = 8_000;
 const RENDER_RUNTIME = process.env.RENDER === 'true';
@@ -24,7 +25,7 @@ const INSTANCE_STARTUP_REST_GRACE_MS = process.env.NODE_ENV === 'test'
 const PROCESS_STARTED_AT = Date.now();
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.10 keeps the observed-ban migration record and requires
+// Step650.8.11 keeps the observed-ban migration record and requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -47,7 +48,7 @@ const PROBE_URL = 'https://fapi.binance.com/fapi/v1/ping';
 // request weight. This is deliberately far below Binance's normal capacity; the
 // purpose of the probe is safety verification, not throughput.
 const BINANCE_PUBLISHED_REQUEST_WEIGHT_LIMIT_1M = 2400;
-// Step650.8.10: the prior fixed value 100 was only 4.2% of Binance's current
+// Step650.8.11: the prior fixed value 100 was only 4.2% of Binance's current
 // published USD-M Futures IP request-weight limit and repeatedly rejected a healthy
 // HTTP 200 shared-egress response before any Kline request. Keep a large safety
 // margin instead of disabling the check: probe at 50%, validation at 62.5%, and
@@ -65,7 +66,7 @@ const VALIDATION_LIMIT = 240;
 const VALIDATION_REST_BUDGET = VALIDATION_SEQUENCE.length;
 const VALIDATION_SESSION_TTL_MS = 2 * 60 * 60_000;
 const VALIDATION_RECOVERY_COOLDOWN_MS = 10 * 60_000;
-const GUARD_SCHEMA_VERSION = '650.8.10';
+const GUARD_SCHEMA_VERSION = '650.8.11';
 const VALIDATION_ADMIN_KEY_VALID = /^[a-f0-9]{64}$/i.test(VALIDATION_ADMIN_KEY);
 const VALIDATION_ADMIN_KEY_FINGERPRINT = VALIDATION_ADMIN_KEY_VALID
   ? createHash('sha256').update(`kaka-binance-admin-v1:${VALIDATION_ADMIN_KEY}`, 'utf8').digest('hex')
@@ -99,7 +100,7 @@ let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.10_migration_guard',
+  source: 'step650.8.11_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -1003,7 +1004,7 @@ export async function acquireBinanceRestRequestSlot({
   try { throwIfRestShuttingDown(source); } catch (error) { releaseCurrent(); throw error; }
   try { throwIfAborted(effectiveSignal, source); } catch (error) { releaseCurrent(); throw error; }
 
-  // Step650.8.10: after this caller owns the FIFO node, every guard/persistence
+  // Step650.8.11: after this caller owns the FIFO node, every guard/persistence
   // failure must release it. Otherwise one transient Supabase error can leave
   // requestChain unresolved forever and deadlock all later Binance REST work.
   try {
@@ -1417,7 +1418,7 @@ async function runBinanceRestProbeOnce(adminKey) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.10',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.11',
       },
     });
     const bodyText = await response.text();

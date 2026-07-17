@@ -1,14 +1,9 @@
 import { inflateRawSync } from 'node:zlib';
 import { WebSocket } from 'ws';
 import {
-  acquireBinanceRestRequestSlot,
-  flushBinanceRestGuardPersistence,
-  getBinanceRestGuardHealth,
-  isBinanceRestBlocked,
-  markBinanceRestRestricted,
-  observeBinanceRestResponse,
-  parseBinanceBanUntil,
-} from './binance-rest-guard.mjs';
+  fetchBinanceContractKlineRelayRows,
+  getBinanceContractKlineRelayHealth,
+} from './binance-contract-kline-relay.mjs';
 
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
@@ -41,12 +36,10 @@ const LIVE_WS_MAX_CONNECT_ATTEMPTS_5M = 30;
 const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/ws',
 ];
-// Step650.8.10：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// Step650.8.11：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
 // 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.8.10：只保留官方精确交易对 Kline 主端点。
-  // 不再用 continuous/www 连续撞多个候选；一次失败就返回归档/快照/WS，等待共享守卫放行。
-  { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
+  { id: 'supabase_edge_kline_relay', continuous: false },
 ];
 
 const memory = new Map();
@@ -427,128 +420,37 @@ function activeBridgeState(key) {
 }
 
 function bridgeCooldown(candidateId, symbol) {
-  // Step650.8.10：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
-  return isBinanceRestBlocked() ||
+  const relay = getBinanceContractKlineRelayHealth();
+  return relay.active === true ||
     activeBridgeState(bridgeStateKey(candidateId, '*')) ||
     activeBridgeState(bridgeStateKey(candidateId, symbol));
 }
 
-async function markBridgeFailure(candidate, symbol, status, message, retryAfterSeconds = null) {
+async function markBridgeFailure(candidate, symbol, status, message) {
   const lower = String(message || '').toLowerCase();
-  const restricted = status === 403 || status === 418 || status === 429 || status === 451 ||
-    lower.includes('too many requests') || lower.includes('banned') ||
-    lower.includes('restricted') || lower.includes('waf');
-  const transient = status === 0 || status >= 500 ||
-    lower.includes('abort') || lower.includes('timeout') || lower.includes('network') || lower.includes('fetch failed');
-
-  if (!restricted && !transient) return { restricted: false, transient: false, until: 0 };
-
+  const relay = getBinanceContractKlineRelayHealth();
+  const restricted = relay.active === true || status === 403 || status === 418 || status === 429 || status === 451 ||
+    lower.includes('too many requests') || lower.includes('banned') || lower.includes('restricted');
+  const transient = status === 0 || status >= 500 || lower.includes('abort') || lower.includes('timeout') || lower.includes('network');
   if (restricted) {
-    const parsedBanUntil = parseBinanceBanUntil(message);
-    if (parsedBanUntil) stats.bridge_ban_until_parsed += 1;
-    const guard = markBinanceRestRestricted({
+    const until = relay.next_allowed_at ? Date.parse(relay.next_allowed_at) : Date.now() + HTTP_TRANSIENT_COOLDOWN_MS;
+    bridgeCandidateState.set(bridgeStateKey(candidate.id, '*'), {
+      until: Number.isFinite(until) ? until : Date.now() + HTTP_TRANSIENT_COOLDOWN_MS,
       status,
-      message,
-      source: `kline_bridge:${candidate.id}`,
-      retryAfterSeconds,
+      scope: '*',
+      reason: relay.reason || 'edge_relay_upstream_restricted',
+      error: String(message || ''),
     });
-    await flushBinanceRestGuardPersistence();
-    return { restricted: true, transient: false, until: Number(guard?.until || 0) };
+    return { restricted: true, transient: false, until };
   }
-
-  const until = Date.now() + HTTP_TRANSIENT_COOLDOWN_MS;
-  bridgeCandidateState.set(bridgeStateKey(candidate.id, symbol), {
-    until,
-    status,
-    scope: symbol,
-    reason: 'upstream_unavailable',
-    error: String(message || ''),
-  });
-  return { restricted: false, transient: true, until };
-}
-
-function bridgeGuardSource(symbol, interval) {
-  return `kline_bridge:fapi_klines:${String(symbol || '').toUpperCase()}:${String(interval || '')}`;
-}
-
-async function waitForBridgeRequestSlot(symbol, interval, signal = null) {
-  const before = getBinanceRestGuardHealth();
-  const release = await acquireBinanceRestRequestSlot({
-    source: bridgeGuardSource(symbol, interval),
-    maxQueueWaitMs: 20_000,
-    signal,
-  });
-  const after = getBinanceRestGuardHealth();
-  if (Number(after.request_slot_waits || 0) > Number(before.request_slot_waits || 0)) {
-    stats.bridge_rate_limiter_waits += 1;
-  }
-  stats.bridge_http_requests += 1;
-  return release;
-}
-
-async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS, symbol = '', interval = '', signal = null) {
-  const release = await waitForBridgeRequestSlot(symbol, interval, signal);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    // Once the REST request starts, always read and classify the upstream response.
-    // Aborting on a downstream disconnect could hide a real 403/418/429 response
-    // after Binance already received the request. Client abort only cancels before start.
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.10',
-      },
+  if (transient) {
+    const until = Date.now() + HTTP_TRANSIENT_COOLDOWN_MS;
+    bridgeCandidateState.set(bridgeStateKey(candidate.id, symbol), {
+      until, status, scope: symbol, reason: 'edge_relay_unavailable', error: String(message || ''),
     });
-    const bodyText = await response.text();
-    const observation = await observeBinanceRestResponse({
-      response,
-      bodyText,
-      source: bridgeGuardSource(symbol, interval),
-    });
-    if (!response.ok) {
-      const error = new Error(observation.message || `${response.status} ${response.statusText}`);
-      error.status = response.status;
-      error.retryAfterSeconds = response.headers.get('retry-after');
-      error.binanceRestrictionHandled = observation.restricted === true;
-      throw error;
-    }
-    if (observation.weightSafe === false) {
-      const error = new Error(`binance_kline_weight_unsafe:${observation.reason || 'unknown'}`);
-      error.status = 409;
-      error.internalBinanceRestGuard = true;
-      error.binanceWeightUnsafe = true;
-      throw error;
-    }
-    let payload;
-    try { payload = JSON.parse(bodyText); } catch (_) { throw new Error('bridge_invalid_json'); }
-    if (payload && !Array.isArray(payload) && Number(payload.code) < 0) {
-      const error = new Error(`binance_${payload.code}:${payload.msg || 'unknown_error'}`);
-      error.status = 400;
-      throw error;
-    }
-    return payload;
-  } finally {
-    clearTimeout(timer);
-    release();
+    return { restricted: false, transient: true, until };
   }
-}
-
-function bridgeUrl(candidate, symbol, interval, startTime, endTime, limit) {
-  const query = new URLSearchParams({
-    interval,
-    startTime: String(Math.max(0, Math.trunc(startTime))),
-    endTime: String(Math.max(1, Math.trunc(endTime))),
-    limit: String(Math.max(1, Math.min(MAX_HTTP_PAGE_ROWS, limit))),
-  });
-  if (candidate.continuous) {
-    query.set('pair', symbol);
-    query.set('contractType', 'PERPETUAL');
-  } else {
-    query.set('symbol', symbol);
-  }
-  return `${candidate.base}${candidate.path}?${query.toString()}`;
+  return { restricted: false, transient: false, until: 0 };
 }
 
 function inspectBridgeWindow(rows, interval, startTime, endTime) {
@@ -591,28 +493,24 @@ function inspectBridgeWindow(rows, interval, startTime, endTime) {
 
 async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endTime, maxRows, requestContext = null) {
   if (bridgeCooldown(candidate.id, symbol)) return [];
-  const source = candidate.continuous
-    ? `binance_official_public_continuous_kline_current_bridge_${candidate.id}`
-    : `binance_official_public_kline_current_bridge_${candidate.id}`;
-  const result = [];
-  const step = intervalMs(interval);
-  let cursor = startTime;
-  while (cursor < endTime && result.length < maxRows) {
-    if (bridgeCooldown(candidate.id, symbol)) break;
-    if (requestContext && requestContext.restCallsUsed >= requestContext.maxRestCalls) break;
-    const pageLimit = Math.min(MAX_HTTP_PAGE_ROWS, maxRows - result.length);
-    if (requestContext) requestContext.restCallsUsed += 1;
-    const payload = await fetchJson(bridgeUrl(candidate, symbol, interval, cursor, endTime, pageLimit), HTTP_BRIDGE_TIMEOUT_MS, symbol, interval, requestContext?.signal || null);
-    const page = parseApiRows(payload, symbol, interval, source)
-      .filter((row) => row.open_time_ms >= cursor && row.open_time_ms < endTime);
-    if (!page.length) break;
-    result.push(...page);
-    const next = page.at(-1).open_time_ms + step;
-    if (next <= cursor) break;
-    cursor = next;
-    if (page.length < pageLimit) break;
-  }
-  return mergeRows(result).slice(-maxRows);
+  if (requestContext && requestContext.restCallsUsed >= requestContext.maxRestCalls) return [];
+  if (requestContext) requestContext.restCallsUsed += 1;
+  stats.bridge_http_requests += 1;
+  const rows = await fetchBinanceContractKlineRelayRows({
+    symbol,
+    interval,
+    startTime,
+    endTime,
+    limit: Math.min(MAX_HTTP_PAGE_ROWS, maxRows),
+    signal: requestContext?.signal || null,
+    validationAuthorized: requestContext?.validationAuthorized === true,
+  });
+  return normalizeRows(
+    rows,
+    symbol,
+    interval,
+    'binance_official_public_kline_supabase_edge_relay_fapi_klines',
+  ).filter((row) => row.open_time_ms >= startTime && row.open_time_ms < endTime).slice(-maxRows);
 }
 
 async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxRows, { bypassCache = false, signal = null, requestContext = null } = {}) {
@@ -662,16 +560,10 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
       const message = String(error?.message || error);
       const status = Number(error?.status || 0);
       lastError = `${candidate.id}:${message}`;
-      const failure = error?.binanceRestBlocked === true
-        ? { restricted: true, transient: false, until: Number(error?.guardState?.until || 0) }
-        : error?.binanceRestrictionHandled === true
-          ? { restricted: true, transient: false, until: Number(getBinanceRestGuardHealth()?.next_allowed_at ? Date.parse(getBinanceRestGuardHealth().next_allowed_at) : 0) }
-          : error?.internalBinanceRestGuard === true
-            ? { restricted: false, transient: false, until: 0 }
-            : await markBridgeFailure(candidate, symbol, status, message, error?.retryAfterSeconds);
+      const failure = await markBridgeFailure(candidate, symbol, Number(error?.upstreamStatus || status), message);
       stats.bridge_errors += 1;
       // 403/418/429/451/IP ban属于同一Render出口IP，不再继续轰炸其余fapi/www候选。
-      if (failure.restricted || error?.binanceRestBlocked === true) {
+      if (failure.restricted || error?.internalBinanceRelayGuard === true) {
         stats.bridge_restricted_short_circuits += 1;
         break;
       }
@@ -940,7 +832,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.10' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.11' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1146,7 +1038,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
 
   if (forceRestValidation === true) {
     if (normalizedInterval !== '15m' || safeLimit !== 240 || !nearNow) return [];
-    const requestContext = { restCallsUsed: 0, maxRestCalls: 1, signal };
+    const requestContext = { restCallsUsed: 0, maxRestCalls: 1, signal, validationAuthorized: true };
     const validationStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
     const rows = await fetchCurrentBridgeRows(
       normalizedSymbol,
@@ -1200,7 +1092,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.8.10：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8.11：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
@@ -1268,7 +1160,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.8.10：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8.11：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
@@ -1304,7 +1196,8 @@ export function getBinanceContractKlineSeedHealth() {
     archive_global_max_active: ARCHIVE_GLOBAL_MAX_ACTIVE,
     archive_global_max_pending: ARCHIVE_GLOBAL_MAX_PENDING,
     snapshot_io_timeout_ms: SNAPSHOT_IO_TIMEOUT_MS,
-    max_bridge_rest_calls_per_api_request: 1,
+    max_bridge_rest_calls_per_api_request: 0,
+    max_edge_relay_calls_per_api_request: 1,
     persistence_enabled: supabaseEnabled(),
     live_stream_count: liveStreams.size,
     live_ws_max_streams: MAX_LIVE_STREAMS,
@@ -1349,19 +1242,19 @@ export function getBinanceContractKlineSeedHealth() {
     gap_repair_last_success_at: stats.gap_repair_last_success_at ? iso(stats.gap_repair_last_success_at) : null,
     live_last_message_at: stats.live_last_message_at ? iso(stats.live_last_message_at) : null,
     bridge_wide_cooldown: (() => {
-      const guard = getBinanceRestGuardHealth();
+      const relay = getBinanceContractKlineRelayHealth();
       return {
-        active: Boolean(guard.active),
-        next_allowed_at: guard.next_allowed_at,
-        reason: guard.reason,
-        candidate_id: guard.source,
-        parsed_ban_until: guard.parsed_ban_until,
-        last_error: guard.last_error,
+        active: relay.active,
+        next_allowed_at: relay.next_allowed_at,
+        reason: relay.reason,
+        candidate_id: 'supabase_edge_kline_relay',
+        last_error: relay.last_error,
       };
     })(),
-    shared_binance_rest_guard: getBinanceRestGuardHealth(),
-    bridge_min_request_gap_ms: getBinanceRestGuardHealth().min_request_gap_ms,
-    source: 'binance_single_exact_symbol_rest_probe_gate_bounded_queue_archive_gap_repair_live_websocket',
+    edge_kline_relay: getBinanceContractKlineRelayHealth(),
+    direct_binance_rest_used_by_kline: false,
+    bridge_min_request_gap_ms: getBinanceContractKlineRelayHealth().min_request_gap_ms,
+    source: 'binance_archive_plus_supabase_edge_exact_kline_relay_plus_live_websocket_no_render_binance_rest',
     time: iso(Date.now()),
   };
 }
@@ -1377,5 +1270,4 @@ export const _test = {
   inspectRecentContinuity,
   bridgeStartForRecentWindow,
   inspectBridgeWindow,
-  parseBinanceBanUntil,
 };

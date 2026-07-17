@@ -9,17 +9,17 @@ import {
   getBinanceContractKlineSeedHealth,
 } from './binance-contract-kline-seed.mjs';
 import {
-  acquireBinanceRestRequestSlot,
-  completeBinanceValidationCall,
-  failBinanceValidationCall,
-  getBinanceRestGuardHealth,
-  isBinanceValidationAdminAuthorized,
-  isBinanceValidationAdminConfigured,
-  observeBinanceRestResponse,
-  runBinanceRestProbe,
-  resetBinanceValidationSession,
-  runWithBinanceValidationSession,
-} from './binance-rest-guard.mjs';
+  checkBinanceContractKlineRelayDeployment,
+  completeBinanceContractKlineRelayValidation,
+  ensureBinanceContractKlineRelayInitialized,
+  failBinanceContractKlineRelayValidation,
+  fetchBinancePublicRestRelayJson,
+  getBinanceContractKlineRelayHealth,
+  resetBinanceContractKlineRelayValidation,
+  runWithBinanceContractKlineRelayValidation,
+  startBinanceContractKlineRelayValidation,
+} from './binance-contract-kline-relay.mjs';
+import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
 
 if (process.env.KAKA_DISABLE_BINANCE_MARKET_START !== '1') {
   startBinanceContractMarket();
@@ -290,35 +290,12 @@ async function jsonFetch(urls, timeout = 15_000) {
   throw lastError || new Error('upstream unavailable');
 }
 async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_market_rest') {
-  const release = await acquireBinanceRestRequestSlot({
-    source,
-    maxQueueWaitMs: 20_000,
-  });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        accept: 'application/json',
-        'user-agent': 'KakaWeb3-Market-Worker/650.8.10',
-      },
-    });
-    const bodyText = await response.text();
-    const observation = await observeBinanceRestResponse({ response, bodyText, source });
-    if (!response.ok) {
-      const error = new Error(observation.message || `${response.status} ${response.statusText}`);
-      error.status = response.status;
-      throw error;
-    }
-    if (!bodyText) return null;
-    try { return JSON.parse(bodyText); }
-    catch (_) { throw new Error(`invalid JSON from Binance upstream: ${bodyText.slice(0, 240)}`); }
-  } finally {
-    clearTimeout(timer);
-    release();
-  }
+  // Step650.8.11: Binance Spot and Contract public HTTP both use the same
+  // authenticated Edge relay and durable queue. Render direct REST is disabled.
+  void timeout;
+  return await fetchBinancePublicRestRelayJson(url, { source });
 }
+
 
 function send(res, status, body) {
   res.writeHead(status, {
@@ -947,7 +924,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  // Step650.8.10: only seconds with real official trades become candles.
+  // Step650.8.11: only seconds with real official trades become candles.
   // Empty seconds remain absent; timeline rendering may visually carry the last
   // price, but the API never fabricates zero-volume OHLC rows.
   return [...buckets.values()]
@@ -970,7 +947,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.10：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.11：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
     if (seedRows.length) return seedRows;
@@ -1022,6 +999,9 @@ export function getBinanceMarketRestHealth() {
 export async function handleMarketApi(req, res, url) {
   if (!url.pathname.startsWith('/api/')) return false;
   const validationResetPath = url.pathname === '/api/binance-contract-validation-reset';
+  const relayValidationStartPath = url.pathname === '/api/binance-contract-kline-relay-validation-start';
+  const relayValidationResetPath = url.pathname === '/api/binance-contract-kline-relay-validation-reset';
+  const postRequiredPath = validationResetPath || relayValidationStartPath || relayValidationResetPath;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -1031,10 +1011,10 @@ export async function handleMarketApi(req, res, url) {
     res.end();
     return true;
   }
-  if (validationResetPath ? req.method !== 'POST' : req.method !== 'GET') {
+  if (postRequiredPath ? req.method !== 'POST' : req.method !== 'GET') {
     send(res, 405, {
       ok: false,
-      error: validationResetPath ? 'POST required' : 'GET required',
+      error: postRequiredPath ? 'POST required' : 'GET required',
       rows: [],
     });
     return true;
@@ -1052,44 +1032,65 @@ export async function handleMarketApi(req, res, url) {
       send(res, 200, getBinanceContractKlineSeedHealth());
       return true;
     }
-    if (url.pathname === '/api/binance-contract-validation-reset') {
-      const adminKey = String(req.headers['x-kaka-admin-key'] || '').trim();
-      if (!isBinanceValidationAdminConfigured()) {
-        send(res, 503, { ok: false, error: 'validation admin key not configured' });
-        return true;
+    if (url.pathname === '/api/binance-contract-kline-relay-health') {
+      await ensureBinanceContractKlineRelayInitialized();
+      let deployment = null;
+      try {
+        deployment = await checkBinanceContractKlineRelayDeployment();
+      } catch (error) {
+        deployment = {
+          ok: false,
+          reachable: false,
+          version: null,
+          upstream_called: false,
+          error: String(error?.message || error),
+        };
       }
-      if (!isBinanceValidationAdminAuthorized(adminKey)) {
-        send(res, 403, { ok: false, error: 'validation admin key invalid' });
-        return true;
-      }
-      const guard = await resetBinanceValidationSession(adminKey, {
-        reason: 'admin_validation_reset',
+      send(res, deployment.ok === true ? 200 : 503, {
+        ...getBinanceContractKlineRelayHealth(),
+        edge_deployment: deployment,
       });
+      return true;
+    }
+    if (url.pathname === '/api/binance-contract-kline-relay-validation-start') {
+      const adminKey = String(req.headers['x-kaka-admin-key'] || '').trim();
+      const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.10',
-        reset: true,
-        guard,
+        version: '650.8.11',
+        relay_validation: result,
+        health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
       });
       return true;
     }
-    if (url.pathname === '/api/binance-contract-rest-probe') {
+    if (url.pathname === '/api/binance-contract-kline-relay-validation-reset') {
       const adminKey = String(req.headers['x-kaka-admin-key'] || '').trim();
-      if (!isBinanceValidationAdminConfigured()) {
-        send(res, 503, { ok: false, error: 'validation admin key not configured' });
-        return true;
-      }
-      if (!isBinanceValidationAdminAuthorized(adminKey)) {
-        send(res, 403, { ok: false, error: 'validation admin key invalid' });
-        return true;
-      }
-      const result = await runBinanceRestProbe(adminKey);
+      const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.10',
-        probe: result,
+        version: '650.8.11',
+        reset: true,
+        health,
         cached_at: new Date().toISOString(),
+      });
+      return true;
+    }
+    if (url.pathname === '/api/binance-contract-validation-reset') {
+      send(res, 410, {
+        ok: false,
+        version: '650.8.11',
+        error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
+        direct_binance_rest_enabled: false,
+      });
+      return true;
+    }
+    if (url.pathname === '/api/binance-contract-rest-probe') {
+      send(res, 410, {
+        ok: false,
+        version: '650.8.11',
+        error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
+        direct_binance_rest_probe_enabled: false,
       });
       return true;
     }
@@ -1159,7 +1160,7 @@ export async function handleMarketApi(req, res, url) {
         return true;
       }
       const rows = validationRequest
-        ? await runWithBinanceValidationSession(
+        ? await runWithBinanceContractKlineRelayValidation(
             validationToken,
             () => fetchMarketKlines(
               provider,
@@ -1190,9 +1191,9 @@ export async function handleMarketApi(req, res, url) {
           coverage.lag_intervals_to_end <= 1 &&
           coverage.continuous_to_current === true;
         if (validationPassed) {
-          await completeBinanceValidationCall({ token: validationToken, symbol, interval });
+          await completeBinanceContractKlineRelayValidation({ token: validationToken, symbol, interval });
         } else {
-          await failBinanceValidationCall({
+          await failBinanceContractKlineRelayValidation({
             token: validationToken,
             symbol,
             interval,
@@ -1217,10 +1218,13 @@ export async function handleMarketApi(req, res, url) {
     return true;
   } catch (error) {
     const message = String(error?.message || error);
-    const status = error?.internalBinanceRestGuard
+    const internalGuard = error?.internalBinanceRelayGuard === true || error?.internalBinanceRestGuard === true;
+    const status = internalGuard
       ? 409
       : (message.includes('not supported') || message.includes('unsupported provider') ? 400 : 502);
-    const guard = error?.internalBinanceRestGuard ? getBinanceRestGuardHealth() : null;
+    const guard = error?.internalBinanceRelayGuard === true
+      ? getBinanceContractKlineRelayHealth()
+      : (error?.internalBinanceRestGuard === true ? getBinanceRestGuardHealth() : null);
     send(res, status, {
       ok: false,
       error: message,
@@ -1235,7 +1239,7 @@ export async function handleMarketApi(req, res, url) {
         active: guard.active,
         next_allowed_at: guard.next_allowed_at,
         reason: guard.reason,
-        operating_mode: guard.operating_mode,
+        operating_mode: guard.operating_mode || (guard.edge_relay_only ? 'edge_relay_guarded' : null),
         last_probe_at: guard.last_probe_at,
         last_probe_http_status: guard.last_probe_http_status,
         last_probe_raw_weight_1m: guard.last_probe_raw_weight_1m,

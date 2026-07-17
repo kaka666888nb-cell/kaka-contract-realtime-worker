@@ -1,10 +1,7 @@
-import {
-  acquireBinanceRestRequestSlot,
-  observeBinanceRestResponse,
-} from './binance-rest-guard.mjs';
+import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.10';
+const VERSION = '650.8.11';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -117,33 +114,12 @@ async function fetchJson(url, timeoutMs = 8000) {
 }
 
 async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_funding') {
-  const release = await acquireBinanceRestRequestSlot({
-    source,
-    maxQueueWaitMs: 20_000,
-  });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.10 contract-funding',
-      },
-    });
-    const text = await response.text();
-    const observation = await observeBinanceRestResponse({ response, bodyText: text, source });
-    if (!response.ok) {
-      const error = new Error(observation.message || `HTTP_${response.status}`);
-      error.status = response.status;
-      throw error;
-    }
-    return JSON.parse(text);
-  } finally {
-    clearTimeout(timer);
-    release();
-  }
+  // Step650.8.11: preserve Binance funding current/history without using the
+  // banned Render egress. The Edge relay has a strict endpoint/parameter allowlist.
+  void timeoutMs;
+  return await fetchBinancePublicRestRelayJson(url, { source });
 }
+
 
 
 async function fetchBinancePair(currentUrl, historyUrl) {

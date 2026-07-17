@@ -356,7 +356,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.10' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.11' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -551,7 +551,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.10：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.11：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }
