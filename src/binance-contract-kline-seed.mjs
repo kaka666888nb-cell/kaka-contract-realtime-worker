@@ -1,5 +1,13 @@
 import { inflateRawSync } from 'node:zlib';
 import { WebSocket } from 'ws';
+import {
+  acquireBinanceRestRequestSlot,
+  getBinanceRestGuardHealth,
+  isBinanceRestBlocked,
+  markBinanceRestRestricted,
+  markBinanceRestSuccess,
+  parseBinanceBanUntil,
+} from './binance-rest-guard.mjs';
 
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
@@ -14,9 +22,6 @@ const MAX_MONTHLY_FILES = 24;
 const FETCH_TIMEOUT_MS = 8_000;
 const HTTP_BRIDGE_TIMEOUT_MS = 6_000;
 const HTTP_BRIDGE_CACHE_MS = 30_000;
-const HTTP_BRIDGE_MIN_REQUEST_GAP_MS = 1_200;
-const HTTP_BRIDGE_BAN_SAFETY_MS = 90_000;
-const HTTP_RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 const HTTP_TRANSIENT_COOLDOWN_MS = 90_000;
 const MAX_HTTP_PAGE_ROWS = 1000;
 const MAX_LIVE_STREAMS = 32;
@@ -27,15 +32,12 @@ const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/market/ws',
   'wss://stream.binancefuture.com/market/ws',
 ];
-// Step650.4：先尝试官方文档 REST 主域，再尝试 Binance 官网同路径反向代理；
-// 同一候选触发 429/451/5xx 后单独冷却，不再影响归档、其他候选或实时 WebSocket。
+// Step650.8：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.7：先请求精确 symbol Kline，通常一页即可补齐，避免连续合约 partial 后再重复请求。
-  // www 路径仅在普通网络/5xx时兜底；任何418/429/451或明确IP封禁会立即停止本轮全部候选。
+  // Step650.8：只保留官方精确交易对 Kline 主端点。
+  // 不再用 continuous/www 连续撞多个候选；一次失败就返回归档/快照/WS，等待共享守卫放行。
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
-  { id: 'fapi_continuous', base: 'https://fapi.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
-  { id: 'www_klines', base: 'https://www.binance.com', path: '/fapi/v1/klines', continuous: false },
-  { id: 'www_continuous', base: 'https://www.binance.com', path: '/fapi/v1/continuousKlines', continuous: true },
 ];
 
 const memory = new Map();
@@ -393,9 +395,6 @@ function bridgeStartForRecentWindow(rows, interval, endMs, limit = MAX_PERSIST_R
 
 const bridgeCandidateState = new Map();
 const bridgeResultCache = new Map();
-let bridgeWideRestrictedState = null;
-let bridgeRequestChain = Promise.resolve();
-let bridgeLastRequestStartedAt = 0;
 
 function bridgeStateKey(candidateId, symbol = '*') {
   return `${candidateId}|${symbol || '*'}`;
@@ -409,30 +408,14 @@ function activeBridgeState(key) {
   return null;
 }
 
-function activeBridgeWideState() {
-  if (!bridgeWideRestrictedState) return null;
-  if (bridgeWideRestrictedState.until > Date.now()) return bridgeWideRestrictedState;
-  bridgeWideRestrictedState = null;
-  return null;
-}
-
-function parseBinanceBanUntil(message) {
-  const match = String(message || '').match(/banned\s+until\s+(\d{12,16})/i);
-  if (!match) return null;
-  let value = Number(match[1]);
-  if (!Number.isFinite(value) || value <= 0) return null;
-  if (value > 10_000_000_000_000) value = Math.floor(value / 1000);
-  return value;
-}
-
 function bridgeCooldown(candidateId, symbol) {
-  // Binance的418/IP ban会跨fapi/www候选共享；普通5xx/网络错误仍只隔离当前候选与交易对。
-  return activeBridgeWideState() ||
+  // Step650.8：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
+  return isBinanceRestBlocked() ||
     activeBridgeState(bridgeStateKey(candidateId, '*')) ||
     activeBridgeState(bridgeStateKey(candidateId, symbol));
 }
 
-function markBridgeFailure(candidate, symbol, status, message) {
+function markBridgeFailure(candidate, symbol, status, message, retryAfterSeconds = null) {
   const lower = String(message || '').toLowerCase();
   const restricted = status === 418 || status === 429 || status === 451 ||
     lower.includes('too many requests') || lower.includes('banned') || lower.includes('restricted');
@@ -444,21 +427,13 @@ function markBridgeFailure(candidate, symbol, status, message) {
   if (restricted) {
     const parsedBanUntil = parseBinanceBanUntil(message);
     if (parsedBanUntil) stats.bridge_ban_until_parsed += 1;
-    const fallbackUntil = Date.now() + HTTP_RESTRICTED_COOLDOWN_MS;
-    const until = Math.max(
-      Number(bridgeWideRestrictedState?.until || 0),
-      fallbackUntil,
-      Number(parsedBanUntil || 0) + HTTP_BRIDGE_BAN_SAFETY_MS,
-    );
-    bridgeWideRestrictedState = {
-      until,
+    const guard = markBinanceRestRestricted({
       status,
-      candidate_id: candidate.id,
-      reason: 'exchange_rate_limit_or_region_block',
-      error: String(message || ''),
-      parsed_ban_until: parsedBanUntil || null,
-    };
-    return { restricted: true, transient: false, until };
+      message,
+      source: `kline_bridge:${candidate.id}`,
+      retryAfterSeconds,
+    });
+    return { restricted: true, transient: false, until: Number(guard?.until || 0) };
   }
 
   const until = Date.now() + HTTP_TRANSIENT_COOLDOWN_MS;
@@ -473,29 +448,17 @@ function markBridgeFailure(candidate, symbol, status, message) {
 }
 
 async function waitForBridgeRequestSlot() {
-  let release;
-  const previous = bridgeRequestChain;
-  bridgeRequestChain = new Promise((resolve) => { release = resolve; });
-  await previous;
-  const waitMs = Math.max(0, HTTP_BRIDGE_MIN_REQUEST_GAP_MS - (Date.now() - bridgeLastRequestStartedAt));
-  if (waitMs > 0) {
+  const before = getBinanceRestGuardHealth();
+  const release = await acquireBinanceRestRequestSlot();
+  const after = getBinanceRestGuardHealth();
+  if (Number(after.request_slot_waits || 0) > Number(before.request_slot_waits || 0)) {
     stats.bridge_rate_limiter_waits += 1;
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
-  bridgeLastRequestStartedAt = Date.now();
   stats.bridge_http_requests += 1;
   return release;
 }
 
 async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
-  const wideState = activeBridgeWideState();
-  if (wideState) {
-    const error = new Error(`bridge_ip_cooldown_until:${wideState.until}`);
-    error.status = 418;
-    error.bridgeWideCooldown = true;
-    throw error;
-  }
-
   const release = await waitForBridgeRequestSlot();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -504,13 +467,16 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.7',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.8',
       },
     });
     const bodyText = await response.text();
+    const retryAfter = response.headers.get('retry-after');
+    const usedWeight = response.headers.get('x-mbx-used-weight-1m');
     if (!response.ok) {
       const error = new Error(`${response.status} ${response.statusText} ${bodyText.slice(0, 360)}`.trim());
       error.status = response.status;
+      error.retryAfterSeconds = retryAfter == null ? null : Number(retryAfter);
       throw error;
     }
     let payload;
@@ -520,6 +486,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS) {
       error.status = 400;
       throw error;
     }
+    markBinanceRestSuccess({ source: 'kline_bridge:fapi_klines', usedWeight1m: usedWeight });
     return payload;
   } finally {
     clearTimeout(timer);
@@ -652,12 +619,12 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
       const message = String(error?.message || error);
       const status = Number(error?.status || 0);
       lastError = `${candidate.id}:${message}`;
-      const failure = error?.bridgeWideCooldown === true
-        ? { restricted: true, transient: false, until: Number(activeBridgeWideState()?.until || 0) }
-        : markBridgeFailure(candidate, symbol, status, message);
+      const failure = error?.binanceRestBlocked === true
+        ? { restricted: true, transient: false, until: Number(error?.guardState?.until || 0) }
+        : markBridgeFailure(candidate, symbol, status, message, error?.retryAfterSeconds);
       stats.bridge_errors += 1;
       // 418/429/451/IP ban属于同一Render出口IP，不再继续轰炸其余fapi/www候选。
-      if (failure.restricted || error?.bridgeWideCooldown === true) {
+      if (failure.restricted || error?.binanceRestBlocked === true) {
         stats.bridge_restricted_short_circuits += 1;
         break;
       }
@@ -824,7 +791,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.7' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1023,7 +990,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.7：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
@@ -1090,7 +1057,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.7：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
@@ -1157,25 +1124,19 @@ export function getBinanceContractKlineSeedHealth() {
     gap_repair_last_success_at: stats.gap_repair_last_success_at ? iso(stats.gap_repair_last_success_at) : null,
     live_last_message_at: stats.live_last_message_at ? iso(stats.live_last_message_at) : null,
     bridge_wide_cooldown: (() => {
-      const state = activeBridgeWideState();
-      return state ? {
-        active: true,
-        next_allowed_at: iso(state.until),
-        reason: state.reason,
-        candidate_id: state.candidate_id,
-        parsed_ban_until: state.parsed_ban_until ? iso(state.parsed_ban_until) : null,
-        last_error: state.error,
-      } : {
-        active: false,
-        next_allowed_at: null,
-        reason: null,
-        candidate_id: null,
-        parsed_ban_until: null,
-        last_error: null,
+      const guard = getBinanceRestGuardHealth();
+      return {
+        active: Boolean(guard.active),
+        next_allowed_at: guard.next_allowed_at,
+        reason: guard.reason,
+        candidate_id: guard.source,
+        parsed_ban_until: guard.parsed_ban_until,
+        last_error: guard.last_error,
       };
     })(),
-    bridge_min_request_gap_ms: HTTP_BRIDGE_MIN_REQUEST_GAP_MS,
-    source: 'binance_exact_symbol_kline_first_shared_ip_ban_guard_archive_gap_repair_live_websocket',
+    shared_binance_rest_guard: getBinanceRestGuardHealth(),
+    bridge_min_request_gap_ms: getBinanceRestGuardHealth().min_request_gap_ms,
+    source: 'binance_single_exact_symbol_rest_persisted_guard_archive_gap_repair_live_websocket',
     time: iso(Date.now()),
   };
 }

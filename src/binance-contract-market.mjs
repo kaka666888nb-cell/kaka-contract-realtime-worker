@@ -9,6 +9,7 @@ const SNAPSHOT_TABLE = 'app_market_backend_snapshots';
 const SNAPSHOT_MIN_UNIVERSE_ROWS = 50;
 const SNAPSHOT_MIN_TICKER_ROWS = 50;
 const SNAPSHOT_PERSIST_INTERVAL_MS = 30_000;
+const AUTOMATIC_REST_ENABLED = false;
 const REST_REFRESH_INTERVAL_MS = 6 * 60 * 60_000;
 const REST_RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 const REST_TRANSIENT_COOLDOWN_MS = 90_000;
@@ -490,11 +491,11 @@ async function persistDirtySnapshots() {
   const universeRows = sortedUniverseRows(DEFAULT_QUOTE);
   const tickerRows = sortedTickerRows().filter((row) => compact(row.symbol).endsWith(DEFAULT_QUOTE));
   if (dirtyUniverse && universeRows.length >= SNAPSHOT_MIN_UNIVERSE_ROWS) {
-    tasks.push(persistSnapshot('universe', universeRows, 'binance_contract_websocket_and_rest_snapshot')
+    tasks.push(persistSnapshot('universe', universeRows, 'binance_contract_websocket_snapshot')
       .then(() => { dirtyUniverse = false; }));
   }
   if (dirtyTickers && tickerRows.length >= SNAPSHOT_MIN_TICKER_ROWS) {
-    tasks.push(persistSnapshot('tickers', tickerRows, 'binance_contract_websocket_and_rest_snapshot')
+    tasks.push(persistSnapshot('tickers', tickerRows, 'binance_contract_websocket_snapshot')
       .then(() => { dirtyTickers = false; }));
   }
   if (!tasks.length) return;
@@ -515,97 +516,10 @@ function schedulePersist() {
   persistTimer.unref?.();
 }
 
-async function jsonFetchCandidates(urls, timeoutMs = 15_000) {
-  let lastError;
-  for (const url of urls) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: { accept: 'application/json', 'user-agent': 'KakaWeb3-Market-Worker/650' },
-      });
-      const text = await response.text();
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText} ${text.slice(0, 240)}`);
-      return text ? JSON.parse(text) : null;
-    } catch (error) {
-      lastError = error;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  throw lastError || new Error('binance_rest_unavailable');
-}
-
-function restrictedRestError(error) {
-  const text = String(error?.message || error).toLowerCase();
-  return text.includes(' 418 ') || text.startsWith('418 ') ||
-    text.includes(' 429 ') || text.startsWith('429 ') ||
-    text.includes(' 451 ') || text.startsWith('451 ') ||
-    text.includes('too many requests') || text.includes('banned until') || text.includes('restricted location');
-}
-
-async function refreshFromRestInternal() {
-  const bases = [
-    'https://fapi.binance.com',
-    'https://fapi1.binance.com',
-    'https://fapi2.binance.com',
-    'https://fapi3.binance.com',
-  ];
-  const [exchangeInfo, tickerPayload] = await Promise.all([
-    jsonFetchCandidates(bases.map((base) => `${base}/fapi/v1/exchangeInfo`)),
-    jsonFetchCandidates(bases.map((base) => `${base}/fapi/v1/ticker/24hr`)),
-  ]);
-  const now = Date.now();
-  let universeCount = 0;
-  let tickerCount = 0;
-  const activeSymbols = new Set();
-  for (const item of Array.isArray(exchangeInfo?.symbols) ? exchangeInfo.symbols : []) {
-    if (String(item?.status || '').toUpperCase() !== 'TRADING') continue;
-    if (String(item?.contractType || '').toUpperCase() !== 'PERPETUAL') continue;
-    const identity = normalizedPerpetual({
-      s: item.symbol,
-      ps: item.pair || item.symbol,
-      st: 1,
-    });
-    if (!identity) continue;
-    identity.base = String(item.baseAsset || identity.base).toUpperCase();
-    identity.quote = String(item.quoteAsset || identity.quote).toUpperCase();
-    upsertUniverse(identity, 'binance_official_public_market_rest_low_frequency', now);
-    activeSymbols.add(identity.symbol);
-    universeCount += 1;
-  }
-  if (universeCount >= SNAPSHOT_MIN_UNIVERSE_ROWS) {
-    for (const symbol of [...universeBySymbol.keys()]) {
-      if (symbol.endsWith(DEFAULT_QUOTE) && !activeSymbols.has(symbol)) removeSymbol(symbol);
-    }
-  }
-  for (const item of Array.isArray(tickerPayload) ? tickerPayload : []) {
-    const identity = normalizedPerpetual({ ...item, ps: item.pair || item.symbol, st: 1 });
-    if (!identity || !universeBySymbol.has(identity.symbol)) continue;
-    upsertTicker(item, identity, 'binance_official_public_ticker_rest_low_frequency', now);
-    tickerCount += 1;
-  }
-  if (!universeCount) throw new Error('binance_rest_universe_empty');
-  restLastSuccessAt = now;
-  restLastError = '';
-  restNextAllowedAt = now + REST_REFRESH_INTERVAL_MS;
-  schedulePersist();
-  return { universeCount, tickerCount };
-}
-
-export async function refreshBinanceContractMarketFromRest({ force = false } = {}) {
-  const now = Date.now();
-  if (!force && now < restNextAllowedAt) return null;
-  if (restRefreshPromise) return restRefreshPromise;
-  restRefreshPromise = refreshFromRestInternal()
-    .catch((error) => {
-      restLastError = String(error?.message || error);
-      restNextAllowedAt = Date.now() + (restrictedRestError(error) ? REST_RESTRICTED_COOLDOWN_MS : REST_TRANSIENT_COOLDOWN_MS);
-      throw error;
-    })
-    .finally(() => { restRefreshPromise = null; });
-  return restRefreshPromise;
+export async function refreshBinanceContractMarketFromRest() {
+  // Step650.8：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
+  return null;
 }
 
 function waitForRows(predicate, timeoutMs = START_WAIT_MS) {
@@ -633,9 +547,6 @@ export function startBinanceContractMarket() {
   started = true;
   restoreSnapshots().finally(() => {
     for (const name of Object.keys(STREAMS)) connectStream(name);
-    setTimeout(() => {
-      refreshBinanceContractMarketFromRest().catch(() => {});
-    }, 10_000).unref?.();
   });
   const watchdog = setInterval(() => {
     const now = Date.now();
@@ -652,7 +563,6 @@ export function startBinanceContractMarket() {
       }
     }
     if (dirtyUniverse || dirtyTickers) schedulePersist();
-    refreshBinanceContractMarketFromRest().catch(() => {});
   }, 30_000);
   watchdog.unref?.();
 }
@@ -664,10 +574,6 @@ export async function getBinanceContractUniverse({ quote = DEFAULT_QUOTE, waitMs
   let rows = sortedUniverseRows(normalizedQuote);
   if (rows.length < minimumRows && waitMs > 0) {
     await waitForRows(() => sortedUniverseRows(normalizedQuote).length >= minimumRows, waitMs);
-    rows = sortedUniverseRows(normalizedQuote);
-  }
-  if (rows.length < minimumRows) {
-    try { await refreshBinanceContractMarketFromRest(); } catch (_) {}
     rows = sortedUniverseRows(normalizedQuote);
   }
   if (rows.length < minimumRows) {
@@ -689,10 +595,6 @@ export async function getBinanceContractTickers({ symbols = [], waitMs = START_W
       rows = sortedTickerRows(wanted);
       return wanted.length ? rows.length >= Math.min(wanted.length, 1) : rows.length >= SNAPSHOT_MIN_TICKER_ROWS;
     }, waitMs);
-    rows = sortedTickerRows(wanted);
-  }
-  if (!rows.length) {
-    try { await refreshBinanceContractMarketFromRest(); } catch (_) {}
     rows = sortedTickerRows(wanted);
   }
   return rows;
@@ -720,12 +622,13 @@ export function getBinanceContractMarketHealth() {
     last_ticker_event_at: lastTickerEventAt ? iso(lastTickerEventAt) : null,
     last_contract_info_event_at: lastContractInfoEventAt ? iso(lastContractInfoEventAt) : null,
     last_persist_at: lastPersistAt ? iso(lastPersistAt) : null,
+    automatic_rest_enabled: AUTOMATIC_REST_ENABLED,
     rest_last_success_at: restLastSuccessAt ? iso(restLastSuccessAt) : null,
     rest_next_allowed_at: restNextAllowedAt ? iso(restNextAllowedAt) : null,
     rest_last_error: restLastError || null,
     persistence_enabled: supabaseEnabled(),
     streams,
-    source: 'binance_official_public_websocket_with_persistent_snapshot',
+    source: 'binance_official_public_websocket_with_persistent_snapshot_no_automatic_rest',
     time: new Date().toISOString(),
   };
 }

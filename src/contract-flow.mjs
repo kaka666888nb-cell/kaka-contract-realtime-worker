@@ -1,4 +1,9 @@
 import { WebSocket } from 'ws';
+import {
+  acquireBinanceRestRequestSlot,
+  markBinanceRestRestricted,
+  markBinanceRestSuccess,
+} from './binance-rest-guard.mjs';
 
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
@@ -638,6 +643,39 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
   catch (_) { throw new Error(`upstream_invalid_json:${text.slice(0, 160)}`); }
 }
 
+async function fetchBinanceJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
+  const release = await acquireBinanceRestRequestSlot();
+  try {
+    const response = await fetch(url, {
+      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8 contract-flow', ...headers },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      const message = `upstream_${response.status}:${text.slice(0, 240)}`;
+      if ([418, 429, 451].includes(response.status) || /too many requests|banned until|restricted/i.test(text)) {
+        markBinanceRestRestricted({
+          status: response.status,
+          message,
+          source: 'contract_flow',
+          retryAfterSeconds: response.headers.get('retry-after'),
+        });
+      }
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
+    }
+    markBinanceRestSuccess({
+      source: 'contract_flow',
+      usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
+    });
+    try { return text.trim() ? JSON.parse(text) : null; }
+    catch (_) { throw new Error(`upstream_invalid_json:${text.slice(0, 160)}`); }
+  } finally {
+    release();
+  }
+}
+
 
 function firstDataObject(payload) {
   const direct = payload?.data;
@@ -694,10 +732,10 @@ function normalizeContractMeta(provider, symbol, raw = {}) {
 }
 
 async function fetchBinanceContractMeta(symbol) {
-  const raw = await firstWorkingJson([
-    `https://fapi1.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`,
+  const raw = await fetchBinanceJson(
     `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`,
-  ], { timeoutMs: 5000 });
+    { timeoutMs: 5000 },
+  );
   return normalizeContractMeta('binance', symbol, {
     ...raw,
     mark_price: raw?.markPrice,
@@ -705,7 +743,7 @@ async function fetchBinanceContractMeta(symbol) {
     last_funding_rate: raw?.lastFundingRate,
     next_funding_time: raw?.nextFundingTime,
     source_time: raw?.time,
-    source: 'binance_premium_index',
+    source: 'binance_premium_index_shared_rest_guard',
   });
 }
 
@@ -1036,23 +1074,19 @@ async function firstWorkingJson(urls, options = {}) {
 }
 
 async function fetchBinanceMetricRows(state) {
-  const hosts = ['https://fapi.binance.com','https://fapi1.binance.com'];
+  const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  let settled = null;
-  let lastError = null;
-  for (const host of hosts) {
-    try {
-      settled = await Promise.allSettled([
-        fetchJson(`${host}/futures/data/openInterestHist?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
-        fetchJson(`${host}/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
-        fetchJson(`${host}/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
-        fetchJson(`${host}/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
-      ]);
-      if (settled.some((item) => item.status === 'fulfilled')) break;
-      lastError = new Error(settled.map((item) => item.status === 'rejected' ? item.reason?.message : '').join(' | '));
-    } catch (error) { lastError = error; }
+  // Step650.8：四个指标请求仍可并行进入本地队列，但共享守卫会严格串行并保持5秒间隔。
+  // 第一个418/429会持久封锁后续排队项，它们不会继续命中币安。
+  const settled = await Promise.allSettled([
+    fetchBinanceJson(`${host}/futures/data/openInterestHist?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
+    fetchBinanceJson(`${host}/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
+    fetchBinanceJson(`${host}/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
+    fetchBinanceJson(`${host}/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=288`, { headers, timeoutMs: 6500 }),
+  ]);
+  if (!settled.some((item) => item.status === 'fulfilled')) {
+    throw new Error(settled.map((item) => item.status === 'rejected' ? item.reason?.message : '').join(' | ') || 'binance_metrics_unavailable');
   }
-  if (!settled || !settled.some((item) => item.status === 'fulfilled')) throw lastError || new Error('binance_metrics_unavailable');
   const map = new Map();
   const oi = settled[0].status === 'fulfilled' && Array.isArray(settled[0].value) ? settled[0].value : [];
   for (const item of oi) {

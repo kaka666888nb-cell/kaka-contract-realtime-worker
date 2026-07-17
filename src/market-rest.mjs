@@ -8,6 +8,11 @@ import {
   getBinanceContractKlineSeed,
   getBinanceContractKlineSeedHealth,
 } from './binance-contract-kline-seed.mjs';
+import {
+  acquireBinanceRestRequestSlot,
+  markBinanceRestRestricted,
+  markBinanceRestSuccess,
+} from './binance-rest-guard.mjs';
 
 startBinanceContractMarket();
 
@@ -225,6 +230,46 @@ async function jsonFetch(urls, timeout = 15_000) {
   }
   throw lastError || new Error('upstream unavailable');
 }
+async function binanceContractJsonFetch(url, timeout = 15_000, source = 'legacy_market_rest') {
+  const release = await acquireBinanceRestRequestSlot();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'KakaWeb3-Market-Worker/650.8',
+      },
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      const message = `${response.status} ${response.statusText} ${bodyText.slice(0, 240)}`.trim();
+      if ([418, 429, 451].includes(response.status) || /too many requests|banned until|restricted/i.test(bodyText)) {
+        markBinanceRestRestricted({
+          status: response.status,
+          message,
+          source,
+          retryAfterSeconds: response.headers.get('retry-after'),
+        });
+      }
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
+    }
+    markBinanceRestSuccess({
+      source,
+      usedWeight1m: response.headers.get('x-mbx-used-weight-1m'),
+    });
+    if (!bodyText) return null;
+    try { return JSON.parse(bodyText); }
+    catch (_) { throw new Error(`invalid JSON from Binance contract upstream: ${bodyText.slice(0, 240)}`); }
+  } finally {
+    clearTimeout(timer);
+    release();
+  }
+}
+
 function send(res, status, body) {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -601,9 +646,10 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
     const base = market === 'contract'
       ? 'https://fapi.binance.com/fapi/v1/klines'
       : 'https://api.binance.com/api/v3/klines';
-    const payload = await jsonFetch(
-      `${base}?symbol=${symbol}&interval=${encodeURIComponent(interval)}&endTime=${end}&limit=${Math.min(1500, limit)}`,
-    );
+    const url = `${base}?symbol=${symbol}&interval=${encodeURIComponent(interval)}&endTime=${end}&limit=${Math.min(1500, limit)}`;
+    const payload = market === 'contract'
+      ? await binanceContractJsonFetch(url, 15_000, 'legacy_contract_kline')
+      : await jsonFetch(url);
     rows = (payload || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[7],a[8]])).filter(Boolean);
   } else if (provider === 'okx') {
     const bar = okxBar(interval);
@@ -740,12 +786,9 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
         const fromId = Math.max(0, beforeId - pageLimit);
         url = `${base}?symbol=${symbol}&fromId=${fromId}&limit=${pageLimit}`;
       }
-      const payload = await jsonFetch(
-        market === 'spot'
-          ? [url, url.replace('https://api.binance.com', 'https://data-api.binance.vision')]
-          : url,
-        20_000,
-      );
+      const payload = market === 'contract'
+        ? await binanceContractJsonFetch(url, 20_000, 'legacy_contract_agg_trades')
+        : await jsonFetch([url, url.replace('https://api.binance.com', 'https://data-api.binance.vision')], 20_000);
       const page = Array.isArray(payload) ? payload : [];
       if (!page.length) break;
       let oldestId = null;

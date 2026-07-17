@@ -4,10 +4,11 @@ import { handleContractFlow } from './contract-flow.mjs';
 import { handleContractDepth } from './contract-depth.mjs';
 import { handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding } from './contract-funding.mjs';
+import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.7';
+const STEP_VERSION = '650.8';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: { ...process.env, PORT: String(CHILD_PORT) },
@@ -29,7 +30,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.7：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+当前日桥接提供，
+  // Step650.8：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -246,6 +247,7 @@ const server = http.createServer(async (req, res) => {
       contract_funding: '/api/contract-funding',
       binance_contract_market_health: '/api/binance-contract-market-health',
       binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
+      binance_rest_guard: getBinanceRestGuardHealth(),
       contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
@@ -268,16 +270,20 @@ const server = http.createServer(async (req, res) => {
         legacy_rest_circuit_breaker: true,
         binance_contract_market_transport: 'official_websocket_ticker_bookticker_contract_info',
         binance_contract_market_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
-        binance_contract_market_rest_role: 'low_frequency_metadata_refresh_only',
+        binance_contract_market_rest_role: 'automatic_rest_disabled_websocket_snapshot_only',
         binance_contract_market_empty_snapshot_never_overwrites: true,
         binance_contract_market_startup_restore: true,
-        binance_contract_kline_seed_source: 'official_data_archive_daily_monthly_plus_current_http_and_live_websocket_bridge',
+        binance_contract_kline_seed_source: 'official_data_archive_plus_single_exact_symbol_rest_guarded_plus_live_websocket',
         binance_contract_kline_seed_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
         binance_contract_kline_partial_candidate_validation: true,
         binance_contract_kline_shared_ip_ban_guard: true,
-        binance_contract_kline_exact_symbol_first: true,
-        binance_contract_kline_http_min_request_gap_ms: 1200,
+        binance_contract_kline_single_official_rest_candidate: 'fapi_v1_klines',
+        binance_contract_kline_http_min_request_gap_ms: 5000,
         binance_contract_kline_parse_official_ban_until: true,
+        binance_contract_rest_guard_persistent_snapshot: true,
+        binance_contract_rest_guard_all_callers: ['kline','funding','contract_meta','position_metrics','legacy_contract_agg_trades'],
+        binance_contract_rest_migration_quarantine_until: '2026-07-17T20:39:46.570Z',
+        binance_contract_rest_multi_host_retry_disabled: true,
         binance_contract_kline_partial_snapshot_never_persists: true,
         binance_contract_kline_current_day_bridge: true,
         binance_contract_kline_internal_gap_aware_repair: true,
@@ -285,9 +291,9 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_live_bridge_on_demand: true,
         binance_contract_kline_gap_diagnostics: true,
         binance_contract_snapshot_routes_bypass_legacy_rest_circuit: true,
-        binance_contract_kline_cold_start: 'exact_symbol_kline_first_then_bounded_archive_gap_repair',
+        binance_contract_kline_cold_start: 'guarded_single_exact_symbol_then_bounded_archive_gap_repair',
         binance_contract_kline_failure_scope: 'symbol_interval_isolated',
-        restricted_cooldown_seconds: 1800,
+        restricted_cooldown_policy: 'official_ban_until_or_retry_after_plus_90_seconds',
         transient_cooldown_seconds: 90,
         contract_meta_cache_seconds: 30,
         contract_depth_cache_ms: 1200,
