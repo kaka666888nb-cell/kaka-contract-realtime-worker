@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.8.3**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.8.4**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -214,3 +214,23 @@ Step650.8.3 also removes the former parent/child split-brain risk. Market HTTP e
 - Each validation budget decrement and next-symbol transition is durably persisted before the corresponding Binance Kline request leaves the process.
 - The probe must include a numeric `x-mbx-used-weight-1m` response header no greater than the conservative threshold `100`; a missing or higher value issues no validation token, sends no Kline request, and enters a local ten-minute safety cooldown.
 - Persistence queue failures are surfaced by `flushBinanceRestGuardPersistence()` instead of being silently treated as success.
+
+
+## Step650.8.4 completed Binance guard, shared streams, and staged release
+
+Step650.8.4 is the first candidate that closes the full Binance safety loop rather than only delaying the next request.
+
+- The persisted guard has three explicit modes: `probe_required`, `validation_only`, and `normal_guarded`. Four successful 15-minute exact-symbol validations move the worker into bounded normal operation; any restriction, unsafe weight, missing weight header, persistence failure, restart with an uncertain in-flight call, or administrator-key rotation fails closed and returns to `probe_required`.
+- Binance `403` WAF responses are handled together with `418`, `429`, and `451`, using the official ban deadline or `Retry-After` plus a safety margin.
+- Every successful Binance REST response is checked for `x-mbx-used-weight-1m`. The conservative limits are 100 for the probe, 150 during validation, and 600 during guarded normal operation.
+- Probe and validation transitions must be durable in the existing Supabase snapshot before the next Binance request is allowed. An unhealthy persistence path blocks Binance network access.
+- The private validation administrator key is never stored in a script or delivery package. The PowerShell validator reads it as hidden input; the temporary validation token is stored locally with Windows DPAPI and is never printed.
+- Binance Spot public REST uses `data-api.binance.vision`, shares one cache/in-flight map, and still passes through the same parent-process guard.
+- Binance contract validation is server-locked to `1000SHIBUSDT -> ARCUSDT -> BANANAS31USDT -> BCHUSDT`, all at `15m`, with one exact `/fapi/v1/klines` request per validation API call.
+- Contract archive downloads have a process-wide active/pending limit, URL-level in-flight deduplication, and a bounded parsed-file cache.
+- App Binance Kline WebSockets are shared by `market + symbol + interval`, with 64 upstream streams, 1000 total downstream clients, 250 clients per stream, connection pacing, reconnect limits, reference counting, and idle cleanup.
+- Binance depth/trade WebSockets are capped at 32 symbols and now have a separate conservative connection-start governor (1500 ms gap, 60 attempts per five minutes).
+- One-second candles are emitted only for seconds that contain official trades. Empty seconds are not fabricated as zero-volume OHLC candles.
+- The WebSocket-only child process cannot issue Binance REST, and the parent health endpoint reports the same guard that actually sends Binance REST.
+
+Step650.8.4 reuses the existing `app_market_backend_snapshots` table and the existing Render environment variables. It requires no SQL migration, Supabase Edge deployment, Cron change, App file, Flutter dependency, or `flutter clean`.
