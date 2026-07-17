@@ -34,14 +34,17 @@ const MAX_LIVE_STREAMS = 32;
 const LIVE_IDLE_MS = 12 * 60_000;
 const LIVE_PERSIST_MIN_MS = 45_000;
 const LIVE_RECONNECT_MAX_MS = 30_000;
+const LIVE_WS_CONNECT_GAP_MS = 2_000;
+const LIVE_WS_CONNECT_WINDOW_MS = 5 * 60_000;
+const LIVE_WS_MAX_CONNECT_ATTEMPTS_5M = 60;
 const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/market/ws',
   'wss://stream.binancefuture.com/market/ws',
 ];
-// Step650.8.4：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// Step650.8.5：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
 // 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
-  // Step650.8.4：只保留官方精确交易对 Kline 主端点。
+  // Step650.8.5：只保留官方精确交易对 Kline 主端点。
   // 不再用 continuous/www 连续撞多个候选；一次失败就返回归档/快照/WS，等待共享守卫放行。
   { id: 'fapi_klines', base: 'https://fapi.binance.com', path: '/fapi/v1/klines', continuous: false },
 ];
@@ -87,6 +90,9 @@ const stats = {
   live_messages: 0,
   live_closed_candles: 0,
   live_last_message_at: 0,
+  live_connect_attempts: 0,
+  live_connect_rate_limiter_waits: 0,
+  live_connect_window_blocks: 0,
 };
 
 function compact(raw) {
@@ -421,7 +427,7 @@ function activeBridgeState(key) {
 }
 
 function bridgeCooldown(candidateId, symbol) {
-  // Step650.8.4：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
+  // Step650.8.5：所有 Binance REST 调用共用持久守卫；普通5xx仍只隔离当前交易对。
   return isBinanceRestBlocked() ||
     activeBridgeState(bridgeStateKey(candidateId, '*')) ||
     activeBridgeState(bridgeStateKey(candidateId, symbol));
@@ -488,7 +494,7 @@ async function fetchJson(url, timeoutMs = HTTP_BRIDGE_TIMEOUT_MS, symbol = '', i
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.4',
+        'user-agent': 'KakaWeb3-Kline-Bridge/650.8.5',
       },
     });
     const bodyText = await response.text();
@@ -680,6 +686,8 @@ async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxR
 
 const liveStreams = new Map();
 let liveSweepTimer = null;
+let liveWsLastConnectAt = 0;
+const liveWsConnectAttempts = [];
 
 function liveKey(symbol, interval) {
   return `${symbol}|${interval}`;
@@ -742,12 +750,52 @@ function mergeLiveRow(symbol, interval, row, closed) {
   }
 }
 
-function connectLiveStream(state) {
+
+function pruneLiveWsConnectAttempts(now = Date.now()) {
+  while (liveWsConnectAttempts.length && now - liveWsConnectAttempts[0] >= LIVE_WS_CONNECT_WINDOW_MS) {
+    liveWsConnectAttempts.shift();
+  }
+}
+
+async function waitForLiveWsConnectSlot(state) {
+  while (!state.closed) {
+    const now = Date.now();
+    pruneLiveWsConnectAttempts(now);
+    const gapWait = Math.max(0, LIVE_WS_CONNECT_GAP_MS - (now - liveWsLastConnectAt));
+    const windowWait = liveWsConnectAttempts.length >= LIVE_WS_MAX_CONNECT_ATTEMPTS_5M
+      ? Math.max(0, (liveWsConnectAttempts[0] + LIVE_WS_CONNECT_WINDOW_MS) - now)
+      : 0;
+    const waitMs = Math.max(gapWait, windowWait);
+    if (waitMs <= 0) {
+      liveWsLastConnectAt = Date.now();
+      liveWsConnectAttempts.push(liveWsLastConnectAt);
+      stats.live_connect_attempts += 1;
+      return true;
+    }
+    stats.live_connect_rate_limiter_waits += 1;
+    if (windowWait > 0) stats.live_connect_window_blocks += 1;
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, Math.min(waitMs, 30_000));
+      timer.unref?.();
+    });
+  }
+  return false;
+}
+
+async function connectLiveStream(state) {
+  if (state.closed || state.connecting) return;
+  state.connecting = true;
+  const allowed = await waitForLiveWsConnectSlot(state);
+  if (!allowed || state.closed) {
+    state.connecting = false;
+    return;
+  }
   if (state.closed) return;
   const host = LIVE_WS_HOSTS[state.hostIndex % LIVE_WS_HOSTS.length];
   const stream = `${state.symbol.toLowerCase()}@kline_${state.interval}`;
   const ws = new WebSocket(`${host}/${stream}`, { handshakeTimeout: 15_000 });
   state.ws = ws;
+  state.connecting = false;
   ws.on('open', () => {
     state.connected = true;
     state.openedAt = Date.now();
@@ -776,7 +824,7 @@ function connectLiveStream(state) {
     state.reconnectAttempt += 1;
     const delay = Math.min(LIVE_RECONNECT_MAX_MS, 1000 * (2 ** Math.min(5, state.reconnectAttempt)));
     clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = setTimeout(() => connectLiveStream(state), delay);
+    state.reconnectTimer = setTimeout(() => { connectLiveStream(state).catch((e) => { state.lastError = String(e?.message || e); }); }, delay);
     state.reconnectTimer.unref?.();
   };
   ws.on('error', reconnect);
@@ -801,6 +849,7 @@ function ensureLiveStream(symbol, interval) {
     reconnectAttempt: 0,
     reconnectTimer: null,
     connected: false,
+    connecting: false,
     openedAt: 0,
     lastMessageAt: 0,
     lastError: '',
@@ -808,7 +857,7 @@ function ensureLiveStream(symbol, interval) {
     ws: null,
   };
   liveStreams.set(key, state);
-  connectLiveStream(state);
+  connectLiveStream(state).catch((error) => { state.lastError = String(error?.message || error); });
   if (!liveSweepTimer) {
     liveSweepTimer = setInterval(() => {
       const now = Date.now();
@@ -885,7 +934,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.4' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.5' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1141,7 +1190,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.8.4：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8.5：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
       const coldStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
@@ -1208,7 +1257,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.8.4：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8.5：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
@@ -1245,10 +1294,14 @@ export function getBinanceContractKlineSeedHealth() {
     archive_global_max_pending: ARCHIVE_GLOBAL_MAX_PENDING,
     persistence_enabled: supabaseEnabled(),
     live_stream_count: liveStreams.size,
+    live_ws_connect_gap_ms: LIVE_WS_CONNECT_GAP_MS,
+    live_ws_max_connect_attempts_5m: LIVE_WS_MAX_CONNECT_ATTEMPTS_5M,
+    live_ws_connect_attempts_in_window: (() => { pruneLiveWsConnectAttempts(now); return liveWsConnectAttempts.length; })(),
     live_streams: [...liveStreams.values()].map((state) => ({
       symbol: state.symbol,
       interval: state.interval,
       connected: state.connected,
+      connecting: state.connecting,
       opened_at: state.openedAt ? iso(state.openedAt) : null,
       last_message_at: state.lastMessageAt ? iso(state.lastMessageAt) : null,
       idle_seconds: Math.max(0, Math.round((now - state.lastAccess) / 1000)),

@@ -5,11 +5,12 @@ import { getContractDepthHealth, handleContractDepth } from './contract-depth.mj
 import { handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding } from './contract-funding.mjs';
 import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
+import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
 import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.4';
+const STEP_VERSION = '650.8.5';
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
   env: {
@@ -37,7 +38,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.4：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.5：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -287,6 +288,7 @@ const server = http.createServer(async (req, res) => {
       binance_contract_market_health: '/api/binance-contract-market-health',
       binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
       binance_contract_rest_probe: '/api/binance-contract-rest-probe',
+      binance_contract_validation_reset: '/api/binance-contract-validation-reset',
       binance_rest_guard: getBinanceRestGuardHealth(),
       binance_market_rest_health: getBinanceMarketRestHealth(),
       realtime_ws_health: realtimeWsHealth,
@@ -338,6 +340,9 @@ const server = http.createServer(async (req, res) => {
         binance_rest_validation_interval: getBinanceRestGuardHealth().validation_interval,
         binance_rest_validation_session_budget: 4,
         binance_rest_validation_max_calls_per_api_request: 1,
+        binance_rest_validation_session_ttl_ms: getBinanceRestGuardHealth().validation_session_ttl_ms,
+        binance_rest_validation_admin_reset_enabled: true,
+        binance_rest_probe_uncertain_failure_cooldown: true,
         binance_rest_probe_state_durable_before_token_return: true,
         binance_rest_validation_state_durable_before_network: true,
         binance_rest_probe_requires_persistence: true,
@@ -355,6 +360,8 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_internal_gap_aware_repair: true,
         binance_contract_kline_memory_fast_path_requires_continuity: true,
         binance_contract_kline_live_bridge_on_demand: true,
+        binance_contract_kline_live_ws_connect_gap_ms: getBinanceContractKlineSeedHealth().live_ws_connect_gap_ms,
+        binance_contract_kline_live_ws_max_connect_attempts_5m: getBinanceContractKlineSeedHealth().live_ws_max_connect_attempts_5m,
         binance_contract_kline_gap_diagnostics: true,
         binance_contract_snapshot_routes_bypass_legacy_rest_circuit: true,
         binance_contract_kline_cold_start: 'post_ban_probe_then_guarded_single_exact_symbol_then_bounded_archive_gap_repair',
@@ -429,7 +436,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // Step650.8.4: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.5: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. The child process is WS-only.
     if (await handleMarketApi(req, res, url)) return;

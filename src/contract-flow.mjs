@@ -649,7 +649,7 @@ async function fetchBinanceJson(url, { headers = {}, timeoutMs = 8000, source = 
   });
   try {
     const response = await fetch(url, {
-      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.4 contract-flow', ...headers },
+      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.5 contract-flow', ...headers },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await response.text();
@@ -1066,7 +1066,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.4: metrics are requested sequentially under the shared governor.
+  // Step650.8.5: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.

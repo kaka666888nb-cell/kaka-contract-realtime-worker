@@ -12,7 +12,7 @@ const PROCESS_REST_DISABLED = process.env.KAKA_DISABLE_BINANCE_REST === '1';
 const VALIDATION_ADMIN_KEY = String(process.env.KAKA_BINANCE_VALIDATION_KEY || '').trim();
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.4 keeps the observed-ban migration record and requires
+// Step650.8.5 keeps the observed-ban migration record and requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -44,7 +44,9 @@ const VALIDATION_ALLOWED_SOURCE_PREFIXES = ['kline_bridge:'];
 const VALIDATION_SEQUENCE = ['1000SHIBUSDT', 'ARCUSDT', 'BANANAS31USDT', 'BCHUSDT'];
 const VALIDATION_INTERVAL = '15m';
 const VALIDATION_REST_BUDGET = VALIDATION_SEQUENCE.length;
-const GUARD_SCHEMA_VERSION = '650.8.4';
+const VALIDATION_SESSION_TTL_MS = 2 * 60 * 60_000;
+const VALIDATION_RECOVERY_COOLDOWN_MS = 10 * 60_000;
+const GUARD_SCHEMA_VERSION = '650.8.5';
 const VALIDATION_ADMIN_KEY_FINGERPRINT = VALIDATION_ADMIN_KEY
   ? createHash('sha256').update(`kaka-binance-admin-v1:${VALIDATION_ADMIN_KEY}`, 'utf8').digest('hex')
   : '';
@@ -64,7 +66,7 @@ let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.4_migration_guard',
+  source: 'step650.8.5_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -76,6 +78,7 @@ let state = {
   validation_session_hash: '',
   validation_budget: 0,
   validation_created_at: 0,
+  validation_expires_at: 0,
   validation_next_index: 0,
   validation_inflight: null,
   validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
@@ -115,6 +118,9 @@ const stats = {
   validation_calls_failed: 0,
   validation_sessions_completed: 0,
   validation_inflight_recovered: 0,
+  validation_session_expired: 0,
+  validation_admin_resets: 0,
+  probe_uncertain_failures: 0,
   admin_key_rotation_resets: 0,
   weight_header_missing: 0,
   weight_limit_unsafe: 0,
@@ -220,6 +226,7 @@ function resetToProbeRequired({
     validation_session_hash: '',
     validation_budget: 0,
     validation_created_at: 0,
+    validation_expires_at: 0,
     validation_next_index: 0,
     validation_inflight: null,
     validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
@@ -348,6 +355,25 @@ function activeState() {
   return null;
 }
 
+function validationSessionExpired() {
+  return state?.operating_mode === 'validation_only' &&
+    Number(state?.validation_expires_at || 0) > 0 &&
+    Number(state.validation_expires_at) <= Date.now();
+}
+
+async function expireValidationSessionIfNeeded(source = 'validation_session_expiry_check') {
+  if (!validationSessionExpired()) return false;
+  stats.validation_session_expired += 1;
+  resetToProbeRequired({
+    reason: 'validation_session_expired',
+    message: `source:${source}`,
+    cooldownMs: VALIDATION_RECOVERY_COOLDOWN_MS,
+    source,
+  });
+  await persistSnapshotStrict();
+  return true;
+}
+
 function probeGateActive() {
   return !activeState() && state?.probe_required === true;
 }
@@ -384,6 +410,7 @@ function normalizedRestoredState(restored, record = null) {
     VALIDATION_SEQUENCE.length,
     Number.parseInt(String(restored?.validation_next_index ?? 0), 10) || 0,
   ));
+  const restoredExpiresAt = toFiniteMs(restored?.validation_expires_at) || 0;
   const restoredInflight = restored?.validation_inflight && typeof restored.validation_inflight === 'object'
     ? {
         symbol: String(restored.validation_inflight.symbol || '').toUpperCase(),
@@ -405,6 +432,13 @@ function normalizedRestoredState(restored, record = null) {
     validationInflight = null;
     reason = fingerprintMatches ? 'guard_schema_changed' : 'validation_admin_key_rotated';
     if (!fingerprintMatches) stats.admin_key_rotation_resets += 1;
+  } else if (restoredMode === 'validation_only' && restoredExpiresAt > 0 && restoredExpiresAt <= Date.now()) {
+    probeRequired = true;
+    operatingMode = 'probe_required';
+    validationInflight = null;
+    until = Math.max(until, Date.now() + VALIDATION_RECOVERY_COOLDOWN_MS);
+    reason = 'validation_session_expired';
+    stats.validation_session_expired += 1;
   } else if (restoredInflight) {
     // A process restart while one validation call was reserved means we cannot know
     // whether the upstream request left the old process. Fail closed and require a
@@ -444,6 +478,7 @@ function normalizedRestoredState(restored, record = null) {
     validation_created_at: operatingMode === 'validation_only'
       ? (toFiniteMs(restored?.validation_created_at) || probePassedAt)
       : 0,
+    validation_expires_at: operatingMode === 'validation_only' ? restoredExpiresAt : 0,
     validation_next_index: operatingMode === 'validation_only' ? restoredNextIndex : (
       operatingMode === 'normal_guarded' ? VALIDATION_SEQUENCE.length : 0
     ),
@@ -593,6 +628,7 @@ export async function acquireBinanceRestRequestSlot({
   maxQueueWaitMs = DEFAULT_MAX_QUEUE_WAIT_MS,
 } = {}) {
   await ensureBinanceRestGuardInitialized();
+  await expireValidationSessionIfNeeded(source);
 
   if (PROCESS_REST_DISABLED) {
     stats.blocked_requests += 1;
@@ -845,6 +881,7 @@ export function markBinanceRestRestricted({ status = 0, message = '', source = '
     validation_session_hash: '',
     validation_budget: 0,
     validation_created_at: 0,
+    validation_expires_at: 0,
     validation_next_index: 0,
     validation_inflight: null,
     validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
@@ -884,6 +921,7 @@ export function markBinanceRestSuccess({ source = '', usedWeight1m = null, autho
     validation_session_hash: hashValidationToken(validationToken),
     validation_budget: VALIDATION_REST_BUDGET,
     validation_created_at: now,
+    validation_expires_at: now + VALIDATION_SESSION_TTL_MS,
     validation_next_index: 0,
     validation_inflight: null,
     validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
@@ -935,6 +973,7 @@ function putProbeBackBehindLocalCooldown(reason, message = '') {
     validation_session_hash: '',
     validation_budget: 0,
     validation_created_at: 0,
+    validation_expires_at: 0,
     validation_next_index: 0,
     validation_inflight: null,
     validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
@@ -944,6 +983,7 @@ function putProbeBackBehindLocalCooldown(reason, message = '') {
 
 async function runBinanceRestProbeOnce(adminKey) {
   await ensureBinanceRestGuardInitialized();
+  await expireValidationSessionIfNeeded('post_ban_probe');
   if (PROCESS_REST_DISABLED) {
     throw guardError('binance_rest_probe_disabled_in_child_process', 'BINANCE_REST_PROCESS_DISABLED', {
       binanceRestProcessDisabled: true,
@@ -1008,7 +1048,7 @@ async function runBinanceRestProbeOnce(adminKey) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.4',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.5',
       },
     });
     const bodyText = await response.text();
@@ -1025,6 +1065,9 @@ async function runBinanceRestProbeOnce(adminKey) {
         await flushBinanceRestGuardPersistence();
       } else {
         stats.probes_failed += 1;
+        stats.probe_uncertain_failures += 1;
+        putProbeBackBehindLocalCooldown('post_ban_probe_http_failure', message);
+        await persistProbeStateOrFail({ reason: 'binance_probe_failure_state_persist_failed' });
       }
       const error = new Error(message);
       error.status = response.status;
@@ -1077,9 +1120,21 @@ async function runBinanceRestProbeOnce(adminKey) {
       guard: getBinanceRestGuardHealth(),
     };
   } catch (error) {
-    if (!Number(error?.status || 0) && error?.name === 'AbortError') {
+    const status = Number(error?.status || 0);
+    const uncertainNetworkFailure = error?.name === 'AbortError' || status === 0;
+    if (uncertainNetworkFailure) {
       stats.probes_failed += 1;
-      stats.last_error = 'binance_rest_probe_timeout';
+      stats.probe_uncertain_failures += 1;
+      stats.last_error = error?.name === 'AbortError'
+        ? 'binance_rest_probe_timeout'
+        : String(error?.message || 'binance_rest_probe_network_failure');
+      putProbeBackBehindLocalCooldown(
+        error?.name === 'AbortError' ? 'post_ban_probe_timeout' : 'post_ban_probe_network_failure',
+        stats.last_error,
+      );
+      try {
+        await persistProbeStateOrFail({ reason: 'binance_probe_uncertain_state_persist_failed' });
+      } catch (_) {}
     }
     throw error;
   } finally {
@@ -1123,6 +1178,7 @@ export async function runWithBinanceValidationSession(
   } = {},
 ) {
   await ensureBinanceRestGuardInitialized();
+  await expireValidationSessionIfNeeded('validation_request');
   if (PROCESS_REST_DISABLED) {
     throw guardError('binance_rest_disabled_in_child_process', 'BINANCE_REST_PROCESS_DISABLED', {
       binanceRestProcessDisabled: true,
@@ -1244,6 +1300,7 @@ export async function completeBinanceValidationCall({ token, symbol, interval } 
     validation_session_hash: completed ? '' : state.validation_session_hash,
     validation_budget: completed ? 0 : remainingBudget,
     validation_created_at: completed ? 0 : state.validation_created_at,
+    validation_expires_at: completed ? 0 : state.validation_expires_at,
     validation_next_index: nextIndex,
     validation_inflight: null,
     validation_admin_key_fingerprint: VALIDATION_ADMIN_KEY_FINGERPRINT,
@@ -1309,6 +1366,36 @@ export async function failBinanceValidationCall({
   return getBinanceRestGuardHealth();
 }
 
+
+export async function resetBinanceValidationSession(adminKey, {
+  reason = 'admin_validation_reset',
+} = {}) {
+  await ensureBinanceRestGuardInitialized();
+  if (!isBinanceValidationAdminConfigured()) {
+    throw guardError(
+      'binance_validation_admin_key_not_configured',
+      'BINANCE_VALIDATION_ADMIN_KEY_NOT_CONFIGURED',
+      { binanceValidationAdminKeyNotConfigured: true },
+    );
+  }
+  if (!isBinanceValidationAdminAuthorized(adminKey)) {
+    throw guardError(
+      'binance_validation_admin_key_invalid',
+      'BINANCE_VALIDATION_ADMIN_KEY_INVALID',
+      { binanceValidationAdminKeyInvalid: true },
+    );
+  }
+  stats.validation_admin_resets += 1;
+  resetToProbeRequired({
+    reason: String(reason || 'admin_validation_reset'),
+    message: 'validation session cleared without a Binance request',
+    cooldownMs: VALIDATION_RECOVERY_COOLDOWN_MS,
+    source: 'admin_validation_reset',
+  });
+  await persistSnapshotStrict();
+  return getBinanceRestGuardHealth();
+}
+
 export function getBinanceRestGuardHealth() {
   const active = activeState();
   return {
@@ -1351,6 +1438,10 @@ export function getBinanceRestGuardHealth() {
     process_rest_disabled: PROCESS_REST_DISABLED,
     guard_schema_version: GUARD_SCHEMA_VERSION,
     validation_created_at: state?.validation_created_at ? iso(state.validation_created_at) : null,
+    validation_expires_at: state?.validation_expires_at ? iso(state.validation_expires_at) : null,
+    validation_session_expired: validationSessionExpired(),
+    validation_session_ttl_ms: VALIDATION_SESSION_TTL_MS,
+    validation_recovery_cooldown_ms: VALIDATION_RECOVERY_COOLDOWN_MS,
     validation_allowed_source_prefixes: [...VALIDATION_ALLOWED_SOURCE_PREFIXES],
     persistence_enabled: supabaseEnabled(),
     persistence_last_error: lastPersistenceError ? String(lastPersistenceError?.message || lastPersistenceError) : null,
@@ -1362,6 +1453,7 @@ export function getBinanceRestGuardHealth() {
     active_request: activeRequest,
     migration_quarantine_until: iso(INITIAL_QUARANTINE_UNTIL_MS),
     probe_endpoint: '/api/binance-contract-rest-probe',
+    validation_reset_endpoint: '/api/binance-contract-validation-reset',
     ...stats,
     initialized_at: stats.initialized_at ? iso(stats.initialized_at) : null,
     last_success_at: stats.last_success_at ? iso(stats.last_success_at) : null,
