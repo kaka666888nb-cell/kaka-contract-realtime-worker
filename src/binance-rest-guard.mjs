@@ -17,13 +17,14 @@ const RENDER_INSTANCE_ID = String(process.env.RENDER_INSTANCE_ID || '');
 const RENDER_DISCOVERY_SERVICE = String(process.env.RENDER_DISCOVERY_SERVICE || '');
 const INSTANCE_SAFETY_REFRESH_MS = 30_000;
 const INSTANCE_DISCOVERY_TIMEOUT_MS = 3_000;
+const EXPECTED_RENDER_PLAN = 'free';
 const INSTANCE_STARTUP_REST_GRACE_MS = process.env.NODE_ENV === 'test'
   ? Math.max(0, Number(process.env.KAKA_BINANCE_TEST_INSTANCE_GRACE_MS || 0))
-  : 90_000;
+  : 180_000;
 const PROCESS_STARTED_AT = Date.now();
 
 // The last observed Binance USD-M Futures IP ban ended at this exact UTC time.
-// Step650.8.8 keeps the observed-ban migration record and requires
+// Step650.8.9 keeps the observed-ban migration record and requires
 // one explicit low-weight /fapi/v1/ping probe before any normal Binance contract
 // REST request can leave this process. This prevents an App page, background metric
 // refresh, or another user from becoming the first post-ban caller.
@@ -58,7 +59,7 @@ const VALIDATION_LIMIT = 240;
 const VALIDATION_REST_BUDGET = VALIDATION_SEQUENCE.length;
 const VALIDATION_SESSION_TTL_MS = 2 * 60 * 60_000;
 const VALIDATION_RECOVERY_COOLDOWN_MS = 10 * 60_000;
-const GUARD_SCHEMA_VERSION = '650.8.8';
+const GUARD_SCHEMA_VERSION = '650.8.9';
 const VALIDATION_ADMIN_KEY_VALID = /^[a-f0-9]{64}$/i.test(VALIDATION_ADMIN_KEY);
 const VALIDATION_ADMIN_KEY_FINGERPRINT = VALIDATION_ADMIN_KEY_VALID
   ? createHash('sha256').update(`kaka-binance-admin-v1:${VALIDATION_ADMIN_KEY}`, 'utf8').digest('hex')
@@ -82,6 +83,9 @@ let instanceSafety = {
   healthy: !RENDER_RUNTIME,
   instance_count: RENDER_RUNTIME ? 0 : 1,
   error: '',
+  strategy: RENDER_RUNTIME ? 'pending' : 'local_single_process',
+  discovery_available: false,
+  discovery_error: '',
 };
 let processRestShuttingDown = false;
 
@@ -89,7 +93,7 @@ let state = {
   until: INITIAL_QUARANTINE_UNTIL_MS,
   status: 418,
   reason: 'observed_binance_ip_ban_migration_quarantine',
-  source: 'step650.8.8_migration_guard',
+  source: 'step650.8.9_migration_guard',
   error: '',
   parsed_ban_until: OBSERVED_BAN_UNTIL_MS,
   retry_after_seconds: null,
@@ -117,6 +121,7 @@ const stats = {
   instance_safety_checks: 0,
   instance_safety_blocks: 0,
   instance_safety_errors: 0,
+  instance_safety_free_plan_fallbacks: 0,
   restored_from_snapshot: 0,
   snapshot_persist_success: 0,
   snapshot_persist_errors: 0,
@@ -179,39 +184,101 @@ function sleep(ms) {
 async function refreshInstanceSafety({ force = false } = {}) {
   const now = Date.now();
   if (!RENDER_RUNTIME) {
-    instanceSafety = { checked_at: now, healthy: true, instance_count: 1, error: '' };
+    instanceSafety = {
+      checked_at: now,
+      healthy: true,
+      instance_count: 1,
+      error: '',
+      strategy: 'local_single_process',
+      discovery_available: false,
+      discovery_error: '',
+    };
     return instanceSafety;
   }
   if (!force && now - Number(instanceSafety.checked_at || 0) < INSTANCE_SAFETY_REFRESH_MS) return instanceSafety;
   stats.instance_safety_checks += 1;
-  if (!RENDER_DISCOVERY_SERVICE) {
-    instanceSafety = { checked_at: now, healthy: false, instance_count: 0, error: 'render_discovery_service_missing' };
-    stats.instance_safety_errors += 1;
-    return instanceSafety;
+
+  // The deployed Blueprint is explicitly plan: free. Render documents that Free
+  // web services cannot scale beyond one instance and cannot receive private
+  // network traffic. Consequently their discovery hostname can legitimately be
+  // absent or return ENOTFOUND. DNS discovery is therefore an optional stronger
+  // check, not a hard prerequisite for this specific plan.
+  if (RENDER_DISCOVERY_SERVICE) {
+    try {
+      const addresses = await Promise.race([
+        dnsLookup(RENDER_DISCOVERY_SERVICE, { all: true, family: 4 }),
+        new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error('render_discovery_timeout')), INSTANCE_DISCOVERY_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+      const unique = new Set((addresses || []).map((item) => String(item?.address || '')).filter(Boolean));
+      const count = unique.size;
+      if (count > 0) {
+        instanceSafety = {
+          checked_at: now,
+          healthy: count === 1,
+          instance_count: count,
+          error: count === 1 ? '' : `render_instance_count_${count}`,
+          strategy: 'render_discovery_dns',
+          discovery_available: true,
+          discovery_error: '',
+        };
+        return instanceSafety;
+      }
+    } catch (error) {
+      const discoveryError = String(error?.message || error);
+      if (EXPECTED_RENDER_PLAN !== 'free') {
+        instanceSafety = {
+          checked_at: now,
+          healthy: false,
+          instance_count: 0,
+          error: discoveryError,
+          strategy: 'render_discovery_dns_failed_closed',
+          discovery_available: false,
+          discovery_error: discoveryError,
+        };
+        stats.instance_safety_errors += 1;
+        return instanceSafety;
+      }
+      stats.instance_safety_free_plan_fallbacks += 1;
+      instanceSafety = {
+        checked_at: now,
+        healthy: true,
+        instance_count: 1,
+        error: '',
+        strategy: 'render_free_plan_single_instance_plus_startup_grace',
+        discovery_available: false,
+        discovery_error: discoveryError,
+      };
+      return instanceSafety;
+    }
   }
-  try {
-    // Render explicitly recommends the OS-backed lookup API for private discovery
-    // so its internal resolver configuration is honored. Bound the lookup so a
-    // DNS half-open state fails closed instead of hanging the Binance REST queue.
-    const addresses = await Promise.race([
-      dnsLookup(RENDER_DISCOVERY_SERVICE, { all: true, family: 4 }),
-      new Promise((_, reject) => {
-        const timer = setTimeout(() => reject(new Error('render_discovery_timeout')), INSTANCE_DISCOVERY_TIMEOUT_MS);
-        timer.unref?.();
-      }),
-    ]);
-    const unique = new Set((addresses || []).map((item) => String(item?.address || '')).filter(Boolean));
-    const count = unique.size;
+
+  if (EXPECTED_RENDER_PLAN === 'free') {
+    stats.instance_safety_free_plan_fallbacks += 1;
     instanceSafety = {
       checked_at: now,
-      healthy: count === 1,
-      instance_count: count,
-      error: count === 1 ? '' : `render_instance_count_${count}`,
+      healthy: true,
+      instance_count: 1,
+      error: '',
+      strategy: 'render_free_plan_single_instance_plus_startup_grace',
+      discovery_available: false,
+      discovery_error: RENDER_DISCOVERY_SERVICE ? '' : 'render_discovery_service_missing',
     };
-  } catch (error) {
-    instanceSafety = { checked_at: now, healthy: false, instance_count: 0, error: String(error?.message || error) };
-    stats.instance_safety_errors += 1;
+    return instanceSafety;
   }
+
+  instanceSafety = {
+    checked_at: now,
+    healthy: false,
+    instance_count: 0,
+    error: 'render_discovery_service_missing',
+    strategy: 'render_discovery_missing_failed_closed',
+    discovery_available: false,
+    discovery_error: 'render_discovery_service_missing',
+  };
+  stats.instance_safety_errors += 1;
   return instanceSafety;
 }
 
@@ -908,7 +975,7 @@ export async function acquireBinanceRestRequestSlot({
   try { throwIfRestShuttingDown(source); } catch (error) { releaseCurrent(); throw error; }
   try { throwIfAborted(effectiveSignal, source); } catch (error) { releaseCurrent(); throw error; }
 
-  // Step650.8.8: after this caller owns the FIFO node, every guard/persistence
+  // Step650.8.9: after this caller owns the FIFO node, every guard/persistence
   // failure must release it. Otherwise one transient Supabase error can leave
   // requestChain unresolved forever and deadlock all later Binance REST work.
   try {
@@ -1299,7 +1366,7 @@ async function runBinanceRestProbeOnce(adminKey) {
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.8',
+        'user-agent': 'KakaWeb3-Binance-Rest-Probe/650.8.9',
       },
     });
     const bodyText = await response.text();
@@ -1760,11 +1827,17 @@ export function getBinanceRestGuardHealth() {
     restore_healthy: initialized && !lastRestoreError,
     single_instance_rest_healthy: instanceSafety.healthy,
     render_instance_count: instanceSafety.instance_count,
+    render_instance_count_verified_by_dns: Boolean(instanceSafety.discovery_available),
     render_instance_safety_error: instanceSafety.error || null,
+    render_instance_safety_strategy: instanceSafety.strategy || null,
+    render_discovery_available: Boolean(instanceSafety.discovery_available),
+    render_discovery_error: instanceSafety.discovery_error || null,
+    render_expected_plan: EXPECTED_RENDER_PLAN,
+    render_free_single_instance_guarantee: EXPECTED_RENDER_PLAN === 'free',
     render_instance_safety_checked_at: iso(instanceSafety.checked_at),
     render_instance_id_present: Boolean(RENDER_INSTANCE_ID),
     multi_instance_rest_supported: false,
-    render_discovery_api: 'dns_lookup_os_resolver',
+    render_discovery_api: instanceSafety.discovery_available ? 'dns_lookup_os_resolver' : 'free_plan_startup_grace_fallback',
     render_discovery_timeout_ms: INSTANCE_DISCOVERY_TIMEOUT_MS,
     render_instance_startup_rest_grace_ms: INSTANCE_STARTUP_REST_GRACE_MS,
     render_instance_startup_rest_grace_remaining_ms: RENDER_RUNTIME
@@ -1798,13 +1871,17 @@ export const _test = {
   activeState,
   probeGateActive,
   validationOnlyBlocks,
+  async refreshInstanceSafetyForTest({ force = true } = {}) {
+    if (process.env.NODE_ENV !== 'test') throw new Error('test_hook_disabled');
+    return refreshInstanceSafety({ force });
+  },
   forceReadyForQueueTest() {
     if (process.env.NODE_ENV !== 'test') throw new Error('test_hook_disabled');
     initialized = true;
     initPromise = null;
     lastRestoreError = null;
     lastPersistenceError = null;
-    instanceSafety = { checked_at: Date.now(), healthy: true, instance_count: 1, error: '' };
+    instanceSafety = { checked_at: Date.now(), healthy: true, instance_count: 1, error: '', strategy: 'test_single_process', discovery_available: false, discovery_error: '' };
     requestChain = Promise.resolve();
     pendingRequests = 0;
     activeRequest = false;
@@ -1832,7 +1909,7 @@ export const _test = {
     initPromise = null;
     lastRestoreError = null;
     lastPersistenceError = null;
-    instanceSafety = { checked_at: Date.now(), healthy: true, instance_count: 1, error: '' };
+    instanceSafety = { checked_at: Date.now(), healthy: true, instance_count: 1, error: '', strategy: 'test_single_process', discovery_available: false, discovery_error: '' };
     requestChain = Promise.resolve();
     pendingRequests = 0;
     activeRequest = false;

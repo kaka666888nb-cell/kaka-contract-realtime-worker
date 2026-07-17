@@ -300,7 +300,7 @@ async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_mark
       signal: controller.signal,
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3-Market-Worker/650.8.8',
+        'user-agent': 'KakaWeb3-Market-Worker/650.8.9',
       },
     });
     const bodyText = await response.text();
@@ -946,7 +946,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  // Step650.8.8: only seconds with real official trades become candles.
+  // Step650.8.9: only seconds with real official trades become candles.
   // Empty seconds remain absent; timeline rendering may visually carry the last
   // price, but the API never fabricates zero-volume OHLC rows.
   return [...buckets.values()]
@@ -969,7 +969,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.8：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.9：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
     if (seedRows.length) return seedRows;
@@ -1066,7 +1066,7 @@ export async function handleMarketApi(req, res, url) {
       });
       send(res, 200, {
         ok: true,
-        version: '650.8.8',
+        version: '650.8.9',
         reset: true,
         guard,
         cached_at: new Date().toISOString(),
@@ -1086,7 +1086,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await runBinanceRestProbe(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.8',
+        version: '650.8.9',
         probe: result,
         cached_at: new Date().toISOString(),
       });
