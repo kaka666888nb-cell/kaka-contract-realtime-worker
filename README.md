@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.8.9**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.8.10**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -216,9 +216,9 @@ Step650.8.3 also removes the former parent/child split-brain risk. Market HTTP e
 - Persistence queue failures are surfaced by `flushBinanceRestGuardPersistence()` instead of being silently treated as success.
 
 
-## Step650.8.9 completed Binance guard, shared streams, and staged release
+## Step650.8.10 completed Binance guard, shared streams, and staged release
 
-Step650.8.9 is the first candidate that closes the full Binance safety loop rather than only delaying the next request.
+Step650.8.10 is the first candidate that closes the full Binance safety loop rather than only delaying the next request.
 
 - The persisted guard has three explicit modes: `probe_required`, `validation_only`, and `normal_guarded`. Four successful 15-minute exact-symbol validations move the worker into bounded normal operation; any restriction, unsafe weight, missing weight header, persistence failure, restart with an uncertain in-flight call, or administrator-key rotation fails closed and returns to `probe_required`.
 - Binance `403` WAF responses are handled together with `418`, `429`, and `451`, using the official ban deadline or `Retry-After` plus a safety margin.
@@ -233,10 +233,10 @@ Step650.8.9 is the first candidate that closes the full Binance safety loop rath
 - One-second candles are emitted only for seconds that contain official trades. Empty seconds are not fabricated as zero-volume OHLC candles.
 - The WebSocket-only child process cannot issue Binance REST, and the parent health endpoint reports the same guard that actually sends Binance REST.
 
-Step650.8.9 reuses the existing `app_market_backend_snapshots` table and the existing Render environment variables. It requires no SQL migration, Supabase Edge deployment, Cron change, App file, Flutter dependency, or `flutter clean`.
+Step650.8.10 reuses the existing `app_market_backend_snapshots` table and the existing Render environment variables. It requires no SQL migration, Supabase Edge deployment, Cron change, App file, Flutter dependency, or `flutter clean`.
 
 
-## Step650.8.9 validation recovery and Kline WS pacing
+## Step650.8.10 validation recovery and Kline WS pacing
 
 - Validation sessions expire after two hours and require a fresh probe.
 - An authenticated local reset endpoint clears stranded validation state without calling Binance.
@@ -244,7 +244,7 @@ Step650.8.9 reuses the existing `app_market_backend_snapshots` table and the exi
 - On-demand Binance Kline WebSocket connection attempts are globally paced and capped at 60 per five minutes.
 
 
-## Step650.8.9 restore fail-closed and reset-route correction
+## Step650.8.10 restore fail-closed and reset-route correction
 
 - Binance REST guard startup now fails closed when the Supabase guard snapshot cannot be restored; it does not overwrite a possibly newer remote ban/session state with a local fallback.
 - Guard health exposes restore attempts/success/errors and the last restore error.
@@ -252,12 +252,12 @@ Step650.8.9 reuses the existing `app_market_backend_snapshots` table and the exi
 - Phase-1 recovery attempts a remote reset whenever the probe may have reached Render, including a lost client response after a successful server-side probe.
 
 
-## Step650.8.9 final Binance queue and aggregate WebSocket audit
+## Step650.8.10 final Binance queue and aggregate WebSocket audit
 
 This release fixes FIFO release on post-queue persistence failures, removes production fallback to Binance Futures testnet/undocumented WebSocket paths, and caps the designed aggregate Binance WebSocket connection-attempt budget at 185 per five minutes across all modules. Validation scripts preserve existing sessions and perform authenticated no-Binance recovery on failure.
 
 
-## Step650.8.9 validation integrity, cancellation, and durable Kline audit
+## Step650.8.10 validation integrity, cancellation, and durable Kline audit
 
 - Admin validation reset increments a persisted control epoch and aborts an in-flight probe. A late probe result cannot recreate a cleared session.
 - Concurrent probe calls are rejected; one validation token is never shared between two scripts.
@@ -267,7 +267,7 @@ This release fixes FIFO release on post-queue persistence failures, removes prod
 - One `/api/klines` request may start at most one Binance REST bridge call.
 - Health reports both official Futures and Spot WebSocket hosts, and slow downstream WebSocket clients are disconnected before their send buffer can grow without bound.
 
-## Step650.8.9 repeated final audit: deployment overlap, exact validation, and downstream isolation
+## Step650.8.10 repeated final audit: deployment overlap, exact validation, and downstream isolation
 
 This revision was rebuilt after another end-to-end Binance audit instead of treating a health-only pass as proof that the real egress path was safe.
 
@@ -283,3 +283,9 @@ This revision was rebuilt after another end-to-end Binance audit instead of trea
 - The validation administrator secret must be exactly 64 hexadecimal characters. No secret value or validation token is shipped in the source or delivery package.
 
 The existing `app_market_backend_snapshots` table and existing Render environment variables are reused. No SQL, Supabase Edge, Cron, Flutter, App, or dependency migration is required.
+
+## Step650.8.10 probe observability and official-limit safety margins
+
+Step650.8.10 fixes the validation blocker found during the first real post-ban probes. Binance returned HTTP 200, but the previous hard stop of 100 request-weight/min was only a very small fraction of the current published USD-M Futures IP limit. The worker now keeps conservative staged ceilings of 1200 for the probe, 1500 during four-symbol validation, and 1800 in normal guarded mode, while continuing to stop on every 403/418/429/451 and to inspect the weight header after every successful REST response.
+
+The exact probe HTTP status, raw weight header, parsed weight, threshold, timestamp, and safe/unsafe decision are persisted in the REST guard snapshot and exposed through health. Internal 409 responses also include the safe diagnostic fields. Validation scripts use baseline counter increments instead of hard-coded lifetime totals.
