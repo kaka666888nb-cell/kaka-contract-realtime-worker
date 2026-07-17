@@ -1,6 +1,6 @@
 # Kaka Web3 Contract Realtime Worker
 
-Current backend version: **Step650.8**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
+Current backend version: **Step650.8.1**. The service keeps the legacy realtime Kline relay while also providing multi-platform contract flow/depth/liquidation/funding and persistent Binance contract market/Kline snapshots.
 
 - HTTP health: `/health`
 - Upstream diagnosis: `/diagnose?market=contract&symbol=BTCUSDT&interval=1m`
@@ -159,3 +159,29 @@ Step650.8 now:
 - continues serving official archive rows, persistent snapshots, and WebSocket data during quarantine; no synthetic or cross-exchange candles are used.
 
 No new SQL table, environment variable, Supabase Edge deployment, Cron task, Flutter dependency, or App file is required. The existing Step650 snapshot table is reused.
+
+
+## Step650.8.1 post-ban probe gate and bounded Binance REST queue
+
+A full static audit of Step650.8 found two remaining production risks before the next real Binance validation:
+
+1. once the time-based quarantine expired, any normal page request (funding, contract metadata, position metrics, legacy aggregate trades, or Kline) could become the first post-ban REST caller before the controlled validation script;
+2. the shared FIFO was serialized but unbounded, so many different users/symbols could leave stale requests queued after their HTTP clients had already gone away.
+
+Step650.8.1 closes both gaps:
+
+- after the quarantine expires, **all normal Binance USD-M REST callers remain blocked** until one explicit low-weight `GET /api/binance-contract-rest-probe` succeeds against official `/fapi/v1/ping`;
+- the probe is the only caller allowed through the post-ban gate; a new 418/429/451 immediately persists the exact deadline and no Kline or secondary symbol is requested;
+- successful probing clears `probe_required` and persists that authorization across a Render restart;
+- normal Binance REST starts are spaced by at least 10 seconds;
+- the queue is bounded to six pending requests and each queued request expires after at most 25 seconds, preventing an abandoned multi-user backlog from running minutes later;
+- explicit queue-full, queue-timeout, probe-required, and active-ban states are visible through `/health`;
+- all restricted responses flush guard persistence before the caller returns whenever the module can await it;
+- `npm run check` now syntax-checks every shipped `.mjs` module, including depth and liquidation.
+
+No App file, SQL migration, Supabase Edge Function, Cron job, environment variable, or new dependency is required.
+
+
+### Step650.8.1 validation-only gate
+
+The audit was extended to Binance spot REST calls in the same Render process. All current Binance spot and contract REST call sites now enter the same persistent guard. After the low-weight probe succeeds, the guard remains in `validation_only` mode: only the exact-symbol Kline bridge source is allowed. Spot universe/ticker/Kline/trades, funding, contract metadata, position metrics, and legacy contract REST remain blocked until staged Kline validation has passed and a later reviewed release explicitly enables them. This prevents background users or open pages from competing with the controlled post-ban test.
