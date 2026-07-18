@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.14';
+const VERSION = '650.8.15';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -226,6 +226,9 @@ const CONTRACT_META_RESTRICTED_RETRY_MS = 30 * 60 * 1000;
 const contractMetaCache = new Map();
 const BINANCE_OI_CRITICAL_TTL_MS = 4 * 60 * 1000;
 const BINANCE_OI_CRITICAL_DELAY_MS = 900;
+const BINANCE_RATIO_CRITICAL_TTL_MS = 5 * 60 * 1000;
+const BINANCE_RATIO_FIRST_PAINT_WAIT_MS = 3200;
+const BINANCE_RATIO_CRITICAL_LIMIT = 3;
 
 
 function percentile(sorted, percentileValue) {
@@ -673,7 +676,10 @@ function getState(provider, symbol) {
       ws: null, status: 'idle', error: '', lastTradeAt: 0, lastPrice: null, lastRequestedAt: Date.now(), reconnectAttempt: 0,
       reconnectTimer: null, heartbeatTimer: null, connectingPromise: null,
       metricRows: new Map(), metricLoaded: false, metricLoading: false, metricError: '', metricFetchedAt: 0,
-      metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0, oiCriticalPromise: null, oiCriticalScheduledAt: 0, metricBackgroundTimer: null,
+      metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0,
+      oiCriticalPromise: null, oiCriticalScheduledAt: 0,
+      ratioCriticalPromise: null, ratioCriticalFetchedAt: 0, ratioCriticalError: '',
+      metricBackgroundTimer: null,
       okxContractMultiplier: null, okxMultiplierPromise: null,
       gateQuantoMultiplier: null, gateMultiplierPromise: null,
       historyLoaded: false, historyLoading: false, historyError: '',
@@ -728,7 +734,7 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
 async function fetchBinanceJson(url, {
   headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0,
 } = {}) {
-  // Step650.8.14: all Binance public HTTP used by contract flow/meta is relayed
+  // Step650.8.15: all Binance public HTTP used by contract flow/meta is relayed
   // through the authenticated Supabase Edge allowlist. Render never contacts
   // fapi.binance.com directly. Critical first-paint OI uses a dedicated low-volume
   // lane; slower ratio history remains background auxiliary work.
@@ -1073,6 +1079,103 @@ async function refreshBinanceOpenInterestCritical(state) {
   return state.oiCriticalPromise;
 }
 
+
+function ratioFamilyFields(prefix) {
+  return [
+    `${prefix}_long_short_ratio`,
+    `${prefix}_long`,
+    `${prefix}_short`,
+  ];
+}
+
+function latestRatioFamilyTime(state, prefix) {
+  const fields = ratioFamilyFields(prefix);
+  let latest = 0;
+  for (const row of state.metricRows.values()) {
+    const valid = fields.some((field) => {
+      const value = asNumber(row?.[field]);
+      return value != null && value > 0;
+    });
+    if (!valid) continue;
+    latest = Math.max(latest, metricRowStart(row));
+  }
+  return latest;
+}
+
+function hasFreshRatioFamily(state, prefix, now = Date.now()) {
+  const latest = latestRatioFamilyTime(state, prefix);
+  return latest > 0 && now - latest <= BINANCE_RATIO_CRITICAL_TTL_MS;
+}
+
+async function refreshBinanceLongShortCritical(state) {
+  await loadPersistedMetrics(state);
+  const now = Date.now();
+  const families = [
+    {
+      prefix: 'global',
+      source: 'position_metrics:global_ratio_first_paint',
+      priority: 65,
+      url: `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=${BINANCE_RATIO_CRITICAL_LIMIT}`,
+    },
+    {
+      prefix: 'top_account',
+      source: 'position_metrics:top_account_ratio_first_paint',
+      priority: 58,
+      url: `https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=${BINANCE_RATIO_CRITICAL_LIMIT}`,
+    },
+    {
+      prefix: 'top_position',
+      source: 'position_metrics:top_position_ratio_first_paint',
+      priority: 56,
+      url: `https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=${BINANCE_RATIO_CRITICAL_LIMIT}`,
+    },
+  ];
+  if (families.every((item) => hasFreshRatioFamily(state, item.prefix, now))) {
+    return metricPayloadFromState(state);
+  }
+  if (state.ratioCriticalPromise) return state.ratioCriticalPromise;
+
+  state.ratioCriticalPromise = (async () => {
+    let successes = 0;
+    const errors = [];
+    for (const family of families) {
+      if (hasFreshRatioFamily(state, family.prefix)) continue;
+      try {
+        const rows = await fetchBinanceJson(family.url, {
+          source: family.source,
+          lane: 'critical',
+          priority: family.priority,
+        });
+        for (const item of Array.isArray(rows) ? rows : []) {
+          const row = metricPoint(new Map(), state.provider, state.symbol, item.timestamp);
+          applyRatio(row, family.prefix, item.longShortRatio, item.longAccount, item.shortAccount);
+          const merged = mergeMetricRow(state.metricRows, row);
+          if (merged) queueMetricPersist(merged);
+        }
+        if (hasFreshRatioFamily(state, family.prefix)) successes += 1;
+        else errors.push(`${family.prefix}_ratio_empty`);
+      } catch (error) {
+        errors.push(`${family.prefix}:${String(error?.message || error)}`);
+        if (error?.internalBinanceRestGuard || [403, 418, 429, 451].includes(Number(error?.status || 0))) break;
+      }
+    }
+
+    state.ratioCriticalFetchedAt = Date.now();
+    state.ratioCriticalError = errors.join(' | ').slice(0, 700);
+    const status = recentMetricFamilyStatus(state);
+    if (successes > 0 || status.global_account || status.top_account || status.top_position) {
+      // A partial ratio result is useful and must not be hidden by a later family.
+      if (status.global_account) state.metricError = '';
+      flushMetricPersistQueue().catch(() => {});
+      return metricPayloadFromState(state);
+    }
+    if (state.ratioCriticalError) state.metricError = state.ratioCriticalError;
+    throw new Error(state.ratioCriticalError || 'binance_long_short_first_paint_unavailable');
+  })().finally(() => { state.ratioCriticalPromise = null; });
+
+  return state.ratioCriticalPromise;
+}
+
 function scheduleVenueMetricsRefresh(state) {
   if (!state || state.metricBackgroundTimer) return;
   const delay = state.provider === 'binance' ? 8_000 : 0;
@@ -1266,7 +1369,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.14: metrics are requested sequentially under the shared governor.
+  // Step650.8.15: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.
@@ -1666,7 +1769,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',flow_first_paint_waits_for_full_metrics:false,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,flow_first_paint_waits_for_full_metrics:false,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-meta'){
     if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
@@ -1708,11 +1811,30 @@ export async function handleContractFlow(req,res,url){
   const state=getState(provider,symbol);
   loadPersistedHistory(state).catch(()=>{});
   loadPersistedMetrics(state).catch(()=>{});
+  let ratioFirstPaintPromise=null;
+  if(provider==='binance'){
+    // Step650.8.15: start the all-account ratio before the OI helper. Both still
+    // use the authenticated Edge governor, but global L/S gets the first critical
+    // slot so the funds/long-short page does not wait for the 45-second App poll.
+    ratioFirstPaintPromise=refreshBinanceLongShortCritical(state).catch(()=>null);
+  }
+  // Start meta/OI only after the ratio promise has acquired or queued its first
+  // critical slot. The persistent markPrice WebSocket still supplies meta first paint.
   scheduleContractMetaRefresh(provider,symbol);
   if(provider==='binance') refreshBinanceOpenInterestCritical(state).catch(()=>{});
   scheduleVenueMetricsRefresh(state);
 
-  if(waitMs>0) await waitForTrades(state,20,waitMs);
+  if(waitMs>0){
+    const waits=[waitForTrades(state,20,waitMs)];
+    if(provider==='binance'&&!hasFreshRatioFamily(state,'global')){
+      const ratioWaitMs=Math.min(BINANCE_RATIO_FIRST_PAINT_WAIT_MS,Math.max(1800,waitMs));
+      waits.push(Promise.race([
+        ratioFirstPaintPromise||Promise.resolve(null),
+        new Promise((resolve)=>setTimeout(resolve,ratioWaitMs)),
+      ]));
+    }
+    await Promise.all(waits);
+  }
   if(provider==='binance'&&waitMs>0&&!latestOpenInterestPatch(state)){
     try{await Promise.race([refreshBinanceOpenInterestCritical(state),new Promise((resolve)=>setTimeout(resolve,Math.min(1200,waitMs)))]);}catch(_){}
   }
@@ -1723,8 +1845,17 @@ export async function handleContractFlow(req,res,url){
   payload.contract_meta=mergeContractMetaWithOpenInterest(getContractMetaFast(provider,symbol),state);
   payload.partial=payload.trade_count<=0||payload.metrics.oi_rows.length===0;
   payload.background_refresh=true;
-  payload.metric_refresh_pending=Boolean(state.metricFetchPromise||state.oiCriticalPromise||state.metricLoading);
+  payload.metric_refresh_pending=Boolean(state.metricFetchPromise||state.oiCriticalPromise||state.ratioCriticalPromise||state.metricLoading);
   payload.metric_error=state.metricError||'';
+  payload.long_short_first_paint={
+    transport:'authenticated_edge_relay_critical_global_first',
+    global_ready:hasFreshRatioFamily(state,'global'),
+    top_account_ready:hasFreshRatioFamily(state,'top_account'),
+    top_position_ready:hasFreshRatioFamily(state,'top_position'),
+    pending:Boolean(state.ratioCriticalPromise),
+    last_attempt_at:state.ratioCriticalFetchedAt?new Date(state.ratioCriticalFetchedAt).toISOString():null,
+    error:state.ratioCriticalError||'',
+  };
   // A valid symbol always receives a usable partial snapshot. Empty/quiet market
   // windows must not become a 503 that leaves the App spinner running forever.
   sendJson(res,200,payload);return true;

@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.14';
+const VERSION = '650.8.15';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -415,7 +415,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.14' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -610,7 +610,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.14：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.15：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }

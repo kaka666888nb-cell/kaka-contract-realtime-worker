@@ -37,7 +37,7 @@ const LIVE_WS_MAX_CONNECT_ATTEMPTS_5M = 30;
 const LIVE_WS_HOSTS = [
   'wss://fstream.binance.com/market/ws',
 ];
-// Step650.8.14：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
+// Step650.8.15：历史归档与实时WebSocket保持独立；REST桥接只保留一个官方精确交易对端点，
 // 并由所有Binance合约REST调用共享的持久守卫统一串行、限速和封禁。
 const HTTP_BRIDGE_CANDIDATES = [
   { id: 'supabase_edge_kline_relay', continuous: false },
@@ -833,7 +833,7 @@ async function fetchBuffer(url, timeoutMs = FETCH_TIMEOUT_MS) {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.14' },
+      headers: { accept: 'application/zip,application/octet-stream,*/*', 'user-agent': 'KakaWeb3-Kline-Seed/650.8.15' },
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1093,10 +1093,10 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     let bridge = [];
     let bridgeWindowComplete = false;
     let merged = mergeRows(persisted).filter((row) => row.open_time_ms < safeEnd);
-    // Step650.8.14：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
+    // Step650.8.15：冷启动仍优先官方当前窗口，但必须验证它真的覆盖请求起点且内部连续。
     // 仅返回当前一根属于 partial，不能阻止归档与后续精确 symbol 候选继续补齐。
     if (nearNow && normalizedInterval !== '1s' && !persisted.length) {
-      // Step650.8.14: the production validation proved the exact 15m/240 relay path.
+      // Step650.8.15: the production validation proved the exact 15m/240 relay path.
       // First paint therefore requests at most 240 current rows even when the App asks
       // for 500/1000. This avoids making a larger cold request the condition for drawing
       // any chart. Older history continues through archive/paged loading.
@@ -1166,7 +1166,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     const finalCoverage = nearNow
       ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
       : null;
-    // Step650.8.14：临近当前的快照只有在最近窗口连续时才持久化。
+    // Step650.8.15：临近当前的快照只有在最近窗口连续时才持久化。
     // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
     const mayPersist = archive.length || bridge.length;
     const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
