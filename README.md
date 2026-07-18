@@ -1,6 +1,6 @@
-# Kaka Web3 Contract Realtime Worker — Step650.8.11
+# Kaka Web3 Contract Realtime Worker — Step650.8.12
 
-Step650.8.11 isolates Binance USDⓈ-M historical Kline HTTP from the Render process after the Render outbound IP received an upstream HTTP 418 ban.
+Step650.8.12 isolates Binance USDⓈ-M historical Kline HTTP from the Render process after the Render outbound IP received an upstream HTTP 418 ban.
 
 ## Architecture
 
@@ -48,3 +48,11 @@ Legacy direct-REST probe/reset routes return HTTP 410.
 3. Wait for deployment stabilization, run the health-only audit, then run the continuation validator only when it reports READY.
 
 No App file, SQL, Cron, `pubspec.yaml`, or `flutter clean` change is required.
+
+
+## Step650.8.12 route and arbitrary-symbol Kline repair
+
+- Generic market handler now claims only its own routes; contract-meta, funding, depth, trades, flow and liquidation are no longer intercepted as `unknown market api`.
+- Binance contract Kline never falls through to a non-allowlisted Render/native REST route.
+- Arbitrary-symbol first paint uses the already validated exact Edge relay window of at most 240 rows, then older pages continue through official archive loading.
+- Kline relay traffic has priority over auxiliary funding/meta/position requests while retaining one active Edge request at a time and zero direct Binance REST from Render.
