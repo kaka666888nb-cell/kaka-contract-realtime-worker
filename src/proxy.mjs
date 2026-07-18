@@ -11,7 +11,7 @@ import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.12';
+const STEP_VERSION = '650.8.13';
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -41,7 +41,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.12：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.13：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -427,6 +427,10 @@ const server = http.createServer(async (req, res) => {
         binance_one_second_synthetic_gap_fill: false,
         binance_app_ws_shared_by_market_symbol_interval: true,
         binance_app_ws_max_shared_streams: 64,
+        binance_futures_ws_route_migration: 'market_public_split',
+        binance_futures_ws_legacy_root_disabled: true,
+        binance_futures_ws_market_path: '/market',
+        binance_futures_ws_public_path: '/public',
         binance_app_ws_max_connect_attempts_5m: Number(realtimeWsHealth?.binance_shared_ws?.max_connect_attempts_5m || 60),
         binance_app_ws_max_total_clients: 1000,
         binance_app_ws_max_clients_per_stream: 250,
@@ -448,8 +452,8 @@ const server = http.createServer(async (req, res) => {
         binance_contract_depth_transport: 'official_combined_websocket_depth20_100ms',
         binance_contract_trades_transport: 'official_combined_websocket_aggTrade',
         binance_contract_rest_disabled_for_depth: true,
-        binance_websocket_endpoint_split_2026: false,
-        binance_websocket_hosts: ['fstream.binance.com', 'stream.binance.com:9443'],
+        binance_websocket_endpoint_split_2026: true,
+        binance_websocket_hosts: ['fstream.binance.com/market', 'fstream.binance.com/public', 'stream.binance.com:9443'],
         binance_websocket_production_only: true,
         binance_flow_ws_max_active_streams: getContractFlowHealth().binance_max_active_streams,
         binance_flow_ws_max_connect_attempts_5m: getContractFlowHealth().binance_ws_max_connect_attempts_5m,
@@ -503,7 +507,7 @@ const server = http.createServer(async (req, res) => {
   req.once('aborted', abortQueuedWork);
   res.once('close', abortQueuedWork);
   try {
-    // Step650.8.12: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.13: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. A disconnected client can cancel only
     // queued/paced work; an already-started upstream request is still fully observed.

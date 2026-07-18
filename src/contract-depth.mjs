@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.12';
+const STEP_VERSION = '650.8.13';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -199,10 +199,12 @@ async function acquireBinanceDepthConnectSlot() {
 
 function binanceStreamUrl(state, view, host) {
   const streamSymbol = state.native.toLowerCase();
+  // Binance USDⓈ-M split legacy websocket traffic into dedicated categories.
+  // Trades are regular market data; depth is high-frequency public data.
   if (view === 'trades') {
-    return `wss://${host}/stream?streams=${streamSymbol}@aggTrade`;
+    return `wss://${host}/market/stream?streams=${streamSymbol}@aggTrade`;
   }
-  return `wss://${host}/stream?streams=${streamSymbol}@depth20@100ms`;
+  return `wss://${host}/public/stream?streams=${streamSymbol}@depth20@100ms`;
 }
 
 function scheduleBinanceReconnect(state, view) {

@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.12';
+const STEP_VERSION = '650.8.13';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();
@@ -638,7 +638,7 @@ function addEvent(feed, event) {
 function websocketUrl(feed) {
   const native = feed.requestedNativeSymbol;
   if (feed.provider === 'binance') {
-    return 'wss://fstream.binance.com/ws/!forceOrder@arr';
+    return 'wss://fstream.binance.com/market/ws/!forceOrder@arr';
   }
   if (feed.provider === 'okx') return 'wss://ws.okx.com:8443/ws/v5/public';
   if (feed.provider === 'bybit') return 'wss://stream.bybit.com/v5/public/linear';

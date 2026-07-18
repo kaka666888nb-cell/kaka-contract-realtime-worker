@@ -259,15 +259,15 @@ function handleContractInfoMessage(raw) {
 
 const STREAMS = {
   ticker: {
-    urls: ['wss://fstream.binance.com/ws/!ticker@arr'],
+    urls: ['wss://fstream.binance.com/market/ws/!ticker@arr'],
     handler: handleTickerMessage,
   },
   bookTicker: {
-    urls: ['wss://fstream.binance.com/ws/!bookTicker'],
+    urls: ['wss://fstream.binance.com/public/ws/!bookTicker'],
     handler: handleBookTickerMessage,
   },
   contractInfo: {
-    urls: ['wss://fstream.binance.com/ws/!contractInfo'],
+    urls: ['wss://fstream.binance.com/market/ws/!contractInfo'],
     handler: handleContractInfoMessage,
   },
 };
@@ -356,7 +356,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.12' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.13' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -551,7 +551,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.12：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.13：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }
@@ -646,6 +646,7 @@ export function getBinanceContractMarketHealth() {
   }
   return {
     ok: universeBySymbol.size > 0 || tickerBySymbol.size > 0,
+    version: '650.8.13',
     provider: PROVIDER,
     market_type: MARKET_TYPE,
     universe_rows: universeBySymbol.size,
@@ -669,7 +670,14 @@ export function getBinanceContractMarketHealth() {
     ws_connect_waits: wsConnectStats.waits,
     ws_connect_window_blocks: wsConnectStats.window_blocks,
     production_ws_only: true,
-    source: 'binance_official_public_websocket_with_persistent_snapshot_no_automatic_rest',
+    futures_ws_route_migration: 'market_public_split',
+    futures_ws_legacy_root_disabled: true,
+    websocket_routes: {
+      ticker: 'market',
+      bookTicker: 'public',
+      contractInfo: 'market',
+    },
+    source: 'binance_official_market_public_websocket_with_persistent_snapshot_no_automatic_rest',
     time: new Date().toISOString(),
   };
 }
