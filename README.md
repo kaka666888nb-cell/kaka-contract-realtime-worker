@@ -1,66 +1,49 @@
-# Kaka Web3 Contract Realtime Worker — Step650.8.13
+# Kaka Web3 Contract Realtime Worker — Step650.8.14
 
-Step650.8.13 isolates Binance USDⓈ-M historical Kline HTTP from the Render process after the Render outbound IP received an upstream HTTP 418 ban.
+Step650.8.14 is a Render-only auxiliary-data first-paint repair built on the validated Step650.8.13 Binance USDⓈ-M WebSocket migration.
 
-## Architecture
+## Current architecture
 
-- Binance contract universe/ticker/book ticker/contract info: official production WebSocket + last-known-good Supabase snapshot.
-- Binance contract completed history: official `data.binance.vision` USD-M archive.
-- Exact near-current historical bridge: authenticated Supabase Edge Function `kaka-binance-contract-kline-relay`.
-- Existing Binance public HTTP needed by funding, contract meta/position metrics, aggregate trades, and guarded Spot fallbacks is also routed through the same strict Edge allowlist after staged validation completes.
-- Current candle: official production Binance Kline WebSocket.
-- Render direct Binance REST: hard-disabled before network in the parent and child processes.
-- No synthetic candles, cross-exchange substitution, interpolation, or client-controlled validation end time.
+- Binance contract universe and 24h ticker: official production `/market` WebSocket plus last-known-good Supabase snapshot.
+- Binance best bid/ask and depth: official production `/public` WebSocket.
+- Binance mark price, index price, current funding rate and next funding time: official global mark-price `/market` WebSocket.
+- Binance completed Kline history: official `data.binance.vision` USD-M archive.
+- Exact near-current Kline bridge and allowlisted auxiliary HTTP: authenticated Supabase Edge relay.
+- Binance current candle, aggregate trades, flow and liquidation: official production WebSocket.
+- Render direct Binance REST: hard-disabled before network in both parent and child processes.
+- No synthetic candles, interpolation, cross-exchange substitution or client-controlled validation end time.
 
-The Edge relay is a separately isolated egress path; it is not represented as a dedicated/fixed IP. It permits one allowlisted `/fapi/v1/klines` call per Render relay request, performs no retry, and reports upstream restriction telemetry back to the durable Render guard.
+The already deployed Edge relay remains unchanged. It is a separately isolated egress path, not a represented fixed/dedicated IP.
 
-## Safety controls
+## Step650.8.14 changes
 
-- Existing `KAKA_BINANCE_VALIDATION_KEY` authorizes validation start/reset; it is never printed or stored in the package.
-- Edge Function requires the Supabase service-role bearer token and should be deployed with normal JWT verification.
-- Before BANANAS31/BCH validation completes, ordinary Binance public HTTP relay calls are blocked; only the exact token-locked validation Kline request can use the Edge path. After completion, existing funding/meta/metrics/Spot fallback calls resume through the allowlist rather than the Render IP.
-- Authenticated GET preflight verifies the deployed Edge version without contacting Binance.
-- Relay FIFO is bounded to six pending requests and starts requests at least 12 seconds apart.
-- 403/418/429/451 immediately open a durable relay cooldown using the official ban time when available plus 90 seconds.
-- Relay guard state is stored in the existing `app_market_backend_snapshots` table; no SQL migration is required.
-- Validation preserves the already passed `1000SHIBUSDT` and `ARCUSDT` results and continues only with `BANANAS31USDT`, then `BCHUSDT`, both 15m/240.
-- Successful Kline telemetry is serialized before validation completion persistence, preventing an older write from overwriting `validation_next_index`.
-- Reset refuses to clear a token while a real relay request still owns the network slot.
+- Funding first paint reads current funding, mark price and index price from the official mark-price WebSocket and does not wait for history.
+- Funding history is stale-while-revalidate and refreshes in the background through the existing authenticated Edge allowlist.
+- Contract meta first paint reuses the same exact mark-price snapshot and adds current open interest from stale cache or a critical-priority Edge refresh.
+- Contract flow returns a valid HTTP 200 partial snapshot immediately; it no longer waits for full ratio/OI history before first paint.
+- Binance critical auxiliary requests use a 2500 ms lane, Kline remains the highest priority 3000 ms lane, and slow auxiliary history remains on the 12000 ms lane while preserving one active Edge request globally.
+- Quiet Binance aggTrade windows return HTTP 200 with an empty list and `empty_reason=no_recent_trade_event` instead of leaving the App spinner on a 502/timeout.
+- Existing `/market` and `/public` WebSocket migration, arbitrary-symbol 240-row Kline first paint, route ownership fix, persistent validation state and zero direct Render Binance REST are preserved.
 
 ## Health endpoints
 
 - `/health`
+- `/ws-health`
 - `/api/binance-contract-market-health`
 - `/api/binance-contract-kline-seed-health`
 - `/api/binance-contract-kline-relay-health`
-
-## Validation endpoints
-
-- `POST /api/binance-contract-kline-relay-validation-start`
-- `POST /api/binance-contract-kline-relay-validation-reset`
-
-Legacy direct-REST probe/reset routes return HTTP 410.
+- `/api/contract-funding/health`
+- `/api/contract-flow/health`
+- `/api/contract-depth/health`
 
 ## Deployment
 
-1. Deploy `supabase/functions/kaka-binance-contract-kline-relay` normally. Do not use `--no-verify-jwt`.
-2. Deploy this Render Worker while preserving all existing environment variables, including `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `KAKA_BINANCE_VALIDATION_KEY`.
-3. Wait for deployment stabilization, run the health-only audit, then run the continuation validator only when it reports READY.
+1. Completely close Kaka Web3 and quit `flutter run`.
+2. Overwrite the existing Render worker repository with this package.
+3. Deploy the same Render service: `kaka-contract-realtime-worker`.
+4. Preserve all existing environment variables.
+5. Wait at least three minutes after Render reports the service live.
+6. Run the Step650.8.14 health-only audit.
+7. Only after it reports READY, run the one-time 2Z auxiliary validation.
 
-No App file, SQL, Cron, `pubspec.yaml`, or `flutter clean` change is required.
-
-
-## Step650.8.13 route and arbitrary-symbol Kline repair
-
-- Generic market handler now claims only its own routes; contract-meta, funding, depth, trades, flow and liquidation are no longer intercepted as `unknown market api`.
-- Binance contract Kline never falls through to a non-allowlisted Render/native REST route.
-- Arbitrary-symbol first paint uses the already validated exact Edge relay window of at most 240 rows, then older pages continue through official archive loading.
-- Kline relay traffic has priority over auxiliary funding/meta/position requests while retaining one active Edge request at a time and zero direct Binance REST from Render.
-
-
-## Step650.8.13 Binance USDⓈ-M WebSocket route migration
-
-Binance futures market streams now use the dedicated `/market` path, while high-frequency book/depth streams use `/public`. The worker no longer uses the retired legacy root `/ws` or `/stream` routes for USDⓈ-M contract traffic.
-
-Migrated market channels: Kline, continuous Kline, aggTrade, ticker, contractInfo, forceOrder.
-Migrated public channels: bookTicker, depth.
+Do not redeploy Supabase Edge, change environment variables, modify App `main.dart`, run SQL/Cron, change `pubspec.yaml`, or run `flutter clean` for this step.

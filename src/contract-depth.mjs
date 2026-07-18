@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.13';
+const STEP_VERSION = '650.8.14';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -347,10 +347,17 @@ async function waitForBinanceView(state, view, timeoutMs = BINANCE_WS_START_TIME
     const waiter = { view, resolve, reject, timer: null };
     waiter.timer = setTimeout(() => {
       state.waiters.delete(waiter);
+      // A quiet symbol may legitimately have no aggTrade during the first few
+      // seconds. Once the official socket is open, return an empty trade list
+      // instead of converting quiet market activity into an App spinner/error.
+      if (view === 'trades' && wsReady(binanceConnection(state, view).socket)) {
+        resolve();
+        return;
+      }
       const error = new Error(`binance_websocket_${view}_data_timeout`);
       error.cooldownMs = 5_000;
       reject(error);
-    }, timeoutMs);
+    }, view === 'trades' ? Math.min(timeoutMs, 2_800) : timeoutMs);
     waiter.timer.unref?.();
     state.waiters.add(waiter);
     notifyBinanceWaiters(state);
@@ -607,6 +614,7 @@ async function loadBinance(view, symbol, limit) {
       upstream_host: BINANCE_WS_HOSTS[binanceConnection(state, 'trades').hostIndex] || 'fstream.binance.com',
       native_symbol: state.native,
       transport: 'websocket_market_aggTrade',
+      connected: wsReady(binanceConnection(state, 'trades').socket),
     };
   }
   const snapshot = state.orderbook;
@@ -617,6 +625,7 @@ async function loadBinance(view, symbol, limit) {
     upstream_host: BINANCE_WS_HOSTS[binanceConnection(state, 'orderbook').hostIndex] || 'fstream.binance.com',
     native_symbol: state.native,
     transport: 'websocket_public_depth20_100ms',
+    connected: wsReady(binanceConnection(state, 'orderbook').socket),
   };
 }
 
@@ -784,6 +793,7 @@ function buildPayload(provider, view, requestedSymbol, limit, data, cacheState =
     cached_at: new Date().toISOString(),
     cache_state: cacheState,
     quantity_unit: data.quantity_unit || 'base_asset',
+    connected: data.connected === true,
     if_contract_multiplier: data.contract_multiplier,
   };
   if (common.if_contract_multiplier == null) delete common.if_contract_multiplier;
@@ -835,7 +845,12 @@ async function resolveCached(provider, view, symbol, limit) {
       .then((data) => {
         const payload = buildPayload(provider, view, symbol, limit, data, 'miss');
         const hasData = view === 'trades' ? payload.items.length > 0 : payload.bids.length > 0 && payload.asks.length > 0;
-        if (!hasData) throw new Error(`empty_${view}`);
+        const quietBinanceTradeStream = provider === 'binance' && view === 'trades' && payload.connected === true;
+        if (!hasData && !quietBinanceTradeStream) throw new Error(`empty_${view}`);
+        if (quietBinanceTradeStream && !hasData) {
+          payload.empty_reason = 'no_recent_trade_event';
+          payload.partial = true;
+        }
         RESPONSE_CACHE.set(key, { payload, storedAt: Date.now() });
         return payload;
       })

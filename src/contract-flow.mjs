@@ -1,6 +1,8 @@
 import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
+import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
+const VERSION = '650.8.14';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -222,6 +224,8 @@ const CONTRACT_META_STALE_MS = 30 * 60 * 1000;
 const CONTRACT_META_RETRY_MS = 90 * 1000;
 const CONTRACT_META_RESTRICTED_RETRY_MS = 30 * 60 * 1000;
 const contractMetaCache = new Map();
+const BINANCE_OI_CRITICAL_TTL_MS = 4 * 60 * 1000;
+const BINANCE_OI_CRITICAL_DELAY_MS = 900;
 
 
 function percentile(sorted, percentileValue) {
@@ -625,6 +629,7 @@ function closeAndDeleteState(state, reason = 'evicted') {
   if (!state) return;
   clearInterval(state.heartbeatTimer);
   clearTimeout(state.reconnectTimer);
+  clearTimeout(state.metricBackgroundTimer);
   state.lastRequestedAt = 0;
   const ws = state.ws;
   state.ws = null;
@@ -668,7 +673,7 @@ function getState(provider, symbol) {
       ws: null, status: 'idle', error: '', lastTradeAt: 0, lastPrice: null, lastRequestedAt: Date.now(), reconnectAttempt: 0,
       reconnectTimer: null, heartbeatTimer: null, connectingPromise: null,
       metricRows: new Map(), metricLoaded: false, metricLoading: false, metricError: '', metricFetchedAt: 0,
-      metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0,
+      metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0, oiCriticalPromise: null, oiCriticalScheduledAt: 0, metricBackgroundTimer: null,
       okxContractMultiplier: null, okxMultiplierPromise: null,
       gateQuantoMultiplier: null, gateMultiplierPromise: null,
       historyLoaded: false, historyLoading: false, historyError: '',
@@ -720,13 +725,16 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
   catch (_) { throw new Error(`upstream_invalid_json:${text.slice(0, 160)}`); }
 }
 
-async function fetchBinanceJson(url, { headers = {}, timeoutMs = 8000, source = 'contract_flow' } = {}) {
-  // Step650.8.13: all Binance public HTTP used by contract flow/meta is relayed
+async function fetchBinanceJson(url, {
+  headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0,
+} = {}) {
+  // Step650.8.14: all Binance public HTTP used by contract flow/meta is relayed
   // through the authenticated Supabase Edge allowlist. Render never contacts
-  // fapi.binance.com directly. headers/timeoutMs are retained for call compatibility.
+  // fapi.binance.com directly. Critical first-paint OI uses a dedicated low-volume
+  // lane; slower ratio history remains background auxiliary work.
   void headers;
   void timeoutMs;
-  return await fetchBinancePublicRestRelayJson(url, { source });
+  return await fetchBinancePublicRestRelayJson(url, { source, lane, priority });
 }
 
 
@@ -786,9 +794,24 @@ function normalizeContractMeta(provider, symbol, raw = {}) {
 }
 
 async function fetchBinanceContractMeta(symbol) {
+  const realtime = getBinanceContractRealtimeMeta(symbol);
+  if (realtime && typeof realtime === 'object') {
+    return normalizeContractMeta('binance', symbol, {
+      ...realtime,
+      mark_price: realtime.mark_price,
+      index_price: realtime.index_price,
+      last_price: realtime.last_price ?? realtime.price,
+      last_funding_rate: realtime.last_funding_rate ?? realtime.funding_rate,
+      next_funding_time: realtime.next_funding_time,
+      source_time: realtime.source_time ?? realtime.cached_at,
+      source: 'binance_official_public_mark_price_websocket',
+    });
+  }
+  // Cold-start fallback only. Normal first paint is WebSocket-only and never waits
+  // behind funding history or position-ratio requests.
   const raw = await fetchBinanceJson(
     `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`,
-    { timeoutMs: 5000, source: 'contract_meta:premium_index' },
+    { timeoutMs: 5000, source: 'contract_meta:premium_index', lane: 'critical', priority: 70 },
   );
   return normalizeContractMeta('binance', symbol, {
     ...raw,
@@ -797,7 +820,7 @@ async function fetchBinanceContractMeta(symbol) {
     last_funding_rate: raw?.lastFundingRate,
     next_funding_time: raw?.nextFundingTime,
     source_time: raw?.time,
-    source: 'binance_premium_index_shared_rest_guard',
+    source: 'binance_premium_index_edge_relay_cold_start',
   });
 }
 
@@ -945,6 +968,119 @@ async function getContractMeta(provider, symbol) {
     })();
   }
   return entry.promise;
+}
+
+function latestMetricRow(state) {
+  if (!state || !(state.metricRows instanceof Map) || state.metricRows.size === 0) return null;
+  const latestKey = [...state.metricRows.keys()].sort((a, b) => b - a)[0];
+  return latestKey ? state.metricRows.get(latestKey) || null : null;
+}
+
+function latestOpenInterestMetricRow(state) {
+  if (!state || !(state.metricRows instanceof Map) || state.metricRows.size === 0) return null;
+  const rows = [...state.metricRows.values()].sort((a, b) => metricRowStart(b) - metricRowStart(a));
+  for (const row of rows) {
+    const amount = asNumber(row?.open_interest);
+    const value = asNumber(row?.open_interest_value);
+    if (amount > 0 || value > 0) return row;
+  }
+  return null;
+}
+
+function latestOpenInterestPatch(state) {
+  const row = latestOpenInterestMetricRow(state);
+  if (!row) return null;
+  const amount = asNumber(row.open_interest);
+  const value = asNumber(row.open_interest_value);
+  return {
+    open_interest: amount > 0 ? amount : null,
+    contract_oi: amount > 0 ? amount : null,
+    open_interest_value: value > 0 ? value : null,
+    contract_oi_value: value > 0 ? value : null,
+    open_interest_source_time: row.bucket_time,
+  };
+}
+
+function mergeContractMetaWithOpenInterest(meta, state) {
+  const oi = latestOpenInterestPatch(state);
+  if (!meta && !oi) return null;
+  return { ...(meta || {}), ...(oi || {}) };
+}
+
+function getContractMetaFast(provider, symbol) {
+  if (provider === 'binance') {
+    const realtime = getBinanceContractRealtimeMeta(symbol);
+    if (realtime) {
+      return normalizeContractMeta('binance', symbol, {
+        ...realtime,
+        mark_price: realtime.mark_price,
+        index_price: realtime.index_price,
+        last_price: realtime.last_price ?? realtime.price,
+        last_funding_rate: realtime.last_funding_rate ?? realtime.funding_rate,
+        next_funding_time: realtime.next_funding_time,
+        source_time: realtime.source_time ?? realtime.cached_at,
+        source: 'binance_official_public_mark_price_websocket',
+      });
+    }
+  }
+  const entry = contractMetaCache.get(`${provider}:${symbol}`);
+  if (entry?.value && Date.now() - Number(entry.fetchedAt || 0) <= CONTRACT_META_STALE_MS) {
+    return { ...entry.value, stale: Date.now() - Number(entry.fetchedAt || 0) > CONTRACT_META_TTL_MS, meta_error: entry.error || '' };
+  }
+  return null;
+}
+
+function scheduleContractMetaRefresh(provider, symbol) {
+  getContractMeta(provider, symbol).catch?.(() => {});
+}
+
+async function refreshBinanceOpenInterestCritical(state) {
+  if (!state || state.provider !== 'binance') return metricPayloadFromState(state);
+  await loadPersistedMetrics(state);
+  const latest = latestOpenInterestMetricRow(state);
+  const latestTime = metricRowStart(latest);
+  if (latestTime && Date.now() - latestTime <= BINANCE_OI_CRITICAL_TTL_MS) {
+    return metricPayloadFromState(state);
+  }
+  if (state.oiCriticalPromise) return state.oiCriticalPromise;
+  state.oiCriticalPromise = (async () => {
+    if (!state.oiCriticalScheduledAt) {
+      state.oiCriticalScheduledAt = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, BINANCE_OI_CRITICAL_DELAY_MS));
+    }
+    try {
+      const rows = await fetchBinanceJson(
+        `https://fapi.binance.com/futures/data/openInterestHist?symbol=${encodeURIComponent(state.symbol)}&period=5m&limit=3`,
+        { source: 'position_metrics:open_interest_first_paint', lane: 'critical', priority: 60 },
+      );
+      for (const item of Array.isArray(rows) ? rows : []) {
+        const row = metricPoint(new Map(), state.provider, state.symbol, item.timestamp);
+        row.open_interest = asNumber(item.sumOpenInterest);
+        row.open_interest_value = asNumber(item.sumOpenInterestValue);
+        const merged = mergeMetricRow(state.metricRows, row);
+        if (merged) queueMetricPersist(merged);
+      }
+      state.metricFetchedAt = Date.now();
+      state.metricError = '';
+      flushMetricPersistQueue().catch(() => {});
+    } catch (error) {
+      state.metricError = String(error?.message || error).slice(0, 700);
+    } finally {
+      state.oiCriticalScheduledAt = 0;
+    }
+    return metricPayloadFromState(state);
+  })().finally(() => { state.oiCriticalPromise = null; });
+  return state.oiCriticalPromise;
+}
+
+function scheduleVenueMetricsRefresh(state) {
+  if (!state || state.metricBackgroundTimer) return;
+  const delay = state.provider === 'binance' ? 8_000 : 0;
+  state.metricBackgroundTimer = setTimeout(() => {
+    state.metricBackgroundTimer = null;
+    fetchVenueMetrics(state).catch(() => {});
+  }, delay);
+  state.metricBackgroundTimer.unref?.();
 }
 
 function metricBucketStart(value = Date.now()) {
@@ -1130,7 +1266,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.13: metrics are requested sequentially under the shared governor.
+  // Step650.8.14: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.
@@ -1143,7 +1279,7 @@ async function fetchBinanceMetricRows(state) {
   const settled = [];
   for (const [url, source] of metricRequests) {
     try {
-      settled.push({ status: 'fulfilled', value: await fetchBinanceJson(url, { headers, timeoutMs: 6500, source }) });
+      settled.push({ status: 'fulfilled', value: await fetchBinanceJson(url, { headers, timeoutMs: 6500, source, lane: 'auxiliary', priority: 10 }) });
     } catch (error) {
       settled.push({ status: 'rejected', reason: error });
       if (error?.internalBinanceRestGuard || [403, 418, 429, 451].includes(Number(error?.status || 0))) break;
@@ -1490,7 +1626,7 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
   };});
   return {
-    ok:true, version:'615.5', provider:state.provider, symbol:state.symbol,
+    ok:true, version:VERSION, provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
     persistence_enabled:PERSISTENCE_ENABLED, history_loaded:state.historyLoaded, history_error:state.historyError,
     stream_status:state.status, stream_error:state.error, trade_count:tradeCount,
@@ -1530,28 +1666,68 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:'650.8.13',streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',flow_first_paint_waits_for_full_metrics:false,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-meta'){
     if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
     let provider=providerKey(url.searchParams.get('provider'));let symbol=symbolKey(url.searchParams.get('symbol'));
     if(req.method==='POST'){const chunks=[];for await(const chunk of req)chunks.push(chunk);try{const body=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');provider=providerKey(body.provider)||provider;symbol=symbolKey(body.symbol)||symbol;}catch(_){}}
-    if(!provider||!symbol||!symbol.endsWith('USDT')){sendJson(res,400,{ok:false,error:'invalid_provider_or_symbol'});return true;}
-    const meta=await getContractMeta(provider,symbol);
-    sendJson(res,meta?200:503,meta?{ok:true,version:'615.5',provider,symbol,contract_meta:meta}:{ok:false,version:'615.5',provider,symbol,error:'contract_meta_unavailable'});return true;
+    if(!provider||!symbol||!symbol.endsWith('USDT')){sendJson(res,400,{ok:false,version:VERSION,error:'invalid_provider_or_symbol'});return true;}
+    const state=getState(provider,symbol);
+    loadPersistedMetrics(state).catch(()=>{});
+    if(provider==='binance'){
+      const oiPromise=refreshBinanceOpenInterestCritical(state);
+      if(!latestOpenInterestPatch(state)){
+        try{await Promise.race([oiPromise,new Promise((resolve)=>setTimeout(resolve,3200))]);}catch(_){}
+      }
+    }
+    let meta=getContractMetaFast(provider,symbol);
+    if(!meta){
+      try{meta=await Promise.race([getContractMeta(provider,symbol),new Promise((resolve)=>setTimeout(()=>resolve(null),provider==='binance'?1800:5200))]);}catch(_){}
+    }
+    meta=mergeContractMetaWithOpenInterest(meta,state);
+    if(meta){
+      sendJson(res,200,{ok:true,version:VERSION,provider,symbol,contract_meta:meta,partial:meta.open_interest==null&&meta.open_interest_value==null,background_refresh:true});
+    }else{
+      scheduleContractMetaRefresh(provider,symbol);
+      sendJson(res,200,{ok:true,version:VERSION,provider,symbol,contract_meta:null,partial:true,background_refresh:true,warning:'contract_meta_warming'});
+    }
+    return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
     let started=0;
     for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:'615.5',started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
   let provider=providerKey(url.searchParams.get('provider'));let symbol=symbolKey(url.searchParams.get('symbol'));let waitMs=Math.min(5000,Math.max(0,Number(url.searchParams.get('wait_ms')||3200)));
   if(req.method==='POST'){const chunks=[];for await(const chunk of req)chunks.push(chunk);try{const body=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');provider=providerKey(body.provider)||provider;symbol=symbolKey(body.symbol)||symbol;if(Number.isFinite(Number(body.wait_ms)))waitMs=Math.min(5000,Math.max(0,Number(body.wait_ms)));}catch(_){}}
-  if(!provider||!symbol||!symbol.endsWith('USDT')){sendJson(res,400,{ok:false,error:'invalid_provider_or_symbol'});return true;}
-  const state=getState(provider,symbol);await loadPersistedHistory(state);await waitForTrades(state,20,waitMs);const [venueMetrics,contractMeta]=await Promise.all([fetchVenueMetrics(state),getContractMeta(provider,symbol)]);const payload=summarize(state,venueMetrics);payload.contract_meta=contractMeta;
-  const hasData=payload.trade_count>0||payload.stored_5m_buckets>0;sendJson(res,hasData?200:503,hasData?payload:{...payload,ok:false,error:'building_24h_history'});return true;
+  if(!provider||!symbol||!symbol.endsWith('USDT')){sendJson(res,400,{ok:false,version:VERSION,error:'invalid_provider_or_symbol'});return true;}
+
+  const state=getState(provider,symbol);
+  loadPersistedHistory(state).catch(()=>{});
+  loadPersistedMetrics(state).catch(()=>{});
+  scheduleContractMetaRefresh(provider,symbol);
+  if(provider==='binance') refreshBinanceOpenInterestCritical(state).catch(()=>{});
+  scheduleVenueMetricsRefresh(state);
+
+  if(waitMs>0) await waitForTrades(state,20,waitMs);
+  if(provider==='binance'&&waitMs>0&&!latestOpenInterestPatch(state)){
+    try{await Promise.race([refreshBinanceOpenInterestCritical(state),new Promise((resolve)=>setTimeout(resolve,Math.min(1200,waitMs)))]);}catch(_){}
+  }
+
+  const venueMetrics=metricPayloadFromState(state);
+  const payload=summarize(state,venueMetrics);
+  payload.version=VERSION;
+  payload.contract_meta=mergeContractMetaWithOpenInterest(getContractMetaFast(provider,symbol),state);
+  payload.partial=payload.trade_count<=0||payload.metrics.oi_rows.length===0;
+  payload.background_refresh=true;
+  payload.metric_refresh_pending=Boolean(state.metricFetchPromise||state.oiCriticalPromise||state.metricLoading);
+  payload.metric_error=state.metricError||'';
+  // A valid symbol always receives a usable partial snapshot. Empty/quiet market
+  // windows must not become a 503 that leaves the App spinner running forever.
+  sendJson(res,200,payload);return true;
 }
 
 setInterval(()=>{const now=Date.now();for(const [key,state] of states.entries()){finalizeReadyBuckets(state,now);if(now-state.lastRequestedAt<=IDLE_CLOSE_MS)continue;closeAndDeleteState(state,'idle');}},60000).unref();

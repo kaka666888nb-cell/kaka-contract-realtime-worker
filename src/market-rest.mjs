@@ -290,7 +290,7 @@ async function jsonFetch(urls, timeout = 15_000) {
   throw lastError || new Error('upstream unavailable');
 }
 async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_market_rest') {
-  // Step650.8.13: Binance Spot and Contract public HTTP both use the same
+  // Step650.8.14: Binance Spot and Contract public HTTP both use the same
   // authenticated Edge relay and durable queue. Render direct REST is disabled.
   void timeout;
   return await fetchBinancePublicRestRelayJson(url, { source });
@@ -924,7 +924,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  // Step650.8.13: only seconds with real official trades become candles.
+  // Step650.8.14: only seconds with real official trades become candles.
   // Empty seconds remain absent; timeline rendering may visually carry the last
   // price, but the API never fabricates zero-volume OHLC rows.
   return [...buckets.values()]
@@ -947,10 +947,10 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.13：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.14：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
-    // Step650.8.13: never fall through to the generic native Binance REST path.
+    // Step650.8.14: never fall through to the generic native Binance REST path.
     // Binance contract Kline is archive + authenticated Edge relay + production WS only.
     // Falling through attempted a public_rest /fapi/v1/klines route that is intentionally
     // not allowlisted and converted a recoverable empty/partial seed into HTTP 502.
@@ -1014,7 +1014,7 @@ const OWNED_MARKET_API_PATHS = new Set([
 ]);
 
 export async function handleMarketApi(req, res, url) {
-  // Step650.8.13: this generic market handler must claim only routes it owns.
+  // Step650.8.14: this generic market handler must claim only routes it owns.
   // Previously it claimed every /api/* path and returned "unknown market api"
   // before contract-meta/funding/depth/trades/flow/liquidation handlers could run.
   if (!OWNED_MARKET_API_PATHS.has(url.pathname)) return false;
@@ -1077,7 +1077,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.13',
+        version: '650.8.14',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1089,7 +1089,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.13',
+        version: '650.8.14',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1099,7 +1099,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.13',
+        version: '650.8.14',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1108,7 +1108,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.13',
+        version: '650.8.14',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -1223,7 +1223,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.13',
+        version: '650.8.14',
         provider,
         market_type: market,
         symbol,

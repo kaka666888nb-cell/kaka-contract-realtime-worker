@@ -11,7 +11,7 @@ import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.13';
+const STEP_VERSION = '650.8.14';
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -41,7 +41,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.13：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.14：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -290,6 +290,7 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
       contract_liquidation_scope: 'single_provider_single_symbol',
       contract_funding: '/api/contract-funding',
+      contract_funding_health: '/api/contract-funding/health',
       binance_contract_market_health: '/api/binance-contract-market-health',
       binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
       binance_contract_rest_probe: 'retired_step650_8_11',
@@ -321,7 +322,7 @@ const server = http.createServer(async (req, res) => {
         legacy_rest_cache: true,
         legacy_rest_inflight_coalescing: true,
         legacy_rest_circuit_breaker: true,
-        binance_contract_market_transport: 'official_websocket_ticker_bookticker_contract_info',
+        binance_contract_market_transport: 'official_websocket_ticker_bookticker_contract_info_mark_price',
         binance_contract_market_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
         binance_contract_market_rest_role: 'automatic_rest_disabled_websocket_snapshot_only',
         binance_contract_market_empty_snapshot_never_overwrites: true,
@@ -333,6 +334,7 @@ const server = http.createServer(async (req, res) => {
         binance_contract_kline_single_upstream_relay: 'supabase_edge_kaka_binance_contract_kline_relay',
         binance_contract_kline_edge_relay_min_request_gap_ms: 3000,
         binance_contract_aux_edge_relay_min_request_gap_ms: 12000,
+        binance_contract_critical_aux_edge_relay_min_request_gap_ms: 2500,
         binance_contract_kline_edge_relay_priority: true,
         contract_api_route_ownership_fixed: true,
         generic_market_handler_intercepts_contract_routes: false,
@@ -446,11 +448,16 @@ const server = http.createServer(async (req, res) => {
         restricted_cooldown_policy: 'official_ban_until_or_retry_after_plus_90_seconds',
         transient_cooldown_seconds: 90,
         contract_meta_cache_seconds: 30,
+        binance_contract_meta_first_paint_transport: 'official_mark_price_websocket',
+        binance_contract_open_interest_first_paint: 'stale_cache_then_critical_background_edge_relay',
+        contract_flow_first_paint_waits_for_full_metrics: false,
+        contract_flow_valid_symbol_partial_response_status: 200,
         contract_depth_cache_ms: 1200,
         contract_depth_stale_seconds: 20,
         contract_depth_page_visible_only: true,
         binance_contract_depth_transport: 'official_combined_websocket_depth20_100ms',
         binance_contract_trades_transport: 'official_combined_websocket_aggTrade',
+        binance_contract_quiet_trade_stream_returns_empty_200: true,
         binance_contract_rest_disabled_for_depth: true,
         binance_websocket_endpoint_split_2026: true,
         binance_websocket_hosts: ['fstream.binance.com/market', 'fstream.binance.com/public', 'stream.binance.com:9443'],
@@ -473,6 +480,9 @@ const server = http.createServer(async (req, res) => {
         contract_liquidation_dynamic_limit_per_provider: 12,
         liquidation_platform_strict_isolation: true,
         contract_funding_current_and_history: true,
+        binance_contract_funding_current_transport: 'official_mark_price_websocket',
+        binance_contract_funding_history_transport: 'authenticated_edge_relay_background',
+        binance_contract_funding_first_paint_waits_for_history: false,
         contract_funding_cache_seconds: 30,
         gate_next_funding_source: 'futures_contract_funding_next_apply',
         liquidation_public_feeds: {
@@ -507,7 +517,7 @@ const server = http.createServer(async (req, res) => {
   req.once('aborted', abortQueuedWork);
   res.once('close', abortQueuedWork);
   try {
-    // Step650.8.13: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.14: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. A disconnected client can cancel only
     // queued/paced work; an already-started upstream request is still fully observed.

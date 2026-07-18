@@ -1010,14 +1010,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.13', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.14', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.13',
+      version: '650.8.14',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1206,7 +1206,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      // Step650.8.13: the WS-only child must never become a second Binance REST
+      // Step650.8.14: the WS-only child must never become a second Binance REST
       // caller. Binance 1s aggregation starts directly from the official aggTrade
       // WebSocket; other providers may still seed from their own public REST.
       if (provider !== 'binance') {
@@ -1263,7 +1263,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.13 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.14 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,

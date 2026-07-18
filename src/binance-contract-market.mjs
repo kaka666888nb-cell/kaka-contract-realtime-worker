@@ -1,5 +1,6 @@
 import { WebSocket } from 'ws';
 
+const VERSION = '650.8.14';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -26,6 +27,7 @@ const wsConnectStats = { attempts: 0, waits: 0, window_blocks: 0 };
 
 const universeBySymbol = new Map();
 const tickerBySymbol = new Map();
+const realtimeMetaBySymbol = new Map();
 const connectionState = new Map();
 const waiters = new Set();
 
@@ -34,6 +36,7 @@ let restoredAt = 0;
 let lastUniverseEventAt = 0;
 let lastTickerEventAt = 0;
 let lastContractInfoEventAt = 0;
+let lastMarkPriceEventAt = 0;
 let lastPersistAt = 0;
 let dirtyUniverse = false;
 let dirtyTickers = false;
@@ -146,11 +149,23 @@ function upsertUniverse(identity, source, updatedAt = Date.now()) {
   notifyWaiters();
 }
 
+function mergeNonNull(previous, next) {
+  const merged = { ...(previous || {}) };
+  for (const [key, value] of Object.entries(next || {})) {
+    if (value == null) continue;
+    if (typeof value === 'string' && value.trim() === '') continue;
+    merged[key] = value;
+  }
+  return merged;
+}
+
 function upsertTicker(item, identity, source, updatedAt = Date.now()) {
   upsertUniverse(identity, source.replace('ticker', 'market'), updatedAt);
   const previous = tickerBySymbol.get(identity.symbol);
   const next = tickerRow(item, identity, source, updatedAt);
-  tickerBySymbol.set(identity.symbol, { ...previous, ...next });
+  // Preserve mark-price/funding fields already supplied by the dedicated stream.
+  // The 24h ticker payload legitimately omits those fields and must not erase them.
+  tickerBySymbol.set(identity.symbol, mergeNonNull(previous, next));
   dirtyTickers = true;
   notifyWaiters();
 }
@@ -229,6 +244,46 @@ function handleBookTickerMessage(raw) {
   }
 }
 
+function handleMarkPriceMessage(raw) {
+  const payload = parsePayload(raw);
+  const rows = Array.isArray(payload) ? payload : [payload];
+  const now = Date.now();
+  let accepted = 0;
+  for (const item of rows) {
+    const identity = normalizedPerpetual(item);
+    if (!identity) continue;
+    const fundingRate = finite(item?.r ?? item?.fundingRate ?? item?.funding_rate);
+    const nextFundingTimeMs = finite(item?.T ?? item?.nextFundingTime ?? item?.next_funding_time);
+    const sourceTimeMs = finite(item?.E ?? item?.time ?? item?.source_time) ?? now;
+    const meta = {
+      provider: PROVIDER,
+      market_type: MARKET_TYPE,
+      symbol: identity.symbol,
+      mark_price: finite(item?.p ?? item?.markPrice ?? item?.mark_price),
+      index_price: finite(item?.i ?? item?.indexPrice ?? item?.index_price),
+      estimated_settle_price: finite(item?.P ?? item?.estimatedSettlePrice ?? item?.estimated_settle_price),
+      last_funding_rate: fundingRate,
+      funding_rate: fundingRate,
+      last_funding_rate_percent: fundingRate == null ? null : fundingRate * 100,
+      funding_rate_percent: fundingRate == null ? null : fundingRate * 100,
+      next_funding_time: nextFundingTimeMs && nextFundingTimeMs > 0 ? iso(nextFundingTimeMs) : null,
+      source_time: iso(sourceTimeMs),
+      cached_at: iso(now),
+      source: 'binance_official_public_mark_price_websocket',
+    };
+    realtimeMetaBySymbol.set(identity.symbol, mergeNonNull(realtimeMetaBySymbol.get(identity.symbol), meta));
+    tickerBySymbol.set(identity.symbol, mergeNonNull(tickerBySymbol.get(identity.symbol), meta));
+    upsertUniverse(identity, 'binance_official_public_mark_price_websocket', now);
+    dirtyTickers = true;
+    accepted += 1;
+  }
+  if (accepted) {
+    lastMarkPriceEventAt = now;
+    notifyWaiters();
+    schedulePersist();
+  }
+}
+
 function handleContractInfoMessage(raw) {
   const payload = parsePayload(raw);
   const rows = Array.isArray(payload) ? payload : [payload];
@@ -269,6 +324,10 @@ const STREAMS = {
   contractInfo: {
     urls: ['wss://fstream.binance.com/market/ws/!contractInfo'],
     handler: handleContractInfoMessage,
+  },
+  markPrice: {
+    urls: ['wss://fstream.binance.com/market/ws/!markPrice@arr@1s'],
+    handler: handleMarkPriceMessage,
   },
 };
 
@@ -356,7 +415,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.13' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.14' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -551,7 +610,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.13：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.14：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }
@@ -586,7 +645,7 @@ export function startBinanceContractMarket() {
     const now = Date.now();
     for (const name of Object.keys(STREAMS)) {
       const state = streamStatus(name);
-      const expectsFrequentMessages = name === 'ticker' || name === 'bookTicker';
+      const expectsFrequentMessages = name === 'ticker' || name === 'bookTicker' || name === 'markPrice';
       const noFirstMessage = expectsFrequentMessages && state.connected && state.lastMessageAt === 0 &&
         state.openedAt > 0 && now - state.openedAt > WS_STALE_MS;
       const stale = expectsFrequentMessages && state.connected && state.lastMessageAt > 0 &&
@@ -634,6 +693,16 @@ export async function getBinanceContractTickers({ symbols = [], waitMs = START_W
   return rows;
 }
 
+export function getBinanceContractRealtimeMeta(symbol) {
+  startBinanceContractMarket();
+  const normalized = compact(symbol);
+  if (!normalized) return null;
+  const ticker = tickerBySymbol.get(normalized) || null;
+  const meta = realtimeMetaBySymbol.get(normalized) || null;
+  if (!ticker && !meta) return null;
+  return mergeNonNull(ticker, meta);
+}
+
 export function getBinanceContractMarketHealth() {
   const streams = {};
   for (const [name, state] of connectionState.entries()) {
@@ -646,16 +715,18 @@ export function getBinanceContractMarketHealth() {
   }
   return {
     ok: universeBySymbol.size > 0 || tickerBySymbol.size > 0,
-    version: '650.8.13',
+    version: VERSION,
     provider: PROVIDER,
     market_type: MARKET_TYPE,
     universe_rows: universeBySymbol.size,
     ticker_rows: tickerBySymbol.size,
+    realtime_meta_rows: realtimeMetaBySymbol.size,
     usdt_universe_rows: sortedUniverseRows(DEFAULT_QUOTE).length,
     restored_at: restoredAt ? iso(restoredAt) : null,
     last_universe_event_at: lastUniverseEventAt ? iso(lastUniverseEventAt) : null,
     last_ticker_event_at: lastTickerEventAt ? iso(lastTickerEventAt) : null,
     last_contract_info_event_at: lastContractInfoEventAt ? iso(lastContractInfoEventAt) : null,
+    last_mark_price_event_at: lastMarkPriceEventAt ? iso(lastMarkPriceEventAt) : null,
     last_persist_at: lastPersistAt ? iso(lastPersistAt) : null,
     automatic_rest_enabled: AUTOMATIC_REST_ENABLED,
     rest_last_success_at: restLastSuccessAt ? iso(restLastSuccessAt) : null,
@@ -676,7 +747,9 @@ export function getBinanceContractMarketHealth() {
       ticker: 'market',
       bookTicker: 'public',
       contractInfo: 'market',
+      markPrice: 'market',
     },
+    funding_current_source: 'binance_official_public_mark_price_websocket',
     source: 'binance_official_market_public_websocket_with_persistent_snapshot_no_automatic_rest',
     time: new Date().toISOString(),
   };

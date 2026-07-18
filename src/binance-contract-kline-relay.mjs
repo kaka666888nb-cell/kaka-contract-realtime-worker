@@ -4,7 +4,7 @@ import {
   isBinanceValidationAdminConfigured,
 } from './binance-rest-guard.mjs';
 
-const VERSION = '650.8.13';
+const VERSION = '650.8.14';
 const EDGE_PROTOCOL_VERSION = '650.8.11';
 const SCHEMA_VERSION = '650.8.11';
 const PROVIDER = 'binance';
@@ -20,6 +20,7 @@ const RELAY_TIMEOUT_MS = 20_000;
 const SNAPSHOT_IO_TIMEOUT_MS = 8_000;
 const MIN_REQUEST_GAP_MS = 12_000;
 const KLINE_MIN_REQUEST_GAP_MS = 3_000;
+const CRITICAL_AUX_MIN_REQUEST_GAP_MS = 2_500;
 const GLOBAL_MIN_REQUEST_GAP_MS = 1_000;
 const MAX_QUEUE_WAIT_MS = 25_000;
 const MAX_PENDING = 6;
@@ -36,7 +37,7 @@ let initialized = false;
 let initializingPromise = null;
 let activeRequest = false;
 let lastRequestStartedAt = 0;
-const lastRequestStartedAtByLane = { kline: 0, auxiliary: 0 };
+const lastRequestStartedAtByLane = { kline: 0, critical: 0, auxiliary: 0 };
 const waiters = [];
 let state = defaultState();
 
@@ -324,7 +325,9 @@ async function markRestricted({ status, reason, source, error, banUntil = 0 } = 
 }
 
 function laneGapMs(lane) {
-  return lane === 'kline' ? KLINE_MIN_REQUEST_GAP_MS : MIN_REQUEST_GAP_MS;
+  if (lane === 'kline') return KLINE_MIN_REQUEST_GAP_MS;
+  if (lane === 'critical') return CRITICAL_AUX_MIN_REQUEST_GAP_MS;
+  return MIN_REQUEST_GAP_MS;
 }
 
 function nextWaiterIndex() {
@@ -353,7 +356,7 @@ function releaseNext() {
     const [waiter] = waiters.splice(index, 1);
     if (waiter.done) continue;
     const now = Date.now();
-    const lane = waiter.lane === 'kline' ? 'kline' : 'auxiliary';
+    const lane = waiter.lane === 'kline' ? 'kline' : waiter.lane === 'critical' ? 'critical' : 'auxiliary';
     const laneDelay = laneGapMs(lane) - (now - Number(lastRequestStartedAtByLane[lane] || 0));
     const globalDelay = GLOBAL_MIN_REQUEST_GAP_MS - (now - lastRequestStartedAt);
     const delay = Math.max(0, laneDelay, globalDelay);
@@ -389,7 +392,7 @@ async function acquireSlot(signal = null, { lane = 'auxiliary', priority = 0 } =
     stats.client_abort_blocks += 1;
     throw new Error('binance_kline_relay_client_aborted_before_queue');
   }
-  const safeLane = lane === 'kline' ? 'kline' : 'auxiliary';
+  const safeLane = lane === 'kline' ? 'kline' : lane === 'critical' ? 'critical' : 'auxiliary';
   const now = Date.now();
   const laneReady = now - Number(lastRequestStartedAtByLane[safeLane] || 0) >= laneGapMs(safeLane);
   const globalReady = now - lastRequestStartedAt >= GLOBAL_MIN_REQUEST_GAP_MS;
@@ -575,7 +578,7 @@ export async function fetchBinanceContractKlineRelayRows({
 }
 
 export async function fetchBinancePublicRestRelayJson(url, {
-  source = 'public_rest', signal = null, allowBeforeValidation = false,
+  source = 'public_rest', signal = null, allowBeforeValidation = false, lane = 'auxiliary', priority = 0,
 } = {}) {
   await ensureBinanceContractKlineRelayInitialized();
   if (state.validation_completed !== true && allowBeforeValidation !== true) {
@@ -588,7 +591,7 @@ export async function fetchBinancePublicRestRelayJson(url, {
   const payload = await invokeAuthenticatedEdgeRelay({
     kind: 'public_rest',
     upstream_url: parsed.toString(),
-  }, { signal, sourceLabel: String(source || 'public_rest') });
+  }, { signal, sourceLabel: String(source || 'public_rest'), lane, priority });
   return payload?.data;
 }
 
@@ -783,6 +786,7 @@ export function getBinanceContractKlineRelayHealth() {
     active_request: activeRequest,
     min_request_gap_ms: MIN_REQUEST_GAP_MS,
     kline_min_request_gap_ms: KLINE_MIN_REQUEST_GAP_MS,
+    critical_aux_min_request_gap_ms: CRITICAL_AUX_MIN_REQUEST_GAP_MS,
     global_min_request_gap_ms: GLOBAL_MIN_REQUEST_GAP_MS,
     kline_priority_enabled: true,
     max_pending: MAX_PENDING,

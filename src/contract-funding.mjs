@@ -1,12 +1,17 @@
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
+import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.13';
+const VERSION = '650.8.14';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
 const FRESH_MS = 30_000;
 const STALE_MS = 10 * 60_000;
+const BINANCE_HISTORY_REFRESH_MS = 5 * 60_000;
+const BINANCE_HISTORY_BACKGROUND_DELAY_MS = 10_000;
+const BINANCE_REALTIME_WAIT_MS = 1_800;
+const BINANCE_HISTORY_REFRESH = new Map();
 
 function sendJson(res, status, payload) {
   const body = Buffer.from(JSON.stringify(payload));
@@ -48,6 +53,10 @@ function numberOrNull(value) {
 }
 
 function msValue(value) {
+  if (typeof value === 'string' && value.trim() && !Number.isFinite(Number(value))) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
   const n = numberOrNull(value);
   if (n == null || n <= 0) return null;
   return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
@@ -113,11 +122,15 @@ async function fetchJson(url, timeoutMs = 8000) {
   }
 }
 
-async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_funding') {
-  // Step650.8.13: preserve Binance funding current/history without using the
+async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_funding', options = {}) {
+  // Step650.8.14: preserve Binance funding current/history without using the
   // banned Render egress. The Edge relay has a strict endpoint/parameter allowlist.
   void timeoutMs;
-  return await fetchBinancePublicRestRelayJson(url, { source });
+  return await fetchBinancePublicRestRelayJson(url, {
+    source,
+    lane: options.lane || 'auxiliary',
+    priority: Number(options.priority || 0),
+  });
 }
 
 
@@ -152,26 +165,132 @@ async function fetchPair(currentUrl, historyUrl) {
   };
 }
 
-async function fetchBinance(symbol, limit) {
-  const { currentRaw, historyRaw, warnings } = await fetchBinancePair(
-    `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`,
-    `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
-  );
+function binanceRealtimeCurrent(symbol) {
+  const raw = getBinanceContractRealtimeMeta(symbol);
+  if (!raw || typeof raw !== 'object') return null;
+  const rate = raw.last_funding_rate ?? raw.funding_rate;
   const current = currentRow({
     provider: 'binance', symbol,
-    rate: currentRaw?.lastFundingRate,
-    nextTime: currentRaw?.nextFundingTime,
-    mark: currentRaw?.markPrice,
-    index: currentRaw?.indexPrice,
-    sourceTime: currentRaw?.time,
+    rate,
+    nextTime: raw.next_funding_time,
+    mark: raw.mark_price,
+    index: raw.index_price,
+    sourceTime: raw.source_time ?? raw.cached_at,
   });
-  const history = Array.isArray(historyRaw) ? historyRaw.map((item) => historyRow({
+  current.last_price = numberOrNull(raw.last_price ?? raw.price);
+  current.source = 'binance_official_public_mark_price_websocket';
+  current.realtime = true;
+  return current;
+}
+
+async function waitForBinanceRealtimeCurrent(symbol, waitMs = BINANCE_REALTIME_WAIT_MS) {
+  const immediate = binanceRealtimeCurrent(symbol);
+  if (immediate) return immediate;
+  const deadline = Date.now() + Math.max(0, waitMs);
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const row = binanceRealtimeCurrent(symbol);
+    if (row) return row;
+  }
+  return null;
+}
+
+async function fetchBinanceFundingHistory(symbol, limit) {
+  const historyRaw = await fetchBinanceJson(
+    `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+    8000,
+    'funding:history_background',
+    { lane: 'auxiliary', priority: -10 },
+  );
+  return Array.isArray(historyRaw) ? historyRaw.map((item) => historyRow({
     provider: 'binance', symbol,
     rate: item?.fundingRate,
     time: item?.fundingTime,
     mark: item?.markPrice,
   })).filter(Boolean) : [];
-  return { current, history, warnings, source: 'binance_official_public_funding_rest' };
+}
+
+function scheduleBinanceFundingHistoryRefresh(key, symbol, limit) {
+  const existing = BINANCE_HISTORY_REFRESH.get(key);
+  if (existing) return existing;
+  const currentCached = CACHE.get(key);
+  const age = currentCached ? Date.now() - currentCached.storedAt : Number.POSITIVE_INFINITY;
+  if (age <= BINANCE_HISTORY_REFRESH_MS && Array.isArray(currentCached?.payload?.history) && currentCached.payload.history.length) {
+    return null;
+  }
+  const promise = (async () => {
+    try {
+      // Give Kline and first-paint OI requests a clean priority window.
+      await new Promise((resolve) => setTimeout(resolve, BINANCE_HISTORY_BACKGROUND_DELAY_MS));
+      const history = await fetchBinanceFundingHistory(symbol, limit);
+      const cached = CACHE.get(key);
+      const current = binanceRealtimeCurrent(symbol) || cached?.payload?.current || null;
+      const payload = {
+        ok: true,
+        version: VERSION,
+        provider: 'binance',
+        market_type: 'contract',
+        symbol,
+        native_symbol: symbol,
+        source: 'binance_mark_price_websocket_plus_background_funding_history_edge_relay',
+        current,
+        history: history.slice(0, limit),
+        warnings: [],
+        partial: current == null,
+        timestamp_ms: Date.now(),
+      };
+      CACHE.set(key, { storedAt: Date.now(), payload });
+      return payload;
+    } catch (error) {
+      const cached = CACHE.get(key);
+      if (cached) {
+        cached.payload = {
+          ...cached.payload,
+          warnings: [...new Set([...(cached.payload.warnings || []), `history:${String(error?.message || error)}`])],
+        };
+      }
+      return null;
+    }
+  })().finally(() => BINANCE_HISTORY_REFRESH.delete(key));
+  BINANCE_HISTORY_REFRESH.set(key, promise);
+  return promise;
+}
+
+async function serveBinanceFunding(res, symbol, limit, key, { scheduleHistory = true } = {}) {
+  const cached = CACHE.get(key);
+  const current = await waitForBinanceRealtimeCurrent(symbol);
+  const history = Array.isArray(cached?.payload?.history) ? cached.payload.history.slice(0, limit) : [];
+  const payload = {
+    ok: true,
+    version: VERSION,
+    provider: 'binance',
+    market_type: 'contract',
+    symbol,
+    native_symbol: symbol,
+    source: 'binance_official_public_mark_price_websocket',
+    current: current || cached?.payload?.current || null,
+    history,
+    warnings: current ? [] : ['mark_price_websocket_warming'],
+    partial: !current || history.length === 0,
+    background_history_refresh: scheduleHistory,
+    timestamp_ms: Date.now(),
+  };
+  CACHE.set(key, { storedAt: cached?.storedAt || Date.now(), payload });
+  if (scheduleHistory) scheduleBinanceFundingHistoryRefresh(key, symbol, limit);
+  sendJson(res, 200, { ...payload, cache_state: current ? (history.length ? 'realtime-plus-cache' : 'realtime') : 'warming' });
+}
+
+async function fetchBinance(symbol, limit) {
+  // Retained for compatibility with load(); the request handler uses the fast
+  // stale-while-revalidate path above so App first paint never waits for history.
+  const current = await waitForBinanceRealtimeCurrent(symbol);
+  const history = await fetchBinanceFundingHistory(symbol, limit);
+  return {
+    current,
+    history,
+    warnings: current ? [] : ['mark_price_websocket_warming'],
+    source: 'binance_mark_price_websocket_plus_funding_history_edge_relay',
+  };
 }
 
 async function fetchOkx(symbol, limit) {
@@ -277,6 +396,21 @@ async function load(provider, symbol, limit) {
 }
 
 export async function handleContractFunding(req, res, url) {
+  if (url.pathname === `${ROUTE}/health`) {
+    sendJson(res, 200, {
+      ok: true,
+      version: VERSION,
+      cache_entries: CACHE.size,
+      inflight_entries: INFLIGHT.size,
+      binance_history_refreshes: BINANCE_HISTORY_REFRESH.size,
+      binance_current_transport: 'mark_price_websocket',
+      binance_history_transport: 'authenticated_edge_relay_background',
+      first_paint_waits_for_history: false,
+      history_background_delay_ms: BINANCE_HISTORY_BACKGROUND_DELAY_MS,
+      time: new Date().toISOString(),
+    });
+    return true;
+  }
   if (url.pathname !== ROUTE) return false;
   if (req.method !== 'GET') {
     sendJson(res, 405, { ok: false, version: VERSION, error: 'method_not_allowed' });
@@ -290,6 +424,12 @@ export async function handleContractFunding(req, res, url) {
     return true;
   }
   const key = `${provider}|${symbol}|${limit}`;
+  if (provider === 'binance') {
+    await serveBinanceFunding(res, symbol, limit, key, {
+      scheduleHistory: String(url.searchParams.get('history_mode') || '').toLowerCase() !== 'none',
+    });
+    return true;
+  }
   const now = Date.now();
   const cached = CACHE.get(key);
   if (cached && now - cached.storedAt <= FRESH_MS) {
