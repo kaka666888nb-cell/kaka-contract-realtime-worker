@@ -1,6 +1,6 @@
-# Kaka Web3 Contract Realtime Worker — Step650.8.12
+# Kaka Web3 Contract Realtime Worker — Step650.8.13
 
-Step650.8.12 isolates Binance USDⓈ-M historical Kline HTTP from the Render process after the Render outbound IP received an upstream HTTP 418 ban.
+Step650.8.13 isolates Binance USDⓈ-M historical Kline HTTP from the Render process after the Render outbound IP received an upstream HTTP 418 ban.
 
 ## Architecture
 
@@ -50,9 +50,17 @@ Legacy direct-REST probe/reset routes return HTTP 410.
 No App file, SQL, Cron, `pubspec.yaml`, or `flutter clean` change is required.
 
 
-## Step650.8.12 route and arbitrary-symbol Kline repair
+## Step650.8.13 route and arbitrary-symbol Kline repair
 
 - Generic market handler now claims only its own routes; contract-meta, funding, depth, trades, flow and liquidation are no longer intercepted as `unknown market api`.
 - Binance contract Kline never falls through to a non-allowlisted Render/native REST route.
 - Arbitrary-symbol first paint uses the already validated exact Edge relay window of at most 240 rows, then older pages continue through official archive loading.
 - Kline relay traffic has priority over auxiliary funding/meta/position requests while retaining one active Edge request at a time and zero direct Binance REST from Render.
+
+
+## Step650.8.13 Binance USDⓈ-M WebSocket route migration
+
+Binance futures market streams now use the dedicated `/market` path, while high-frequency book/depth streams use `/public`. The worker no longer uses the retired legacy root `/ws` or `/stream` routes for USDⓈ-M contract traffic.
+
+Migrated market channels: Kline, continuous Kline, aggTrade, ticker, contractInfo, forceOrder.
+Migrated public channels: bookTicker, depth.
