@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.15';
+const VERSION = '650.8.15.1';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -734,7 +734,7 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
 async function fetchBinanceJson(url, {
   headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0,
 } = {}) {
-  // Step650.8.15: all Binance public HTTP used by contract flow/meta is relayed
+  // Step650.8.15.1: all Binance public HTTP used by contract flow/meta is relayed
   // through the authenticated Supabase Edge allowlist. Render never contacts
   // fapi.binance.com directly. Critical first-paint OI uses a dedicated low-volume
   // lane; slower ratio history remains background auxiliary work.
@@ -1080,12 +1080,24 @@ async function refreshBinanceOpenInterestCritical(state) {
 }
 
 
+function ratioFamilyFieldNames(prefix) {
+  if (prefix === 'global') {
+    return {
+      ratio: 'global_long_short_ratio',
+      long: 'global_long_account',
+      short: 'global_short_account',
+    };
+  }
+  return {
+    ratio: `${prefix}_long_short_ratio`,
+    long: `${prefix}_long`,
+    short: `${prefix}_short`,
+  };
+}
+
 function ratioFamilyFields(prefix) {
-  return [
-    `${prefix}_long_short_ratio`,
-    `${prefix}_long`,
-    `${prefix}_short`,
-  ];
+  const names = ratioFamilyFieldNames(prefix);
+  return [names.ratio, names.long, names.short];
 }
 
 function latestRatioFamilyTime(state, prefix) {
@@ -1228,6 +1240,18 @@ function normalizeMetricRow(raw) {
     // OI、账户占比与多空比在本模块中都应为正值；旧版由null误转出的0视为缺失。
     row[field] = value != null && value > 0 ? value : null;
   }
+  // Step650.8.15 wrote Binance global shares to transient legacy keys
+  // global_long/global_short, while the persisted schema and App use
+  // global_long_account/global_short_account. Accept those legacy in-memory
+  // keys once, but always emit/persist the canonical schema fields.
+  if (row.global_long_account == null) {
+    const legacyLong = asNumber(raw.global_long);
+    if (legacyLong != null && legacyLong > 0) row.global_long_account = legacyLong;
+  }
+  if (row.global_short_account == null) {
+    const legacyShort = asNumber(raw.global_short);
+    if (legacyShort != null && legacyShort > 0) row.global_short_account = legacyShort;
+  }
   row.source = String(raw?.source || row.source);
   row.updated_at = String(raw?.updated_at || row.updated_at);
   return row;
@@ -1317,10 +1341,11 @@ function applyRatio(row, prefix, ratio, longShare, shortShare) {
   const r = asNumber(ratio);
   const l = asNumber(longShare);
   const sh = asNumber(shortShare);
-  if (r != null) row[`${prefix}_long_short_ratio`] = r;
-  if (l != null) row[`${prefix}_long`] = l;
-  if (sh != null) row[`${prefix}_short`] = sh;
-  if (r == null && l != null && sh != null && sh > 0) row[`${prefix}_long_short_ratio`] = l / sh;
+  const fields = ratioFamilyFieldNames(prefix);
+  if (r != null) row[fields.ratio] = r;
+  if (l != null) row[fields.long] = l;
+  if (sh != null) row[fields.short] = sh;
+  if (r == null && l != null && sh != null && sh > 0) row[fields.ratio] = l / sh;
 }
 
 function applyRatioFromParts(row, prefix, ratio, longPart, shortPart) {
@@ -1338,7 +1363,7 @@ function applyRatioFromParts(row, prefix, ratio, longPart, shortPart) {
   }
   applyRatio(row, prefix, r, longShare, shortShare);
   if (r == null && longValue != null && shortValue != null && shortValue > 0) {
-    row[`${prefix}_long_short_ratio`] = longValue / shortValue;
+    row[ratioFamilyFieldNames(prefix).ratio] = longValue / shortValue;
   }
 }
 
@@ -1369,7 +1394,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.15: metrics are requested sequentially under the shared governor.
+  // Step650.8.15.1: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.
@@ -1769,7 +1794,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,flow_first_paint_waits_for_full_metrics:false,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,flow_first_paint_waits_for_full_metrics:false,okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-meta'){
     if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
@@ -1813,7 +1838,7 @@ export async function handleContractFlow(req,res,url){
   loadPersistedMetrics(state).catch(()=>{});
   let ratioFirstPaintPromise=null;
   if(provider==='binance'){
-    // Step650.8.15: start the all-account ratio before the OI helper. Both still
+    // Step650.8.15.1: start the all-account ratio before the OI helper. Both still
     // use the authenticated Edge governor, but global L/S gets the first critical
     // slot so the funds/long-short page does not wait for the 45-second App poll.
     ratioFirstPaintPromise=refreshBinanceLongShortCritical(state).catch(()=>null);
