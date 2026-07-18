@@ -4,7 +4,8 @@ import {
   isBinanceValidationAdminConfigured,
 } from './binance-rest-guard.mjs';
 
-const VERSION = '650.8.11';
+const VERSION = '650.8.12';
+const EDGE_PROTOCOL_VERSION = '650.8.11';
 const SCHEMA_VERSION = '650.8.11';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
@@ -15,9 +16,11 @@ const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 const RELAY_FUNCTION_NAME = 'kaka-binance-contract-kline-relay';
 const RELAY_URL = SUPABASE_URL ? `${SUPABASE_URL}/functions/v1/${RELAY_FUNCTION_NAME}` : '';
-const RELAY_TIMEOUT_MS = 12_000;
+const RELAY_TIMEOUT_MS = 20_000;
 const SNAPSHOT_IO_TIMEOUT_MS = 8_000;
 const MIN_REQUEST_GAP_MS = 12_000;
+const KLINE_MIN_REQUEST_GAP_MS = 3_000;
+const GLOBAL_MIN_REQUEST_GAP_MS = 1_000;
 const MAX_QUEUE_WAIT_MS = 25_000;
 const MAX_PENDING = 6;
 const RESTRICTED_FALLBACK_MS = 30 * 60_000;
@@ -33,6 +36,7 @@ let initialized = false;
 let initializingPromise = null;
 let activeRequest = false;
 let lastRequestStartedAt = 0;
+const lastRequestStartedAtByLane = { kline: 0, auxiliary: 0 };
 const waiters = [];
 let state = defaultState();
 
@@ -77,6 +81,7 @@ function nowIso(value = Date.now()) {
 function defaultState() {
   return {
     schema_version: SCHEMA_VERSION,
+    edge_protocol_version: EDGE_PROTOCOL_VERSION,
     until: 0,
     status: 200,
     reason: 'step650_8_11_edge_relay_ready',
@@ -255,7 +260,7 @@ export async function checkBinanceContractKlineRelayDeployment() {
     try { payload = text ? JSON.parse(text) : null; } catch (_) {}
     const healthy = response.ok && payload?.ok === true &&
       payload?.relay_ready === true && payload?.upstream_called === false &&
-      String(payload?.version || '') === VERSION;
+      String(payload?.version || '') === EDGE_PROTOCOL_VERSION;
     if (!healthy) {
       throw new Error(`edge_relay_health_${response.status}:${String(payload?.error || text || 'invalid_payload').slice(0, 180)}`);
     }
@@ -318,12 +323,40 @@ async function markRestricted({ status, reason, source, error, banUntil = 0 } = 
   await persistStateStrict();
 }
 
+function laneGapMs(lane) {
+  return lane === 'kline' ? KLINE_MIN_REQUEST_GAP_MS : MIN_REQUEST_GAP_MS;
+}
+
+function nextWaiterIndex() {
+  let bestIndex = -1;
+  let bestPriority = -Infinity;
+  for (let index = 0; index < waiters.length; index += 1) {
+    const waiter = waiters[index];
+    if (waiter.done) continue;
+    const priority = Number(waiter.priority || 0);
+    if (bestIndex < 0 || priority > bestPriority) {
+      bestIndex = index;
+      bestPriority = priority;
+    }
+  }
+  return bestIndex;
+}
+
 function releaseNext() {
   if (activeRequest) return;
   while (waiters.length) {
-    const waiter = waiters.shift();
+    const index = nextWaiterIndex();
+    if (index < 0) {
+      waiters.splice(0, waiters.length);
+      return;
+    }
+    const [waiter] = waiters.splice(index, 1);
     if (waiter.done) continue;
-    const delay = Math.max(0, MIN_REQUEST_GAP_MS - (Date.now() - lastRequestStartedAt));
+    const now = Date.now();
+    const lane = waiter.lane === 'kline' ? 'kline' : 'auxiliary';
+    const laneDelay = laneGapMs(lane) - (now - Number(lastRequestStartedAtByLane[lane] || 0));
+    const globalDelay = GLOBAL_MIN_REQUEST_GAP_MS - (now - lastRequestStartedAt);
+    const delay = Math.max(0, laneDelay, globalDelay);
     const grant = () => {
       if (waiter.done || activeRequest) return;
       waiter.done = true;
@@ -331,6 +364,7 @@ function releaseNext() {
       waiter.signal?.removeEventListener('abort', waiter.abort);
       activeRequest = true;
       lastRequestStartedAt = Date.now();
+      lastRequestStartedAtByLane[lane] = lastRequestStartedAt;
       stats.requests_started += 1;
       waiter.resolve(() => {
         if (!activeRequest) return;
@@ -343,7 +377,7 @@ function releaseNext() {
   }
 }
 
-async function acquireSlot(signal = null) {
+async function acquireSlot(signal = null, { lane = 'auxiliary', priority = 0 } = {}) {
   await ensureBinanceContractKlineRelayInitialized();
   if (activeState()) {
     const error = new Error('binance_kline_edge_relay_cooling_down');
@@ -355,9 +389,14 @@ async function acquireSlot(signal = null) {
     stats.client_abort_blocks += 1;
     throw new Error('binance_kline_relay_client_aborted_before_queue');
   }
-  if (!activeRequest && waiters.length === 0 && Date.now() - lastRequestStartedAt >= MIN_REQUEST_GAP_MS) {
+  const safeLane = lane === 'kline' ? 'kline' : 'auxiliary';
+  const now = Date.now();
+  const laneReady = now - Number(lastRequestStartedAtByLane[safeLane] || 0) >= laneGapMs(safeLane);
+  const globalReady = now - lastRequestStartedAt >= GLOBAL_MIN_REQUEST_GAP_MS;
+  if (!activeRequest && waiters.length === 0 && laneReady && globalReady) {
     activeRequest = true;
     lastRequestStartedAt = Date.now();
+    lastRequestStartedAtByLane[safeLane] = lastRequestStartedAt;
     stats.requests_started += 1;
     let released = false;
     return () => {
@@ -373,7 +412,7 @@ async function acquireSlot(signal = null) {
   }
   stats.queue_waits += 1;
   return await new Promise((resolve, reject) => {
-    const waiter = { resolve, reject, done: false, signal, timeout: null, abort: null };
+    const waiter = { resolve, reject, done: false, signal, timeout: null, abort: null, lane: safeLane, priority: Number(priority || 0) };
     waiter.abort = () => {
       if (waiter.done) return;
       waiter.done = true;
@@ -429,8 +468,8 @@ function normalizeRelayRows(rawRows, symbol, interval) {
   return [...new Map(rows.map((row) => [row.open_time_ms, row])).values()].sort((a, b) => a.open_time_ms - b.open_time_ms);
 }
 
-async function invokeAuthenticatedEdgeRelay(body, { signal = null, sourceLabel = 'public_rest' } = {}) {
-  const release = await acquireSlot(signal);
+async function invokeAuthenticatedEdgeRelay(body, { signal = null, sourceLabel = 'public_rest', lane = 'auxiliary', priority = 0 } = {}) {
+  const release = await acquireSlot(signal, { lane, priority });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RELAY_TIMEOUT_MS);
   try {
@@ -529,6 +568,8 @@ export async function fetchBinanceContractKlineRelayRows({
   }, {
     signal,
     sourceLabel: `kline:${String(symbol || '').toUpperCase()}:${String(interval || '15m')}`,
+    lane: 'kline',
+    priority: 100,
   });
   return normalizeRelayRows(payload?.rows, String(symbol || '').toUpperCase(), String(interval || '15m'));
 }
@@ -741,6 +782,9 @@ export function getBinanceContractKlineRelayHealth() {
     queue_depth: waiters.filter((waiter) => !waiter.done).length,
     active_request: activeRequest,
     min_request_gap_ms: MIN_REQUEST_GAP_MS,
+    kline_min_request_gap_ms: KLINE_MIN_REQUEST_GAP_MS,
+    global_min_request_gap_ms: GLOBAL_MIN_REQUEST_GAP_MS,
+    kline_priority_enabled: true,
     max_pending: MAX_PENDING,
     prior_validated_symbols: PRIOR_VALIDATED_SYMBOLS,
     validation_sequence: VALIDATION_SEQUENCE,

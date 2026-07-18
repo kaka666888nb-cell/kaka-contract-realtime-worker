@@ -1,7 +1,7 @@
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.11';
+const VERSION = '650.8.12';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -114,7 +114,7 @@ async function fetchJson(url, timeoutMs = 8000) {
 }
 
 async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_funding') {
-  // Step650.8.11: preserve Binance funding current/history without using the
+  // Step650.8.12: preserve Binance funding current/history without using the
   // banned Render egress. The Edge relay has a strict endpoint/parameter allowlist.
   void timeoutMs;
   return await fetchBinancePublicRestRelayJson(url, { source });
