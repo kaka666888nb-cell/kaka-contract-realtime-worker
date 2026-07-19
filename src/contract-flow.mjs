@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -205,6 +205,16 @@ const binanceFlowConnectAttempts = [];
 let binanceFlowConnectChain = Promise.resolve();
 let binanceFlowLastConnectAt = 0;
 const binanceFlowWsStats = { attempts: 0, waits: 0, window_blocks: 0, capacity_rejections: 0, evictions: 0 };
+const flowWsTrafficByProvider = Object.fromEntries(
+  [...PROVIDERS].map((provider) => [provider, { messages: 0, bytes: 0 }]),
+);
+
+function flowRawByteLength(raw) {
+  if (Buffer.isBuffer(raw)) return raw.length;
+  if (raw instanceof ArrayBuffer) return raw.byteLength;
+  if (ArrayBuffer.isView(raw)) return raw.byteLength;
+  return Buffer.byteLength(String(raw ?? ''), 'utf8');
+}
 const CORE_SYMBOLS = String(process.env.KAKA_FLOW_CORE_SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,DOTUSDT,LTCUSDT')
   .split(',').map(symbolKey).filter((value) => value && value.endsWith('USDT'));
 const CORE_SYMBOL_SET = new Set(CORE_SYMBOLS);
@@ -601,7 +611,12 @@ async function startStream(state) {
         } catch (_) {}
       }, 20000);
     });
-    ws.on('message', (raw) => { try { ingest(state, cfg.parse(raw)); } catch (_) {} });
+    ws.on('message', (raw) => {
+      const traffic = flowWsTrafficByProvider[state.provider] || (flowWsTrafficByProvider[state.provider] = { messages: 0, bytes: 0 });
+      traffic.messages += 1;
+      traffic.bytes += flowRawByteLength(raw);
+      try { ingest(state, cfg.parse(raw)); } catch (_) {}
+    });
     const close = (reason) => {
       if (state.ws !== ws) return;
       clearInterval(state.heartbeatTimer); state.heartbeatTimer = null; state.ws = null;
@@ -734,7 +749,7 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
 async function fetchBinanceJson(url, {
   headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0,
 } = {}) {
-  // Step650.8.15.1: all Binance public HTTP used by contract flow/meta is relayed
+  // Step650.8.15.2: all Binance public HTTP used by contract flow/meta is relayed
   // through the authenticated Supabase Edge allowlist. Render never contacts
   // fapi.binance.com directly. Critical first-paint OI uses a dedicated low-volume
   // lane; slower ratio history remains background auxiliary work.
@@ -1394,7 +1409,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.15.1: metrics are requested sequentially under the shared governor.
+  // Step650.8.15.2: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.
@@ -1789,6 +1804,9 @@ export function getContractFlowHealth() {
     binance_ws_connect_window_blocks: binanceFlowWsStats.window_blocks,
     binance_ws_capacity_rejections: binanceFlowWsStats.capacity_rejections,
     production_ws_only: true,
+    websocket_ingress: Object.fromEntries(
+      Object.entries(flowWsTrafficByProvider).map(([provider, value]) => [provider, { ...value }]),
+    ),
   };
 }
 
@@ -1838,7 +1856,7 @@ export async function handleContractFlow(req,res,url){
   loadPersistedMetrics(state).catch(()=>{});
   let ratioFirstPaintPromise=null;
   if(provider==='binance'){
-    // Step650.8.15.1: start the all-account ratio before the OI helper. Both still
+    // Step650.8.15.2: start the all-account ratio before the OI helper. Both still
     // use the authenticated Edge governor, but global L/S gets the first critical
     // slot so the funds/long-short page does not wait for the 45-second App poll.
     ratioFirstPaintPromise=refreshBinanceLongShortCritical(state).catch(()=>null);

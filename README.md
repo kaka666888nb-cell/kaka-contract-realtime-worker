@@ -1,6 +1,14 @@
-# Kaka Web3 Contract Realtime Worker — Step650.8.15.1
+# Kaka Web3 Contract Realtime Worker — Step650.8.15.2
 
-Step650.8.15.1 is a Render-only auxiliary-data first-paint repair built on the validated Step650.8.13 Binance USDⓈ-M WebSocket migration.
+Step650.8.15.2 is a Render-only auxiliary-data first-paint repair built on the validated Step650.8.13 Binance USDⓈ-M WebSocket migration.
+
+
+## Step651.2D.2 bandwidth containment
+
+- Throttles the full Binance contract last-known-good snapshot upload from every 30 seconds to every 15 minutes.
+- Stops ticker/book/mark-price events from falsely marking the market universe dirty when symbol identity did not change.
+- Adds read-only byte/message counters for Binance market WebSocket streams, contract-flow WebSockets, and snapshot persistence.
+- Does not change App APIs, contract-flow sampling, funding, depth, liquidation, Kline, Edge relay, SQL, environment variables, or direct Binance REST protections.
 
 ## Current architecture
 
@@ -15,7 +23,7 @@ Step650.8.15.1 is a Render-only auxiliary-data first-paint repair built on the v
 
 The already deployed Edge relay remains unchanged. It is a separately isolated egress path, not a represented fixed/dedicated IP.
 
-## Step650.8.15.1 changes
+## Step650.8.15.2 changes
 
 - Funding first paint reads current funding, mark price and index price from the official mark-price WebSocket and does not wait for history.
 - Funding history is stale-while-revalidate and refreshes in the background through the existing authenticated Edge allowlist.
@@ -43,7 +51,7 @@ The already deployed Edge relay remains unchanged. It is a separately isolated e
 3. Deploy the same Render service: `kaka-contract-realtime-worker`.
 4. Preserve all existing environment variables.
 5. Wait at least three minutes after Render reports the service live.
-6. Run the Step650.8.15.1 health-only audit.
+6. Run the Step650.8.15.2 health-only audit.
 7. Only after it reports READY, run the one-time 2Z auxiliary validation.
 
 Do not redeploy Supabase Edge, change environment variables, modify App `main.dart`, run SQL/Cron, change `pubspec.yaml`, or run `flutter clean` for this step.

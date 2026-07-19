@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -9,7 +9,10 @@ const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY |
 const SNAPSHOT_TABLE = 'app_market_backend_snapshots';
 const SNAPSHOT_MIN_UNIVERSE_ROWS = 50;
 const SNAPSHOT_MIN_TICKER_ROWS = 50;
-const SNAPSHOT_PERSIST_INTERVAL_MS = 30_000;
+// Step651.2D.2: a full ~700-row market snapshot must not be uploaded every 30 seconds.
+// Fifteen minutes is still fresh enough for last-known-good cold-start recovery because
+// the official WebSocket immediately refreshes live rows after startup.
+const SNAPSHOT_PERSIST_INTERVAL_MS = 15 * 60_000;
 const AUTOMATIC_REST_ENABLED = false;
 const REST_REFRESH_INTERVAL_MS = 6 * 60 * 60_000;
 const REST_RESTRICTED_COOLDOWN_MS = 30 * 60_000;
@@ -45,6 +48,33 @@ let restRefreshPromise = null;
 let restNextAllowedAt = 0;
 let restLastSuccessAt = 0;
 let restLastError = '';
+const snapshotPersistStats = {
+  attempts: 0,
+  succeeded: 0,
+  failed: 0,
+  request_bytes: 0,
+  last_request_bytes: 0,
+  last_snapshot_type: '',
+  last_attempt_at: 0,
+};
+const marketWsTraffic = Object.fromEntries(
+  ['ticker', 'bookTicker', 'contractInfo', 'markPrice'].map((name) => [name, { messages: 0, bytes: 0 }]),
+);
+
+function rawByteLength(raw) {
+  if (Buffer.isBuffer(raw)) return raw.length;
+  if (raw instanceof ArrayBuffer) return raw.byteLength;
+  if (ArrayBuffer.isView(raw)) return raw.byteLength;
+  return Buffer.byteLength(String(raw ?? ''), 'utf8');
+}
+
+function universeIdentityChanged(previous, next) {
+  if (!previous) return true;
+  for (const key of ['provider', 'market_type', 'symbol', 'raw_symbol', 'base_asset', 'quote_asset', 'status', 'active']) {
+    if (previous[key] !== next[key]) return true;
+  }
+  return false;
+}
 
 function compact(raw) {
   return String(raw || '')
@@ -144,9 +174,14 @@ function notifyWaiters() {
 function upsertUniverse(identity, source, updatedAt = Date.now()) {
   const previous = universeBySymbol.get(identity.symbol);
   const next = universeRow(identity, source, updatedAt);
+  // Step651.2D.2: ticker/book/mark-price events arrive continuously, but they do
+  // not change the market universe. Do not mark the entire universe snapshot
+  // dirty merely because source/cached_at changed on another market message.
+  if (!universeIdentityChanged(previous, next)) return false;
   universeBySymbol.set(identity.symbol, { ...previous, ...next });
   dirtyUniverse = true;
   notifyWaiters();
+  return true;
 }
 
 function mergeNonNull(previous, next) {
@@ -415,7 +450,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.1' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.2' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -432,6 +467,9 @@ async function connectStream(name) {
     });
     socket.on('message', (raw) => {
       state.lastMessageAt = Date.now();
+      const traffic = marketWsTraffic[name] || (marketWsTraffic[name] = { messages: 0, bytes: 0 });
+      traffic.messages += 1;
+      traffic.bytes += rawByteLength(raw);
       try {
         spec.handler(raw);
       } catch (error) {
@@ -540,6 +578,7 @@ async function restoreSnapshots() {
 
 async function persistSnapshot(snapshotType, rows, source) {
   if (!supabaseEnabled() || !rows.length) return;
+  const nowIso = new Date().toISOString();
   const body = [{
     provider: PROVIDER,
     market_type: MARKET_TYPE,
@@ -548,19 +587,32 @@ async function persistSnapshot(snapshotType, rows, source) {
     payload: { rows },
     row_count: rows.length,
     source,
-    source_time: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    source_time: nowIso,
+    updated_at: nowIso,
   }];
-  const response = await fetchWithTimeout(
-    `${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}?on_conflict=provider,market_type,snapshot_type,quote_asset`,
-    {
-      method: 'POST',
-      headers: supabaseHeaders('resolution=merge-duplicates,return=minimal'),
-      body: JSON.stringify(body),
-    },
-    15_000,
-  );
-  if (!response.ok) throw new Error(`snapshot_persist_http_${response.status}`);
+  const bodyText = JSON.stringify(body);
+  const requestBytes = Buffer.byteLength(bodyText, 'utf8');
+  snapshotPersistStats.attempts += 1;
+  snapshotPersistStats.request_bytes += requestBytes;
+  snapshotPersistStats.last_request_bytes = requestBytes;
+  snapshotPersistStats.last_snapshot_type = snapshotType;
+  snapshotPersistStats.last_attempt_at = Date.now();
+  try {
+    const response = await fetchWithTimeout(
+      `${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}?on_conflict=provider,market_type,snapshot_type,quote_asset`,
+      {
+        method: 'POST',
+        headers: supabaseHeaders('resolution=merge-duplicates,return=minimal'),
+        body: bodyText,
+      },
+      15_000,
+    );
+    if (!response.ok) throw new Error(`snapshot_persist_http_${response.status}`);
+    snapshotPersistStats.succeeded += 1;
+  } catch (error) {
+    snapshotPersistStats.failed += 1;
+    throw error;
+  }
 }
 
 function sortedUniverseRows(quote = DEFAULT_QUOTE) {
@@ -610,7 +662,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.15.1：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.15.2：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }
@@ -733,6 +785,14 @@ export function getBinanceContractMarketHealth() {
     rest_next_allowed_at: restNextAllowedAt ? iso(restNextAllowedAt) : null,
     rest_last_error: restLastError || null,
     persistence_enabled: supabaseEnabled(),
+    snapshot_persist_interval_seconds: Math.round(SNAPSHOT_PERSIST_INTERVAL_MS / 1000),
+    snapshot_persist_stats: {
+      ...snapshotPersistStats,
+      last_attempt_at: snapshotPersistStats.last_attempt_at ? iso(snapshotPersistStats.last_attempt_at) : null,
+    },
+    websocket_ingress: Object.fromEntries(
+      Object.entries(marketWsTraffic).map(([name, value]) => [name, { ...value }]),
+    ),
     streams,
     ws_connect_gap_ms: WS_CONNECT_GAP_MS,
     ws_max_connect_attempts_5m: WS_MAX_CONNECT_ATTEMPTS_5M,
