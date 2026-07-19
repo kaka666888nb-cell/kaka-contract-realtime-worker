@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.3';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -19,6 +19,14 @@ const REST_RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 const REST_TRANSIENT_COOLDOWN_MS = 90_000;
 const WS_RECONNECT_MAX_MS = 60_000;
 const WS_STALE_MS = 45_000;
+// Step651.2D.3: all-market ticker and mark-price payloads are large snapshots.
+// The App calibrates large lists at low frequency and detail Klines have their own
+// realtime WebSocket, so receiving the same 700-row arrays every second wastes
+// several GiB per day. Capture one official snapshot per minute instead.
+const MARKET_TICKER_SNAPSHOT_INTERVAL_MS = 60_000;
+const MARKET_MARK_PRICE_SNAPSHOT_INTERVAL_MS = 60_000;
+const MARKET_SNAPSHOT_RETRY_MS = 15_000;
+const MARKET_SNAPSHOT_TIMEOUT_MS = 20_000;
 const START_WAIT_MS = 6_500;
 const WS_CONNECT_GAP_MS = 3_000;
 const WS_CONNECT_WINDOW_MS = 5 * 60_000;
@@ -347,22 +355,25 @@ function handleContractInfoMessage(raw) {
   }
 }
 
-const STREAMS = {
-  ticker: {
-    urls: ['wss://fstream.binance.com/market/ws/!ticker@arr'],
-    handler: handleTickerMessage,
-  },
-  bookTicker: {
-    urls: ['wss://fstream.binance.com/public/ws/!bookTicker'],
-    handler: handleBookTickerMessage,
-  },
+const PERSISTENT_STREAMS = {
   contractInfo: {
     urls: ['wss://fstream.binance.com/market/ws/!contractInfo'],
     handler: handleContractInfoMessage,
   },
+};
+
+const PERIODIC_SNAPSHOT_STREAMS = {
+  ticker: {
+    urls: ['wss://fstream.binance.com/market/ws/!ticker@arr'],
+    handler: handleTickerMessage,
+    intervalMs: MARKET_TICKER_SNAPSHOT_INTERVAL_MS,
+    initialDelayMs: 0,
+  },
   markPrice: {
     urls: ['wss://fstream.binance.com/market/ws/!markPrice@arr@1s'],
     handler: handleMarkPriceMessage,
+    intervalMs: MARKET_MARK_PRICE_SNAPSHOT_INTERVAL_MS,
+    initialDelayMs: 5_000,
   },
 };
 
@@ -435,7 +446,7 @@ async function acquireMarketWsConnectSlot() {
 }
 
 async function connectStream(name) {
-  const spec = STREAMS[name];
+  const spec = PERSISTENT_STREAMS[name];
   if (!spec) return;
   const state = streamStatus(name);
   if (state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState)) return;
@@ -450,7 +461,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.2' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.3' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -480,6 +491,98 @@ async function connectStream(name) {
       state.lastError = String(error?.message || error);
     });
     socket.on('close', () => scheduleReconnect(name));
+  })().finally(() => {
+    state.connectingPromise = null;
+  });
+  return state.connectingPromise;
+}
+
+function schedulePeriodicSnapshot(name, delayMs) {
+  const spec = PERIODIC_SNAPSHOT_STREAMS[name];
+  if (!spec) return;
+  const state = streamStatus(name);
+  if (state.reconnectTimer || state.connectingPromise ||
+      (state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState))) {
+    return;
+  }
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null;
+    capturePeriodicSnapshot(name).catch(() => {});
+  }, Math.max(0, delayMs));
+  state.reconnectTimer.unref?.();
+}
+
+async function capturePeriodicSnapshot(name) {
+  const spec = PERIODIC_SNAPSHOT_STREAMS[name];
+  if (!spec) return;
+  const state = streamStatus(name);
+  if (state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState)) return;
+  if (state.connectingPromise) return state.connectingPromise;
+
+  state.connectingPromise = (async () => {
+    await acquireMarketWsConnectSlot();
+    if (state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState)) return;
+    const url = spec.urls[state.urlIndex % spec.urls.length];
+    state.urlIndex = (state.urlIndex + 1) % spec.urls.length;
+    let socket;
+    let completed = false;
+    let timeoutTimer = null;
+    try {
+      socket = new WebSocket(url, {
+        handshakeTimeout: 15_000,
+        perMessageDeflate: false,
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.3' },
+      });
+    } catch (error) {
+      state.lastError = String(error?.message || error);
+      schedulePeriodicSnapshot(name, MARKET_SNAPSHOT_RETRY_MS);
+      return;
+    }
+    state.socket = socket;
+
+    const finish = (success) => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      timeoutTimer = null;
+      state.connected = false;
+      if (state.socket === socket) state.socket = null;
+      if (success) state.attempts = 0;
+      else state.attempts += 1;
+      schedulePeriodicSnapshot(name, success ? spec.intervalMs : MARKET_SNAPSHOT_RETRY_MS);
+    };
+
+    socket.on('open', () => {
+      state.connected = true;
+      state.openedAt = Date.now();
+      state.lastMessageAt = 0;
+      state.lastError = '';
+      timeoutTimer = setTimeout(() => {
+        if (completed) return;
+        completed = true;
+        state.lastError = 'periodic_snapshot_timeout';
+        try { socket.terminate(); } catch (_) {}
+      }, MARKET_SNAPSHOT_TIMEOUT_MS);
+      timeoutTimer.unref?.();
+    });
+    socket.on('message', (raw) => {
+      if (completed) return;
+      completed = true;
+      state.lastMessageAt = Date.now();
+      const traffic = marketWsTraffic[name] || (marketWsTraffic[name] = { messages: 0, bytes: 0 });
+      traffic.messages += 1;
+      traffic.bytes += rawByteLength(raw);
+      try {
+        spec.handler(raw);
+      } catch (error) {
+        state.lastError = String(error?.message || error);
+      }
+      try { socket.close(1000, 'periodic_snapshot_complete'); } catch (_) {
+        try { socket.terminate(); } catch (_) {}
+      }
+    });
+    socket.on('error', (error) => {
+      state.lastError = String(error?.message || error);
+    });
+    socket.on('close', () => finish(completed && state.lastMessageAt > 0));
   })().finally(() => {
     state.connectingPromise = null;
   });
@@ -662,7 +765,7 @@ function schedulePersist() {
 }
 
 export async function refreshBinanceContractMarketFromRest() {
-  // Step650.8.15.2：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
+  // Step650.8.15.3：目录与Ticker严格由官方WebSocket + Supabase最后正确快照提供。
   // 该导出仅保留旧调用兼容性，永远不会访问Binance REST。
   return null;
 }
@@ -691,20 +794,24 @@ export function startBinanceContractMarket() {
   if (started) return;
   started = true;
   restoreSnapshots().finally(() => {
-    for (const name of Object.keys(STREAMS)) connectStream(name).catch(() => {});
+    for (const name of Object.keys(PERSISTENT_STREAMS)) connectStream(name).catch(() => {});
+    for (const [name, spec] of Object.entries(PERIODIC_SNAPSHOT_STREAMS)) {
+      schedulePeriodicSnapshot(name, spec.initialDelayMs || 0);
+    }
   });
   const watchdog = setInterval(() => {
-    const now = Date.now();
-    for (const name of Object.keys(STREAMS)) {
+    for (const name of Object.keys(PERSISTENT_STREAMS)) {
       const state = streamStatus(name);
-      const expectsFrequentMessages = name === 'ticker' || name === 'bookTicker' || name === 'markPrice';
-      const noFirstMessage = expectsFrequentMessages && state.connected && state.lastMessageAt === 0 &&
-        state.openedAt > 0 && now - state.openedAt > WS_STALE_MS;
-      const stale = expectsFrequentMessages && state.connected && state.lastMessageAt > 0 &&
-        now - state.lastMessageAt > WS_STALE_MS;
-      if (!state.connected || noFirstMessage || stale) {
+      if (!state.connected) {
         try { state.socket?.terminate(); } catch (_) {}
         scheduleReconnect(name);
+      }
+    }
+    for (const name of Object.keys(PERIODIC_SNAPSHOT_STREAMS)) {
+      const state = streamStatus(name);
+      const socketActive = state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState);
+      if (!state.reconnectTimer && !state.connectingPromise && !socketActive) {
+        schedulePeriodicSnapshot(name, 0);
       }
     }
     if (dirtyUniverse || dirtyTickers) schedulePersist();
@@ -804,13 +911,23 @@ export function getBinanceContractMarketHealth() {
     futures_ws_route_migration: 'market_public_split',
     futures_ws_legacy_root_disabled: true,
     websocket_routes: {
-      ticker: 'market',
-      bookTicker: 'public',
-      contractInfo: 'market',
-      markPrice: 'market',
+      ticker: 'market_periodic_snapshot',
+      bookTicker: 'disabled_redundant',
+      contractInfo: 'market_persistent',
+      markPrice: 'market_periodic_snapshot',
     },
-    funding_current_source: 'binance_official_public_mark_price_websocket',
-    source: 'binance_official_market_public_websocket_with_persistent_snapshot_no_automatic_rest',
+    websocket_modes: {
+      ticker: 'periodic_one_shot',
+      bookTicker: 'disabled_redundant_ticker_fallback',
+      contractInfo: 'persistent_low_volume',
+      markPrice: 'periodic_one_shot',
+    },
+    market_snapshot_intervals_seconds: {
+      ticker: Math.round(MARKET_TICKER_SNAPSHOT_INTERVAL_MS / 1000),
+      markPrice: Math.round(MARKET_MARK_PRICE_SNAPSHOT_INTERVAL_MS / 1000),
+    },
+    funding_current_source: 'binance_official_public_mark_price_websocket_periodic_snapshot',
+    source: 'binance_official_periodic_market_snapshots_with_persistent_last_correct_snapshot_no_automatic_rest',
     time: new Date().toISOString(),
   };
 }

@@ -1,6 +1,15 @@
-# Kaka Web3 Contract Realtime Worker — Step650.8.15.2
+# Kaka Web3 Contract Realtime Worker — Step650.8.15.3 / Step651.2D.3
 
-Step650.8.15.2 is a Render-only auxiliary-data first-paint repair built on the validated Step650.8.13 Binance USDⓈ-M WebSocket migration.
+## Step651.2D.3 Render outbound-bandwidth containment
+
+- Replaces the continuous Binance all-market `!ticker@arr` and `!markPrice@arr@1s` downloads with official one-shot snapshots once per 60 seconds.
+- Disables the redundant continuous all-market `!bookTicker` stream; the 24h ticker snapshot already supplies the list price and the detail Kline WebSocket supplies realtime detail price.
+- Keeps the low-volume `!contractInfo` stream for listing/status changes.
+- Keeps the 15-minute Supabase last-correct snapshot persistence from Step651.2D.2.
+- Does not call Binance REST from Render, does not change Kline WebSockets, contract flow, funding calculations, depth, liquidation, App code, SQL, Storage, Edge or Cron.
+- Adds health metadata `websocket_modes` and `market_snapshot_intervals_seconds` for deployment verification.
+
+Step650.8.15.3 is a Render-only auxiliary-data first-paint repair built on the validated Step650.8.13 Binance USDⓈ-M WebSocket migration.
 
 
 ## Step651.2D.2 bandwidth containment
@@ -23,7 +32,7 @@ Step650.8.15.2 is a Render-only auxiliary-data first-paint repair built on the v
 
 The already deployed Edge relay remains unchanged. It is a separately isolated egress path, not a represented fixed/dedicated IP.
 
-## Step650.8.15.2 changes
+## Step650.8.15.3 changes
 
 - Funding first paint reads current funding, mark price and index price from the official mark-price WebSocket and does not wait for history.
 - Funding history is stale-while-revalidate and refreshes in the background through the existing authenticated Edge allowlist.
@@ -51,7 +60,7 @@ The already deployed Edge relay remains unchanged. It is a separately isolated e
 3. Deploy the same Render service: `kaka-contract-realtime-worker`.
 4. Preserve all existing environment variables.
 5. Wait at least three minutes after Render reports the service live.
-6. Run the Step650.8.15.2 health-only audit.
+6. Run the Step650.8.15.3 health-only audit.
 7. Only after it reports READY, run the one-time 2Z auxiliary validation.
 
 Do not redeploy Supabase Edge, change environment variables, modify App `main.dart`, run SQL/Cron, change `pubspec.yaml`, or run `flutter clean` for this step.
