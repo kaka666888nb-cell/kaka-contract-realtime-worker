@@ -1021,14 +1021,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.9', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.10', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.9',
+      version: '650.8.15.10',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1274,7 +1274,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.9 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.10 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,

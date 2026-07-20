@@ -837,6 +837,52 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
   return [...buckets.values()].sort((a, b) => a.open_time_ms - b.open_time_ms);
 }
 
+
+// Step650.8.15.10: calendar-month aggregation for safe Binance contract daily seeds.
+// A month is not a fixed 30-day duration, so use UTC year/month boundaries and never
+// interpolate or fabricate missing source candles.
+function aggregateCalendarMonths(sourceRows, provider, market, symbol) {
+  const buckets = new Map();
+  const sorted = [...sourceRows].sort((a, b) => a.open_time_ms - b.open_time_ms);
+  for (const source of sorted) {
+    const time = Number(source.open_time_ms);
+    if (!Number.isFinite(time)) continue;
+    const date = new Date(time);
+    const bucketStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+    const nextMonth = Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1);
+    const sourceVolume = num(source.volume) || 0;
+    const sourceQuote = num(source.quote_volume) || sourceVolume * (num(source.close) || 0);
+    const current = buckets.get(bucketStart);
+    if (!current) {
+      buckets.set(bucketStart, {
+        provider,
+        market_type: market,
+        symbol,
+        interval: '1M',
+        open_time: new Date(bucketStart).toISOString(),
+        open_time_ms: bucketStart,
+        close_time: new Date(nextMonth - 1).toISOString(),
+        open: source.open,
+        high: source.high,
+        low: source.low,
+        close: source.close,
+        volume: sourceVolume,
+        quote_volume: sourceQuote,
+        trade_count: num(source.trade_count) || 0,
+        source: 'binance_official_safe_daily_to_calendar_month_render',
+      });
+    } else {
+      current.high = Math.max(Number(current.high), Number(source.high));
+      current.low = Math.min(Number(current.low), Number(source.low));
+      current.close = source.close;
+      current.volume = Number(current.volume) + sourceVolume;
+      current.quote_volume = Number(current.quote_volume) + sourceQuote;
+      current.trade_count = Number(current.trade_count) + (num(source.trade_count) || 0);
+    }
+  }
+  return [...buckets.values()].sort((a, b) => a.open_time_ms - b.open_time_ms);
+}
+
 async function coinbaseKlines(symbol, interval, end, limit) {
   const productId = coinbaseProductId(symbol);
   const sourceGranularity = coinbaseSourceGranularity(interval);
@@ -1228,9 +1274,12 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'gate') {
     const raw = gateId(symbol);
+    // Gate spot recent-trades is a latest-page endpoint. Supplying the futures-style `to`
+    // parameter made the spot request fail on some routes. For 1-second first paint we only
+    // need the latest real public trades; historical empty seconds are never fabricated.
     const url = market === 'contract'
       ? `https://api.gateio.ws/api/v4/futures/usdt/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
-      : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`;
+      : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000`;
     const payload = await jsonFetch(url, 20_000);
     for (const item of Array.isArray(payload) ? payload : []) {
       const timestamp = item.create_time_ms ?? item.time_ms ?? item.create_time ?? item.time;
@@ -1297,13 +1346,36 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.15.8：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
-    // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
-    const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
-    // Step650.8.15.8: never fall through to the generic native Binance REST path.
-    // Binance contract Kline is archive + authenticated Edge relay + production WS only.
-    // Falling through attempted a public_rest /fapi/v1/klines route that is intentionally
-    // not allowlisted and converted a recoverable empty/partial seed into HTTP 502.
+    // Binance contract Kline remains archive + authenticated Edge relay + production WS only.
+    // Render direct Futures REST is hard-disabled. Any candidate failure stays isolated and
+    // never falls through to the generic native Binance REST path.
+    let seedRows = await getBinanceContractKlineSeed({
+      symbol,
+      interval,
+      end,
+      limit,
+      forceRestValidation: options.forceRestValidation === true,
+      signal: options.signal || null,
+      maxRestCalls: 1,
+    });
+
+    // Step650.8.15.10: a sparse/empty direct monthly seed can occur when the current monthly
+    // archive is not yet available. Reuse the same safe seed chain for official daily candles
+    // and aggregate them by real UTC calendar month. This sends no Render-direct Binance REST.
+    if (interval === '1M' && seedRows.length < 3) {
+      const dailyLimit = Math.min(720, Math.max(120, Number(limit || 80) * 35));
+      const dailyRows = await getBinanceContractKlineSeed({
+        symbol,
+        interval: '1d',
+        end,
+        limit: dailyLimit,
+        forceRestValidation: options.forceRestValidation === true,
+        signal: options.signal || null,
+        maxRestCalls: 1,
+      });
+      const monthlyRows = aggregateCalendarMonths(dailyRows, provider, market, symbol).slice(-limit);
+      if (monthlyRows.length > seedRows.length) seedRows = monthlyRows;
+    }
     return seedRows;
   }
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
@@ -1427,7 +1499,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.9',
+        version: '650.8.15.10',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1439,7 +1511,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.9',
+        version: '650.8.15.10',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1449,7 +1521,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.9',
+        version: '650.8.15.10',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1458,7 +1530,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.9',
+        version: '650.8.15.10',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -1575,7 +1647,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.9',
+        version: '650.8.15.10',
         provider,
         market_type: market,
         symbol,
