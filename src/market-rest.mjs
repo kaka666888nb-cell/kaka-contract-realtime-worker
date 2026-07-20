@@ -373,7 +373,7 @@ async function bybitPublicJson(pathAndQuery, { requireRows = false, timeout = 12
 }
 
 async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_market_rest') {
-  // Step650.8.15.7: Binance Spot and Contract public HTTP both use the same
+  // Step650.8.15.8: Binance Spot and Contract public HTTP both use the same
   // authenticated Edge relay and durable queue. Render direct REST is disabled.
   void timeout;
   return await fetchBinancePublicRestRelayJson(url, { source });
@@ -888,6 +888,103 @@ async function coinbaseKlines(symbol, interval, end, limit) {
   return aggregateCandles(dedupedSource, 'coinbase', 'spot', symbol, interval).slice(-limit);
 }
 
+async function resolveNativeMarketIdentity(provider, market, symbol) {
+  const displaySymbol = compact(symbol);
+  if (market !== 'contract' || !['bybit', 'bitget'].includes(provider)) {
+    return {
+      symbol: displaySymbol,
+      native_symbol: displaySymbol,
+      quote_asset: split(displaySymbol)[1],
+    };
+  }
+  const [, quote] = split(displaySymbol);
+  const identities = await universe(provider, market, quote);
+  const maps = identityMap(identities);
+  const identity = maps.byDisplay.get(displaySymbol) || maps.byNative.get(displaySymbol);
+  if (!identity) {
+    throw new Error(`${provider} native contract identity unavailable for ${displaySymbol}`);
+  }
+  return identity;
+}
+
+function alignedKlineEnd(end, interval) {
+  const now = Date.now();
+  const requested = Number(end);
+  const safe = Number.isFinite(requested) && requested > 0 ? Math.min(requested, now) : now;
+  const step = intervalMs(interval);
+  return Math.floor(safe / step) * step;
+}
+
+async function fetchBitgetContractKlines({ displaySymbol, nativeSymbol, quote, interval, end, limit }) {
+  const bar = bitgetBar(interval, 'contract');
+  if (!bar) throw new Error(`bitget interval ${interval} requires aggregation`);
+  const productType = bitgetContractCategory(quote).toLowerCase();
+  const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 1000));
+  const nearCurrent = Number(end) >= Date.now() - intervalMs(interval) * 2;
+  const alignedEnd = alignedKlineEnd(end, interval);
+  const urls = [
+    `https://api.bitget.com/api/v2/mix/market/candles?symbol=${encodeURIComponent(nativeSymbol)}` +
+      `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
+      `${nearCurrent ? '' : `&endTime=${alignedEnd}`}&limit=${safeLimit}`,
+    `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(nativeSymbol)}` +
+      `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
+      `&endTime=${alignedEnd}&limit=${Math.min(200, safeLimit)}`,
+  ];
+  let lastError = null;
+  for (const url of urls) {
+    try {
+      const payload = await jsonFetch(url, 15_000);
+      if (String(payload?.code || '00000') !== '00000') {
+        lastError = new Error(`bitget kline code=${payload?.code} msg=${payload?.msg || ''}`);
+        continue;
+      }
+      const data = payloadRows(payload);
+      if (!data.length) {
+        lastError = new Error(`bitget empty kline result symbol=${nativeSymbol} productType=${productType}`);
+        continue;
+      }
+      const rows = data
+        .map((a) => krow('bitget', 'contract', displaySymbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0]))
+        .filter(Boolean)
+        .map((row) => ({
+          ...row,
+          raw_symbol: nativeSymbol,
+          native_symbol: nativeSymbol,
+          quote_asset: quote,
+          source: 'bitget_official_usdc_contract_kline_render',
+        }));
+      if (rows.length) return rows;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error(`bitget contract kline unavailable for ${displaySymbol}`);
+}
+
+async function fetchBybitContractKlines({ displaySymbol, nativeSymbol, quote, interval, end, limit }) {
+  const bar = bybitBar(interval);
+  if (!bar) throw new Error(`bybit interval ${interval} requires aggregation`);
+  const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 1000));
+  const nearCurrent = Number(end) >= Date.now() - intervalMs(interval) * 2;
+  const safeEnd = Math.min(Number(end) || Date.now(), Date.now());
+  const query = `/v5/market/kline?category=linear&symbol=${encodeURIComponent(nativeSymbol)}` +
+    `&interval=${encodeURIComponent(bar)}&limit=${safeLimit}` +
+    `${nearCurrent ? '' : `&end=${safeEnd}`}`;
+  const payload = await bybitPublicJson(query, { requireRows: true, timeout: 15_000 });
+  const rows = payloadRows(payload)
+    .map((a) => krow('bybit', 'contract', displaySymbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0]))
+    .filter(Boolean)
+    .map((row) => ({
+      ...row,
+      raw_symbol: nativeSymbol,
+      native_symbol: nativeSymbol,
+      quote_asset: quote,
+      source: 'bybit_official_usdc_contract_kline_render',
+    }));
+  if (!rows.length) throw new Error(`bybit empty kline result symbol=${nativeSymbol}`);
+  return rows;
+}
+
 async function fetchNativeMarketKlines(provider, market, symbol, interval, end, limit) {
   let rows = [];
   if (provider === 'binance') {
@@ -957,23 +1054,45 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
   } else if (provider === 'bitget') {
     const bar = bitgetBar(interval, market);
     if (!bar) throw new Error(`bitget interval ${interval} requires aggregation`);
-    const base = market === 'contract'
-      ? 'https://api.bitget.com/api/v2/mix/market/candles'
-      : 'https://api.bitget.com/api/v2/spot/market/candles';
-    const product = market === 'contract' ? '&productType=USDT-FUTURES' : '';
-    const payload = await jsonFetch(
-      `${base}?symbol=${symbol}${product}&granularity=${encodeURIComponent(bar)}` +
-      `&endTime=${end}&limit=${Math.min(market === 'spot' ? 200 : 1000, limit)}`,
-    );
-    rows = (payload.data || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
+    if (market === 'contract') {
+      const identity = await resolveNativeMarketIdentity(provider, market, symbol);
+      rows = await fetchBitgetContractKlines({
+        displaySymbol: compact(symbol),
+        nativeSymbol: compact(identity.native_symbol || identity.raw_symbol || symbol),
+        quote: normalizedQuote(identity.quote_asset || split(compact(symbol))[1], 'USDC'),
+        interval,
+        end,
+        limit,
+      });
+    } else {
+      const payload = await jsonFetch(
+        `https://api.bitget.com/api/v2/spot/market/candles?symbol=${symbol}` +
+        `&granularity=${encodeURIComponent(bar)}&endTime=${end}&limit=${Math.min(200, limit)}`,
+      );
+      rows = (payload.data || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
+    }
   } else if (provider === 'bybit') {
     const bar = bybitBar(interval);
     if (!bar) throw new Error(`bybit interval ${interval} requires aggregation`);
-    const payload = await jsonFetch(
-      `https://api.bybit.com/v5/market/kline?category=${market === 'contract' ? 'linear' : 'spot'}` +
-      `&symbol=${symbol}&interval=${encodeURIComponent(bar)}&end=${end}&limit=${Math.min(1000, limit)}`,
-    );
-    rows = (payload.result?.list || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
+    if (market === 'contract') {
+      const identity = await resolveNativeMarketIdentity(provider, market, symbol);
+      rows = await fetchBybitContractKlines({
+        displaySymbol: compact(symbol),
+        nativeSymbol: compact(identity.native_symbol || identity.raw_symbol || symbol),
+        quote: normalizedQuote(identity.quote_asset || split(compact(symbol))[1], 'USDC'),
+        interval,
+        end,
+        limit,
+      });
+    } else {
+      const payload = await bybitPublicJson(
+        `/v5/market/kline?category=spot&symbol=${encodeURIComponent(symbol)}` +
+        `&interval=${encodeURIComponent(bar)}&end=${Math.min(Number(end) || Date.now(), Date.now())}` +
+        `&limit=${Math.min(1000, limit)}`,
+        { requireRows: true, timeout: 15_000 },
+      );
+      rows = payloadRows(payload).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
+    }
   }
   return [...new Map(rows.map((item) => [item.open_time_ms, item])).values()]
     .sort((a, b) => a.open_time_ms - b.open_time_ms)
@@ -1135,7 +1254,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  // Step650.8.15.7: only seconds with real official trades become candles.
+  // Step650.8.15.8: only seconds with real official trades become candles.
   // Empty seconds remain absent; timeline rendering may visually carry the last
   // price, but the API never fabricates zero-volume OHLC rows.
   return [...buckets.values()]
@@ -1158,10 +1277,10 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.15.7：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.15.8：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
-    // Step650.8.15.7: never fall through to the generic native Binance REST path.
+    // Step650.8.15.8: never fall through to the generic native Binance REST path.
     // Binance contract Kline is archive + authenticated Edge relay + production WS only.
     // Falling through attempted a public_rest /fapi/v1/klines route that is intentionally
     // not allowlisted and converted a recoverable empty/partial seed into HTTP 502.
@@ -1225,7 +1344,7 @@ const OWNED_MARKET_API_PATHS = new Set([
 ]);
 
 export async function handleMarketApi(req, res, url) {
-  // Step650.8.15.7: this generic market handler must claim only routes it owns.
+  // Step650.8.15.8: this generic market handler must claim only routes it owns.
   // Previously it claimed every /api/* path and returned "unknown market api"
   // before contract-meta/funding/depth/trades/flow/liquidation handlers could run.
   if (!OWNED_MARKET_API_PATHS.has(url.pathname)) return false;
@@ -1288,7 +1407,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.7',
+        version: '650.8.15.8',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1300,7 +1419,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.7',
+        version: '650.8.15.8',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1310,7 +1429,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.7',
+        version: '650.8.15.8',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1319,7 +1438,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.7',
+        version: '650.8.15.8',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -1436,7 +1555,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.7',
+        version: '650.8.15.8',
         provider,
         market_type: market,
         symbol,
