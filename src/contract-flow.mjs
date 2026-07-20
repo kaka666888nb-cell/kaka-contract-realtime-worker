@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.15.5';
+const VERSION = '650.8.15.6';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -763,7 +763,7 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
 async function fetchBinanceJson(url, {
   headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0,
 } = {}) {
-  // Step650.8.15.5: all Binance public HTTP used by contract flow/meta is relayed
+  // Step650.8.15.6: all Binance public HTTP used by contract flow/meta is relayed
   // through the authenticated Supabase Edge allowlist. Render never contacts
   // fapi.binance.com directly. Critical first-paint OI uses a dedicated low-volume
   // lane; slower ratio history remains background auxiliary work.
@@ -1424,7 +1424,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.15.5: metrics are requested sequentially under the shared governor.
+  // Step650.8.15.6: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.
@@ -1871,7 +1871,7 @@ export async function handleContractFlow(req,res,url){
   loadPersistedMetrics(state).catch(()=>{});
   let ratioFirstPaintPromise=null;
   if(provider==='binance'){
-    // Step650.8.15.5: start the all-account ratio before the OI helper. Both still
+    // Step650.8.15.6: start the all-account ratio before the OI helper. Both still
     // use the authenticated Edge governor, but global L/S gets the first critical
     // slot so the funds/long-short page does not wait for the 45-second App poll.
     ratioFirstPaintPromise=refreshBinanceLongShortCritical(state).catch(()=>null);
