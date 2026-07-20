@@ -772,25 +772,55 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
   } else if (provider === 'bitget') {
     const bar = bitgetBar(interval, market);
     if (!bar) throw new Error(`bitget interval ${interval} requires aggregation`);
-    const base = market === 'contract'
-      ? 'https://api.bitget.com/api/v2/mix/market/candles'
-      : 'https://api.bitget.com/api/v2/spot/market/candles';
     const [, symbolQuote] = split(compact(symbol));
-    const product = market === 'contract'
-      ? `&productType=${encodeURIComponent(bitgetContractProductType(symbolQuote))}`
-      : '';
-    const payload = await jsonFetch(
-      `${base}?symbol=${symbol}${product}&granularity=${encodeURIComponent(bar)}` +
-      `&endTime=${end}&limit=${Math.min(market === 'spot' ? 200 : 1000, limit)}`,
-    );
-    rows = (payload.data || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
+    const productType = bitgetContractProductType(symbolQuote);
+    const currentPath = market === 'contract'
+      ? '/api/v2/mix/market/candles'
+      : '/api/v2/spot/market/candles';
+    const historyPath = market === 'contract'
+      ? '/api/v2/mix/market/history-candles'
+      : '/api/v2/spot/market/history-candles';
+    const endpointPaths = [currentPath, historyPath];
+    let lastError = null;
+    for (const path of endpointPaths) {
+      try {
+        const maxLimit = path.includes('history') ? 200 : (market === 'spot' ? 200 : 1000);
+        const params = new URLSearchParams({
+          symbol,
+          granularity: bar,
+          endTime: String(end),
+          limit: String(Math.min(maxLimit, limit)),
+        });
+        if (market === 'contract') params.set('productType', productType);
+        const payload = await jsonFetch(`https://api.bitget.com${path}?${params.toString()}`);
+        if (payload?.code && String(payload.code) !== '00000') {
+          throw new Error(`bitget ${path} code=${payload.code} msg=${payload.msg || ''}`);
+        }
+        const pageRows = (payload?.data || [])
+          .map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0]))
+          .filter(Boolean);
+        if (pageRows.length) {
+          rows = pageRows;
+          break;
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!rows.length && lastError) throw lastError;
   } else if (provider === 'bybit') {
     const bar = bybitBar(interval);
     if (!bar) throw new Error(`bybit interval ${interval} requires aggregation`);
-    const payload = await jsonFetch(
-      `https://api.bybit.com/v5/market/kline?category=${market === 'contract' ? 'linear' : 'spot'}` +
-      `&symbol=${symbol}&interval=${encodeURIComponent(bar)}&end=${end}&limit=${Math.min(1000, limit)}`,
-    );
+    const query = `category=${market === 'contract' ? 'linear' : 'spot'}` +
+      `&symbol=${symbol}&interval=${encodeURIComponent(bar)}&end=${end}&limit=${Math.min(1000, limit)}`;
+    const payload = await jsonFetch([
+      `https://api.bybit.com/v5/market/kline?${query}`,
+      `https://api.bytick.com/v5/market/kline?${query}`,
+      `https://api.bybit.eu/v5/market/kline?${query}`,
+    ]);
+    if (Number(payload?.retCode ?? 0) !== 0) {
+      throw new Error(`bybit kline retCode=${payload?.retCode} retMsg=${payload?.retMsg || ''}`);
+    }
     rows = (payload.result?.list || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
   }
   return [...new Map(rows.map((item) => [item.open_time_ms, item])).values()]
@@ -1110,7 +1140,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.3',
+        version: '650.8.15.4',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1122,7 +1152,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.3',
+        version: '650.8.15.4',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1132,7 +1162,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.3',
+        version: '650.8.15.4',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1141,7 +1171,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.3',
+        version: '650.8.15.4',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -1256,7 +1286,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.3',
+        version: '650.8.15.4',
         provider,
         market_type: market,
         symbol,
