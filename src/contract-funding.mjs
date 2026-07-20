@@ -2,7 +2,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.6';
+const VERSION = '650.8.15.7';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -38,11 +38,6 @@ function splitSymbol(symbol) {
     }
   }
   return { base: symbol.replace(/USDT$/, ''), quote: 'USDT' };
-}
-
-function bitgetProductType(symbol) {
-  const { quote } = splitSymbol(symbol);
-  return quote === 'USDC' ? 'usdc-futures' : 'usdt-futures';
 }
 
 function nativeSymbol(provider, symbol) {
@@ -128,7 +123,7 @@ async function fetchJson(url, timeoutMs = 8000) {
 }
 
 async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_funding', options = {}) {
-  // Step650.8.15.6: preserve Binance funding current/history without using the
+  // Step650.8.15.7: preserve Binance funding current/history without using the
   // banned Render egress. The Edge relay has a strict endpoint/parameter allowlist.
   void timeoutMs;
   return await fetchBinancePublicRestRelayJson(url, {
@@ -343,7 +338,7 @@ async function fetchBybit(symbol, limit) {
 }
 
 async function fetchBitget(symbol, limit) {
-  const q = `symbol=${encodeURIComponent(symbol)}&productType=${encodeURIComponent(bitgetProductType(symbol))}`;
+  const q = `symbol=${encodeURIComponent(symbol)}&productType=usdt-futures`;
   const { currentRaw, historyRaw, warnings } = await fetchPair(
     `https://api.bitget.com/api/v2/mix/market/current-fund-rate?${q}`,
     `https://api.bitget.com/api/v2/mix/market/history-fund-rate?${q}&pageSize=${limit}`,

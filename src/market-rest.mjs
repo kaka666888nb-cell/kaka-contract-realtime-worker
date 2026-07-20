@@ -20,7 +20,6 @@ import {
   startBinanceContractKlineRelayValidation,
 } from './binance-contract-kline-relay.mjs';
 import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
-import { WebSocket } from 'ws';
 
 if (process.env.KAKA_DISABLE_BINANCE_MARKET_START !== '1') {
   startBinanceContractMarket();
@@ -32,13 +31,12 @@ const COINBASE_BASE_URL = 'https://api.exchange.coinbase.com';
 const BYBIT_PUBLIC_REST_HOSTS = [
   'https://api.bybit.com',
   'https://api.bytick.com',
-  // Official Japan Open API domains added by Bybit in July 2026.
-  'https://api.moneypartners.co.jp',
-  'https://api2.moneypartners.co.jp',
-  'https://api3.moneypartners.co.jp',
 ];
-const exactTickerWsCache = new Map();
-const EXACT_TICKER_WS_TTL_MS = 8_000;
+const MARKET_UNIVERSE_CACHE_TTL_MS = 5 * 60_000;
+const MARKET_TICKER_CACHE_TTL_MS = 10_000;
+const marketUniverseCache = new Map();
+const marketTickerCache = new Map();
+const marketCacheInflight = new Map();
 const coinbaseTickerCache = new Map();
 const COINBASE_TICKER_TTL_MS = 5_000;
 const BINANCE_SHARED_CACHE_MAX = 256;
@@ -92,6 +90,24 @@ async function sharedBinanceResult(key, ttlMs, loader) {
   }
 }
 
+async function sharedMarketResult(key, ttlMs, loader) {
+  const now = Date.now();
+  const cached = marketTickerCache.get(key) || marketUniverseCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.value;
+  const running = marketCacheInflight.get(key);
+  if (running) return await running;
+  const task = Promise.resolve().then(loader);
+  marketCacheInflight.set(key, task);
+  try {
+    const value = await task;
+    const target = key.startsWith('universe:') ? marketUniverseCache : marketTickerCache;
+    target.set(key, { value, expiresAt: Date.now() + Math.max(1000, Number(ttlMs) || 0) });
+    return value;
+  } finally {
+    if (marketCacheInflight.get(key) === task) marketCacheInflight.delete(key);
+  }
+}
+
 function providerKey(raw) {
   const value = String(raw || '').trim().toLowerCase().replaceAll('gate.io', 'gate');
   if (value === 'okex') return 'okx';
@@ -126,17 +142,33 @@ function normalizedQuote(raw, fallback = 'USDT') {
     ? value
     : fallback;
 }
-function contractQuoteFromSymbols(symbols = [], fallback = 'USDT') {
+function quoteFromSymbols(symbols = [], fallback = 'USDT') {
   for (const symbol of symbols) {
     const [, quote] = split(compact(symbol));
     if (quote) return normalizedQuote(quote, fallback);
   }
   return normalizedQuote(fallback, 'USDT');
 }
-function bitgetContractProductType(quote) {
-  // Bitget documents USDC-FUTURES / USDT-FUTURES as the canonical REST values.
-  // Some examples show lowercase, so callers may still retry lowercase when needed.
+function bitgetContractCategory(quote) {
   return normalizedQuote(quote, 'USDT') === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES';
+}
+function payloadRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.data?.list)) return payload.data.list;
+  if (Array.isArray(payload?.result?.list)) return payload.result.list;
+  return [];
+}
+function identityMap(rows = []) {
+  const byDisplay = new Map();
+  const byNative = new Map();
+  for (const row of rows) {
+    const display = compact(row?.symbol);
+    const native = compact(row?.native_symbol || row?.raw_symbol || row?.symbol);
+    if (display) byDisplay.set(display, row);
+    if (native) byNative.set(native, row);
+  }
+  return { byDisplay, byNative };
 }
 function coinbaseProductId(symbol) {
   const [base, quote] = split(compact(symbol));
@@ -178,18 +210,6 @@ function intervalMs(interval) {
     '1M': 2_592_000_000,
   })[interval] || 900_000;
 }
-function alignedKlineEnd(end, interval) {
-  const step = Math.max(1_000, intervalMs(interval));
-  const parsed = Number(end);
-  const capped = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, Date.now()) : Date.now();
-  return Math.floor(capped / step) * step;
-}
-function latestKlineWindow(end, interval) {
-  const parsed = Number(end);
-  if (!Number.isFinite(parsed) || parsed <= 0) return true;
-  return parsed >= Date.now() - intervalMs(interval) * 2;
-}
-
 function klineCoverage(rows, interval, endMs) {
   const sorted = [...new Map((Array.isArray(rows) ? rows : []).map((row) => [Number(row?.open_time_ms), row])).values()]
     .filter((row) => Number.isFinite(Number(row?.open_time_ms)))
@@ -301,7 +321,7 @@ async function jsonFetch(urls, timeout = 15_000) {
         signal: controller.signal,
         headers: {
           accept: 'application/json',
-          'user-agent': 'KakaWeb3-Market-Worker/650.8.15.6',
+          'user-agent': 'KakaWeb3-Market-Worker/515.1.2',
         },
       });
       const bodyText = await response.text();
@@ -330,7 +350,6 @@ async function jsonFetch(urls, timeout = 15_000) {
   }
   throw lastError || new Error('upstream unavailable');
 }
-
 async function bybitPublicJson(pathAndQuery, { requireRows = false, timeout = 12_000 } = {}) {
   let lastError = null;
   for (const host of BYBIT_PUBLIC_REST_HOSTS) {
@@ -340,8 +359,8 @@ async function bybitPublicJson(pathAndQuery, { requireRows = false, timeout = 12
         lastError = new Error(`bybit retCode=${payload?.retCode} retMsg=${payload?.retMsg || ''} host=${host}`);
         continue;
       }
-      const list = payload?.result?.list;
-      if (requireRows && (!Array.isArray(list) || list.length === 0)) {
+      const rows = payloadRows(payload);
+      if (requireRows && rows.length === 0) {
         lastError = new Error(`bybit empty result host=${host}`);
         continue;
       }
@@ -353,87 +372,8 @@ async function bybitPublicJson(pathAndQuery, { requireRows = false, timeout = 12
   throw lastError || new Error('Bybit official public API unavailable');
 }
 
-function exactTickerWsCacheKey(provider, market, symbols) {
-  return `${provider}|${market}|${[...symbols].sort().join(',')}`;
-}
-
-async function fetchExactTickersByWebSocket(provider, market, symbols, timeoutMs = 4_500) {
-  const requested = [...new Set(symbols.map(compact).filter(Boolean))].slice(0, 24);
-  if (!requested.length || !['bybit', 'bitget'].includes(provider)) return [];
-  const cacheKey = exactTickerWsCacheKey(provider, market, requested);
-  const cached = exactTickerWsCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < EXACT_TICKER_WS_TTL_MS) {
-    return cached.rows.map((row) => ({ ...row }));
-  }
-
-  const url = provider === 'bybit'
-    ? `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`
-    : 'wss://ws.bitget.com/v2/ws/public';
-
-  return await new Promise((resolve) => {
-    const rows = new Map();
-    let settled = false;
-    const ws = new WebSocket(url, { headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.6' } });
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try { ws.close(); } catch (_) {}
-      const result = [...rows.values()];
-      if (result.length) exactTickerWsCache.set(cacheKey, { at: Date.now(), rows: result });
-      resolve(result);
-    };
-    const timer = setTimeout(finish, timeoutMs);
-
-    ws.on('open', () => {
-      try {
-        if (provider === 'bybit') {
-          ws.send(JSON.stringify({ op: 'subscribe', args: requested.map((symbol) => `tickers.${symbol}`) }));
-        } else {
-          const [, quote] = split(requested[0]);
-          const instType = market === 'contract'
-            ? (quote === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES')
-            : 'SPOT';
-          ws.send(JSON.stringify({
-            op: 'subscribe',
-            args: requested.map((symbol) => ({ instType, channel: 'ticker', instId: symbol })),
-          }));
-        }
-      } catch (_) {
-        finish();
-      }
-    });
-
-    ws.on('message', (raw) => {
-      try {
-        const message = JSON.parse(raw.toString());
-        if (provider === 'bybit') {
-          if (!String(message?.topic || '').startsWith('tickers.')) return;
-          const data = Array.isArray(message?.data) ? message.data[0] : message?.data;
-          const symbol = compact(data?.symbol || String(message.topic).split('.').at(-1));
-          if (!requested.includes(symbol) || !data) return;
-          const row = tickerRow(provider, market, data, symbol);
-          if (row?.last_price) rows.set(symbol, row);
-        } else {
-          if (message?.arg?.channel !== 'ticker') return;
-          for (const data of Array.isArray(message?.data) ? message.data : []) {
-            const symbol = compact(data?.symbol || data?.instId || message?.arg?.instId);
-            if (!requested.includes(symbol)) continue;
-            const row = tickerRow(provider, market, data, symbol);
-            if (row?.last_price) rows.set(symbol, row);
-          }
-        }
-        if (rows.size >= requested.length) finish();
-      } catch (_) {
-      }
-    });
-    ws.on('error', finish);
-    ws.on('close', finish);
-  });
-}
-
 async function binanceRestJsonFetch(url, timeout = 15_000, source = 'legacy_market_rest') {
-  // Step650.8.15.3: Binance Spot and Contract public HTTP both use the same
+  // Step650.8.15.7: Binance Spot and Contract public HTTP both use the same
   // authenticated Edge relay and durable queue. Render direct REST is disabled.
   void timeout;
   return await fetchBinancePublicRestRelayJson(url, { source });
@@ -448,29 +388,38 @@ function send(res, status, body) {
   });
   res.end(JSON.stringify(body));
 }
-function marketRow(provider, market, symbol, base, quote, raw) {
+function marketRow(provider, market, symbol, base, quote, raw, extra = {}) {
+  const displaySymbol = compact(symbol);
+  const nativeSymbol = compact(extra.native_symbol || raw || symbol);
   return {
     provider,
     market_type: market,
-    symbol: compact(symbol),
-    raw_symbol: raw,
+    symbol: displaySymbol,
+    raw_symbol: String(raw || nativeSymbol),
+    native_symbol: nativeSymbol,
     base_asset: String(base).toUpperCase(),
     quote_asset: String(quote).toUpperCase(),
+    settle_asset: String(extra.settle_asset || quote || '').toUpperCase(),
+    contract_type: extra.contract_type || null,
     status: 'TRADING',
     active: true,
     source: `${provider}_official_public_market_render`,
   };
 }
 
-async function universe(provider, market, requestedQuote = 'USDT') {
-  const quote = normalizedQuote(requestedQuote, provider === 'coinbase' ? 'USD' : 'USDT');
+async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
+  const quoteFilter = normalizedQuote(requestedQuote, provider === 'coinbase' ? 'USD' : 'USDT');
   assertProviderMarket(provider, market);
   const rows = [];
   if (provider === 'binance') {
     if (market === 'contract') {
-      const snapshotRows = await getBinanceContractUniverse({ quote });
-      if (!snapshotRows.length) throw new Error('binance contract universe snapshot unavailable');
-      rows.push(...snapshotRows);
+      const snapshotRows = await getBinanceContractUniverse({ quote: quoteFilter });
+      if (!snapshotRows.length) throw new Error(`binance contract universe snapshot unavailable quote=${quoteFilter}`);
+      rows.push(...snapshotRows.map((row) => ({
+        ...row,
+        raw_symbol: row.raw_symbol || row.symbol,
+        native_symbol: compact(row.native_symbol || row.raw_symbol || row.symbol),
+      })));
     } else {
       const payload = await sharedBinanceResult(
         'spot_universe:exchange_info',
@@ -510,9 +459,7 @@ async function universe(provider, market, requestedQuote = 'USDT') {
     }
   } else if (provider === 'gate') {
     if (market === 'contract') {
-      // Gate public perpetual endpoints currently expose USDT/BTC settlement only.
-      // Never fabricate a USDC perpetual by relabelling a USDT contract.
-      if (quote !== 'USDT') return [];
+      if (quoteFilter !== 'USDT') return [];
       const payload = await jsonFetch([
         'https://api.gateio.ws/api/v4/futures/usdt/contracts',
         'https://fx-api.gateio.ws/api/v4/futures/usdt/contracts',
@@ -531,50 +478,102 @@ async function universe(provider, market, requestedQuote = 'USDT') {
       }
     }
   } else if (provider === 'bitget') {
-    const payload = await jsonFetch(
-      market === 'contract'
-        ? `https://api.bitget.com/api/v2/mix/market/contracts?productType=${encodeURIComponent(bitgetContractProductType(quote))}`
-        : 'https://api.bitget.com/api/v2/spot/public/symbols',
-    );
-    for (const item of payload.data || []) {
-      const status = String(item.symbolStatus || item.status || '').toLowerCase();
-      if (status && !['normal', 'online', 'listed'].includes(status)) continue;
-      if (item.baseCoin && item.quoteCoin) {
-        rows.push(marketRow(provider, market, item.symbol, item.baseCoin, item.quoteCoin, item.symbol));
+    if (market === 'contract') {
+      const category = bitgetContractCategory(quoteFilter);
+      const urls = [
+        `https://api.bitget.com/api/v3/market/instruments?category=${encodeURIComponent(category)}`,
+        `https://api.bitget.com/api/v2/mix/market/contracts?productType=${encodeURIComponent(category)}`,
+        `https://api.bitget.com/api/v2/mix/market/contracts?productType=${encodeURIComponent(category.toLowerCase())}`,
+      ];
+      let lastError = null;
+      let items = [];
+      for (const url of urls) {
+        try {
+          const payload = await jsonFetch(url);
+          if (String(payload?.code || '00000') !== '00000') {
+            lastError = new Error(`bitget instruments code=${payload?.code} msg=${payload?.msg || ''}`);
+            continue;
+          }
+          items = payloadRows(payload);
+          if (items.length) break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!items.length && lastError) throw lastError;
+      for (const item of items) {
+        const status = String(item.symbolStatus || item.status || item.state || '').toLowerCase();
+        if (status && !['normal', 'online', 'listed', 'live', 'trading'].includes(status)) continue;
+        const raw = String(item.symbol || item.symbolName || '').toUpperCase();
+        const base = String(item.baseCoin || item.baseCurrency || '').toUpperCase();
+        const quote = String(item.quoteCoin || item.quoteCurrency || item.settleCoin || quoteFilter).toUpperCase();
+        if (!raw || !base || !quote) continue;
+        rows.push(marketRow(provider, market, `${base}${quote}`, base, quote, raw, {
+          native_symbol: raw,
+          settle_asset: item.settleCoin || item.marginCoin || quote,
+          contract_type: item.symbolType || item.contractType || 'linear_perpetual',
+        }));
+      }
+    } else {
+      const payload = await jsonFetch('https://api.bitget.com/api/v2/spot/public/symbols');
+      for (const item of payloadRows(payload)) {
+        const status = String(item.symbolStatus || item.status || '').toLowerCase();
+        if (status && !['normal', 'online', 'listed'].includes(status)) continue;
+        if (item.baseCoin && item.quoteCoin) {
+          rows.push(marketRow(provider, market, item.symbol, item.baseCoin, item.quoteCoin, item.symbol));
+        }
       }
     }
   } else if (provider === 'bybit') {
     const category = market === 'contract' ? 'linear' : 'spot';
     let cursor = '';
     do {
-      const suffix = market === 'contract'
-        ? `&limit=1000${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
+      const contractFilter = market === 'contract'
+        ? `&limit=1000${quoteFilter === 'USDC' ? '&settleCoin=USDC' : ''}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
         : '';
-      const query = `category=${category}${suffix}`;
-      const payload = await bybitPublicJson(`/v5/market/instruments-info?${query}`, { requireRows: true });
-      if (Number(payload?.retCode ?? 0) !== 0) {
-        throw new Error(`bybit instruments retCode=${payload?.retCode} retMsg=${payload?.retMsg || ''}`);
-      }
+      const payload = await bybitPublicJson(
+        `/v5/market/instruments-info?category=${category}${contractFilter}`,
+        { requireRows: true },
+      );
       const result = payload.result || {};
       for (const item of result.list || []) {
         if (String(item.status || 'Trading').toLowerCase() !== 'trading') continue;
         if (market === 'contract' && String(item.contractType || '').toLowerCase() !== 'linearperpetual') continue;
         const raw = String(item.symbol || '').toUpperCase();
-        const [base, quote] = split(raw);
-        if (base && quote) {
-          rows.push(marketRow(provider, market, raw, item.baseCoin || base, item.quoteCoin || quote, raw));
-        }
+        const base = String(item.baseCoin || '').toUpperCase();
+        const settle = String(item.settleCoin || '').toUpperCase();
+        const nativeQuote = String(item.quoteCoin || '').toUpperCase();
+        const displayQuote = market === 'contract' && settle === 'USDC'
+          ? 'USDC'
+          : (nativeQuote || settle || split(raw)[1]);
+        if (!raw || !base || !displayQuote) continue;
+        rows.push(marketRow(provider, market, `${base}${displayQuote}`, base, displayQuote, raw, {
+          native_symbol: raw,
+          settle_asset: settle || displayQuote,
+          contract_type: item.contractType || null,
+        }));
       }
       cursor = market === 'contract' ? String(result.nextPageCursor || '') : '';
     } while (cursor);
   }
-  return [...new Map(rows.map((item) => [`${item.provider}:${item.symbol}`, item])).values()]
+  return [...new Map(rows.map((item) => [`${item.provider}:${item.market_type}:${item.symbol}`, item])).values()]
+    .filter((item) => item.quote_asset === quoteFilter)
     .sort((a, b) => a.symbol.localeCompare(b.symbol));
 }
 
-function tickerRow(provider, market, item, rawSymbol) {
-  const symbol = compact(rawSymbol);
-  if (!symbol) return null;
+async function universe(provider, market, requestedQuote = 'USDT') {
+  const quote = normalizedQuote(requestedQuote, provider === 'coinbase' ? 'USD' : 'USDT');
+  return await sharedMarketResult(
+    `universe:${provider}:${market}:${quote}`,
+    MARKET_UNIVERSE_CACHE_TTL_MS,
+    () => fetchUniverse(provider, market, quote),
+  );
+}
+
+function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
+  const nativeSymbol = compact(rawSymbol);
+  const symbol = compact(displaySymbol || nativeSymbol);
+  if (!symbol || !nativeSymbol) return null;
   const last = num(item.last_price ?? item.lastPrice ?? item.last ?? item.close ?? item.lastPr);
   const open = num(item.open_24h ?? item.openPrice ?? item.open ?? item.open24h ?? item.prevPrice24h);
   let percent = num(
@@ -588,6 +587,8 @@ function tickerRow(provider, market, item, rawSymbol) {
     provider,
     market_type: market,
     symbol,
+    raw_symbol: nativeSymbol,
+    native_symbol: nativeSymbol,
     last_price: last,
     price: last,
     price_change_percent_24h: percent,
@@ -648,12 +649,13 @@ async function coinbaseTicker(symbol) {
 
 async function tickers(provider, market, wantedSymbols = []) {
   assertProviderMarket(provider, market);
-  const requestedQuote = contractQuoteFromSymbols(wantedSymbols, 'USDT');
+  const wanted = [...new Set(wantedSymbols.map(compact).filter(Boolean))].slice(0, 120);
+  const requestedQuote = quoteFromSymbols(wanted, provider === 'coinbase' ? 'USD' : 'USDT');
+
   if (provider === 'coinbase') {
-    const symbols = [...new Set(wantedSymbols.map(compact).filter(Boolean))].slice(0, 48);
-    if (!symbols.length) return [];
+    if (!wanted.length) return [];
     let lastError = null;
-    const rows = await mapLimit(symbols, 5, async (symbol) => {
+    const rows = await mapLimit(wanted.slice(0, 48), 5, async (symbol) => {
       try {
         return await coinbaseTicker(symbol);
       } catch (error) {
@@ -665,12 +667,10 @@ async function tickers(provider, market, wantedSymbols = []) {
     if (!validRows.length && lastError) throw lastError;
     return validRows;
   }
-  let items = [];
+
   if (provider === 'binance') {
     if (market === 'contract') {
-      // Step650.2：单个旧/下架符号未命中时返回空数组，不把整个 Binance ticker 路由误判为上游故障，
-      // 更不能因此打开 provider 级熔断，导致同批 BTC/BNB/BCH 等正常交易对一起变成破折号。
-      return getBinanceContractTickers({ symbols: wantedSymbols });
+      return getBinanceContractTickers({ symbols: wanted });
     }
     const payload = await sharedBinanceResult(
       'spot_ticker:24hr_all',
@@ -681,8 +681,74 @@ async function tickers(provider, market, wantedSymbols = []) {
         'spot_ticker:24hr_all',
       ),
     );
-    items = Array.isArray(payload) ? payload : [];
-  } else if (provider === 'okx') {
+    return (Array.isArray(payload) ? payload : [])
+      .map((item) => tickerRow(provider, market, item, item.symbol))
+      .filter(Boolean);
+  }
+
+  if (provider === 'bybit' && market === 'contract') {
+    const identities = await universe(provider, market, requestedQuote);
+    const maps = identityMap(identities);
+    const payload = await sharedMarketResult(
+      `ticker:${provider}:${market}:${requestedQuote}`,
+      MARKET_TICKER_CACHE_TTL_MS,
+      () => bybitPublicJson('/v5/market/tickers?category=linear', { requireRows: true }),
+    );
+    const rows = [];
+    for (const item of payloadRows(payload)) {
+      const native = compact(item.symbol);
+      const identity = maps.byNative.get(native);
+      if (!identity) continue;
+      if (wanted.length && !wanted.includes(identity.symbol)) continue;
+      const row = tickerRow(provider, market, item, native, identity.symbol);
+      if (row) rows.push({ ...row, settle_asset: identity.settle_asset, contract_type: identity.contract_type });
+    }
+    return rows;
+  }
+
+  if (provider === 'bitget' && market === 'contract') {
+    const identities = await universe(provider, market, requestedQuote);
+    const maps = identityMap(identities);
+    const category = bitgetContractCategory(requestedQuote);
+    const payload = await sharedMarketResult(
+      `ticker:${provider}:${market}:${requestedQuote}`,
+      MARKET_TICKER_CACHE_TTL_MS,
+      async () => {
+        const urls = [
+          `https://api.bitget.com/api/v3/market/tickers?category=${encodeURIComponent(category)}`,
+          `https://api.bitget.com/api/v2/mix/market/tickers?productType=${encodeURIComponent(category)}`,
+          `https://api.bitget.com/api/v2/mix/market/tickers?productType=${encodeURIComponent(category.toLowerCase())}`,
+        ];
+        let lastError = null;
+        for (const url of urls) {
+          try {
+            const result = await jsonFetch(url);
+            if (String(result?.code || '00000') !== '00000') {
+              lastError = new Error(`bitget tickers code=${result?.code} msg=${result?.msg || ''}`);
+              continue;
+            }
+            if (payloadRows(result).length) return result;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error(`bitget ${category} ticker rows unavailable`);
+      },
+    );
+    const rows = [];
+    for (const item of payloadRows(payload)) {
+      const native = compact(item.symbol || item.symbolName);
+      const identity = maps.byNative.get(native) || maps.byDisplay.get(native);
+      if (!identity) continue;
+      if (wanted.length && !wanted.includes(identity.symbol)) continue;
+      const row = tickerRow(provider, market, item, native, identity.symbol);
+      if (row) rows.push({ ...row, settle_asset: identity.settle_asset, contract_type: identity.contract_type });
+    }
+    return rows;
+  }
+
+  let items = [];
+  if (provider === 'okx') {
     const payload = await jsonFetch(
       `https://www.okx.com/api/v5/market/tickers?instType=${market === 'contract' ? 'SWAP' : 'SPOT'}`,
     );
@@ -696,79 +762,11 @@ async function tickers(provider, market, wantedSymbols = []) {
     );
     items = Array.isArray(payload) ? payload : [];
   } else if (provider === 'bitget') {
-    const productType = bitgetContractProductType(requestedQuote);
-    const productTypes = market === 'contract'
-      ? [productType, productType.toLowerCase()]
-      : [''];
-    const exactSymbols = [...new Set(wantedSymbols.map(compact).filter(Boolean))].slice(0, 80);
-    if (market === 'contract' && exactSymbols.length) {
-      for (const candidateType of productTypes) {
-        const exactRows = await mapLimit(exactSymbols, 5, async (symbol) => {
-          try {
-            const payload = await jsonFetch(
-              `https://api.bitget.com/api/v2/mix/market/ticker?symbol=${encodeURIComponent(symbol)}` +
-              `&productType=${encodeURIComponent(candidateType)}`,
-            );
-            if (String(payload?.code || '00000') !== '00000') return null;
-            const item = Array.isArray(payload?.data) ? payload.data[0] : payload?.data;
-            return item ? tickerRow(provider, market, item, item.symbol || symbol) : null;
-          } catch (_) {
-            return null;
-          }
-        });
-        const valid = exactRows.filter(Boolean);
-        if (valid.length) return valid;
-      }
-    }
-    let lastBitgetError = null;
-    for (const candidateType of productTypes) {
-      try {
-        const payload = await jsonFetch(
-          market === 'contract'
-            ? `https://api.bitget.com/api/v2/mix/market/tickers?productType=${encodeURIComponent(candidateType)}`
-            : 'https://api.bitget.com/api/v2/spot/market/tickers',
-        );
-        if (String(payload?.code || '00000') !== '00000') {
-          lastBitgetError = new Error(`bitget tickers code=${payload?.code} msg=${payload?.msg || ''}`);
-          continue;
-        }
-        items = payload.data || [];
-        if (items.length) break;
-      } catch (error) {
-        lastBitgetError = error;
-      }
-    }
-    if (!items.length && exactSymbols.length) {
-      const wsRows = await fetchExactTickersByWebSocket(provider, market, exactSymbols);
-      if (wsRows.length) return wsRows;
-    }
-    if (!items.length && lastBitgetError) throw lastBitgetError;
+    const payload = await jsonFetch('https://api.bitget.com/api/v2/spot/market/tickers');
+    items = payloadRows(payload);
   } else if (provider === 'bybit') {
-    const category = market === 'contract' ? 'linear' : 'spot';
-    const exactSymbols = [...new Set(wantedSymbols.map(compact).filter(Boolean))].slice(0, 80);
-    if (exactSymbols.length) {
-      const exactRows = await mapLimit(exactSymbols, 5, async (symbol) => {
-        try {
-          const query = `category=${category}&symbol=${encodeURIComponent(symbol)}`;
-          const payload = await bybitPublicJson(`/v5/market/tickers?${query}`, { requireRows: true });
-          if (Number(payload?.retCode ?? 0) !== 0) return null;
-          const item = Array.isArray(payload?.result?.list) ? payload.result.list[0] : null;
-          return item ? tickerRow(provider, market, item, item.symbol || symbol) : null;
-        } catch (_) {
-          return null;
-        }
-      });
-      const valid = exactRows.filter(Boolean);
-      if (valid.length) return valid;
-      const wsRows = await fetchExactTickersByWebSocket(provider, market, exactSymbols);
-      if (wsRows.length) return wsRows;
-    }
-    const query = `category=${category}`;
-    const payload = await bybitPublicJson(`/v5/market/tickers?${query}`, { requireRows: true });
-    if (Number(payload?.retCode ?? 0) !== 0) {
-      throw new Error(`bybit tickers retCode=${payload?.retCode} retMsg=${payload?.retMsg || ''}`);
-    }
-    items = payload.result?.list || [];
+    const payload = await bybitPublicJson('/v5/market/tickers?category=spot', { requireRows: true });
+    items = payloadRows(payload);
   }
   return items
     .map((item) => tickerRow(provider, market, item, item.symbol ?? item.instId ?? item.contract ?? item.currency_pair))
@@ -922,10 +920,6 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
       after = oldest;
     }
   } else if (provider === 'gate') {
-    const [, symbolQuote] = split(compact(symbol));
-    if (market === 'contract' && symbolQuote !== 'USDT') {
-      throw new Error(`gate native ${symbolQuote} perpetual is not available`);
-    }
     const bar = gateBar(interval, market);
     if (!bar) throw new Error(`gate ${market} interval ${interval} requires aggregation`);
     const seconds = Math.max(1, Math.floor(intervalMs(interval) / 1000));
@@ -963,61 +957,22 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
   } else if (provider === 'bitget') {
     const bar = bitgetBar(interval, market);
     if (!bar) throw new Error(`bitget interval ${interval} requires aggregation`);
-    const [, symbolQuote] = split(compact(symbol));
-    const productType = bitgetContractProductType(symbolQuote);
-    const productTypes = market === 'contract' ? [productType, productType.toLowerCase()] : [''];
-    const requestEnd = alignedKlineEnd(end, interval);
-    const latestWindow = latestKlineWindow(end, interval);
-    const currentPath = market === 'contract'
-      ? '/api/v2/mix/market/candles'
-      : '/api/v2/spot/market/candles';
-    const historyPath = market === 'contract'
-      ? '/api/v2/mix/market/history-candles'
-      : '/api/v2/spot/market/history-candles';
-    const endpointPaths = [currentPath, historyPath];
-    let lastError = null;
-    outerBitgetKline:
-    for (const path of endpointPaths) {
-      for (const candidateType of productTypes) {
-        try {
-          const maxLimit = path.includes('history') ? 200 : (market === 'spot' ? 200 : 1000);
-          const params = new URLSearchParams({
-            symbol,
-            granularity: bar,
-            limit: String(Math.min(maxLimit, limit)),
-          });
-          if (!latestWindow) params.set('endTime', String(requestEnd));
-          if (market === 'contract') params.set('productType', candidateType);
-          const payload = await jsonFetch(`https://api.bitget.com${path}?${params.toString()}`);
-          if (payload?.code && String(payload.code) !== '00000') {
-            throw new Error(`bitget ${path} code=${payload.code} msg=${payload.msg || ''}`);
-          }
-          const pageRows = (payload?.data || [])
-            .map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0]))
-            .filter(Boolean);
-          if (pageRows.length) {
-            rows = pageRows;
-            break outerBitgetKline;
-          }
-        } catch (error) {
-          lastError = error;
-        }
-      }
-    }
-    if (!rows.length && lastError) throw lastError;
+    const base = market === 'contract'
+      ? 'https://api.bitget.com/api/v2/mix/market/candles'
+      : 'https://api.bitget.com/api/v2/spot/market/candles';
+    const product = market === 'contract' ? '&productType=USDT-FUTURES' : '';
+    const payload = await jsonFetch(
+      `${base}?symbol=${symbol}${product}&granularity=${encodeURIComponent(bar)}` +
+      `&endTime=${end}&limit=${Math.min(market === 'spot' ? 200 : 1000, limit)}`,
+    );
+    rows = (payload.data || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
   } else if (provider === 'bybit') {
     const bar = bybitBar(interval);
     if (!bar) throw new Error(`bybit interval ${interval} requires aggregation`);
-    const requestEnd = alignedKlineEnd(end, interval);
-    const latestWindow = latestKlineWindow(end, interval);
-    const query = `category=${market === 'contract' ? 'linear' : 'spot'}` +
-      `&symbol=${symbol}&interval=${encodeURIComponent(bar)}` +
-      `${latestWindow ? '' : `&end=${requestEnd}`}` +
-      `&limit=${Math.min(1000, limit)}`;
-    const payload = await bybitPublicJson(`/v5/market/kline?${query}`, { requireRows: true });
-    if (Number(payload?.retCode ?? 0) !== 0) {
-      throw new Error(`bybit kline retCode=${payload?.retCode} retMsg=${payload?.retMsg || ''}`);
-    }
+    const payload = await jsonFetch(
+      `https://api.bybit.com/v5/market/kline?category=${market === 'contract' ? 'linear' : 'spot'}` +
+      `&symbol=${symbol}&interval=${encodeURIComponent(bar)}&end=${end}&limit=${Math.min(1000, limit)}`,
+    );
     rows = (payload.result?.list || []).map((a) => krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0])).filter(Boolean);
   }
   return [...new Map(rows.map((item) => [item.open_time_ms, item])).values()]
@@ -1125,7 +1080,7 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'bitget') {
     const url = market === 'contract'
-      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${symbol}&productType=${encodeURIComponent(bitgetContractProductType(split(compact(symbol))[1]))}&limit=100`
+      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${symbol}&productType=USDT-FUTURES&limit=100`
       : `https://api.bitget.com/api/v2/spot/market/fills?symbol=${symbol}&limit=500`;
     const payload = await jsonFetch(url, 20_000);
     for (const item of payload.data || []) {
@@ -1134,10 +1089,6 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'gate') {
     const raw = gateId(symbol);
-    const [, gateQuote] = split(compact(symbol));
-    if (market === 'contract' && gateQuote !== 'USDT') {
-      throw new Error(`gate native ${gateQuote} perpetual trades are not available`);
-    }
     const url = market === 'contract'
       ? `https://api.gateio.ws/api/v4/futures/usdt/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
       : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`;
@@ -1184,7 +1135,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.trade_count += 1;
     }
   }
-  // Step650.8.15.3: only seconds with real official trades become candles.
+  // Step650.8.15.7: only seconds with real official trades become candles.
   // Empty seconds remain absent; timeline rendering may visually carry the last
   // price, but the API never fabricates zero-volume OHLC rows.
   return [...buckets.values()]
@@ -1207,10 +1158,10 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (interval === '1s') return fetchSecondMarketKlines(provider, market, symbol, end, limit);
   if (interval === 'timeline') interval = '1m';
   if (provider === 'binance' && market === 'contract') {
-    // Step650.8.15.3：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
+    // Step650.8.15.7：Binance 合约历史K线先读官方日/月归档；若持久快照尾部已有实时蜡烛但内部仍断层，则从第一个缺口开始补官方当前日HTTP桥接，再启动按需实时K线WebSocket。
     // 归档、当前桥接和实时流按open_time去重合并后持久化；任何候选失败都不跨平台、不插值、不造蜡烛。
     const seedRows = await getBinanceContractKlineSeed({ symbol, interval, end, limit, forceRestValidation: options.forceRestValidation === true, signal: options.signal || null, maxRestCalls: 1 });
-    // Step650.8.15.3: never fall through to the generic native Binance REST path.
+    // Step650.8.15.7: never fall through to the generic native Binance REST path.
     // Binance contract Kline is archive + authenticated Edge relay + production WS only.
     // Falling through attempted a public_rest /fapi/v1/klines route that is intentionally
     // not allowlisted and converted a recoverable empty/partial seed into HTTP 502.
@@ -1274,7 +1225,7 @@ const OWNED_MARKET_API_PATHS = new Set([
 ]);
 
 export async function handleMarketApi(req, res, url) {
-  // Step650.8.15.3: this generic market handler must claim only routes it owns.
+  // Step650.8.15.7: this generic market handler must claim only routes it owns.
   // Previously it claimed every /api/* path and returned "unknown market api"
   // before contract-meta/funding/depth/trades/flow/liquidation handlers could run.
   if (!OWNED_MARKET_API_PATHS.has(url.pathname)) return false;
@@ -1337,7 +1288,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.6',
+        version: '650.8.15.7',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1349,7 +1300,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.6',
+        version: '650.8.15.7',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1359,7 +1310,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.6',
+        version: '650.8.15.7',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1368,7 +1319,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.6',
+        version: '650.8.15.7',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -1401,7 +1352,9 @@ export async function handleMarketApi(req, res, url) {
         has_more: next < all.length,
         provider_status: provider === 'binance' && market === 'contract'
           ? 'official_public_websocket_snapshot_ok'
-          : 'official_public_ok_render',
+          : (market === 'contract' && ['bybit', 'bitget'].includes(provider)
+            ? 'official_public_native_identity_ok_render'
+            : 'official_public_ok_render'),
         source: rows[0]?.source || `${provider}_official_public_market_render`,
         cached_at: rows[0]?.cached_at || new Date().toISOString(),
       });
@@ -1483,7 +1436,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.6',
+        version: '650.8.15.7',
         provider,
         market_type: market,
         symbol,
@@ -1545,11 +1498,9 @@ export async function handleMarketApi(req, res, url) {
 
 export const _test = {
   aggregateTradesToSecondRows,
+  identityMap,
   klineCoverage,
-  alignedKlineEnd,
-  latestKlineWindow,
-  bitgetContractProductType,
-  fetchNativeMarketKlines,
-  tickers,
-  universe,
+  marketRow,
+  payloadRows,
+  tickerRow,
 };

@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.6';
+const STEP_VERSION = '650.8.15.7';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -422,10 +422,6 @@ function baseFromCompact(symbol) {
   return symbol.endsWith(quote) ? symbol.slice(0, -quote.length) : symbol;
 }
 
-function bitgetProductType(symbol) {
-  return quoteFromCompact(compactSymbol(symbol)) === 'USDC' ? 'usdc-futures' : 'usdt-futures';
-}
-
 function providerSymbol(provider, rawSymbol) {
   const compact = compactSymbol(rawSymbol);
   const quote = quoteFromCompact(compact);
@@ -703,7 +699,7 @@ async function loadBybit(view, symbol, limit) {
 async function loadBitget(view, symbol, limit) {
   const native = providerSymbol('bitget', symbol);
   if (view === 'trades') {
-    const url = `https://api.bitget.com/api/v2/mix/market/fills?symbol=${encodeURIComponent(native)}&productType=${encodeURIComponent(bitgetProductType(symbol))}&limit=${limit}`;
+    const url = `https://api.bitget.com/api/v2/mix/market/fills?symbol=${encodeURIComponent(native)}&productType=usdt-futures&limit=${limit}`;
     const data = await fetchJson(url);
     if (String(data?.code || '') !== '00000' || !Array.isArray(data?.data)) throw new Error(`bitget_trades_${data?.code ?? 'invalid'}`);
     const items = data.data.map((row) => {
@@ -725,7 +721,7 @@ async function loadBitget(view, symbol, limit) {
     return { items, timestamp_ms: items[0]?.time_ms || integerValue(data?.requestTime) || Date.now(), upstream_host: 'api.bitget.com', native_symbol: native };
   }
   const requestLimit = limit <= 1 ? 1 : limit <= 5 ? 5 : limit <= 15 ? 15 : 50;
-  const url = `https://api.bitget.com/api/v2/mix/market/merge-depth?productType=${encodeURIComponent(bitgetProductType(symbol))}&symbol=${encodeURIComponent(native)}&precision=scale0&limit=${requestLimit}`;
+  const url = `https://api.bitget.com/api/v2/mix/market/merge-depth?productType=usdt-futures&symbol=${encodeURIComponent(native)}&precision=scale0&limit=${requestLimit}`;
   const data = await fetchJson(url);
   if (String(data?.code || '') !== '00000' || !data?.data) throw new Error(`bitget_orderbook_${data?.code ?? 'invalid'}`);
   const bids = normalizeLevels(data.data.bids, { side: 'bid' }).slice(0, limit);
