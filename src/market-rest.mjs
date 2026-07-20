@@ -104,10 +104,26 @@ function compact(raw) {
     .replace(/[^A-Z0-9]/g, '');
 }
 function split(symbol) {
-  for (const quote of ['USDT', 'USDC', 'USD']) {
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'TUSD', 'DAI', 'USD', 'BTC', 'ETH']) {
     if (symbol.endsWith(quote)) return [symbol.slice(0, -quote.length), quote];
   }
   return [symbol, 'USDT'];
+}
+function normalizedQuote(raw, fallback = 'USDT') {
+  const value = String(raw || '').trim().toUpperCase();
+  return ['FDUSD', 'USDT', 'USDC', 'TUSD', 'DAI', 'USD', 'BTC', 'ETH'].includes(value)
+    ? value
+    : fallback;
+}
+function contractQuoteFromSymbols(symbols = [], fallback = 'USDT') {
+  for (const symbol of symbols) {
+    const [, quote] = split(compact(symbol));
+    if (quote) return normalizedQuote(quote, fallback);
+  }
+  return normalizedQuote(fallback, 'USDT');
+}
+function bitgetContractProductType(quote) {
+  return normalizedQuote(quote, 'USDT') === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES';
 }
 function coinbaseProductId(symbol) {
   const [base, quote] = split(compact(symbol));
@@ -319,12 +335,13 @@ function marketRow(provider, market, symbol, base, quote, raw) {
   };
 }
 
-async function universe(provider, market) {
+async function universe(provider, market, requestedQuote = 'USDT') {
+  const quote = normalizedQuote(requestedQuote, provider === 'coinbase' ? 'USD' : 'USDT');
   assertProviderMarket(provider, market);
   const rows = [];
   if (provider === 'binance') {
     if (market === 'contract') {
-      const snapshotRows = await getBinanceContractUniverse({ quote: 'USDT' });
+      const snapshotRows = await getBinanceContractUniverse({ quote });
       if (!snapshotRows.length) throw new Error('binance contract universe snapshot unavailable');
       rows.push(...snapshotRows);
     } else {
@@ -366,6 +383,9 @@ async function universe(provider, market) {
     }
   } else if (provider === 'gate') {
     if (market === 'contract') {
+      // Gate public perpetual endpoints currently expose USDT/BTC settlement only.
+      // Never fabricate a USDC perpetual by relabelling a USDT contract.
+      if (quote !== 'USDT') return [];
       const payload = await jsonFetch([
         'https://api.gateio.ws/api/v4/futures/usdt/contracts',
         'https://fx-api.gateio.ws/api/v4/futures/usdt/contracts',
@@ -386,7 +406,7 @@ async function universe(provider, market) {
   } else if (provider === 'bitget') {
     const payload = await jsonFetch(
       market === 'contract'
-        ? 'https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES'
+        ? `https://api.bitget.com/api/v2/mix/market/contracts?productType=${encodeURIComponent(bitgetContractProductType(quote))}`
         : 'https://api.bitget.com/api/v2/spot/public/symbols',
     );
     for (const item of payload.data || []) {
@@ -499,6 +519,7 @@ async function coinbaseTicker(symbol) {
 
 async function tickers(provider, market, wantedSymbols = []) {
   assertProviderMarket(provider, market);
+  const requestedQuote = contractQuoteFromSymbols(wantedSymbols, 'USDT');
   if (provider === 'coinbase') {
     const symbols = [...new Set(wantedSymbols.map(compact).filter(Boolean))].slice(0, 48);
     if (!symbols.length) return [];
@@ -538,6 +559,7 @@ async function tickers(provider, market, wantedSymbols = []) {
     );
     items = payload.data || [];
   } else if (provider === 'gate') {
+    if (market === 'contract' && requestedQuote !== 'USDT') return [];
     const payload = await jsonFetch(
       market === 'contract'
         ? ['https://api.gateio.ws/api/v4/futures/usdt/tickers', 'https://fx-api.gateio.ws/api/v4/futures/usdt/tickers']
@@ -547,7 +569,7 @@ async function tickers(provider, market, wantedSymbols = []) {
   } else if (provider === 'bitget') {
     const payload = await jsonFetch(
       market === 'contract'
-        ? 'https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES'
+        ? `https://api.bitget.com/api/v2/mix/market/tickers?productType=${encodeURIComponent(bitgetContractProductType(requestedQuote))}`
         : 'https://api.bitget.com/api/v2/spot/market/tickers',
     );
     items = payload.data || [];
@@ -709,6 +731,10 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
       after = oldest;
     }
   } else if (provider === 'gate') {
+    const [, symbolQuote] = split(compact(symbol));
+    if (market === 'contract' && symbolQuote !== 'USDT') {
+      throw new Error(`gate native ${symbolQuote} perpetual is not available`);
+    }
     const bar = gateBar(interval, market);
     if (!bar) throw new Error(`gate ${market} interval ${interval} requires aggregation`);
     const seconds = Math.max(1, Math.floor(intervalMs(interval) / 1000));
@@ -749,7 +775,10 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
     const base = market === 'contract'
       ? 'https://api.bitget.com/api/v2/mix/market/candles'
       : 'https://api.bitget.com/api/v2/spot/market/candles';
-    const product = market === 'contract' ? '&productType=USDT-FUTURES' : '';
+    const [, symbolQuote] = split(compact(symbol));
+    const product = market === 'contract'
+      ? `&productType=${encodeURIComponent(bitgetContractProductType(symbolQuote))}`
+      : '';
     const payload = await jsonFetch(
       `${base}?symbol=${symbol}${product}&granularity=${encodeURIComponent(bar)}` +
       `&endTime=${end}&limit=${Math.min(market === 'spot' ? 200 : 1000, limit)}`,
@@ -869,7 +898,7 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'bitget') {
     const url = market === 'contract'
-      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${symbol}&productType=USDT-FUTURES&limit=100`
+      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${symbol}&productType=${encodeURIComponent(bitgetContractProductType(split(compact(symbol))[1]))}&limit=100`
       : `https://api.bitget.com/api/v2/spot/market/fills?symbol=${symbol}&limit=500`;
     const payload = await jsonFetch(url, 20_000);
     for (const item of payload.data || []) {
@@ -878,6 +907,10 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'gate') {
     const raw = gateId(symbol);
+    const [, gateQuote] = split(compact(symbol));
+    if (market === 'contract' && gateQuote !== 'USDT') {
+      throw new Error(`gate native ${gateQuote} perpetual trades are not available`);
+    }
     const url = market === 'contract'
       ? `https://api.gateio.ws/api/v4/futures/usdt/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
       : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`;
@@ -1126,7 +1159,7 @@ export async function handleMarketApi(req, res, url) {
       const query = (url.searchParams.get('query') || '').toUpperCase();
       const limit = clamp(url.searchParams.get('limit'), 20, 1000, 120);
       const cursor = clamp(url.searchParams.get('cursor'), 0, 10_000_000, 0);
-      const all = (await universe(provider, market)).filter((item) =>
+      const all = (await universe(provider, market, quote)).filter((item) =>
         item.quote_asset === quote && (!query || item.symbol.includes(query) || item.base_asset.includes(query)),
       );
       const rows = all.slice(cursor, cursor + limit);
