@@ -888,7 +888,7 @@ async function coinbaseKlines(symbol, interval, end, limit) {
   return aggregateCandles(dedupedSource, 'coinbase', 'spot', symbol, interval).slice(-limit);
 }
 
-async function resolveNativeMarketIdentity(provider, market, symbol) {
+export async function resolveNativeMarketIdentity(provider, market, symbol) {
   const displaySymbol = compact(symbol);
   if (market !== 'contract' || !['bybit', 'bitget'].includes(provider)) {
     return {
@@ -1189,21 +1189,41 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
   } else if (provider === 'bybit') {
     const category = market === 'contract' ? 'linear' : 'spot';
     const maxLimit = market === 'contract' ? 1000 : 60;
-    const payload = await jsonFetch(
-      `https://api.bybit.com/v5/market/recent-trade?category=${category}&symbol=${symbol}&limit=${maxLimit}`,
-      20_000,
+    const identity = market === 'contract'
+      ? await resolveNativeMarketIdentity(provider, market, symbol)
+      : { native_symbol: symbol };
+    const nativeSymbol = compact(identity.native_symbol || symbol);
+    const payload = await bybitPublicJson(
+      `/v5/market/recent-trade?category=${category}&symbol=${encodeURIComponent(nativeSymbol)}&limit=${maxLimit}`,
+      { requireRows: true, timeout: 20_000 },
     );
-    for (const item of payload.result?.list || []) {
-      const trade = publicTrade(item.time ?? item.T, item.price, item.size, item.execId ?? item.i);
+    for (const item of payloadRows(payload)) {
+      const trade = publicTrade(item.time ?? item.T, item.price ?? item.p, item.size ?? item.v, item.execId ?? item.i);
       if (trade && trade.time <= end + 5_000) trades.push(trade);
     }
   } else if (provider === 'bitget') {
+    let nativeSymbol = symbol;
+    let productType = 'USDT-FUTURES';
+    if (market === 'contract') {
+      const identity = await resolveNativeMarketIdentity(provider, market, symbol);
+      nativeSymbol = compact(identity.native_symbol || symbol);
+      const quote = normalizedQuote(identity.quote_asset || split(compact(symbol))[1], 'USDT');
+      productType = quote === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES';
+    }
     const url = market === 'contract'
-      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${symbol}&productType=USDT-FUTURES&limit=100`
-      : `https://api.bitget.com/api/v2/spot/market/fills?symbol=${symbol}&limit=500`;
-    const payload = await jsonFetch(url, 20_000);
-    for (const item of payload.data || []) {
-      const trade = publicTrade(item.ts, item.price, item.size, item.tradeId);
+      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${encodeURIComponent(nativeSymbol)}&productType=${encodeURIComponent(productType)}&limit=100`
+      : `https://api.bitget.com/api/v2/spot/market/fills?symbol=${encodeURIComponent(nativeSymbol)}&limit=500`;
+    let payload = await jsonFetch(url, 20_000);
+    let items = payloadRows(payload);
+    if (market === 'contract' && items.length === 0) {
+      payload = await jsonFetch(
+        `https://api.bitget.com/api/v3/market/fills?category=${encodeURIComponent(productType)}&symbol=${encodeURIComponent(nativeSymbol)}&limit=100`,
+        20_000,
+      );
+      items = payloadRows(payload);
+    }
+    for (const item of items) {
+      const trade = publicTrade(item.ts, item.price, item.size, item.tradeId ?? item.execId);
       if (trade && trade.time <= end + 5_000) trades.push(trade);
     }
   } else if (provider === 'gate') {
@@ -1407,7 +1427,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.8',
+        version: '650.8.15.9',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1419,7 +1439,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.8',
+        version: '650.8.15.9',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1429,7 +1449,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.8',
+        version: '650.8.15.9',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1438,7 +1458,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.8',
+        version: '650.8.15.9',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -1555,7 +1575,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.8',
+        version: '650.8.15.9',
         provider,
         market_type: market,
         symbol,

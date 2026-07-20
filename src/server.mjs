@@ -1,4 +1,4 @@
-import { handleMarketApi, fetchMarketKlines } from './market-rest.mjs';
+import { handleMarketApi, fetchMarketKlines, resolveNativeMarketIdentity } from './market-rest.mjs';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -163,7 +163,7 @@ function tradeItem(timestamp, price, size) {
   return { time: normalizedTime, price: px, size: qty };
 }
 
-function secondTradeConfig(provider, market, symbol) {
+function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quoteAsset = splitSymbol(symbol)[1]) {
   if (provider === 'binance') {
     return {
       tradeMode: true,
@@ -225,7 +225,7 @@ function secondTradeConfig(provider, market, symbol) {
     return {
       tradeMode: true,
       url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
-      subscribe: { op: 'subscribe', args: [`publicTrade.${symbol}`] },
+      subscribe: { op: 'subscribe', args: [`publicTrade.${nativeSymbol}`] },
       heartbeatMessage: { op: 'ping' },
       parseTrades(raw) {
         const message = JSON.parse(raw.toString());
@@ -246,9 +246,11 @@ function secondTradeConfig(provider, market, symbol) {
       subscribe: {
         op: 'subscribe',
         args: [{
-          instType: market === 'contract' ? 'USDT-FUTURES' : 'SPOT',
+          instType: market === 'contract'
+            ? (String(quoteAsset).toUpperCase() === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES')
+            : 'SPOT',
           channel: 'trade',
-          instId: symbol,
+          instId: nativeSymbol,
         }],
       },
       parseTrades(raw) {
@@ -514,6 +516,13 @@ async function coinbaseConfig(symbol, interval, outputInterval = interval) {
 
 async function upstreamConfig(provider, market, symbol, interval) {
   const upstreamInterval = sourceInterval(provider, market, interval);
+  let nativeSymbol = symbol;
+  let quoteAsset = splitSymbol(symbol)[1];
+  if (market === 'contract' && (provider === 'bybit' || provider === 'bitget')) {
+    const identity = await resolveNativeMarketIdentity(provider, market, symbol);
+    nativeSymbol = symbolKey(identity.native_symbol || identity.raw_symbol || symbol);
+    quoteAsset = String(identity.quote_asset || quoteAsset).toUpperCase();
+  }
   if (isRealtimeSecondInterval(interval) && provider === 'binance' && market === 'spot') return {
     url: `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_1s`,
     subscribe: null,
@@ -536,7 +545,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
         [kline.t,kline.o,kline.h,kline.l,kline.c,kline.v,kline.q], kline.x, kline.n);
     },
   };
-  if (isRealtimeSecondInterval(interval)) return secondTradeConfig(provider, market, symbol);
+  if (isRealtimeSecondInterval(interval)) return secondTradeConfig(provider, market, symbol, nativeSymbol, quoteAsset);
   if (provider === 'coinbase') return coinbaseConfig(symbol, upstreamInterval, interval);
   if (usesRestPolling(provider, interval, upstreamInterval)) return { restPoll: true, sourceInterval: upstreamInterval };
   if (provider === 'binance') return {
@@ -599,9 +608,11 @@ async function upstreamConfig(provider, market, symbol, interval) {
       subscribe: {
         op: 'subscribe',
         args: [{
-          instType: market === 'contract' ? 'USDT-FUTURES' : 'SPOT',
+          instType: market === 'contract'
+            ? (quoteAsset === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES')
+            : 'SPOT',
           channel,
-          instId: symbol,
+          instId: nativeSymbol,
         }],
       },
       parse(raw) {
@@ -618,7 +629,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
     if (!channelInterval) throw new Error(`bybit interval ${upstreamInterval} is not supported`);
     return {
       url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
-      subscribe: { op: 'subscribe', args: [`kline.${channelInterval}.${symbol}`] },
+      subscribe: { op: 'subscribe', args: [`kline.${channelInterval}.${nativeSymbol}`] },
       heartbeatMessage: { op: 'ping' },
       parse(raw) {
         const message = JSON.parse(raw.toString());
@@ -1010,14 +1021,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.8', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.9', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.8',
+      version: '650.8.15.9',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1263,7 +1274,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.8 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.9 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,
