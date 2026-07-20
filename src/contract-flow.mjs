@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.15.4';
+const VERSION = '650.8.15.5';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -37,9 +37,13 @@ function linearQuoteSupported(symbol) {
   return quote === 'USDT' || quote === 'USDC';
 }
 
-function bitgetProductType(symbol) {
+function bitgetWsInstType(symbol) {
   const [, quote] = splitSymbol(symbol);
   return quote === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES';
+}
+function bitgetRestProductType(symbol) {
+  const [, quote] = splitSymbol(symbol);
+  return quote === 'USDC' ? 'usdc-futures' : 'usdt-futures';
 }
 
 function okxInstId(symbol) {
@@ -149,7 +153,7 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
   if (provider === 'bitget') {
     return {
       url: 'wss://ws.bitget.com/v2/ws/public',
-      subscriptions: [{ op: 'subscribe', args: [{ instType: bitgetProductType(symbol), channel: 'trade', instId: symbol }] }],
+      subscriptions: [{ op: 'subscribe', args: [{ instType: bitgetWsInstType(symbol), channel: 'trade', instId: symbol }] }],
       heartbeat: 'ping',
       parse(raw) {
         const text = raw.toString();
@@ -759,7 +763,7 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
 async function fetchBinanceJson(url, {
   headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0,
 } = {}) {
-  // Step650.8.15.4: all Binance public HTTP used by contract flow/meta is relayed
+  // Step650.8.15.5: all Binance public HTTP used by contract flow/meta is relayed
   // through the authenticated Supabase Edge allowlist. Render never contacts
   // fapi.binance.com directly. Critical first-paint OI uses a dedicated low-volume
   // lane; slower ratio history remains background auxiliary work.
@@ -910,7 +914,7 @@ async function fetchBybitContractMeta(symbol) {
 
 async function fetchBitgetContractMeta(symbol) {
   const encoded = encodeURIComponent(symbol);
-  const productType = encodeURIComponent(bitgetProductType(symbol));
+  const productType = encodeURIComponent(bitgetRestProductType(symbol));
   const settled = await Promise.allSettled([
     fetchJson(`https://api.bitget.com/api/v2/mix/market/ticker?symbol=${encoded}&productType=${productType}`, { timeoutMs: 5500 }),
     fetchJson(`https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol=${encoded}&productType=${productType}`, { timeoutMs: 5500 }),
@@ -1420,7 +1424,7 @@ async function firstWorkingJson(urls, options = {}) {
 async function fetchBinanceMetricRows(state) {
   const host = 'https://fapi.binance.com';
   const headers = BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {};
-  // Step650.8.15.4: metrics are requested sequentially under the shared governor.
+  // Step650.8.15.5: metrics are requested sequentially under the shared governor.
   // This avoids filling a bounded queue with four calls that must already wait
   // ten seconds between starts. A restricted or unsafe-weight response stops the
   // remaining calls before they touch Binance.
@@ -1550,7 +1554,7 @@ async function fetchBybitMetricRows(state) {
 async function fetchBitgetMetricRows(state) {
   const symbol = encodeURIComponent(state.symbol);
   const settled = await Promise.allSettled([
-    fetchJson(`https://api.bitget.com/api/v2/mix/market/open-interest?symbol=${symbol}&productType=${encodeURIComponent(bitgetProductType(state.symbol))}`, { timeoutMs: 7000 }),
+    fetchJson(`https://api.bitget.com/api/v2/mix/market/open-interest?symbol=${symbol}&productType=${encodeURIComponent(bitgetRestProductType(state.symbol))}`, { timeoutMs: 7000 }),
     fetchJson(`https://api.bitget.com/api/v3/market/futures-long-short?symbol=${symbol}&period=5m`, { timeoutMs: 7000 }),
     fetchJson(`https://api.bitget.com/api/v3/market/futures-account-long-short?symbol=${symbol}&period=5m`, { timeoutMs: 7000 }),
     fetchJson(`https://api.bitget.com/api/v3/market/futures-position-long-short?symbol=${symbol}&period=5m`, { timeoutMs: 7000 }),
@@ -1867,7 +1871,7 @@ export async function handleContractFlow(req,res,url){
   loadPersistedMetrics(state).catch(()=>{});
   let ratioFirstPaintPromise=null;
   if(provider==='binance'){
-    // Step650.8.15.4: start the all-account ratio before the OI helper. Both still
+    // Step650.8.15.5: start the all-account ratio before the OI helper. Both still
     // use the authenticated Edge governor, but global L/S gets the first critical
     // slot so the funds/long-short page does not wait for the 45-second App poll.
     ratioFirstPaintPromise=refreshBinanceLongShortCritical(state).catch(()=>null);

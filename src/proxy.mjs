@@ -11,7 +11,7 @@ import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.4';
+const STEP_VERSION = '650.8.15.5';
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
