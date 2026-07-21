@@ -1,5 +1,5 @@
-// Step655: add native TUSD spot identity on top of Step653 FDUSD depth/trades; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.21';
+// Step656: add native DAI spot identity and keep FDUSD/TUSD depth/trades; Binance contract REST remains disabled.
+const STEP_VERSION = '650.8.15.22';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -446,7 +446,7 @@ function compactSymbol(value) {
 
 function quoteFromCompact(symbol) {
   // Longest quote first so BTCFDUSD is parsed as BTC / FDUSD, never BTCFD / USD.
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'TUSD', 'USD']) {
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'TUSD', 'DAI', 'USD']) {
     if (symbol.endsWith(quote) && symbol.length > quote.length) return quote;
   }
   return 'USDT';
@@ -1331,6 +1331,15 @@ export function getContractDepthHealth() {
       bybit: providerSymbol('bybit', 'BTCTUSD', 'spot'),
       bitget: providerSymbol('bitget', 'BTCTUSD', 'spot'),
       gate: providerSymbol('gate', 'BTCTUSD', 'spot'),
+    },
+    dai_spot_identity_enabled: true,
+    dai_spot_identity_examples: {
+      binance: providerSymbol('binance', 'BTCDAI', 'spot'),
+      coinbase: providerSymbol('coinbase', 'BTCDAI', 'spot'),
+      okx: providerSymbol('okx', 'BTCDAI', 'spot'),
+      bybit: providerSymbol('bybit', 'BTCDAI', 'spot'),
+      bitget: providerSymbol('bitget', 'BTCDAI', 'spot'),
+      gate: providerSymbol('gate', 'BTCDAI', 'spot'),
     },
     binance_ws_symbols: BINANCE_WS_STATES.size,
     binance_ws_max_symbols: BINANCE_WS_MAX_SYMBOLS,
