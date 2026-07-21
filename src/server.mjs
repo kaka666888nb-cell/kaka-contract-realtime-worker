@@ -1,12 +1,14 @@
 import { handleMarketApi, fetchMarketKlines, resolveNativeMarketIdentity } from './market-rest.mjs';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { installProviderGovernorFetch, getProviderGovernorHealth } from './provider-request-governor.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const SPOT_PROVIDERS = ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate'];
 const CONTRACT_PROVIDERS = ['binance', 'okx', 'bybit', 'bitget', 'gate'];
 const VALID_INTERVALS = new Set(['timeline','1s','1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1d','3d','1w','1M']);
+installProviderGovernorFetch({ role: 'realtime-child-rest-fallback' });
 
 function providerKey(raw) {
   const value = String(raw || '').trim().toLowerCase().replaceAll('gate.io', 'gate');
@@ -1021,20 +1023,21 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.18', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.19', binance_shared_ws: binanceSharedWsHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.18',
+      version: '650.8.15.19',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
       spot_providers: SPOT_PROVIDERS,
       contract_providers: CONTRACT_PROVIDERS,
       markets: ['spot', 'contract'],
+      provider_request_governor: getProviderGovernorHealth(),
       time: new Date().toISOString(),
     }));
     return;
@@ -1217,7 +1220,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      // Step650.8.15.18: WebSocket carries official real trades only.
+      // Step650.8.15.19: WebSocket carries official real trades only.
       // Historical 1-second seeds are fetched by the App through /api/klines. Empty
       // natural seconds are extended locally on the visible device with zero volume,
       // so Render does not replay history or emit one synthetic message per second.
@@ -1268,7 +1271,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.18 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.19 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,

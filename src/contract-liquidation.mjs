@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.18';
+const STEP_VERSION = '650.8.15.19';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();

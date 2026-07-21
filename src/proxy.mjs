@@ -8,10 +8,12 @@ import { beginBinanceRestShutdown, getBinanceRestGuardHealth, runWithBinanceRequ
 import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
 import { getBinanceContractKlineRelayHealth } from './binance-contract-kline-relay.mjs';
 import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
+import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.18';
+const STEP_VERSION = '650.8.15.19';
+installProviderGovernorFetch({ role: 'parent-http-api' });
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -41,7 +43,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.15.18：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.15.19：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -302,6 +304,10 @@ const server = http.createServer(async (req, res) => {
       binance_rest_guard: getBinanceRestGuardHealth(),
       binance_market_rest_health: getBinanceMarketRestHealth(),
       realtime_ws_health: realtimeWsHealth,
+      provider_request_governor: {
+        parent: getProviderGovernorHealth(),
+        child: realtimeWsHealth?.provider_request_governor || null,
+      },
       contract_funding_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_liquidation_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow_persistence: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
@@ -322,6 +328,21 @@ const server = http.createServer(async (req, res) => {
         legacy_rest_cache: true,
         legacy_rest_inflight_coalescing: true,
         legacy_rest_circuit_breaker: true,
+        non_binance_provider_request_governor: true,
+        non_binance_provider_request_governor_version: '652.1C.2',
+        non_binance_governed_providers: ['okx','bybit','bitget','gate','coinbase'],
+        non_binance_provider_min_start_gap_ms: 220,
+        non_binance_provider_max_concurrent: 2,
+        non_binance_provider_max_queue: 96,
+        non_binance_global_max_active: 6,
+        non_binance_exact_get_inflight_merge: true,
+        non_binance_retry_after_honored: true,
+        non_binance_unsupported_market_negative_cache_minutes: 15,
+        bybit_403_minimum_hard_cooldown_minutes: 10,
+        okx_50011_rate_limit_detection: true,
+        bitget_429_rate_limit_detection: true,
+        gate_rate_limit_reset_header_detection: true,
+        coinbase_public_rest_guard_below_official_10rps: true,
         binance_contract_market_transport: 'official_websocket_ticker_bookticker_contract_info_mark_price',
         binance_contract_market_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
         binance_contract_market_rest_role: 'automatic_rest_disabled_websocket_snapshot_only',
@@ -513,6 +534,36 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/api/provider-governor/health') {
+    const childHealth = await fetchChildJson('/ws-health').catch((error) => ({
+      ok: false,
+      error: String(error?.message || error),
+      provider_request_governor: null,
+    }));
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({
+      ok: true,
+      version: STEP_VERSION,
+      provider_request_governor: {
+        parent: getProviderGovernorHealth(),
+        child: childHealth?.provider_request_governor || null,
+      },
+      time: new Date().toISOString(),
+    }));
+    return;
+  }
+
+  if (url.pathname === '/api/provider-governor/self-test') {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({
+      ok: true,
+      version: STEP_VERSION,
+      self_test: runProviderGovernorSelfTest(),
+      time: new Date().toISOString(),
+    }));
+    return;
+  }
+
   if (url.pathname === '/api/realtime-ws-health') {
     try {
       const payload = await fetchChildJson('/ws-health');
@@ -532,7 +583,7 @@ const server = http.createServer(async (req, res) => {
   req.once('aborted', abortQueuedWork);
   res.once('close', abortQueuedWork);
   try {
-    // Step650.8.15.18: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.15.19: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. A disconnected client can cancel only
     // queued/paced work; an already-started upstream request is still fully observed.
