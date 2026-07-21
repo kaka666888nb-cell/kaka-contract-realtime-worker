@@ -11,7 +11,7 @@ import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.16';
+const STEP_VERSION = '650.8.15.17';
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -41,7 +41,7 @@ function legacyPolicy(url) {
   const market = (url.searchParams.get('market_type') || url.searchParams.get('market') || '').toLowerCase();
   const isBinanceContractSnapshot = provider === 'binance' && /contract|future|perpetual|swap|linear/.test(market) &&
     ['/api/universe', '/api/tickers', '/api/klines'].includes(url.pathname);
-  // Step650.8.15.16：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
+  // Step650.8.15.17：这三条 Binance 合约路由已分别由 WebSocket 快照或官方归档+共享REST守卫+实时桥接提供，
   // 不再经过旧 REST provider 级熔断。某个旧符号/归档文件暂缺不能连带封死全部正常币种。
   if (isBinanceContractSnapshot) return null;
   if (url.pathname === '/api/tickers') return { freshMs: 8_000, staleMs: 24 * 60 * 60_000 };
@@ -532,7 +532,7 @@ const server = http.createServer(async (req, res) => {
   req.once('aborted', abortQueuedWork);
   res.once('close', abortQueuedWork);
   try {
-    // Step650.8.15.16: all HTTP market endpoints run in the parent process so Binance
+    // Step650.8.15.17: all HTTP market endpoints run in the parent process so Binance
     // Spot/Contract REST, probe, Kline validation, funding, and metrics share one
     // in-memory guard and one bounded queue. A disconnected client can cancel only
     // queued/paced work; an already-started upstream request is still fully observed.

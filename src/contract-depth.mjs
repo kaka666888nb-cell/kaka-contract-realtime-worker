@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.16';
+const STEP_VERSION = '650.8.15.17';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -33,9 +33,10 @@ const BINANCE_WS_START_TIMEOUT_MS = 6_000;
 const BINANCE_WS_HOSTS = ['fstream.binance.com'];
 let BINANCE_WS_CTOR_PROMISE = null;
 
-// Step652.1C.1.2: Coinbase Exchange REST can return 404 for an otherwise
-// tradable Advanced Trade product book. Keep one public Advanced Trade level2
-// socket per currently viewed product instead of retrying the broken REST path.
+// Step652.1C.1.3: Coinbase BTC-USDC is exposed as a USD/USDC unified-book
+// alias. The public Advanced Trade level2 feed can normalize the subscribed
+// BTC-USDC id to BTC-USD in l2_data events. Accept that official alias and, if
+// the direct alias subscription stays silent, reconnect once with BTC-USD.
 const COINBASE_L2_STATES = new Map();
 const COINBASE_L2_WS_URL = 'wss://advanced-trade-ws.coinbase.com';
 const COINBASE_L2_IDLE_MS = 75_000;
@@ -46,9 +47,24 @@ const COINBASE_L2_STATS = {
   connections_started: 0,
   snapshots_received: 0,
   updates_received: 0,
+  alias_events_accepted: 0,
+  alias_fallback_connects: 0,
+  heartbeats_subscribed: 0,
   idle_closes: 0,
   capacity_rejections: 0,
 };
+
+function coinbaseLevel2Route(native) {
+  const requestedNative = String(native || '').trim().toUpperCase();
+  const match = requestedNative.match(/^([A-Z0-9]+)-USDC$/);
+  const aliasNative = match ? `${match[1]}-USD` : '';
+  return {
+    requestedNative,
+    aliasNative,
+    acceptedProductIds: new Set([requestedNative, aliasNative].filter(Boolean)),
+    aliasMode: aliasNative ? 'coinbase_usd_usdc_unified' : '',
+  };
+}
 
 async function resolveWebSocketCtor() {
   if (!BINANCE_WS_CTOR_PROMISE) {
@@ -889,22 +905,27 @@ async function loadSpotGate(view, symbol, limit) {
 }
 
 
-function coinbaseL2State(native) {
-  let state = COINBASE_L2_STATES.get(native);
+function coinbaseL2State(requestedNative) {
+  const route = coinbaseLevel2Route(requestedNative);
+  let state = COINBASE_L2_STATES.get(route.requestedNative);
   if (state) return state;
   if (COINBASE_L2_STATES.size >= COINBASE_L2_MAX_SYMBOLS) {
     const candidates = [...COINBASE_L2_STATES.values()].sort((a, b) => a.lastAccessAt - b.lastAccessAt);
     const victim = candidates[0];
     if (victim) {
       closeWsQuietly(victim.socket);
-      COINBASE_L2_STATES.delete(victim.native);
+      COINBASE_L2_STATES.delete(victim.requestedNative);
     } else {
       COINBASE_L2_STATS.capacity_rejections += 1;
       throw new Error('coinbase_level2_capacity_reached');
     }
   }
   state = {
-    native,
+    requestedNative: route.requestedNative,
+    aliasNative: route.aliasNative,
+    aliasMode: route.aliasMode,
+    acceptedProductIds: route.acceptedProductIds,
+    subscribeNative: route.requestedNative,
     socket: null,
     connecting: null,
     bids: new Map(),
@@ -912,16 +933,24 @@ function coinbaseL2State(native) {
     timestamp_ms: 0,
     lastAccessAt: Date.now(),
     lastMessageAt: 0,
+    lastChannel: '',
+    lastProductId: '',
+    lastError: '',
+    aliasFallbackAttempted: false,
   };
-  COINBASE_L2_STATES.set(native, state);
+  COINBASE_L2_STATES.set(route.requestedNative, state);
   return state;
 }
 
 function applyCoinbaseLevel2Message(state, decoded) {
-  if (String(decoded?.channel || '') !== 'l2_data' || !Array.isArray(decoded?.events)) return;
+  state.lastChannel = String(decoded?.channel || '');
+  if (state.lastChannel !== 'l2_data' || !Array.isArray(decoded?.events)) return;
   let changed = false;
   for (const event of decoded.events) {
-    if (String(event?.product_id || '').toUpperCase() !== state.native.toUpperCase()) continue;
+    const productId = String(event?.product_id || '').toUpperCase();
+    state.lastProductId = productId;
+    if (!state.acceptedProductIds.has(productId)) continue;
+    if (productId !== state.requestedNative) COINBASE_L2_STATS.alias_events_accepted += 1;
     const eventType = String(event?.type || '').toLowerCase();
     if (eventType === 'snapshot') {
       state.bids.clear();
@@ -944,6 +973,7 @@ function applyCoinbaseLevel2Message(state, decoded) {
   if (changed) {
     state.timestamp_ms = Date.parse(String(decoded?.timestamp || '')) || Date.now();
     state.lastMessageAt = Date.now();
+    state.lastError = '';
   }
 }
 
@@ -968,6 +998,7 @@ async function ensureCoinbaseLevel2(state) {
         closeWsQuietly(socket);
         const error = new Error('coinbase_level2_connect_timeout');
         error.cooldownMs = 5_000;
+        state.lastError = error.message;
         finish(error);
       }, 6_000);
       timer.unref?.();
@@ -977,11 +1008,17 @@ async function ensureCoinbaseLevel2(state) {
         try {
           socket.send(JSON.stringify({
             type: 'subscribe',
-            product_ids: [state.native],
+            product_ids: [state.subscribeNative],
             channel: 'level2',
           }));
+          socket.send(JSON.stringify({
+            type: 'subscribe',
+            channel: 'heartbeats',
+          }));
+          COINBASE_L2_STATS.heartbeats_subscribed += 1;
           finish();
         } catch (error) {
+          state.lastError = String(error?.message || error || 'coinbase_level2_subscribe_error');
           finish(error);
         }
       });
@@ -989,15 +1026,17 @@ async function ensureCoinbaseLevel2(state) {
         try {
           const decoded = JSON.parse(await wsMessageText(event));
           if (String(decoded?.type || '').toLowerCase() === 'error' || String(decoded?.channel || '').toLowerCase() === 'error') {
-            const error = new Error(`coinbase_level2_${decoded?.message || decoded?.error || 'error'}`);
-            error.cooldownMs = 5_000;
+            state.lastError = String(decoded?.message || decoded?.error || 'coinbase_level2_error');
             closeWsQuietly(socket);
             return;
           }
           applyCoinbaseLevel2Message(state, decoded);
-        } catch (_) {}
+        } catch (error) {
+          state.lastError = String(error?.message || error || 'coinbase_level2_message_parse_error');
+        }
       });
       wsListen(socket, 'error', (error) => {
+        state.lastError = String(error?.message || error || 'coinbase_level2_socket_error');
         if (!opened) finish(error instanceof Error ? error : new Error('coinbase_level2_socket_error'));
       });
       wsListen(socket, 'close', () => {
@@ -1011,17 +1050,45 @@ async function ensureCoinbaseLevel2(state) {
   return state.connecting;
 }
 
-async function loadCoinbaseLevel2Book(native, limit) {
-  const state = coinbaseL2State(native);
-  state.lastAccessAt = Date.now();
-  await ensureCoinbaseLevel2(state);
-  const deadline = Date.now() + COINBASE_L2_START_TIMEOUT_MS;
+async function waitForCoinbaseLevel2Book(state, timeoutMs) {
+  const deadline = Date.now() + Math.max(250, timeoutMs);
   while (Date.now() < deadline) {
-    if (state.bids.size > 0 && state.asks.size > 0 && Date.now() - state.lastMessageAt <= COINBASE_L2_STALE_MS) break;
+    if (state.bids.size > 0 && state.asks.size > 0 && Date.now() - state.lastMessageAt <= COINBASE_L2_STALE_MS) return true;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  if (state.bids.size === 0 || state.asks.size === 0) {
-    const error = new Error('coinbase_level2_snapshot_timeout');
+  return state.bids.size > 0 && state.asks.size > 0;
+}
+
+async function loadCoinbaseLevel2Book(requestedNative, limit) {
+  const state = coinbaseL2State(requestedNative);
+  state.lastAccessAt = Date.now();
+  await ensureCoinbaseLevel2(state);
+
+  // First allow the requested BTC-USDC subscription to return either BTC-USDC
+  // or the normalized BTC-USD alias. If Coinbase stays silent, reconnect once
+  // using the official USD/USDC unified-book alias explicitly.
+  let ready = await waitForCoinbaseLevel2Book(state, state.aliasNative ? 3_500 : COINBASE_L2_START_TIMEOUT_MS);
+  if (!ready && state.aliasNative && !state.aliasFallbackAttempted) {
+    state.aliasFallbackAttempted = true;
+    state.subscribeNative = state.aliasNative;
+    state.lastError = '';
+    state.bids.clear();
+    state.asks.clear();
+    closeWsQuietly(state.socket);
+    state.socket = null;
+    COINBASE_L2_STATS.alias_fallback_connects += 1;
+    await ensureCoinbaseLevel2(state);
+    ready = await waitForCoinbaseLevel2Book(state, COINBASE_L2_START_TIMEOUT_MS);
+  }
+
+  if (!ready || state.bids.size === 0 || state.asks.size === 0) {
+    const detail = [
+      state.lastError,
+      state.lastChannel ? `channel=${state.lastChannel}` : '',
+      state.lastProductId ? `product=${state.lastProductId}` : '',
+      state.subscribeNative ? `subscribed=${state.subscribeNative}` : '',
+    ].filter(Boolean).join('|');
+    const error = new Error(detail ? `coinbase_level2_snapshot_timeout:${detail}` : 'coinbase_level2_snapshot_timeout');
     error.cooldownMs = 5_000;
     throw error;
   }
@@ -1038,7 +1105,9 @@ async function loadCoinbaseLevel2Book(native, limit) {
     asks,
     timestamp_ms: state.timestamp_ms || state.lastMessageAt || Date.now(),
     upstream_host: 'advanced-trade-ws.coinbase.com',
-    native_symbol: native,
+    native_symbol: state.requestedNative,
+    upstream_symbol: state.lastProductId || state.subscribeNative,
+    alias_mode: state.aliasMode,
     transport: 'public_level2_websocket',
     connected: wsReady(state.socket),
   };
@@ -1113,6 +1182,8 @@ function buildPayload(provider, marketType, view, requestedSymbol, limit, data, 
     connected: data.connected === true,
     if_contract_multiplier: data.contract_multiplier,
   };
+  if (data.upstream_symbol) common.upstream_symbol = String(data.upstream_symbol);
+  if (data.alias_mode) common.alias_mode = String(data.alias_mode);
   if (common.if_contract_multiplier == null) delete common.if_contract_multiplier;
   else {
     common.contract_multiplier = common.if_contract_multiplier;
@@ -1205,10 +1276,19 @@ export function getContractDepthHealth() {
         (wsReady(state.orderbookConnection?.socket) ? 1 : 0) +
         (wsReady(state.tradesConnection?.socket) ? 1 : 0);
     }, 0),
-    coinbase_level2_mode: 'advanced_trade_public_websocket',
+    coinbase_level2_mode: 'advanced_trade_public_websocket_alias_aware',
     coinbase_level2_symbols: COINBASE_L2_STATES.size,
     coinbase_level2_connections: [...COINBASE_L2_STATES.values()].filter((state) => wsReady(state.socket)).length,
     coinbase_level2_max_symbols: COINBASE_L2_MAX_SYMBOLS,
+    coinbase_level2_active_routes: [...COINBASE_L2_STATES.values()].map((state) => ({
+      requested_symbol: state.requestedNative,
+      subscribed_symbol: state.subscribeNative,
+      last_product_id: state.lastProductId,
+      last_channel: state.lastChannel,
+      last_error: state.lastError,
+      bids: state.bids.size,
+      asks: state.asks.size,
+    })),
     ...COINBASE_L2_STATS,
     ...BINANCE_WS_STATS,
   };
