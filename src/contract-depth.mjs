@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.12';
+const STEP_VERSION = '650.8.15.13';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
