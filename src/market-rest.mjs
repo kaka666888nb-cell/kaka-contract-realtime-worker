@@ -136,11 +136,14 @@ function split(symbol) {
   }
   return [symbol, 'USDT'];
 }
+const SUPPORTED_EXACT_QUOTE_ASSETS = Object.freeze([
+  'FDUSD', 'USDT', 'USDC', 'USD1', 'USD',
+  'BTC', 'BNB', 'ETH', 'EUR', 'JPY',
+]);
+
 function normalizedQuote(raw, fallback = 'USDT') {
   const value = String(raw || '').trim().toUpperCase();
-  return ['FDUSD', 'USDT', 'USDC', 'TUSD', 'DAI', 'USD', 'BTC', 'ETH'].includes(value)
-    ? value
-    : fallback;
+  return SUPPORTED_EXACT_QUOTE_ASSETS.includes(value) ? value : fallback;
 }
 function quoteFromSymbols(symbols = [], fallback = 'USDT') {
   for (const symbol of symbols) {
@@ -401,6 +404,9 @@ function marketRow(provider, market, symbol, base, quote, raw, extra = {}) {
     quote_asset: String(quote).toUpperCase(),
     settle_asset: String(extra.settle_asset || quote || '').toUpperCase(),
     contract_type: extra.contract_type || null,
+    contract_multiplier: num(extra.contract_multiplier),
+    contract_value_currency: String(extra.contract_value_currency || '').toUpperCase() || null,
+    quantity_semantics: extra.quantity_semantics || (market === 'contract' ? 'base_asset' : 'base_asset'),
     status: 'TRADING',
     active: true,
     source: `${provider}_official_public_market_render`,
@@ -455,7 +461,25 @@ async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
       if (market === 'contract' && item.ctType !== 'linear') continue;
       const base = item.baseCcy || item.ctValCcy;
       const quote = item.quoteCcy || item.settleCcy;
-      if (base && quote) rows.push(marketRow(provider, market, item.instId, base, quote, item.instId));
+      if (base && quote) {
+        const ctVal = num(item.ctVal);
+        const ctMult = num(item.ctMult) ?? 1;
+        const valueCurrency = String(item.ctValCcy || '').toUpperCase();
+        const multiplier = market === 'contract' &&
+                ctVal !== null &&
+                ctVal > 0 &&
+                ctMult > 0 &&
+                (!valueCurrency || valueCurrency === String(base).toUpperCase())
+            ? ctVal * ctMult
+            : null;
+        rows.push(marketRow(provider, market, item.instId, base, quote, item.instId, {
+          contract_multiplier: multiplier,
+          contract_value_currency: valueCurrency,
+          quantity_semantics: market === 'contract'
+              ? (multiplier ? 'contract_count_convertible_to_base' : 'contract_count')
+              : 'base_asset',
+        }));
+      }
     }
   } else if (provider === 'gate') {
     if (market === 'contract') {
@@ -467,7 +491,14 @@ async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
       for (const item of payload || []) {
         if (item.in_delisting === true) continue;
         const [base, quote = 'USDT'] = String(item.name || '').toUpperCase().split('_');
-        if (base) rows.push(marketRow(provider, market, item.name, base, quote, item.name));
+        const multiplier = num(item.quanto_multiplier);
+        if (base) rows.push(marketRow(provider, market, item.name, base, quote, item.name, {
+          contract_multiplier: multiplier,
+          contract_value_currency: base,
+          quantity_semantics: multiplier && multiplier > 0
+              ? 'contract_count_convertible_to_base'
+              : 'contract_count',
+        }));
       }
     } else {
       const payload = await jsonFetch('https://api.gateio.ws/api/v4/spot/currency_pairs');
@@ -570,6 +601,111 @@ async function universe(provider, market, requestedQuote = 'USDT') {
   );
 }
 
+function tickerVolumeSemantics(provider, market, item, last) {
+  let baseVolume = null;
+  let quoteVolume = null;
+  let contractCount = null;
+  let quoteVolumeUsd = null;
+  let baseSource = null;
+  let quoteSource = null;
+
+  if (provider === 'binance') {
+    baseVolume = num(item.base_volume_24h ?? item.volume_24h ?? item.volume);
+    quoteVolume = num(item.quote_volume_24h ?? item.quoteVolume);
+    contractCount = num(item.contract_count_24h);
+    baseSource = item.base_volume_24h != null || item.volume_24h != null
+      ? 'canonical_base_asset'
+      : 'binance_volume';
+    quoteSource = item.quote_volume_24h != null
+      ? 'canonical_quote_asset'
+      : 'binance_quoteVolume';
+  } else if (provider === 'coinbase') {
+    baseVolume = num(item.base_volume_24h ?? item.volume);
+    quoteVolume = num(item.quote_volume_24h);
+    baseSource = 'coinbase_base_volume';
+    quoteSource = 'coinbase_quote_turnover';
+  } else if (provider === 'bybit') {
+    baseVolume = num(item.base_volume_24h ?? item.volume24h);
+    quoteVolume = num(item.quote_volume_24h ?? item.turnover24h);
+    baseSource = 'bybit_volume24h';
+    quoteSource = 'bybit_turnover24h';
+  } else if (provider === 'bitget') {
+    baseVolume = num(item.base_volume_24h ?? item.baseVolume);
+    quoteVolume = num(item.quote_volume_24h ?? item.quoteVolume);
+    quoteVolumeUsd = num(item.usdtVolume);
+    baseSource = 'bitget_baseVolume';
+    quoteSource = 'bitget_quoteVolume';
+  } else if (provider === 'okx') {
+    if (market === 'contract') {
+      // OKX derivatives: vol24h is number of contracts; volCcy24h is
+      // underlying/base currency; volCcyQuote24h is quote turnover.
+      contractCount = num(item.vol24h);
+      baseVolume = num(item.base_volume_24h ?? item.volCcy24h);
+      quoteVolume = num(
+        item.quote_volume_24h ??
+        item.volCcyQuote24h ??
+        item.volCcyQuote
+      );
+      if (quoteVolume === null && baseVolume !== null && last !== null) {
+        quoteVolume = baseVolume * last;
+        quoteSource = 'okx_base_times_last_fallback';
+      } else {
+        quoteSource = 'okx_volCcyQuote24h';
+      }
+      baseSource = 'okx_volCcy24h';
+    } else {
+      // OKX spot: vol24h is base quantity and volCcy24h is quote turnover.
+      baseVolume = num(item.base_volume_24h ?? item.vol24h);
+      quoteVolume = num(
+        item.quote_volume_24h ??
+        item.volCcyQuote24h ??
+        item.volCcy24h
+      );
+      baseSource = 'okx_spot_vol24h';
+      quoteSource = item.volCcyQuote24h != null
+        ? 'okx_spot_volCcyQuote24h'
+        : 'okx_spot_volCcy24h';
+    }
+  } else if (provider === 'gate') {
+    if (market === 'contract') {
+      contractCount = num(item.volume_24h ?? item.volume);
+      baseVolume = num(item.base_volume_24h ?? item.volume_24h_base);
+      quoteVolume = num(item.quote_volume_24h ?? item.volume_24h_quote);
+      quoteVolumeUsd = num(item.volume_24h_usd);
+      baseSource = 'gate_volume_24h_base';
+      quoteSource = 'gate_volume_24h_quote';
+    } else {
+      baseVolume = num(item.base_volume_24h ?? item.base_volume);
+      quoteVolume = num(item.quote_volume_24h ?? item.quote_volume);
+      baseSource = 'gate_spot_base_volume';
+      quoteSource = 'gate_spot_quote_volume';
+    }
+  }
+
+  // Canonical fallback is accepted only when the field name itself states
+  // the unit. Raw "volume" or contract "vol24h" is never guessed here.
+  baseVolume ??= num(item.base_volume_24h);
+  quoteVolume ??= num(item.quote_volume_24h);
+  contractCount ??= num(item.contract_count_24h);
+
+  return {
+    base_volume_24h: baseVolume,
+    quote_volume_24h: quoteVolume,
+    quote_volume_usd_24h: quoteVolumeUsd,
+    contract_count_24h: contractCount,
+    base_volume_unit: baseVolume === null ? null : 'base_asset',
+    quote_volume_unit: quoteVolume === null ? null : 'quote_asset',
+    contract_count_unit: contractCount === null ? null : 'contracts',
+    base_volume_source: baseSource,
+    quote_volume_source: quoteSource,
+    quantity_semantics: baseVolume !== null
+      ? 'base_asset'
+      : contractCount !== null
+        ? 'contract_count'
+        : 'unavailable',
+  };
+}
+
 function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
   const nativeSymbol = compact(rawSymbol);
   const symbol = compact(displaySymbol || nativeSymbol);
@@ -577,12 +713,22 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
   const last = num(item.last_price ?? item.lastPrice ?? item.last ?? item.close ?? item.lastPr);
   const open = num(item.open_24h ?? item.openPrice ?? item.open ?? item.open24h ?? item.prevPrice24h);
   let percent = num(
-    item.price_change_percent_24h ?? item.priceChangePercent ?? item.change_percentage ?? item.change24h ?? item.price24hPcnt,
+    item.price_change_percent_24h ??
+    item.priceChangePercent ??
+    item.change_percentage ??
+    item.change24h ??
+    item.price24hPcnt
   );
-  if (percent !== null && (provider === 'bitget' || provider === 'bybit') && Math.abs(percent) <= 2) {
+  if (percent !== null &&
+      (provider === 'bitget' || provider === 'bybit') &&
+      Math.abs(percent) <= 2) {
     percent *= 100;
   }
-  if (percent === null && last !== null && open) percent = ((last - open) / open) * 100;
+  if (percent === null && last !== null && open) {
+    percent = ((last - open) / open) * 100;
+  }
+
+  const volumes = tickerVolumeSemantics(provider, market, item, last);
   return {
     provider,
     market_type: market,
@@ -592,19 +738,25 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
     last_price: last,
     price: last,
     price_change_percent_24h: percent,
-    quote_volume_24h: num(
-      item.quote_volume_24h ?? item.quoteVolume ?? item.quote_volume ?? item.volume_24h_quote ??
-      item.volCcy24h ?? item.amount ?? item.quoteVolume24h ?? item.usdtVolume ?? item.turnover24h,
-    ),
-    base_volume_24h: num(
-      item.base_volume_24h ?? item.volume ?? item.volume_24h ?? item.vol24h ?? item.baseVolume ??
-      item.base_volume ?? item.baseVolume24h ?? item.volume24h,
-    ),
+    volume_24h: volumes.base_volume_24h,
+    base_volume_24h: volumes.base_volume_24h,
+    quote_volume_24h: volumes.quote_volume_24h,
+    quote_volume_usd_24h: volumes.quote_volume_usd_24h,
+    contract_count_24h: volumes.contract_count_24h,
+    base_volume_unit: volumes.base_volume_unit,
+    quote_volume_unit: volumes.quote_volume_unit,
+    contract_count_unit: volumes.contract_count_unit,
+    base_volume_source: volumes.base_volume_source,
+    quote_volume_source: volumes.quote_volume_source,
+    quantity_semantics: volumes.quantity_semantics,
     high_24h: num(item.high_24h ?? item.highPrice ?? item.high24h ?? item.highPrice24h),
     low_24h: num(item.low_24h ?? item.lowPrice ?? item.low24h ?? item.lowPrice24h),
     funding_rate: num(item.fundingRate),
-    open_interest: num(item.openInterest),
+    open_interest: num(item.openInterest ?? item.holdingAmount),
     open_interest_value: num(item.openInterestValue),
+    open_interest_unit: item.openInterestValue != null
+      ? 'base_or_provider_defined_with_value'
+      : null,
     source: `${provider}_official_public_ticker_render`,
     cached_at: new Date().toISOString(),
   };
@@ -639,7 +791,7 @@ async function coinbaseTicker(symbol) {
     open,
     high_24h: stats.high,
     low_24h: stats.low,
-    volume: baseVolume,
+    base_volume_24h: baseVolume,
     quote_volume_24h: last !== null && baseVolume !== null ? last * baseVolume : null,
   }, normalized);
   if (!row) throw new Error(`Coinbase ticker unavailable for ${productId}`);
@@ -838,7 +990,7 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
 }
 
 
-// Step650.8.15.23: calendar-month aggregation for safe Binance contract daily seeds.
+// Step650.8.15.24: calendar-month aggregation for safe Binance contract daily seeds.
 // A month is not a fixed 30-day duration, so use UTC year/month boundaries and never
 // interpolate or fabricate missing source candles.
 function aggregateCalendarMonths(sourceRows, provider, market, symbol) {
@@ -1056,14 +1208,37 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
       if (!data.length) break;
       let oldest = after;
       for (const a of data) {
-        const row = krow(provider, market, symbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[7],0]);
-        if (row) { rows.push(row); oldest = Math.min(oldest, Number(a[0])); }
+        const rawContractsOrBase = num(a[5]);
+        const baseVolume = market === 'contract' ? num(a[6]) : rawContractsOrBase;
+        const quoteVolume = market === 'contract'
+          ? num(a[7])
+          : (num(a[7]) ?? num(a[6]));
+        const row = krow(
+          provider,
+          market,
+          symbol,
+          interval,
+          [a[0], a[1], a[2], a[3], a[4], baseVolume, quoteVolume, 0],
+        );
+        if (row) {
+          if (market === 'contract') {
+            row.contract_count = rawContractsOrBase;
+            row.quantity_semantics = 'base_asset';
+            row.base_volume_unit = 'base_asset';
+            row.quote_volume_unit = 'quote_asset';
+          }
+          rows.push(row);
+          oldest = Math.min(oldest, Number(a[0]));
+        }
       }
       if (data.length < count || oldest >= after) break;
       after = oldest;
     }
   } else if (provider === 'gate') {
     const bar = gateBar(interval, market);
+    const contractMultiplier = market === 'contract'
+      ? await marketContractBaseMultiplier('gate', symbol)
+      : 1;
     if (!bar) throw new Error(`gate ${market} interval ${interval} requires aggregation`);
     const seconds = Math.max(1, Math.floor(intervalMs(interval) / 1000));
     const maxPoints = market === 'contract' ? 2000 : 1000;
@@ -1085,10 +1260,68 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
         `&interval=${encodeURIComponent(bar)}&from=${pageFrom}&to=${pageTo}`,
       );
       const payload = await jsonFetch(urls);
-      const pageRows = (Array.isArray(payload) ? payload : []).map((a) => Array.isArray(a)
-        ? krow(provider, market, symbol, interval, [Number(a[0]) * 1000,a[5],a[3],a[4],a[2],a[6],a[1],0])
-        : krow(provider, market, symbol, interval, [Number(a.t) * 1000,a.o,a.h,a.l,a.c,a.v,a.a ?? a.sum,a.n]))
-        .filter(Boolean);
+      const pageRows = (Array.isArray(payload) ? payload : []).map((a) => {
+        if (Array.isArray(a)) {
+          const close = num(a[2]);
+          if (market === 'contract') {
+            const contracts = Math.abs(num(a[1]) || 0);
+            const baseVolume = contractMultiplier === null
+              ? null
+              : contracts * contractMultiplier;
+            const quoteVolume = num(a[6]) ??
+              (baseVolume !== null && close !== null ? baseVolume * close : null);
+            const row = krow(
+              provider,
+              market,
+              symbol,
+              interval,
+              [Number(a[0]) * 1000, a[5], a[3], a[4], a[2], baseVolume, quoteVolume, 0],
+            );
+            if (row) {
+              row.contract_count = contracts;
+              row.quantity_semantics = baseVolume === null ? 'contract_count' : 'base_asset';
+            }
+            return row;
+          }
+          // Gate spot arrays: [time, quote_volume, close, high, low, open, base_volume].
+          return krow(
+            provider,
+            market,
+            symbol,
+            interval,
+            [Number(a[0]) * 1000, a[5], a[3], a[4], a[2], a[6], a[1], 0],
+          );
+        }
+
+        const close = num(a.c);
+        if (market === 'contract') {
+          const contracts = Math.abs(num(a.v) || 0);
+          const baseVolume = contractMultiplier === null
+            ? null
+            : contracts * contractMultiplier;
+          const quoteVolume = num(a.sum ?? a.a) ??
+            (baseVolume !== null && close !== null ? baseVolume * close : null);
+          const row = krow(
+            provider,
+            market,
+            symbol,
+            interval,
+            [Number(a.t) * 1000, a.o, a.h, a.l, a.c, baseVolume, quoteVolume, a.n],
+          );
+          if (row) {
+            row.contract_count = contracts;
+            row.quantity_semantics = baseVolume === null ? 'contract_count' : 'base_asset';
+          }
+          return row;
+        }
+        return krow(
+          provider,
+          market,
+          symbol,
+          interval,
+          [Number(a.t) * 1000, a.o, a.h, a.l, a.c, a.v, a.a ?? a.sum, a.n],
+        );
+      }).filter(Boolean);
       if (!pageRows.length) break;
       rows.push(...pageRows);
       const oldestMs = Math.min(...pageRows.map((row) => Number(row.open_time_ms)));
@@ -1146,6 +1379,46 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
 }
 
 
+
+async function marketContractBaseMultiplier(provider, symbol) {
+  const display = compact(symbol);
+  if (!display) return null;
+  if (provider === 'okx') {
+    return await sharedMarketResult(
+      `contract_multiplier:okx:${display}`,
+      6 * 60 * 60_000,
+      async () => {
+        const payload = await jsonFetch(
+          `https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(okxId(display, 'contract'))}`,
+          12_000,
+        );
+        const row = Array.isArray(payload?.data) ? payload.data[0] : null;
+        const [base] = split(display);
+        const ctVal = num(row?.ctVal);
+        const ctMult = num(row?.ctMult) ?? 1;
+        const valueCurrency = String(row?.ctValCcy || '').toUpperCase();
+        if (ctVal === null || ctVal <= 0 || ctMult <= 0) return null;
+        if (valueCurrency && valueCurrency !== base) return null;
+        return ctVal * ctMult;
+      },
+    );
+  }
+  if (provider === 'gate') {
+    return await sharedMarketResult(
+      `contract_multiplier:gate:${display}`,
+      6 * 60 * 60_000,
+      async () => {
+        const payload = await jsonFetch([
+          `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(gateId(display))}`,
+          `https://fx-api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(gateId(display))}`,
+        ], 12_000);
+        const multiplier = num(payload?.quanto_multiplier);
+        return multiplier !== null && multiplier > 0 ? multiplier : null;
+      },
+    );
+  }
+  return 1;
+}
 
 function normalizeTradeTimestamp(value) {
   if (typeof value === 'string' && !/^\d+(?:\.\d+)?$/.test(value.trim())) {
@@ -1228,9 +1501,20 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       `https://www.okx.com/api/v5/market/trades?instId=${encodeURIComponent(okxId(symbol, market))}&limit=500`,
       20_000,
     );
+    const multiplier = market === 'contract'
+      ? await marketContractBaseMultiplier('okx', symbol)
+      : 1;
     for (const item of payload.data || []) {
-      const trade = publicTrade(item.ts, item.px, item.sz, item.tradeId);
-      if (trade && trade.time <= end + 5_000) trades.push(trade);
+      const rawSize = num(item.sz);
+      const baseSize = rawSize === null || multiplier === null
+        ? null
+        : rawSize * multiplier;
+      const trade = publicTrade(item.ts, item.px, baseSize, item.tradeId);
+      if (trade && trade.time <= end + 5_000) {
+        trade.raw_contract_count = market === 'contract' ? Math.abs(rawSize || 0) : null;
+        trade.quantity_unit = 'base_asset';
+        trades.push(trade);
+      }
     }
   } else if (provider === 'bybit') {
     const category = market === 'contract' ? 'linear' : 'spot';
@@ -1274,17 +1558,25 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'gate') {
     const raw = gateId(symbol);
-    // Gate spot recent-trades is a latest-page endpoint. Supplying the futures-style `to`
-    // parameter made the spot request fail on some routes. For 1-second first paint we only
-    // need the latest real public trades; historical empty seconds are never fabricated.
     const url = market === 'contract'
       ? `https://api.gateio.ws/api/v4/futures/usdt/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
       : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000`;
     const payload = await jsonFetch(url, 20_000);
+    const multiplier = market === 'contract'
+      ? await marketContractBaseMultiplier('gate', symbol)
+      : 1;
     for (const item of Array.isArray(payload) ? payload : []) {
       const timestamp = item.create_time_ms ?? item.time_ms ?? item.create_time ?? item.time;
-      const trade = publicTrade(timestamp, item.price, item.amount ?? item.size, item.id);
-      if (trade && trade.time <= end + 5_000) trades.push(trade);
+      const rawSize = num(item.amount ?? item.size);
+      const baseSize = rawSize === null || multiplier === null
+        ? null
+        : Math.abs(rawSize) * multiplier;
+      const trade = publicTrade(timestamp, item.price, baseSize, item.id);
+      if (trade && trade.time <= end + 5_000) {
+        trade.raw_contract_count = market === 'contract' ? Math.abs(rawSize || 0) : null;
+        trade.quantity_unit = 'base_asset';
+        trades.push(trade);
+      }
     }
   }
   return dedupePublicTrades(trades).slice(-wanted);
@@ -1359,7 +1651,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
       maxRestCalls: 1,
     });
 
-    // Step650.8.15.23: a sparse/empty direct monthly seed can occur when the current monthly
+    // Step650.8.15.24: a sparse/empty direct monthly seed can occur when the current monthly
     // archive is not yet available. Reuse the same safe seed chain for official daily candles
     // and aggregate them by real UTC calendar month. This sends no Render-direct Binance REST.
     if (interval === '1M' && seedRows.length < 3) {
@@ -1479,12 +1771,96 @@ async function binanceAssetQuoteSummary(rawBase) {
   );
 }
 
+
+function marketUnitSelfTest() {
+  const tests = [];
+  const add = (name, ok, actual = null) => tests.push({ name, ok: Boolean(ok), actual });
+
+  const binance = tickerVolumeSemantics(
+    'binance',
+    'spot',
+    { volume: '2', quoteVolume: '200' },
+    100,
+  );
+  add(
+    'binance_spot_base_and_quote',
+    binance.base_volume_24h === 2 && binance.quote_volume_24h === 200,
+    binance,
+  );
+
+  const bybit = tickerVolumeSemantics(
+    'bybit',
+    'contract',
+    { volume24h: '3', turnover24h: '300' },
+    100,
+  );
+  add(
+    'bybit_volume_and_turnover',
+    bybit.base_volume_24h === 3 && bybit.quote_volume_24h === 300,
+    bybit,
+  );
+
+  const bitget = tickerVolumeSemantics(
+    'bitget',
+    'contract',
+    { baseVolume: '4', quoteVolume: '400', usdtVolume: '401' },
+    100,
+  );
+  add(
+    'bitget_base_quote_usdt_separated',
+    bitget.base_volume_24h === 4 &&
+      bitget.quote_volume_24h === 400 &&
+      bitget.quote_volume_usd_24h === 401,
+    bitget,
+  );
+
+  const okx = tickerVolumeSemantics(
+    'okx',
+    'contract',
+    { vol24h: '10', volCcy24h: '0.1', volCcyQuote24h: '10000' },
+    100000,
+  );
+  add(
+    'okx_contract_count_base_quote_separated',
+    okx.contract_count_24h === 10 &&
+      okx.base_volume_24h === 0.1 &&
+      okx.quote_volume_24h === 10000,
+    okx,
+  );
+
+  const gate = tickerVolumeSemantics(
+    'gate',
+    'contract',
+    {
+      volume_24h: '20',
+      volume_24h_base: '0.002',
+      volume_24h_quote: '200',
+    },
+    100000,
+  );
+  add(
+    'gate_contract_count_base_quote_separated',
+    gate.contract_count_24h === 20 &&
+      gate.base_volume_24h === 0.002 &&
+      gate.quote_volume_24h === 200,
+    gate,
+  );
+
+  return {
+    ok: tests.every((item) => item.ok),
+    checks: tests.length,
+    tests,
+  };
+}
+
 export function getBinanceMarketRestHealth() {
   pruneBinanceSharedCache();
   return {
     spot_market_data_host: 'data-api.binance.vision',
     binance_asset_quote_discovery_enabled: true,
     binance_asset_quote_candidates: BINANCE_COMMON_QUOTE_ASSETS,
+    exact_quote_normalization: SUPPORTED_EXACT_QUOTE_ASSETS,
+    market_unit_self_test: marketUnitSelfTest(),
     shared_cache_entries: binanceSharedCache.size,
     shared_inflight_entries: binanceSharedInflight.size,
     shared_cache_max: BINANCE_SHARED_CACHE_MAX,
@@ -1496,6 +1872,7 @@ export function getBinanceMarketRestHealth() {
 
 const OWNED_MARKET_API_PATHS = new Set([
   '/api/binance-asset-quotes',
+  '/api/market-unit-self-test',
   '/api/universe',
   '/api/tickers',
   '/api/klines',
@@ -1572,7 +1949,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.23',
+        version: '650.8.15.24',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1584,7 +1961,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.23',
+        version: '650.8.15.24',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1594,7 +1971,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.23',
+        version: '650.8.15.24',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1603,9 +1980,18 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.23',
+        version: '650.8.15.24',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
+      });
+      return true;
+    }
+    if (url.pathname === '/api/market-unit-self-test') {
+      const selfTest = marketUnitSelfTest();
+      send(res, selfTest.ok ? 200 : 500, {
+        ok: selfTest.ok,
+        version: '650.8.15.24',
+        self_test: selfTest,
       });
       return true;
     }
@@ -1618,7 +2004,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.23',
+        version: '650.8.15.24',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -1739,7 +2125,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.23',
+        version: '650.8.15.24',
         provider,
         market_type: market,
         symbol,
