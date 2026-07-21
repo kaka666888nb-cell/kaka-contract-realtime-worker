@@ -338,83 +338,29 @@ function createSecondTradeAggregator({ provider, market, symbol, interval, clien
     };
   }
 
-  function newCarryCandle(start, price) {
-    return {
-      start,
-      open: price,
-      high: price,
-      low: price,
-      close: price,
-      volume: 0,
-      quoteVolume: 0,
-      trades: 0,
-    };
-  }
-
-  function closeCurrentIfNeeded() {
-    if (!candle) return;
-    if (Number(candle.trades || 0) > 0 || Number(candle.volume || 0) > 0) {
-      sendCandle(candle, true);
-    }
-  }
-
-  function emitCarryRange(fromStart, toStartInclusive, price, currentOpenStart = null) {
-    if (!Number.isFinite(price) || price <= 0) return;
-    for (let start = fromStart; start <= toStartInclusive; start += 1000) {
-      candle = newCarryCandle(start, price);
-      sendCandle(candle, currentOpenStart === start ? false : true);
-    }
-  }
-
   function ingest(rawTrades) {
     const now = Date.now();
     const trades = (Array.isArray(rawTrades) ? rawTrades : [])
       .filter((item) => item && item.time >= now - 120_000 && item.time <= now + 10_000)
       .sort((a, b) => a.time - b.time);
     let changed = false;
-
     for (const trade of trades) {
       const start = Math.floor(trade.time / 1000) * 1000;
-      if (!Number.isFinite(trade.price) || trade.price <= 0) continue;
-
       if (!candle) {
         candle = newTradeCandle(start, trade);
       } else if (start > candle.start) {
-        const carryPrice = Number.isFinite(lastOfficialPrice) && lastOfficialPrice > 0
-          ? lastOfficialPrice
-          : candle.close;
-        closeCurrentIfNeeded();
-        const firstMissing = candle.start + 1000;
-        const lastMissing = start - 1000;
-        if (firstMissing <= lastMissing) {
-          emitCarryRange(firstMissing, lastMissing, carryPrice, null);
-        }
+        sendCandle(candle, true);
         candle = newTradeCandle(start, trade);
       } else if (start === candle.start) {
-        if (Number(candle.trades || 0) === 0 && Number(candle.volume || 0) === 0) {
-          // A provisional zero-volume carry candle becomes a real-trade candle when
-          // the venue reports the first trade for that same natural second.
-          candle.open = trade.price;
-          candle.high = trade.price;
-          candle.low = trade.price;
-          candle.close = trade.price;
-          candle.volume = trade.size;
-          candle.quoteVolume = trade.size * trade.price;
-          candle.trades = 1;
-        } else {
-          candle.high = Math.max(candle.high, trade.price);
-          candle.low = Math.min(candle.low, trade.price);
-          candle.close = trade.price;
-          candle.volume += trade.size;
-          candle.quoteVolume += trade.size * trade.price;
-          candle.trades += 1;
-        }
+        candle.high = Math.max(candle.high, trade.price);
+        candle.low = Math.min(candle.low, trade.price);
+        candle.close = trade.price;
+        candle.volume += trade.size;
+        candle.quoteVolume += trade.size * trade.price;
+        candle.trades += 1;
       } else {
-        // Ignore genuinely late trades for already-published seconds. Rewriting old
-        // buckets would make the visible timeline jump backwards.
         continue;
       }
-
       lastOfficialPrice = trade.price;
       lastTradeAt = Math.max(lastTradeAt, trade.time);
       changed = true;
@@ -423,18 +369,12 @@ function createSecondTradeAggregator({ provider, market, symbol, interval, clien
   }
 
   function tick() {
+    if (!candle) return;
     const nowBucket = Math.floor(Date.now() / 1000) * 1000;
-    if (!Number.isFinite(lastOfficialPrice) || lastOfficialPrice <= 0) return;
-
-    if (!candle) {
-      candle = newCarryCandle(nowBucket, lastOfficialPrice);
-      sendCandle(candle, false);
-      return;
+    if (nowBucket > candle.start) {
+      sendCandle(candle, true);
+      candle = null;
     }
-    if (nowBucket <= candle.start) return;
-
-    closeCurrentIfNeeded();
-    emitCarryRange(candle.start + 1000, nowBucket, lastOfficialPrice, nowBucket);
   }
 
   function seedRows(rows) {
@@ -446,23 +386,36 @@ function createSecondTradeAggregator({ provider, market, symbol, interval, clien
         Number(row.trade_count || 0) > 0
       )
       .sort((a, b) => Number(a.open_time_ms) - Number(b.open_time_ms));
+    for (const row of sorted) {
+      if (!emit && client?.readyState !== WebSocket.OPEN) break;
+      const payload = normalizedMessage(
+        provider,
+        market,
+        symbol,
+        interval,
+        [row.open_time_ms,row.open,row.high,row.low,row.close,row.volume,row.quote_volume],
+        Number(row.open_time_ms) + 1000 <= Date.now(),
+        row.trade_count,
+      );
+      if (emit) emit(payload);
+      else client.send(payload);
+    }
     const latest = sorted.at(-1);
     if (!latest) return;
-
     const latestStart = Number(latest.open_time_ms);
-    if (lastTradeAt > latestStart) return;
-
-    lastOfficialPrice = Number(latest.close);
-    lastTradeAt = latestStart;
-
-    // Historical REST data is loaded by the App separately. The realtime socket uses
-    // the latest same-venue official trade only as its starting price, then begins at
-    // the current natural second. This prevents sparse historical trade buckets from
-    // being replayed as if they were realtime gaps and avoids a catch-up message burst.
-    const nowBucket = Math.floor(Date.now() / 1000) * 1000;
-    if (!candle || Number(candle.trades || 0) === 0 || candle.start < nowBucket) {
-      candle = newCarryCandle(nowBucket, lastOfficialPrice);
-      sendCandle(candle, false);
+    if (!candle || latestStart > candle.start) {
+      candle = {
+        start: latestStart,
+        open: Number(latest.open),
+        high: Number(latest.high),
+        low: Number(latest.low),
+        close: Number(latest.close),
+        volume: Number(latest.volume || 0),
+        quoteVolume: Number(latest.quote_volume || 0),
+        trades: Number(latest.trade_count || 0),
+      };
+      lastOfficialPrice = candle.close;
+      lastTradeAt = latestStart;
     }
   }
 
@@ -1068,14 +1021,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.13', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.14', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.13',
+      version: '650.8.15.14',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1264,16 +1217,10 @@ wss.on('connection', async (client, req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      // Step650.8.15.8: the WS-only child must never become a second Binance REST
-      // caller. Binance 1s aggregation starts directly from the official aggTrade
-      // WebSocket; other providers may still seed from their own public REST.
-      if (provider !== 'binance') {
-        fetchMarketKlines(provider, market, symbol, '1s', Date.now(), 500)
-          .then((historyRows) => secondAggregator?.seedRows(historyRows))
-          .catch(() => {
-            // 某平台最近成交历史暂不可用时继续实时流，不跨平台回落。
-          });
-      }
+      // Step650.8.15.14: WebSocket carries official real trades only.
+      // Historical 1-second seeds are fetched by the App through /api/klines. Empty
+      // natural seconds are extended locally on the visible device with zero volume,
+      // so Render does not replay history or emit one synthetic message per second.
     }
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({
@@ -1321,7 +1268,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.13 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.14 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,
