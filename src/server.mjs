@@ -371,24 +371,13 @@ function createSecondTradeAggregator({ provider, market, symbol, interval, clien
   function tick() {
     const nowBucket = Math.floor(Date.now() / 1000) * 1000;
 
-    // Step650.8.15.11: a 1-second chart is a wall-clock series. When the venue has
-    // no trade in a second, carry the last official price into a zero-volume,
-    // zero-trade candle for that second. This is display continuity only: the price
-    // comes from the same venue's latest official trade, no cross-venue value is used,
-    // and no volume/trade is fabricated.
+    // Step650.8.15.12: a 1-second chart is a wall-clock series. When the Node event
+    // loop wakes late, emit every missing natural second instead of jumping directly
+    // from the last bucket to the current bucket. Each empty second carries only the
+    // same venue's last official trade price and keeps volume/quote/trades at zero.
     if (!Number.isFinite(lastOfficialPrice) || lastOfficialPrice <= 0) return;
 
-    if (candle && nowBucket > candle.start) {
-      // Only resend a closing update when the prior second contained a real trade.
-      // Pure carry-forward candles were already emitted once, so avoiding a second
-      // close message keeps visible-only WebSocket bandwidth near one message/second.
-      if (Number(candle.trades || 0) > 0 || Number(candle.volume || 0) > 0) {
-        sendCandle(candle, true);
-      }
-      candle = null;
-    }
-
-    if (!candle || nowBucket > candle.start) {
+    if (!candle) {
       candle = {
         start: nowBucket,
         open: lastOfficialPrice,
@@ -400,6 +389,34 @@ function createSecondTradeAggregator({ provider, market, symbol, interval, clien
         trades: 0,
       };
       sendCandle(candle, false);
+      return;
+    }
+
+    if (nowBucket <= candle.start) return;
+
+    // A real-trade candle may already have been sent as an in-progress update. Close
+    // it once before advancing. Carry candles are emitted once only to avoid doubling
+    // visible-only downstream bandwidth.
+    if (Number(candle.trades || 0) > 0 || Number(candle.volume || 0) > 0) {
+      sendCandle(candle, true);
+    }
+
+    let nextStart = candle.start + 1000;
+    while (nextStart <= nowBucket) {
+      candle = {
+        start: nextStart,
+        open: lastOfficialPrice,
+        high: lastOfficialPrice,
+        low: lastOfficialPrice,
+        close: lastOfficialPrice,
+        volume: 0,
+        quoteVolume: 0,
+        trades: 0,
+      };
+      // Buckets already behind wall-clock are closed; the current natural second stays
+      // open so a real trade arriving in that same second can update OHLC and volume.
+      sendCandle(candle, nextStart < nowBucket);
+      nextStart += 1000;
     }
   }
 
@@ -1047,14 +1064,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.11', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.12', binance_shared_ws: binanceSharedWsHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.11',
+      version: '650.8.15.12',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1300,7 +1317,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.11 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.12 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,
