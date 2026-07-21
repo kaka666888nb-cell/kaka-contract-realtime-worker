@@ -131,7 +131,7 @@ function compact(raw) {
     .replace(/[^A-Z0-9]/g, '');
 }
 function split(symbol) {
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'TUSD', 'DAI', 'USD', 'BTC', 'ETH']) {
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'JPY']) {
     if (symbol.endsWith(quote)) return [symbol.slice(0, -quote.length), quote];
   }
   return [symbol, 'USDT'];
@@ -838,7 +838,7 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
 }
 
 
-// Step650.8.15.22: calendar-month aggregation for safe Binance contract daily seeds.
+// Step650.8.15.23: calendar-month aggregation for safe Binance contract daily seeds.
 // A month is not a fixed 30-day duration, so use UTC year/month boundaries and never
 // interpolate or fabricate missing source candles.
 function aggregateCalendarMonths(sourceRows, provider, market, symbol) {
@@ -1359,7 +1359,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
       maxRestCalls: 1,
     });
 
-    // Step650.8.15.22: a sparse/empty direct monthly seed can occur when the current monthly
+    // Step650.8.15.23: a sparse/empty direct monthly seed can occur when the current monthly
     // archive is not yet available. Reuse the same safe seed chain for official daily candles
     // and aggregate them by real UTC calendar month. This sends no Render-direct Binance REST.
     if (interval === '1M' && seedRows.length < 3) {
@@ -1409,10 +1409,82 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   return aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
 }
 
+
+const BINANCE_COMMON_QUOTE_ASSETS = Object.freeze([
+  'USDT', 'USDC', 'FDUSD', 'USD1', 'USD',
+  'BTC', 'BNB', 'ETH', 'EUR', 'JPY',
+]);
+
+async function binanceAssetQuoteSummary(rawBase) {
+  const base = compact(rawBase);
+  if (!base) throw new Error('base required');
+
+  return await sharedMarketResult(
+    `binance_asset_quotes:${base}`,
+    5 * 60_000,
+    async () => {
+      const counts = new Map(
+        BINANCE_COMMON_QUOTE_ASSETS.map((quote) => [
+          quote,
+          { quote_asset: quote, spot_count: 0, contract_count: 0 },
+        ]),
+      );
+
+      const payload = await sharedBinanceResult(
+        'spot_universe:exchange_info',
+        6 * 60 * 60_000,
+        () => binanceRestJsonFetch(
+          'https://data-api.binance.vision/api/v3/exchangeInfo',
+          15_000,
+          'spot_universe:exchange_info',
+        ),
+      );
+      for (const item of payload.symbols || []) {
+        if (String(item.status || '').toUpperCase() !== 'TRADING') continue;
+        if (String(item.baseAsset || '').toUpperCase() !== base) continue;
+        const quote = String(item.quoteAsset || '').toUpperCase();
+        const row = counts.get(quote);
+        if (row) row.spot_count += 1;
+      }
+
+      // Binance contract scope in the App is USDⓈ-M. Use only the existing
+      // official WebSocket universe snapshots for USDT and USDC; never fapi REST.
+      for (const quote of ['USDT', 'USDC']) {
+        try {
+          const rows = await getBinanceContractUniverse({ quote });
+          const row = counts.get(quote);
+          if (row) {
+            row.contract_count = rows.filter((item) =>
+              String(item.base_asset || '').toUpperCase() === base &&
+              String(item.quote_asset || '').toUpperCase() === quote
+            ).length;
+          }
+        } catch (_) {
+          // Snapshot unavailable never enables a quote without a real row.
+        }
+      }
+
+      return [...counts.values()]
+        .map((row) => ({
+          ...row,
+          total_count: row.spot_count + row.contract_count,
+        }))
+        .filter((row) => row.total_count > 0)
+        .sort((a, b) =>
+          (b.total_count - a.total_count) ||
+          (BINANCE_COMMON_QUOTE_ASSETS.indexOf(a.quote_asset) -
+            BINANCE_COMMON_QUOTE_ASSETS.indexOf(b.quote_asset))
+        );
+    },
+  );
+}
+
 export function getBinanceMarketRestHealth() {
   pruneBinanceSharedCache();
   return {
     spot_market_data_host: 'data-api.binance.vision',
+    binance_asset_quote_discovery_enabled: true,
+    binance_asset_quote_candidates: BINANCE_COMMON_QUOTE_ASSETS,
     shared_cache_entries: binanceSharedCache.size,
     shared_inflight_entries: binanceSharedInflight.size,
     shared_cache_max: BINANCE_SHARED_CACHE_MAX,
@@ -1423,6 +1495,7 @@ export function getBinanceMarketRestHealth() {
 }
 
 const OWNED_MARKET_API_PATHS = new Set([
+  '/api/binance-asset-quotes',
   '/api/universe',
   '/api/tickers',
   '/api/klines',
@@ -1499,7 +1572,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.22',
+        version: '650.8.15.23',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1511,7 +1584,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.22',
+        version: '650.8.15.23',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1521,7 +1594,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.22',
+        version: '650.8.15.23',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1530,9 +1603,28 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.22',
+        version: '650.8.15.23',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
+      });
+      return true;
+    }
+    if (url.pathname === '/api/binance-asset-quotes') {
+      const base = compact(url.searchParams.get('base'));
+      if (!base) {
+        send(res, 400, { ok: false, error: 'base required', rows: [] });
+        return true;
+      }
+      const rows = await binanceAssetQuoteSummary(base);
+      send(res, 200, {
+        ok: true,
+        version: '650.8.15.23',
+        provider: 'binance',
+        base_asset: base,
+        rows,
+        total_quote_assets: rows.length,
+        source: 'binance_official_exchange_info_and_contract_websocket_snapshot',
+        cached_at: new Date().toISOString(),
       });
       return true;
     }
@@ -1647,7 +1739,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.22',
+        version: '650.8.15.23',
         provider,
         market_type: market,
         symbol,
