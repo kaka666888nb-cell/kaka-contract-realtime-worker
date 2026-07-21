@@ -31,7 +31,7 @@ function symbolKey(raw) {
     .replace(/[^A-Z0-9]/g, '');
 }
 function splitSymbol(symbol) {
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'JPY']) {
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'TRY', 'BRL', 'AUD', 'CAD']) {
     if (symbol.endsWith(quote)) return [symbol.slice(0, -quote.length), quote];
   }
   return [symbol, 'USDT'];
@@ -47,6 +47,22 @@ function okxInstId(symbol, market) {
 function gateSymbol(symbol) {
   const [base, quote] = splitSymbol(symbol);
   return `${base}_${quote}`;
+}
+function bybitContractCategory(quote) {
+  return String(quote || '').toUpperCase() === 'USD'
+    ? 'inverse'
+    : 'linear';
+}
+function bitgetContractInstType(quote) {
+  const safe = String(quote || '').toUpperCase();
+  if (safe === 'USDC') return 'USDC-FUTURES';
+  if (safe === 'USD') return 'COIN-FUTURES';
+  return 'USDT-FUTURES';
+}
+function gateContractSettle(quote) {
+  return String(quote || '').toUpperCase() === 'USD'
+    ? 'btc'
+    : 'usdt';
 }
 function intervalMs(interval) {
   const map = {
@@ -224,17 +240,39 @@ function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quot
     };
   }
   if (provider === 'bybit') {
+    const category = market === 'contract'
+      ? bybitContractCategory(quoteAsset)
+      : 'spot';
     return {
       tradeMode: true,
-      url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
-      subscribe: { op: 'subscribe', args: [`publicTrade.${nativeSymbol}`] },
+      url: `wss://stream.bybit.com/v5/public/${category}`,
+      subscribe: {
+        op: 'subscribe',
+        args: [`publicTrade.${nativeSymbol}`],
+      },
       heartbeatMessage: { op: 'ping' },
       parseTrades(raw) {
         const message = JSON.parse(raw.toString());
-        if (!String(message?.topic || '').startsWith('publicTrade.')) return [];
+        if (!String(message?.topic || '').startsWith('publicTrade.')) {
+          return [];
+        }
         const items = [];
-        for (const trade of Array.isArray(message?.data) ? message.data : []) {
-          const item = tradeItem(trade.T ?? message.ts, trade.p ?? trade.price, trade.v ?? trade.size);
+        for (const trade of
+            Array.isArray(message?.data) ? message.data : []) {
+          const price = Number(trade.p ?? trade.price);
+          const rawSize = Number(trade.v ?? trade.size);
+          const baseSize =
+              category === 'inverse' &&
+              Number.isFinite(price) &&
+              price > 0 &&
+              Number.isFinite(rawSize)
+                  ? Math.abs(rawSize) / price
+                  : rawSize;
+          const item = tradeItem(
+            trade.T ?? message.ts,
+            price,
+            baseSize,
+          );
           if (item) items.push(item);
         }
         return items;
@@ -249,7 +287,7 @@ function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quot
         op: 'subscribe',
         args: [{
           instType: market === 'contract'
-            ? (String(quoteAsset).toUpperCase() === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES')
+            ? bitgetContractInstType(quoteAsset)
             : 'SPOT',
           channel: 'trade',
           instId: nativeSymbol,
@@ -274,9 +312,12 @@ function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quot
   }
   if (provider === 'gate') {
     const contract = market === 'contract';
+    const settle = gateContractSettle(quoteAsset);
     return {
       tradeMode: true,
-      url: contract ? 'wss://fx-ws.gateio.ws/v4/ws/usdt' : 'wss://api.gateio.ws/ws/v4/',
+      url: contract
+        ? `wss://fx-ws.gateio.ws/v4/ws/${settle}`
+        : 'wss://api.gateio.ws/ws/v4/',
       subscribe: {
         time: Math.floor(Date.now() / 1000),
         channel: contract ? 'futures.trades' : 'spot.trades',
@@ -285,14 +326,37 @@ function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quot
       },
       parseTrades(raw) {
         const message = JSON.parse(raw.toString());
-        const expected = contract ? 'futures.trades' : 'spot.trades';
-        if (message?.channel !== expected || message?.event !== 'update') return [];
-        const list = Array.isArray(message?.result) ? message.result : (message?.result ? [message.result] : []);
+        const expected =
+            contract ? 'futures.trades' : 'spot.trades';
+        if (message?.channel !== expected ||
+            message?.event !== 'update') {
+          return [];
+        }
+        const list = Array.isArray(message?.result)
+          ? message.result
+          : (message?.result ? [message.result] : []);
         const items = [];
         for (const trade of list) {
-          const time = trade.create_time_ms ?? trade.create_time ?? trade.time_ms ?? trade.time;
-          const size = contract ? (trade.size ?? trade.amount) : (trade.amount ?? trade.size);
-          const item = tradeItem(time, trade.price, size);
+          const time =
+              trade.create_time_ms ??
+              trade.create_time ??
+              trade.time_ms ??
+              trade.time;
+          const price = Number(trade.price);
+          const rawSize = Number(
+            contract
+              ? (trade.size ?? trade.amount)
+              : (trade.amount ?? trade.size),
+          );
+          const baseSize =
+              contract &&
+              String(quoteAsset).toUpperCase() === 'USD' &&
+              Number.isFinite(price) &&
+              price > 0 &&
+              Number.isFinite(rawSize)
+                  ? Math.abs(rawSize) / price
+                  : rawSize;
+          const item = tradeItem(time, price, baseSize);
           if (item) items.push(item);
         }
         return items;
@@ -573,8 +637,24 @@ async function upstreamConfig(provider, market, symbol, interval) {
         const message = JSON.parse(raw.toString());
         const candle = Array.isArray(message?.data) ? message.data[0] : null;
         if (!Array.isArray(candle)) return null;
-        return normalizedMessage(provider, market, symbol, interval,
-          [candle[0],candle[1],candle[2],candle[3],candle[4],candle[5],candle[7]], String(candle[8]) === '1');
+        return normalizedMessage(
+          provider,
+          market,
+          symbol,
+          interval,
+          [
+            candle[0],
+            candle[1],
+            candle[2],
+            candle[3],
+            candle[4],
+            market === 'contract' ? candle[6] : candle[5],
+            market === 'contract'
+                ? candle[7]
+                : (candle[7] ?? candle[6]),
+          ],
+          String(candle[8]) === '1',
+        );
       },
     };
   }
@@ -583,7 +663,9 @@ async function upstreamConfig(provider, market, symbol, interval) {
     const channelInterval = gateInterval(upstreamInterval, market);
     if (!channelInterval) throw new Error(`gate ${market} interval ${upstreamInterval} is not supported`);
     return {
-      url: contract ? 'wss://fx-ws.gateio.ws/v4/ws/usdt' : 'wss://api.gateio.ws/ws/v4/',
+      url: contract
+        ? `wss://fx-ws.gateio.ws/v4/ws/${gateContractSettle(quoteAsset)}`
+        : 'wss://api.gateio.ws/ws/v4/',
       subscribe: {
         time: Math.floor(Date.now() / 1000),
         channel: contract ? 'futures.candlesticks' : 'spot.candlesticks',
@@ -597,8 +679,33 @@ async function upstreamConfig(provider, market, symbol, interval) {
         const result = Array.isArray(message.result) ? message.result[0] : message.result;
         if (!result) return null;
         const timestamp = Number(result.t) * (Number(result.t) < 10_000_000_000 ? 1000 : 1);
-        return normalizedMessage(provider, market, symbol, interval,
-          [timestamp,result.o,result.h,result.l,result.c,result.v,result.a ?? result.sum], false, result.n);
+        const close = Number(result.c);
+        const quoteVolume = Number(result.a ?? result.sum);
+        const baseVolume =
+            contract &&
+            quoteAsset === 'USD' &&
+            Number.isFinite(close) &&
+            close > 0 &&
+            Number.isFinite(quoteVolume)
+                ? quoteVolume / close
+                : result.v;
+        return normalizedMessage(
+          provider,
+          market,
+          symbol,
+          interval,
+          [
+            timestamp,
+            result.o,
+            result.h,
+            result.l,
+            result.c,
+            baseVolume,
+            result.a ?? result.sum,
+          ],
+          false,
+          result.n,
+        );
       },
     };
   }
@@ -611,7 +718,7 @@ async function upstreamConfig(provider, market, symbol, interval) {
         op: 'subscribe',
         args: [{
           instType: market === 'contract'
-            ? (quoteAsset === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES')
+            ? bitgetContractInstType(quoteAsset)
             : 'SPOT',
           channel,
           instId: nativeSymbol,
@@ -629,17 +736,45 @@ async function upstreamConfig(provider, market, symbol, interval) {
   if (provider === 'bybit') {
     const channelInterval = bybitInterval(upstreamInterval);
     if (!channelInterval) throw new Error(`bybit interval ${upstreamInterval} is not supported`);
+    const category = market === 'contract'
+      ? bybitContractCategory(quoteAsset)
+      : 'spot';
     return {
-      url: `wss://stream.bybit.com/v5/public/${market === 'contract' ? 'linear' : 'spot'}`,
-      subscribe: { op: 'subscribe', args: [`kline.${channelInterval}.${nativeSymbol}`] },
+      url: `wss://stream.bybit.com/v5/public/${category}`,
+      subscribe: {
+        op: 'subscribe',
+        args: [`kline.${channelInterval}.${nativeSymbol}`],
+      },
       heartbeatMessage: { op: 'ping' },
       parse(raw) {
         const message = JSON.parse(raw.toString());
-        if (!String(message?.topic || '').startsWith('kline.')) return null;
-        const candle = Array.isArray(message?.data) ? message.data[0] : null;
+        if (!String(message?.topic || '').startsWith('kline.')) {
+          return null;
+        }
+        const candle =
+            Array.isArray(message?.data) ? message.data[0] : null;
         if (!candle || typeof candle !== 'object') return null;
-        return normalizedMessage(provider, market, symbol, interval,
-          [candle.start,candle.open,candle.high,candle.low,candle.close,candle.volume,candle.turnover], candle.confirm === true);
+        const inverse = category === 'inverse';
+        const baseVolume =
+            inverse ? candle.turnover : candle.volume;
+        const quoteVolume =
+            inverse ? candle.volume : candle.turnover;
+        return normalizedMessage(
+          provider,
+          market,
+          symbol,
+          interval,
+          [
+            candle.start,
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            baseVolume,
+            quoteVolume,
+          ],
+          candle.confirm === true,
+        );
       },
     };
   }
@@ -1023,14 +1158,14 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.24', binance_shared_ws: binanceSharedWsHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.25', binance_shared_ws: binanceSharedWsHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.24',
+      version: '650.8.15.25',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1220,7 +1355,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
     if (cfg.tradeMode === true) {
       secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
       secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      // Step650.8.15.24: WebSocket carries official real trades only.
+      // Step650.8.15.25: WebSocket carries official real trades only.
       // Historical 1-second seeds are fetched by the App through /api/klines. Empty
       // natural seconds are extended locally on the visible device with zero volume,
       // so Render does not replay history or emit one synthetic message per second.
@@ -1271,7 +1406,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.24 listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.25 listening on ${PORT}`));
 
 export const _test = {
   createSecondTradeAggregator,

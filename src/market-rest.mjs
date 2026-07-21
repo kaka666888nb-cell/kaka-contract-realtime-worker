@@ -131,14 +131,15 @@ function compact(raw) {
     .replace(/[^A-Z0-9]/g, '');
 }
 function split(symbol) {
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'JPY']) {
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'TRY', 'BRL', 'AUD', 'CAD']) {
     if (symbol.endsWith(quote)) return [symbol.slice(0, -quote.length), quote];
   }
   return [symbol, 'USDT'];
 }
 const SUPPORTED_EXACT_QUOTE_ASSETS = Object.freeze([
   'FDUSD', 'USDT', 'USDC', 'USD1', 'USD',
-  'BTC', 'BNB', 'ETH', 'EUR', 'JPY',
+  'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY',
+  'TRY', 'BRL', 'AUD', 'CAD',
 ]);
 
 function normalizedQuote(raw, fallback = 'USDT') {
@@ -152,8 +153,42 @@ function quoteFromSymbols(symbols = [], fallback = 'USDT') {
   }
   return normalizedQuote(fallback, 'USDT');
 }
+const CONTRACT_QUOTES_BY_PROVIDER = Object.freeze({
+  binance: Object.freeze(['USDT', 'USDC']),
+  okx: Object.freeze(['USDT', 'USDC', 'USD']),
+  bybit: Object.freeze(['USDT', 'USDC', 'USD']),
+  bitget: Object.freeze(['USDT', 'USDC', 'USD']),
+  gate: Object.freeze(['USDT', 'USD']),
+});
+
+function contractQuoteSupported(provider, quote) {
+  return (CONTRACT_QUOTES_BY_PROVIDER[provider] || []).includes(
+    normalizedQuote(quote, 'USDT'),
+  );
+}
+function bybitContractCategory(quote) {
+  return normalizedQuote(quote, 'USDT') === 'USD' ? 'inverse' : 'linear';
+}
 function bitgetContractCategory(quote) {
-  return normalizedQuote(quote, 'USDT') === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES';
+  const safe = normalizedQuote(quote, 'USDT');
+  if (safe === 'USDC') return 'USDC-FUTURES';
+  if (safe === 'USD') return 'COIN-FUTURES';
+  return 'USDT-FUTURES';
+}
+function gateContractSettle(quote) {
+  return normalizedQuote(quote, 'USDT') === 'USD' ? 'btc' : 'usdt';
+}
+function contractDisplayIdentity(provider, base, requestedQuote, rawSymbol = '') {
+  const quote = normalizedQuote(requestedQuote, 'USDT');
+  if (!contractQuoteSupported(provider, quote)) return null;
+  const safeBase = compact(base);
+  if (!safeBase) return null;
+  return {
+    symbol: `${safeBase}${quote}`,
+    base_asset: safeBase,
+    quote_asset: quote,
+    raw_symbol: String(rawSymbol || `${safeBase}${quote}`),
+  };
 }
 function payloadRows(payload) {
   if (Array.isArray(payload)) return payload;
@@ -413,18 +448,34 @@ function marketRow(provider, market, symbol, base, quote, raw, extra = {}) {
   };
 }
 
-async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
-  const quoteFilter = normalizedQuote(requestedQuote, provider === 'coinbase' ? 'USD' : 'USDT');
+async function fetchUniverse(
+  provider,
+  market,
+  requestedQuote = 'USDT',
+  filterQuote = true,
+) {
+  const quoteFilter = normalizedQuote(
+    requestedQuote,
+    provider === 'coinbase' ? 'USD' : 'USDT',
+  );
   assertProviderMarket(provider, market);
+  if (market === 'contract' &&
+      !contractQuoteSupported(provider, quoteFilter)) {
+    return [];
+  }
+
   const rows = [];
   if (provider === 'binance') {
     if (market === 'contract') {
-      const snapshotRows = await getBinanceContractUniverse({ quote: quoteFilter });
-      if (!snapshotRows.length) throw new Error(`binance contract universe snapshot unavailable quote=${quoteFilter}`);
+      const snapshotRows =
+          await getBinanceContractUniverse({ quote: quoteFilter });
+      if (!snapshotRows.length) return [];
       rows.push(...snapshotRows.map((row) => ({
         ...row,
         raw_symbol: row.raw_symbol || row.symbol,
-        native_symbol: compact(row.native_symbol || row.raw_symbol || row.symbol),
+        native_symbol: compact(
+          row.native_symbol || row.raw_symbol || row.symbol,
+        ),
       })));
     } else {
       const payload = await sharedBinanceResult(
@@ -438,19 +489,35 @@ async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
       );
       for (const item of payload.symbols || []) {
         if (String(item.status).toUpperCase() !== 'TRADING') continue;
-        rows.push(marketRow(provider, market, item.symbol, item.baseAsset, item.quoteAsset, item.symbol));
+        rows.push(marketRow(
+          provider,
+          market,
+          item.symbol,
+          item.baseAsset,
+          item.quoteAsset,
+          item.symbol,
+        ));
       }
     }
   } else if (provider === 'coinbase') {
     const payload = await jsonFetch(`${COINBASE_BASE_URL}/products`);
     for (const item of Array.isArray(payload) ? payload : []) {
       if (String(item.status || '').toLowerCase() !== 'online') continue;
-      if (item.trading_disabled === true || item.cancel_only === true) continue;
+      if (item.trading_disabled === true || item.cancel_only === true) {
+        continue;
+      }
       const raw = String(item.id || '').toUpperCase();
       const base = String(item.base_currency || '').toUpperCase();
       const quote = String(item.quote_currency || '').toUpperCase();
       if (!raw || !base || !quote) continue;
-      rows.push(marketRow(provider, 'spot', raw, base, quote, raw));
+      rows.push(marketRow(
+        provider,
+        'spot',
+        raw,
+        base,
+        quote,
+        raw,
+      ));
     }
   } else if (provider === 'okx') {
     const payload = await jsonFetch(
@@ -458,54 +525,130 @@ async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
     );
     for (const item of payload.data || []) {
       if (item.state && item.state !== 'live') continue;
-      if (market === 'contract' && item.ctType !== 'linear') continue;
-      const base = item.baseCcy || item.ctValCcy;
-      const quote = item.quoteCcy || item.settleCcy;
-      if (base && quote) {
+      if (market === 'contract') {
+        const parts = String(item.instId || '').toUpperCase().split('-');
+        const base = parts[0] || '';
+        const quote = parts[1] || '';
+        if (!base || !quote) continue;
+        if (quoteFilter === 'USD' &&
+            String(item.ctType || '').toLowerCase() !== 'inverse') {
+          continue;
+        }
+        if (quoteFilter !== 'USD' &&
+            String(item.ctType || '').toLowerCase() !== 'linear') {
+          continue;
+        }
         const ctVal = num(item.ctVal);
         const ctMult = num(item.ctMult) ?? 1;
-        const valueCurrency = String(item.ctValCcy || '').toUpperCase();
-        const multiplier = market === 'contract' &&
-                ctVal !== null &&
-                ctVal > 0 &&
-                ctMult > 0 &&
-                (!valueCurrency || valueCurrency === String(base).toUpperCase())
-            ? ctVal * ctMult
-            : null;
-        rows.push(marketRow(provider, market, item.instId, base, quote, item.instId, {
-          contract_multiplier: multiplier,
-          contract_value_currency: valueCurrency,
-          quantity_semantics: market === 'contract'
-              ? (multiplier ? 'contract_count_convertible_to_base' : 'contract_count')
-              : 'base_asset',
-        }));
+        const valueCurrency =
+            String(item.ctValCcy || '').toUpperCase();
+        const contractValue =
+            ctVal !== null && ctVal > 0 && ctMult > 0
+                ? ctVal * ctMult
+                : null;
+        const baseMultiplier =
+            contractValue !== null && valueCurrency === base
+                ? contractValue
+                : null;
+        rows.push(marketRow(
+          provider,
+          market,
+          `${base}${quote}`,
+          base,
+          quote,
+          item.instId,
+          {
+            native_symbol: item.instId,
+            settle_asset: item.settleCcy || quote,
+            contract_type: item.ctType || null,
+            contract_multiplier: baseMultiplier,
+            contract_value: contractValue,
+            contract_value_currency: valueCurrency,
+            quantity_semantics: baseMultiplier
+                ? 'contract_count_convertible_to_base'
+                : contractValue !== null && valueCurrency === quote
+                    ? 'contract_count_convertible_to_quote'
+                    : 'contract_count',
+          },
+        ));
+      } else {
+        const base = item.baseCcy;
+        const quote = item.quoteCcy;
+        if (base && quote) {
+          rows.push(marketRow(
+            provider,
+            market,
+            item.instId,
+            base,
+            quote,
+            item.instId,
+          ));
+        }
       }
     }
   } else if (provider === 'gate') {
     if (market === 'contract') {
-      if (quoteFilter !== 'USDT') return [];
+      const settle = gateContractSettle(quoteFilter);
       const payload = await jsonFetch([
-        'https://api.gateio.ws/api/v4/futures/usdt/contracts',
-        'https://fx-api.gateio.ws/api/v4/futures/usdt/contracts',
+        `https://api.gateio.ws/api/v4/futures/${settle}/contracts`,
+        `https://fx-api.gateio.ws/api/v4/futures/${settle}/contracts`,
       ]);
       for (const item of payload || []) {
-        if (item.in_delisting === true) continue;
-        const [base, quote = 'USDT'] = String(item.name || '').toUpperCase().split('_');
+        if (item.in_delisting === true ||
+            String(item.status || 'trading').toLowerCase() !== 'trading') {
+          continue;
+        }
+        const [base, nativeQuote = quoteFilter] =
+            String(item.name || '').toUpperCase().split('_');
+        const quote = nativeQuote || quoteFilter;
+        if (!base || quote !== quoteFilter) continue;
         const multiplier = num(item.quanto_multiplier);
-        if (base) rows.push(marketRow(provider, market, item.name, base, quote, item.name, {
-          contract_multiplier: multiplier,
-          contract_value_currency: base,
-          quantity_semantics: multiplier && multiplier > 0
-              ? 'contract_count_convertible_to_base'
-              : 'contract_count',
-        }));
+        rows.push(marketRow(
+          provider,
+          market,
+          item.name,
+          base,
+          quote,
+          item.name,
+          {
+            settle_asset: settle.toUpperCase(),
+            contract_type: item.type || null,
+            contract_multiplier:
+                quote === 'USDT' && multiplier !== null && multiplier > 0
+                    ? multiplier
+                    : null,
+            contract_value: multiplier,
+            contract_value_currency:
+                quote === 'USD' ? 'USD' : base,
+            quantity_semantics: quote === 'USD'
+                ? 'contract_count_inverse'
+                : multiplier && multiplier > 0
+                    ? 'contract_count_convertible_to_base'
+                    : 'contract_count',
+          },
+        ));
       }
     } else {
-      const payload = await jsonFetch('https://api.gateio.ws/api/v4/spot/currency_pairs');
+      const payload = await jsonFetch(
+        'https://api.gateio.ws/api/v4/spot/currency_pairs',
+      );
       for (const item of payload || []) {
-        if (String(item.trade_status || 'tradable').toLowerCase() !== 'tradable') continue;
-        const [base, quote] = String(item.id || '').toUpperCase().split('_');
-        if (base && quote) rows.push(marketRow(provider, market, item.id, item.base || base, item.quote || quote, item.id));
+        if (String(item.trade_status || 'tradable').toLowerCase() !==
+            'tradable') {
+          continue;
+        }
+        const [base, quote] =
+            String(item.id || '').toUpperCase().split('_');
+        if (base && quote) {
+          rows.push(marketRow(
+            provider,
+            market,
+            item.id,
+            item.base || base,
+            item.quote || quote,
+            item.id,
+          ));
+        }
       }
     }
   } else if (provider === 'bitget') {
@@ -522,7 +665,9 @@ async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
         try {
           const payload = await jsonFetch(url);
           if (String(payload?.code || '00000') !== '00000') {
-            lastError = new Error(`bitget instruments code=${payload?.code} msg=${payload?.msg || ''}`);
+            lastError = new Error(
+              `bitget instruments code=${payload?.code} msg=${payload?.msg || ''}`,
+            );
             continue;
           }
           items = payloadRows(payload);
@@ -533,72 +678,195 @@ async function fetchUniverse(provider, market, requestedQuote = 'USDT') {
       }
       if (!items.length && lastError) throw lastError;
       for (const item of items) {
-        const status = String(item.symbolStatus || item.status || item.state || '').toLowerCase();
-        if (status && !['normal', 'online', 'listed', 'live', 'trading'].includes(status)) continue;
-        const raw = String(item.symbol || item.symbolName || '').toUpperCase();
-        const base = String(item.baseCoin || item.baseCurrency || '').toUpperCase();
-        const quote = String(item.quoteCoin || item.quoteCurrency || item.settleCoin || quoteFilter).toUpperCase();
-        if (!raw || !base || !quote) continue;
-        rows.push(marketRow(provider, market, `${base}${quote}`, base, quote, raw, {
-          native_symbol: raw,
-          settle_asset: item.settleCoin || item.marginCoin || quote,
-          contract_type: item.symbolType || item.contractType || 'linear_perpetual',
-        }));
+        const status =
+            String(item.symbolStatus || item.status || item.state || '')
+                .toLowerCase();
+        if (status &&
+            !['normal', 'online', 'listed', 'live', 'trading']
+                .includes(status)) {
+          continue;
+        }
+        const type =
+            String(item.symbolType || item.contractType || '')
+                .toLowerCase();
+        if (type && !type.includes('perpetual')) continue;
+        const raw =
+            String(item.symbol || item.symbolName || '').toUpperCase();
+        const base =
+            String(item.baseCoin || item.baseCurrency || '').toUpperCase();
+        const quote =
+            String(
+              item.quoteCoin ||
+                  item.quoteCurrency ||
+                  (quoteFilter === 'USD' ? 'USD' : item.settleCoin) ||
+                  quoteFilter,
+            ).toUpperCase();
+        if (!raw || !base || !quote || quote !== quoteFilter) continue;
+        rows.push(marketRow(
+          provider,
+          market,
+          `${base}${quote}`,
+          base,
+          quote,
+          raw,
+          {
+            native_symbol: raw,
+            settle_asset:
+                item.settleCoin || item.marginCoin || quote,
+            contract_type:
+                item.symbolType || item.contractType || 'perpetual',
+            quantity_semantics:
+                quote === 'USD' ? 'provider_defined_coin_margined' : 'base_asset',
+          },
+        ));
       }
     } else {
-      const payload = await jsonFetch('https://api.bitget.com/api/v2/spot/public/symbols');
+      const payload = await jsonFetch(
+        'https://api.bitget.com/api/v2/spot/public/symbols',
+      );
       for (const item of payloadRows(payload)) {
-        const status = String(item.symbolStatus || item.status || '').toLowerCase();
-        if (status && !['normal', 'online', 'listed'].includes(status)) continue;
+        const status =
+            String(item.symbolStatus || item.status || '').toLowerCase();
+        if (status &&
+            !['normal', 'online', 'listed'].includes(status)) {
+          continue;
+        }
         if (item.baseCoin && item.quoteCoin) {
-          rows.push(marketRow(provider, market, item.symbol, item.baseCoin, item.quoteCoin, item.symbol));
+          rows.push(marketRow(
+            provider,
+            market,
+            item.symbol,
+            item.baseCoin,
+            item.quoteCoin,
+            item.symbol,
+          ));
         }
       }
     }
   } else if (provider === 'bybit') {
-    const category = market === 'contract' ? 'linear' : 'spot';
+    const category =
+        market === 'contract'
+            ? bybitContractCategory(quoteFilter)
+            : 'spot';
     let cursor = '';
     do {
       const contractFilter = market === 'contract'
-        ? `&limit=1000${quoteFilter === 'USDC' ? '&settleCoin=USDC' : ''}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
-        : '';
+          ? `&limit=1000${category === 'linear' && quoteFilter === 'USDC' ? '&settleCoin=USDC' : ''}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
+          : '';
       const payload = await bybitPublicJson(
         `/v5/market/instruments-info?category=${category}${contractFilter}`,
         { requireRows: true },
       );
       const result = payload.result || {};
       for (const item of result.list || []) {
-        if (String(item.status || 'Trading').toLowerCase() !== 'trading') continue;
-        if (market === 'contract' && String(item.contractType || '').toLowerCase() !== 'linearperpetual') continue;
+        if (String(item.status || 'Trading').toLowerCase() !== 'trading') {
+          continue;
+        }
+        if (market === 'contract') {
+          const expectedType =
+              category === 'inverse'
+                  ? 'inverseperpetual'
+                  : 'linearperpetual';
+          if (String(item.contractType || '').toLowerCase() !==
+              expectedType) {
+            continue;
+          }
+        }
         const raw = String(item.symbol || '').toUpperCase();
         const base = String(item.baseCoin || '').toUpperCase();
         const settle = String(item.settleCoin || '').toUpperCase();
         const nativeQuote = String(item.quoteCoin || '').toUpperCase();
-        const displayQuote = market === 'contract' && settle === 'USDC'
-          ? 'USDC'
-          : (nativeQuote || settle || split(raw)[1]);
+        const displayQuote = market === 'contract'
+            ? (category === 'inverse'
+                ? 'USD'
+                : (settle === 'USDC'
+                    ? 'USDC'
+                    : nativeQuote || settle || split(raw)[1]))
+            : nativeQuote;
         if (!raw || !base || !displayQuote) continue;
-        rows.push(marketRow(provider, market, `${base}${displayQuote}`, base, displayQuote, raw, {
-          native_symbol: raw,
-          settle_asset: settle || displayQuote,
-          contract_type: item.contractType || null,
-        }));
+        if (market === 'contract' && displayQuote !== quoteFilter) {
+          continue;
+        }
+        rows.push(marketRow(
+          provider,
+          market,
+          `${base}${displayQuote}`,
+          base,
+          displayQuote,
+          raw,
+          {
+            native_symbol: raw,
+            settle_asset: settle || displayQuote,
+            contract_type: item.contractType || null,
+            quantity_semantics:
+                category === 'inverse'
+                    ? 'quote_asset'
+                    : 'base_asset',
+          },
+        ));
       }
-      cursor = market === 'contract' ? String(result.nextPageCursor || '') : '';
+      cursor = market === 'contract'
+          ? String(result.nextPageCursor || '')
+          : '';
     } while (cursor);
   }
-  return [...new Map(rows.map((item) => [`${item.provider}:${item.market_type}:${item.symbol}`, item])).values()]
-    .filter((item) => item.quote_asset === quoteFilter)
-    .sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+  const deduped = [...new Map(
+    rows.map((item) => [
+      `${item.provider}:${item.market_type}:${item.symbol}`,
+      item,
+    ]),
+  ).values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+  return filterQuote
+      ? deduped.filter((item) => item.quote_asset === quoteFilter)
+      : deduped;
+}
+
+async function universeCatalog(provider, market) {
+  assertProviderMarket(provider, market);
+  return await sharedMarketResult(
+    `universe_catalog:${provider}:${market}`,
+    MARKET_UNIVERSE_CACHE_TTL_MS,
+    async () => {
+      if (market === 'spot') {
+        return await fetchUniverse(
+          provider,
+          market,
+          provider === 'coinbase' ? 'USD' : 'USDT',
+          false,
+        );
+      }
+      const quotes = CONTRACT_QUOTES_BY_PROVIDER[provider] || [];
+      const groups = await Promise.all(
+        quotes.map(async (quote) => {
+          try {
+            return await fetchUniverse(provider, market, quote, true);
+          } catch (_) {
+            return [];
+          }
+        }),
+      );
+      return [...new Map(
+        groups.flat().map((row) => [
+          `${row.provider}:${row.market_type}:${row.symbol}`,
+          row,
+        ]),
+      ).values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+    },
+  );
 }
 
 async function universe(provider, market, requestedQuote = 'USDT') {
-  const quote = normalizedQuote(requestedQuote, provider === 'coinbase' ? 'USD' : 'USDT');
-  return await sharedMarketResult(
-    `universe:${provider}:${market}:${quote}`,
-    MARKET_UNIVERSE_CACHE_TTL_MS,
-    () => fetchUniverse(provider, market, quote),
+  const quote = normalizedQuote(
+    requestedQuote,
+    provider === 'coinbase' ? 'USD' : 'USDT',
   );
+  if (market === 'contract' &&
+      !contractQuoteSupported(provider, quote)) {
+    return [];
+  }
+  const catalog = await universeCatalog(provider, market);
+  return catalog.filter((row) => row.quote_asset === quote);
 }
 
 function tickerVolumeSemantics(provider, market, item, last) {
@@ -844,7 +1112,10 @@ async function tickers(provider, market, wantedSymbols = []) {
     const payload = await sharedMarketResult(
       `ticker:${provider}:${market}:${requestedQuote}`,
       MARKET_TICKER_CACHE_TTL_MS,
-      () => bybitPublicJson('/v5/market/tickers?category=linear', { requireRows: true }),
+      () => bybitPublicJson(
+        `/v5/market/tickers?category=${bybitContractCategory(requestedQuote)}`,
+        { requireRows: true },
+      ),
     );
     const rows = [];
     for (const item of payloadRows(payload)) {
@@ -906,10 +1177,13 @@ async function tickers(provider, market, wantedSymbols = []) {
     );
     items = payload.data || [];
   } else if (provider === 'gate') {
-    if (market === 'contract' && requestedQuote !== 'USDT') return [];
+    const settle = gateContractSettle(requestedQuote);
     const payload = await jsonFetch(
       market === 'contract'
-        ? ['https://api.gateio.ws/api/v4/futures/usdt/tickers', 'https://fx-api.gateio.ws/api/v4/futures/usdt/tickers']
+        ? [
+            `https://api.gateio.ws/api/v4/futures/${settle}/tickers`,
+            `https://fx-api.gateio.ws/api/v4/futures/${settle}/tickers`,
+          ]
         : 'https://api.gateio.ws/api/v4/spot/tickers',
     );
     items = Array.isArray(payload) ? payload : [];
@@ -921,8 +1195,15 @@ async function tickers(provider, market, wantedSymbols = []) {
     items = payloadRows(payload);
   }
   return items
-    .map((item) => tickerRow(provider, market, item, item.symbol ?? item.instId ?? item.contract ?? item.currency_pair))
-    .filter(Boolean);
+    .map((item) => tickerRow(
+      provider,
+      market,
+      item,
+      item.symbol ?? item.instId ?? item.contract ?? item.currency_pair,
+    ))
+    .filter(Boolean)
+    .filter((row) => split(row.symbol)[1] === requestedQuote)
+    .filter((row) => !wanted.length || wanted.includes(row.symbol));
 }
 
 function krow(provider, market, symbol, interval, values) {
@@ -990,7 +1271,7 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
 }
 
 
-// Step650.8.15.24: calendar-month aggregation for safe Binance contract daily seeds.
+// Step650.8.15.25: calendar-month aggregation for safe Binance contract daily seeds.
 // A month is not a fixed 30-day duration, so use UTC year/month boundaries and never
 // interpolate or fabricate missing source candles.
 function aggregateCalendarMonths(sourceRows, provider, market, symbol) {
@@ -1159,27 +1440,63 @@ async function fetchBitgetContractKlines({ displaySymbol, nativeSymbol, quote, i
   throw lastError || new Error(`bitget contract kline unavailable for ${displaySymbol}`);
 }
 
-async function fetchBybitContractKlines({ displaySymbol, nativeSymbol, quote, interval, end, limit }) {
+async function fetchBybitContractKlines({
+  displaySymbol,
+  nativeSymbol,
+  quote,
+  interval,
+  end,
+  limit,
+}) {
   const bar = bybitBar(interval);
-  if (!bar) throw new Error(`bybit interval ${interval} requires aggregation`);
+  if (!bar) {
+    throw new Error(`bybit interval ${interval} requires aggregation`);
+  }
+  const category = bybitContractCategory(quote);
   const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 1000));
   const nearCurrent = Number(end) >= Date.now() - intervalMs(interval) * 2;
   const safeEnd = Math.min(Number(end) || Date.now(), Date.now());
-  const query = `/v5/market/kline?category=linear&symbol=${encodeURIComponent(nativeSymbol)}` +
-    `&interval=${encodeURIComponent(bar)}&limit=${safeLimit}` +
-    `${nearCurrent ? '' : `&end=${safeEnd}`}`;
-  const payload = await bybitPublicJson(query, { requireRows: true, timeout: 15_000 });
+  const query =
+      `/v5/market/kline?category=${category}` +
+      `&symbol=${encodeURIComponent(nativeSymbol)}` +
+      `&interval=${encodeURIComponent(bar)}` +
+      `&limit=${safeLimit}` +
+      `${nearCurrent ? '' : `&end=${safeEnd}`}`;
+  const payload = await bybitPublicJson(
+    query,
+    { requireRows: true, timeout: 15_000 },
+  );
   const rows = payloadRows(payload)
-    .map((a) => krow('bybit', 'contract', displaySymbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0]))
+    .map((a) => {
+      const inverse = category === 'inverse';
+      // Bybit official Kline units: linear volume=base, turnover=quote;
+      // inverse volume=quote(USD), turnover=base.
+      const baseVolume = inverse ? a[6] : a[5];
+      const quoteVolume = inverse ? a[5] : a[6];
+      const row = krow(
+        'bybit',
+        'contract',
+        displaySymbol,
+        interval,
+        [a[0], a[1], a[2], a[3], a[4], baseVolume, quoteVolume, 0],
+      );
+      if (!row) return null;
+      row.quantity_semantics = 'base_asset';
+      row.base_volume_unit = 'base_asset';
+      row.quote_volume_unit = 'quote_asset';
+      return row;
+    })
     .filter(Boolean)
     .map((row) => ({
       ...row,
       raw_symbol: nativeSymbol,
       native_symbol: nativeSymbol,
       quote_asset: quote,
-      source: 'bybit_official_usdc_contract_kline_render',
+      source: `bybit_official_${category}_contract_kline_render`,
     }));
-  if (!rows.length) throw new Error(`bybit empty kline result symbol=${nativeSymbol}`);
+  if (!rows.length) {
+    throw new Error(`bybit empty kline result symbol=${nativeSymbol}`);
+  }
   return rows;
 }
 
@@ -1236,17 +1553,20 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
     }
   } else if (provider === 'gate') {
     const bar = gateBar(interval, market);
-    const contractMultiplier = market === 'contract'
-      ? await marketContractBaseMultiplier('gate', symbol)
-      : 1;
+    const contractQuote = split(compact(symbol))[1];
+    const gateSettle = gateContractSettle(contractQuote);
+    const contractMultiplier =
+        market === 'contract' && contractQuote !== 'USD'
+            ? await marketContractBaseMultiplier('gate', symbol)
+            : null;
     if (!bar) throw new Error(`gate ${market} interval ${interval} requires aggregation`);
     const seconds = Math.max(1, Math.floor(intervalMs(interval) / 1000));
     const maxPoints = market === 'contract' ? 2000 : 1000;
     const maxPages = market === 'contract' ? 3 : 5;
     const endpointPaths = market === 'contract'
       ? [
-          'https://api.gateio.ws/api/v4/futures/usdt/candlesticks',
-          'https://fx-api.gateio.ws/api/v4/futures/usdt/candlesticks',
+          `https://api.gateio.ws/api/v4/futures/${gateSettle}/candlesticks`,
+          `https://fx-api.gateio.ws/api/v4/futures/${gateSettle}/candlesticks`,
         ]
       : ['https://api.gateio.ws/api/v4/spot/candlesticks'];
     const key = market === 'contract' ? 'contract' : 'currency_pair';
@@ -1265,21 +1585,34 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
           const close = num(a[2]);
           if (market === 'contract') {
             const contracts = Math.abs(num(a[1]) || 0);
-            const baseVolume = contractMultiplier === null
-              ? null
-              : contracts * contractMultiplier;
-            const quoteVolume = num(a[6]) ??
-              (baseVolume !== null && close !== null ? baseVolume * close : null);
+            const officialQuoteVolume = num(a[6]);
+            const baseVolume = contractQuote === 'USD'
+              ? (officialQuoteVolume !== null && close !== null && close > 0
+                  ? officialQuoteVolume / close
+                  : null)
+              : (contractMultiplier === null
+                  ? null
+                  : contracts * contractMultiplier);
+            const quoteVolume = officialQuoteVolume ??
+              (baseVolume !== null && close !== null
+                  ? baseVolume * close
+                  : null);
             const row = krow(
               provider,
               market,
               symbol,
               interval,
-              [Number(a[0]) * 1000, a[5], a[3], a[4], a[2], baseVolume, quoteVolume, 0],
+              [Number(a[0]) * 1000, a[5], a[3], a[4], a[2],
+               baseVolume, quoteVolume, 0],
             );
             if (row) {
               row.contract_count = contracts;
-              row.quantity_semantics = baseVolume === null ? 'contract_count' : 'base_asset';
+              row.quantity_semantics =
+                  baseVolume === null ? 'contract_count' : 'base_asset';
+              row.base_volume_unit =
+                  baseVolume === null ? null : 'base_asset';
+              row.quote_volume_unit =
+                  quoteVolume === null ? null : 'quote_asset';
             }
             return row;
           }
@@ -1296,21 +1629,34 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
         const close = num(a.c);
         if (market === 'contract') {
           const contracts = Math.abs(num(a.v) || 0);
-          const baseVolume = contractMultiplier === null
-            ? null
-            : contracts * contractMultiplier;
-          const quoteVolume = num(a.sum ?? a.a) ??
-            (baseVolume !== null && close !== null ? baseVolume * close : null);
+          const officialQuoteVolume = num(a.sum ?? a.a);
+          const baseVolume = contractQuote === 'USD'
+            ? (officialQuoteVolume !== null && close !== null && close > 0
+                ? officialQuoteVolume / close
+                : null)
+            : (contractMultiplier === null
+                ? null
+                : contracts * contractMultiplier);
+          const quoteVolume = officialQuoteVolume ??
+            (baseVolume !== null && close !== null
+                ? baseVolume * close
+                : null);
           const row = krow(
             provider,
             market,
             symbol,
             interval,
-            [Number(a.t) * 1000, a.o, a.h, a.l, a.c, baseVolume, quoteVolume, a.n],
+            [Number(a.t) * 1000, a.o, a.h, a.l, a.c,
+             baseVolume, quoteVolume, a.n],
           );
           if (row) {
             row.contract_count = contracts;
-            row.quantity_semantics = baseVolume === null ? 'contract_count' : 'base_asset';
+            row.quantity_semantics =
+                baseVolume === null ? 'contract_count' : 'base_asset';
+            row.base_volume_unit =
+                baseVolume === null ? null : 'base_asset';
+            row.quote_volume_unit =
+                quoteVolume === null ? null : 'quote_asset';
           }
           return row;
         }
@@ -1409,8 +1755,8 @@ async function marketContractBaseMultiplier(provider, symbol) {
       6 * 60 * 60_000,
       async () => {
         const payload = await jsonFetch([
-          `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(gateId(display))}`,
-          `https://fx-api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(gateId(display))}`,
+          `https://api.gateio.ws/api/v4/futures/${gateContractSettle(split(display)[1])}/contracts/${encodeURIComponent(gateId(display))}`,
+          `https://fx-api.gateio.ws/api/v4/futures/${gateContractSettle(split(display)[1])}/contracts/${encodeURIComponent(gateId(display))}`,
         ], 12_000);
         const multiplier = num(payload?.quanto_multiplier);
         return multiplier !== null && multiplier > 0 ? multiplier : null;
@@ -1517,7 +1863,9 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       }
     }
   } else if (provider === 'bybit') {
-    const category = market === 'contract' ? 'linear' : 'spot';
+    const category = market === 'contract'
+      ? bybitContractCategory(split(compact(symbol))[1])
+      : 'spot';
     const maxLimit = market === 'contract' ? 1000 : 60;
     const identity = market === 'contract'
       ? await resolveNativeMarketIdentity(provider, market, symbol)
@@ -1528,8 +1876,25 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       { requireRows: true, timeout: 20_000 },
     );
     for (const item of payloadRows(payload)) {
-      const trade = publicTrade(item.time ?? item.T, item.price ?? item.p, item.size ?? item.v, item.execId ?? item.i);
-      if (trade && trade.time <= end + 5_000) trades.push(trade);
+      const price = num(item.price ?? item.p);
+      const rawSize = num(item.size ?? item.v);
+      const baseSize = category === 'inverse' &&
+              price !== null && price > 0 && rawSize !== null
+          ? Math.abs(rawSize) / price
+          : rawSize;
+      const trade = publicTrade(
+        item.time ?? item.T,
+        price,
+        baseSize,
+        item.execId ?? item.i,
+      );
+      if (trade && trade.time <= end + 5_000) {
+        if (category === 'inverse') {
+          trade.quote_amount = Math.abs(rawSize || 0);
+          trade.quantity_unit = 'base_asset';
+        }
+        trades.push(trade);
+      }
     }
   } else if (provider === 'bitget') {
     let nativeSymbol = symbol;
@@ -1538,7 +1903,7 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       const identity = await resolveNativeMarketIdentity(provider, market, symbol);
       nativeSymbol = compact(identity.native_symbol || symbol);
       const quote = normalizedQuote(identity.quote_asset || split(compact(symbol))[1], 'USDT');
-      productType = quote === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES';
+      productType = bitgetContractCategory(quote);
     }
     const url = market === 'contract'
       ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${encodeURIComponent(nativeSymbol)}&productType=${encodeURIComponent(productType)}&limit=100`
@@ -1558,23 +1923,33 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'gate') {
     const raw = gateId(symbol);
+    const quote = split(compact(symbol))[1];
+    const settle = gateContractSettle(quote);
     const url = market === 'contract'
-      ? `https://api.gateio.ws/api/v4/futures/usdt/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
+      ? `https://api.gateio.ws/api/v4/futures/${settle}/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
       : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000`;
     const payload = await jsonFetch(url, 20_000);
-    const multiplier = market === 'contract'
-      ? await marketContractBaseMultiplier('gate', symbol)
-      : 1;
+    const multiplier =
+      market === 'contract' && quote !== 'USD'
+        ? await marketContractBaseMultiplier('gate', symbol)
+        : 1;
     for (const item of Array.isArray(payload) ? payload : []) {
       const timestamp = item.create_time_ms ?? item.time_ms ?? item.create_time ?? item.time;
       const rawSize = num(item.amount ?? item.size);
-      const baseSize = rawSize === null || multiplier === null
+      const price = num(item.price);
+      const baseSize = rawSize === null || price === null || price <= 0
         ? null
-        : Math.abs(rawSize) * multiplier;
-      const trade = publicTrade(timestamp, item.price, baseSize, item.id);
+        : (market === 'contract' && quote === 'USD'
+            ? Math.abs(rawSize) / price
+            : Math.abs(rawSize) * multiplier);
+      const trade = publicTrade(timestamp, price, baseSize, item.id);
       if (trade && trade.time <= end + 5_000) {
-        trade.raw_contract_count = market === 'contract' ? Math.abs(rawSize || 0) : null;
+        trade.raw_contract_count =
+            market === 'contract' ? Math.abs(rawSize || 0) : null;
         trade.quantity_unit = 'base_asset';
+        if (market === 'contract' && quote === 'USD') {
+          trade.quote_amount = Math.abs(rawSize || 0);
+        }
         trades.push(trade);
       }
     }
@@ -1602,7 +1977,8 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
         low: trade.price,
         close: trade.price,
         volume: trade.size,
-        quote_volume: trade.size * trade.price,
+        quote_volume: num(trade.quote_amount) ??
+          trade.size * trade.price,
         trade_count: 1,
         source: `${provider}_official_public_trade_1s_render`,
       });
@@ -1611,7 +1987,8 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
       current.low = Math.min(current.low, trade.price);
       current.close = trade.price;
       current.volume += trade.size;
-      current.quote_volume += trade.size * trade.price;
+      current.quote_volume +=
+        num(trade.quote_amount) ?? trade.size * trade.price;
       current.trade_count += 1;
     }
   }
@@ -1651,7 +2028,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
       maxRestCalls: 1,
     });
 
-    // Step650.8.15.24: a sparse/empty direct monthly seed can occur when the current monthly
+    // Step650.8.15.25: a sparse/empty direct monthly seed can occur when the current monthly
     // archive is not yet available. Reuse the same safe seed chain for official daily candles
     // and aggregate them by real UTC calendar month. This sends no Render-direct Binance REST.
     if (interval === '1M' && seedRows.length < 3) {
@@ -1704,55 +2081,91 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
 
 const BINANCE_COMMON_QUOTE_ASSETS = Object.freeze([
   'USDT', 'USDC', 'FDUSD', 'USD1', 'USD',
-  'BTC', 'BNB', 'ETH', 'EUR', 'JPY',
+  'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY',
+  'TRY', 'BRL', 'AUD', 'CAD',
 ]);
 
-async function binanceAssetQuoteSummary(rawBase) {
+const ASSET_QUOTE_CANDIDATES = Object.freeze([
+  'USDT', 'USDC', 'FDUSD', 'USD1', 'USD',
+  'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY',
+  'TRY', 'BRL', 'AUD', 'CAD',
+]);
+
+async function assetQuoteSummary(rawBase) {
   const base = compact(rawBase);
   if (!base) throw new Error('base required');
 
   return await sharedMarketResult(
-    `binance_asset_quotes:${base}`,
+    `asset_quote_summary:${base}`,
     5 * 60_000,
     async () => {
       const counts = new Map(
-        BINANCE_COMMON_QUOTE_ASSETS.map((quote) => [
+        ASSET_QUOTE_CANDIDATES.map((quote) => [
           quote,
-          { quote_asset: quote, spot_count: 0, contract_count: 0 },
+          {
+            quote_asset: quote,
+            spot_count: 0,
+            contract_count: 0,
+            providers: {},
+          },
         ]),
       );
 
-      const payload = await sharedBinanceResult(
-        'spot_universe:exchange_info',
-        6 * 60 * 60_000,
-        () => binanceRestJsonFetch(
-          'https://data-api.binance.vision/api/v3/exchangeInfo',
-          15_000,
-          'spot_universe:exchange_info',
-        ),
+      const spotGroups = await Promise.all(
+        SPOT_PROVIDERS.map(async (provider) => {
+          try {
+            return [provider, await universeCatalog(provider, 'spot')];
+          } catch (_) {
+            return [provider, []];
+          }
+        }),
       );
-      for (const item of payload.symbols || []) {
-        if (String(item.status || '').toUpperCase() !== 'TRADING') continue;
-        if (String(item.baseAsset || '').toUpperCase() !== base) continue;
-        const quote = String(item.quoteAsset || '').toUpperCase();
-        const row = counts.get(quote);
-        if (row) row.spot_count += 1;
+      for (const [provider, rows] of spotGroups) {
+        for (const item of rows) {
+          if (String(item.base_asset || '').toUpperCase() !== base) {
+            continue;
+          }
+          const quote =
+              String(item.quote_asset || '').toUpperCase();
+          const target = counts.get(quote);
+          if (!target) continue;
+          target.spot_count += 1;
+          target.providers[provider] = {
+            ...(target.providers[provider] || {}),
+            spot_count:
+                Number(target.providers[provider]?.spot_count || 0) + 1,
+            contract_count:
+                Number(target.providers[provider]?.contract_count || 0),
+          };
+        }
       }
 
-      // Binance contract scope in the App is USDⓈ-M. Use only the existing
-      // official WebSocket universe snapshots for USDT and USDC; never fapi REST.
-      for (const quote of ['USDT', 'USDC']) {
-        try {
-          const rows = await getBinanceContractUniverse({ quote });
-          const row = counts.get(quote);
-          if (row) {
-            row.contract_count = rows.filter((item) =>
-              String(item.base_asset || '').toUpperCase() === base &&
-              String(item.quote_asset || '').toUpperCase() === quote
-            ).length;
+      const contractGroups = await Promise.all(
+        CONTRACT_PROVIDERS.map(async (provider) => {
+          try {
+            return [provider, await universeCatalog(provider, 'contract')];
+          } catch (_) {
+            return [provider, []];
           }
-        } catch (_) {
-          // Snapshot unavailable never enables a quote without a real row.
+        }),
+      );
+      for (const [provider, rows] of contractGroups) {
+        for (const item of rows) {
+          if (String(item.base_asset || '').toUpperCase() !== base) {
+            continue;
+          }
+          const quote =
+              String(item.quote_asset || '').toUpperCase();
+          const target = counts.get(quote);
+          if (!target) continue;
+          target.contract_count += 1;
+          target.providers[provider] = {
+            ...(target.providers[provider] || {}),
+            spot_count:
+                Number(target.providers[provider]?.spot_count || 0),
+            contract_count:
+                Number(target.providers[provider]?.contract_count || 0) + 1,
+          };
         }
       }
 
@@ -1764,11 +2177,16 @@ async function binanceAssetQuoteSummary(rawBase) {
         .filter((row) => row.total_count > 0)
         .sort((a, b) =>
           (b.total_count - a.total_count) ||
-          (BINANCE_COMMON_QUOTE_ASSETS.indexOf(a.quote_asset) -
-            BINANCE_COMMON_QUOTE_ASSETS.indexOf(b.quote_asset))
+          (ASSET_QUOTE_CANDIDATES.indexOf(a.quote_asset) -
+            ASSET_QUOTE_CANDIDATES.indexOf(b.quote_asset))
         );
     },
   );
+}
+
+async function binanceAssetQuoteSummary(rawBase) {
+  // Backward-compatible route. Step657 App uses the all-provider route.
+  return assetQuoteSummary(rawBase);
 }
 
 
@@ -1858,7 +2276,11 @@ export function getBinanceMarketRestHealth() {
   return {
     spot_market_data_host: 'data-api.binance.vision',
     binance_asset_quote_discovery_enabled: true,
+    all_provider_asset_quote_discovery_enabled: true,
+    contract_quote_support: CONTRACT_QUOTES_BY_PROVIDER,
+    binance_coin_m_usd_enabled: false,
     binance_asset_quote_candidates: BINANCE_COMMON_QUOTE_ASSETS,
+    asset_quote_candidates: ASSET_QUOTE_CANDIDATES,
     exact_quote_normalization: SUPPORTED_EXACT_QUOTE_ASSETS,
     market_unit_self_test: marketUnitSelfTest(),
     shared_cache_entries: binanceSharedCache.size,
@@ -1872,6 +2294,8 @@ export function getBinanceMarketRestHealth() {
 
 const OWNED_MARKET_API_PATHS = new Set([
   '/api/binance-asset-quotes',
+  '/api/asset-quote-summary',
+  '/api/contract-quote-self-test',
   '/api/market-unit-self-test',
   '/api/universe',
   '/api/tickers',
@@ -1949,7 +2373,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.24',
+        version: '650.8.15.25',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -1961,7 +2385,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.24',
+        version: '650.8.15.25',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -1971,7 +2395,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.24',
+        version: '650.8.15.25',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -1980,7 +2404,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.24',
+        version: '650.8.15.25',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -1990,8 +2414,44 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.24',
+        version: '650.8.15.25',
         self_test: selfTest,
+      });
+      return true;
+    }
+    if (url.pathname === '/api/contract-quote-self-test') {
+      const tests = [
+        ['okx_usdc', contractQuoteSupported('okx', 'USDC')],
+        ['okx_usd', contractQuoteSupported('okx', 'USD')],
+        ['bybit_usd_inverse', bybitContractCategory('USD') === 'inverse'],
+        ['bitget_usd_coin', bitgetContractCategory('USD') === 'COIN-FUTURES'],
+        ['gate_usd_btc_settle', gateContractSettle('USD') === 'btc'],
+        ['binance_usd_disabled', !contractQuoteSupported('binance', 'USD')],
+      ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
+      send(res, tests.every((item) => item.ok) ? 200 : 500, {
+        ok: tests.every((item) => item.ok),
+        version: '650.8.15.25',
+        checks: tests.length,
+        tests,
+      });
+      return true;
+    }
+    if (url.pathname === '/api/asset-quote-summary') {
+      const base = compact(url.searchParams.get('base'));
+      if (!base) {
+        send(res, 400, { ok: false, error: 'base required', rows: [] });
+        return true;
+      }
+      const rows = await assetQuoteSummary(base);
+      send(res, 200, {
+        ok: true,
+        version: '650.8.15.25',
+        base_asset: base,
+        rows,
+        total_quote_assets: rows.length,
+        source: 'six_spot_and_five_contract_official_public_catalogs',
+        binance_coin_m_usd_enabled: false,
+        cached_at: new Date().toISOString(),
       });
       return true;
     }
@@ -2004,12 +2464,12 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.24',
+        version: '650.8.15.25',
         provider: 'binance',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
-        source: 'binance_official_exchange_info_and_contract_websocket_snapshot',
+        source: 'six_spot_and_five_contract_official_public_catalogs_compat',
         cached_at: new Date().toISOString(),
       });
       return true;
@@ -2125,7 +2585,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.24',
+        version: '650.8.15.25',
         provider,
         market_type: market,
         symbol,

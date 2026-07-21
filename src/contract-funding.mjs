@@ -2,7 +2,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.24';
+const VERSION = '650.8.15.25';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -43,21 +43,52 @@ function splitSymbol(symbol) {
 function supportsNativeContract(provider, symbol) {
   const { quote } = splitSymbol(symbol);
   if (quote === 'USDT') return SUPPORTED.has(provider);
-  if (quote === 'USDC') return provider === 'binance' || provider === 'bybit' || provider === 'bitget';
+  if (quote === 'USDC') {
+    return provider === 'binance' ||
+      provider === 'okx' ||
+      provider === 'bybit' ||
+      provider === 'bitget';
+  }
+  if (quote === 'USD') {
+    return provider === 'okx' ||
+      provider === 'bybit' ||
+      provider === 'bitget' ||
+      provider === 'gate';
+  }
   return false;
+}
+function bybitCategory(symbol) {
+  return splitSymbol(symbol).quote === 'USD'
+    ? 'inverse'
+    : 'linear';
+}
+function gateSettle(symbol) {
+  return splitSymbol(symbol).quote === 'USD'
+    ? 'btc'
+    : 'usdt';
 }
 
 function nativeSymbol(provider, symbol) {
   const { base, quote } = splitSymbol(symbol);
   if (!supportsNativeContract(provider, symbol)) throw new Error('unsupported_native_contract_quote');
-  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') return `${base}PERP`;
+  if ((provider === 'bybit' || provider === 'bitget') &&
+      quote === 'USDC') {
+    return `${base}PERP`;
+  }
+  if ((provider === 'bybit' || provider === 'bitget') &&
+      quote === 'USD') {
+    return `${base}USD`;
+  }
   if (provider === 'okx') return `${base}-${quote}-SWAP`;
   if (provider === 'gate') return `${base}_${quote}`;
   return symbol;
 }
 
 function bitgetProductType(symbol) {
-  return splitSymbol(symbol).quote === 'USDC' ? 'usdc-futures' : 'usdt-futures';
+  const quote = splitSymbol(symbol).quote;
+  if (quote === 'USDC') return 'usdc-futures';
+  if (quote === 'USD') return 'coin-futures';
+  return 'usdt-futures';
 }
 
 function numberOrNull(value) {
@@ -330,8 +361,8 @@ async function fetchOkx(symbol, limit) {
 async function fetchBybit(symbol, limit) {
   const native = nativeSymbol('bybit', symbol);
   const { currentRaw, historyRaw, warnings } = await fetchPair(
-    `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(native)}`,
-    `https://api.bybit.com/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(native)}&limit=${limit}`,
+    `https://api.bybit.com/v5/market/tickers?category=${bybitCategory(symbol)}&symbol=${encodeURIComponent(native)}`,
+    `https://api.bybit.com/v5/market/funding/history?category=${bybitCategory(symbol)}&symbol=${encodeURIComponent(native)}&limit=${limit}`,
   );
   const item = Array.isArray(currentRaw?.result?.list) ? currentRaw.result.list[0] : null;
   const current = currentRow({
@@ -378,8 +409,8 @@ async function fetchBitget(symbol, limit) {
 async function fetchGate(symbol, limit) {
   const native = nativeSymbol('gate', symbol);
   const { currentRaw: contractRaw, historyRaw, warnings } = await fetchPair(
-    `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(native)}`,
-    `https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract=${encodeURIComponent(native)}&limit=${limit}`,
+    `https://api.gateio.ws/api/v4/futures/${gateSettle(symbol)}/contracts/${encodeURIComponent(native)}`,
+    `https://api.gateio.ws/api/v4/futures/${gateSettle(symbol)}/funding_rate?contract=${encodeURIComponent(native)}&limit=${limit}`,
   );
   const current = currentRow({
     provider: 'gate', symbol,
@@ -421,6 +452,12 @@ export async function handleContractFunding(req, res, url) {
       binance_current_transport: 'mark_price_websocket',
       binance_history_transport: 'authenticated_edge_relay_background',
       first_paint_waits_for_history: false,
+      native_contract_quotes: {
+        USDT: ['binance','okx','bybit','bitget','gate'],
+        USDC: ['binance','okx','bybit','bitget'],
+        USD: ['okx','bybit','bitget','gate'],
+      },
+      binance_coin_m_usd_enabled: false,
       history_background_delay_ms: BINANCE_HISTORY_BACKGROUND_DELAY_MS,
       time: new Date().toISOString(),
     });

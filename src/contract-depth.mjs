@@ -1,5 +1,5 @@
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.24';
+const STEP_VERSION = '650.8.15.25';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -446,7 +446,7 @@ function compactSymbol(value) {
 
 function quoteFromCompact(symbol) {
   // Longest quote first so BTCFDUSD is parsed as BTC / FDUSD, never BTCFD / USD.
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'JPY']) {
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'TRY', 'BRL', 'AUD', 'CAD']) {
     if (symbol.endsWith(quote) && symbol.length > quote.length) return quote;
   }
   return 'USDT';
@@ -458,9 +458,29 @@ function baseFromCompact(symbol) {
 }
 
 function contractQuoteSupported(provider, quote) {
-  if (quote === 'USDT') return ['binance', 'okx', 'bybit', 'bitget', 'gate'].includes(provider);
-  if (quote === 'USDC') return ['binance', 'bybit', 'bitget'].includes(provider);
+  if (quote === 'USDT') {
+    return ['binance', 'okx', 'bybit', 'bitget', 'gate']
+      .includes(provider);
+  }
+  if (quote === 'USDC') {
+    return ['binance', 'okx', 'bybit', 'bitget']
+      .includes(provider);
+  }
+  if (quote === 'USD') {
+    return ['okx', 'bybit', 'bitget', 'gate']
+      .includes(provider);
+  }
   return false;
+}
+function bybitCategory(rawSymbol) {
+  return quoteFromCompact(compactSymbol(rawSymbol)) === 'USD'
+    ? 'inverse'
+    : 'linear';
+}
+function gateSettle(rawSymbol) {
+  return quoteFromCompact(compactSymbol(rawSymbol)) === 'USD'
+    ? 'btc'
+    : 'usdt';
 }
 
 function providerSymbol(provider, rawSymbol, marketType = 'contract') {
@@ -478,14 +498,24 @@ function providerSymbol(provider, rawSymbol, marketType = 'contract') {
     error.statusCode = 400;
     throw error;
   }
-  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') return `${base}PERP`;
+  if ((provider === 'bybit' || provider === 'bitget') &&
+      quote === 'USDC') {
+    return `${base}PERP`;
+  }
+  if ((provider === 'bybit' || provider === 'bitget') &&
+      quote === 'USD') {
+    return `${base}USD`;
+  }
   if (provider === 'okx') return `${base}-${quote}-SWAP`;
   if (provider === 'gate') return `${base}_${quote}`;
   return `${base}${quote}`;
 }
 
 function bitgetProductType(rawSymbol) {
-  return quoteFromCompact(compactSymbol(rawSymbol)) === 'USDC' ? 'usdc-futures' : 'usdt-futures';
+  const quote = quoteFromCompact(compactSymbol(rawSymbol));
+  if (quote === 'USDC') return 'usdc-futures';
+  if (quote === 'USD') return 'coin-futures';
+  return 'usdt-futures';
 }
 
 function numberValue(value) {
@@ -592,71 +622,132 @@ async function fetchFirstJson(urls, timeoutMs = 8_000) {
   throw lastError || new Error('all_upstreams_failed');
 }
 
-function normalizeLevels(rawLevels, { quantityMultiplier = 1, side = 'bid', objectPriceKeys = ['price', 'p', 'px'], objectSizeKeys = ['quantity', 'size', 's', 'sz'] } = {}) {
-  if (!Array.isArray(rawLevels)) return [];
+function normalizeLevels(
+  source,
+  {
+    side,
+    quantityMultiplier = 1,
+    quantityFromContracts = null,
+    quantityUnit = 'base_asset',
+  } = {},
+) {
+  const rows = Array.isArray(source) ? source : [];
   const result = [];
-  for (const raw of rawLevels) {
+  for (const raw of rows) {
     let rawPrice;
     let rawSize;
-    let contractCount = null;
     if (Array.isArray(raw)) {
       rawPrice = raw[0];
       rawSize = raw[1];
     } else if (raw && typeof raw === 'object') {
-      rawPrice = objectPriceKeys.map((key) => raw[key]).find((value) => value != null);
-      rawSize = objectSizeKeys.map((key) => raw[key]).find((value) => value != null);
+      rawPrice = ['price', 'p', 'px']
+        .map((key) => raw[key])
+        .find((value) => value != null);
+      rawSize = ['quantity', 'size', 'amount', 'q', 'sz']
+        .map((key) => raw[key])
+        .find((value) => value != null);
     }
     const price = positiveNumber(rawPrice);
     const size = numberValue(rawSize);
     if (price == null || size == null || size === 0) continue;
-    contractCount = Math.abs(size);
-    const quantity = contractCount * quantityMultiplier;
+    const contracts = Math.abs(size);
+    const quantity = typeof quantityFromContracts === 'function'
+      ? quantityFromContracts(contracts, price)
+      : contracts * quantityMultiplier;
     if (!Number.isFinite(quantity) || quantity <= 0) continue;
+    const quoteAmount = quantityUnit === 'base_asset'
+      ? price * quantity
+      : null;
     result.push({
       price,
       quantity,
-      quote_amount: price * quantity,
-      if_contracts: quantityMultiplier === 1 ? undefined : contractCount,
+      quote_amount: quoteAmount,
+      quantity_contracts:
+          quantityUnit === 'contracts' ||
+          quantityMultiplier !== 1 ||
+          typeof quantityFromContracts === 'function'
+              ? contracts
+              : undefined,
+      quantity_unit: quantityUnit,
     });
   }
-  result.sort((a, b) => side === 'bid' ? b.price - a.price : a.price - b.price);
+  result.sort((a, b) =>
+    side === 'bid' ? b.price - a.price : a.price - b.price,
+  );
   return result.map((row) => {
     const copy = { ...row };
-    if (copy.if_contracts == null) delete copy.if_contracts;
-    else {
-      copy.quantity_contracts = copy.if_contracts;
-      delete copy.if_contracts;
+    if (copy.quantity_contracts == null) {
+      delete copy.quantity_contracts;
     }
+    if (copy.quote_amount == null) delete copy.quote_amount;
     return copy;
   });
 }
 
-async function okxContractMultiplier(instId) {
+async function okxContractMeta(instId) {
   const key = `okx:${instId}`;
   const cached = CONTRACT_META_CACHE.get(key);
-  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) return cached.multiplier;
-  const url = `https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`;
+  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) {
+    return cached.meta;
+  }
+  const url =
+      `https://www.okx.com/api/v5/public/instruments` +
+      `?instType=SWAP&instId=${encodeURIComponent(instId)}`;
   const decoded = await fetchJson(url, 8_000);
-  const row = Array.isArray(decoded?.data) ? decoded.data[0] : null;
-  const ctVal = positiveNumber(row?.ctVal) ?? 1;
+  const row =
+      Array.isArray(decoded?.data) ? decoded.data[0] : null;
+  const ctVal = positiveNumber(row?.ctVal);
   const ctMult = positiveNumber(row?.ctMult) ?? 1;
-  const multiplier = ctVal * ctMult;
-  CONTRACT_META_CACHE.set(key, { multiplier, storedAt: Date.now() });
-  return multiplier;
+  const valueCurrency =
+      String(row?.ctValCcy || '').toUpperCase();
+  const parts = String(instId).toUpperCase().split('-');
+  const base = parts[0] || '';
+  const quote = parts[1] || '';
+  const contractValue =
+      ctVal == null ? null : ctVal * ctMult;
+  const meta = {
+    base,
+    quote,
+    contract_value: contractValue,
+    contract_value_currency: valueCurrency,
+    base_multiplier:
+        contractValue != null && valueCurrency === base
+            ? contractValue
+            : null,
+    quote_multiplier:
+        contractValue != null && valueCurrency === quote
+            ? contractValue
+            : null,
+  };
+  CONTRACT_META_CACHE.set(key, {
+    meta,
+    storedAt: Date.now(),
+  });
+  return meta;
 }
 
-async function gateContractMultiplier(contract) {
+async function gateContractMeta(contract) {
   const key = `gate:${contract}`;
   const cached = CONTRACT_META_CACHE.get(key);
-  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) return cached.multiplier;
+  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) {
+    return cached.meta;
+  }
+  const settle = gateSettle(contract);
   const urls = [
-    `https://fx-api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
-    `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
+    `https://fx-api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
+    `https://api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
   ];
   const { data } = await fetchFirstJson(urls, 8_000);
-  const multiplier = positiveNumber(data?.quanto_multiplier) ?? 1;
-  CONTRACT_META_CACHE.set(key, { multiplier, storedAt: Date.now() });
-  return multiplier;
+  const meta = {
+    type: String(data?.type || '').toLowerCase(),
+    multiplier: positiveNumber(data?.quanto_multiplier),
+    settle,
+  };
+  CONTRACT_META_CACHE.set(key, {
+    meta,
+    storedAt: Date.now(),
+  });
+  return meta;
 }
 
 async function loadBinance(view, symbol, limit) {
@@ -687,69 +778,220 @@ async function loadBinance(view, symbol, limit) {
 
 async function loadOkx(view, symbol, limit) {
   const native = providerSymbol('okx', symbol);
-  const multiplier = await okxContractMultiplier(native);
+  const meta = await okxContractMeta(native);
+  const convertContracts = (contracts, price) => {
+    if (meta.base_multiplier != null) {
+      return contracts * meta.base_multiplier;
+    }
+    if (meta.quote_multiplier != null && price > 0) {
+      return contracts * meta.quote_multiplier / price;
+    }
+    return null;
+  };
   if (view === 'trades') {
-    const url = `https://www.okx.com/api/v5/market/trades?instId=${encodeURIComponent(native)}&limit=${limit}`;
+    const url =
+        `https://www.okx.com/api/v5/market/trades` +
+        `?instId=${encodeURIComponent(native)}&limit=${limit}`;
     const data = await fetchJson(url);
-    if (String(data?.code ?? '0') !== '0' || !Array.isArray(data?.data)) throw new Error(`okx_trades_${data?.code ?? 'invalid'}`);
+    if (String(data?.code ?? '0') !== '0' ||
+        !Array.isArray(data?.data)) {
+      throw new Error(`okx_trades_${data?.code ?? 'invalid'}`);
+    }
     const items = data.data.map((row) => {
       const price = positiveNumber(row?.px);
       const contracts = positiveNumber(row?.sz);
-      const quantity = contracts == null ? null : contracts * multiplier;
+      const quantity =
+          price == null || contracts == null
+              ? null
+              : convertContracts(contracts, price);
       const timeMs = integerValue(row?.ts);
       const side = String(row?.side || '').toLowerCase();
-      if (price == null || quantity == null || quantity <= 0 || timeMs <= 0 || !['buy', 'sell'].includes(side)) return null;
+      if (price == null ||
+          contracts == null ||
+          timeMs <= 0 ||
+          !['buy', 'sell'].includes(side)) {
+        return null;
+      }
+      if (quantity == null || quantity <= 0) {
+        return {
+          id: String(row?.tradeId ??
+              `${timeMs}:${price}:${contracts}`),
+          time_ms: timeMs,
+          price,
+          quantity: contracts,
+          quantity_contracts: contracts,
+          quantity_unit: 'contracts',
+          side,
+        };
+      }
       return {
-        id: String(row?.tradeId ?? `${timeMs}:${price}:${quantity}`),
+        id: String(row?.tradeId ??
+            `${timeMs}:${price}:${quantity}`),
         time_ms: timeMs,
         price,
         quantity,
         quantity_contracts: contracts,
+        quantity_unit: 'base_asset',
         quote_amount: price * quantity,
         side,
       };
     }).filter(Boolean);
-    return { items, timestamp_ms: items[0]?.time_ms || Date.now(), upstream_host: 'www.okx.com', native_symbol: native, quantity_unit: 'base_asset', contract_multiplier: multiplier };
+    const quantityUnit = items.some(
+      (row) => row.quantity_unit === 'base_asset',
+    ) ? 'base_asset' : 'contracts';
+    return {
+      items,
+      timestamp_ms: items[0]?.time_ms || Date.now(),
+      upstream_host: 'www.okx.com',
+      native_symbol: native,
+      quantity_unit: quantityUnit,
+      contract_value: meta.contract_value,
+      contract_value_currency:
+          meta.contract_value_currency,
+    };
   }
-  const url = `https://www.okx.com/api/v5/market/books?instId=${encodeURIComponent(native)}&sz=${Math.max(1, Math.min(limit, 20))}`;
+
+  const url =
+      `https://www.okx.com/api/v5/market/books` +
+      `?instId=${encodeURIComponent(native)}` +
+      `&sz=${Math.max(1, Math.min(limit, 20))}`;
   const data = await fetchJson(url);
-  if (String(data?.code ?? '0') !== '0' || !Array.isArray(data?.data) || !data.data[0]) throw new Error(`okx_orderbook_${data?.code ?? 'invalid'}`);
+  if (String(data?.code ?? '0') !== '0' ||
+      !Array.isArray(data?.data) ||
+      !data.data[0]) {
+    throw new Error(`okx_orderbook_${data?.code ?? 'invalid'}`);
+  }
   const row = data.data[0];
-  const bids = normalizeLevels(row?.bids, { side: 'bid', quantityMultiplier: multiplier });
-  const asks = normalizeLevels(row?.asks, { side: 'ask', quantityMultiplier: multiplier });
-  return { bids, asks, timestamp_ms: integerValue(row?.ts) || Date.now(), upstream_host: 'www.okx.com', native_symbol: native, quantity_unit: 'base_asset', contract_multiplier: multiplier };
+  const canConvert =
+      meta.base_multiplier != null ||
+      meta.quote_multiplier != null;
+  const bids = normalizeLevels(row?.bids, {
+    side: 'bid',
+    quantityFromContracts:
+        canConvert ? convertContracts : null,
+    quantityUnit: canConvert ? 'base_asset' : 'contracts',
+  });
+  const asks = normalizeLevels(row?.asks, {
+    side: 'ask',
+    quantityFromContracts:
+        canConvert ? convertContracts : null,
+    quantityUnit: canConvert ? 'base_asset' : 'contracts',
+  });
+  return {
+    bids,
+    asks,
+    timestamp_ms: integerValue(row?.ts) || Date.now(),
+    upstream_host: 'www.okx.com',
+    native_symbol: native,
+    quantity_unit: canConvert ? 'base_asset' : 'contracts',
+    contract_value: meta.contract_value,
+    contract_value_currency:
+        meta.contract_value_currency,
+  };
 }
 
 async function loadBybit(view, symbol, limit) {
   const native = providerSymbol('bybit', symbol);
+  const category = bybitCategory(symbol);
   if (view === 'trades') {
-    const url = `https://api.bybit.com/v5/market/recent-trade?category=linear&symbol=${encodeURIComponent(native)}&limit=${limit}`;
+    const url =
+        `https://api.bybit.com/v5/market/recent-trade` +
+        `?category=${category}` +
+        `&symbol=${encodeURIComponent(native)}` +
+        `&limit=${limit}`;
     const data = await fetchJson(url);
-    if (integerValue(data?.retCode) !== 0 || !Array.isArray(data?.result?.list)) throw new Error(`bybit_trades_${data?.retCode ?? 'invalid'}`);
+    if (integerValue(data?.retCode) !== 0 ||
+        !Array.isArray(data?.result?.list)) {
+      throw new Error(
+        `bybit_trades_${data?.retCode ?? 'invalid'}`,
+      );
+    }
     const items = data.result.list.map((row) => {
       const price = positiveNumber(row?.p ?? row?.price);
-      const quantity = positiveNumber(row?.v ?? row?.size);
+      const rawQuantity = positiveNumber(row?.v ?? row?.size);
+      const quantity =
+          category === 'inverse' &&
+          price != null &&
+          rawQuantity != null
+              ? rawQuantity / price
+              : rawQuantity;
       const timeMs = integerValue(row?.T ?? row?.time);
-      const rawSide = String(row?.S ?? row?.side ?? '').toLowerCase();
-      const side = rawSide === 'buy' ? 'buy' : rawSide === 'sell' ? 'sell' : '';
-      if (price == null || quantity == null || timeMs <= 0 || !side) return null;
+      const rawSide =
+          String(row?.S ?? row?.side ?? '').toLowerCase();
+      const side =
+          rawSide === 'buy'
+              ? 'buy'
+              : rawSide === 'sell'
+                  ? 'sell'
+                  : '';
+      if (price == null ||
+          quantity == null ||
+          timeMs <= 0 ||
+          !side) {
+        return null;
+      }
       return {
-        id: String(row?.i ?? row?.execId ?? `${timeMs}:${price}:${quantity}`),
+        id: String(row?.i ?? row?.execId ??
+            `${timeMs}:${price}:${quantity}`),
         time_ms: timeMs,
         price,
         quantity,
-        quote_amount: price * quantity,
+        quantity_unit: 'base_asset',
+        quote_amount:
+            category === 'inverse'
+                ? rawQuantity
+                : price * quantity,
         side,
       };
     }).filter(Boolean);
-    return { items, timestamp_ms: items[0]?.time_ms || integerValue(data?.time) || Date.now(), upstream_host: 'api.bybit.com', native_symbol: native };
+    return {
+      items,
+      timestamp_ms:
+          items[0]?.time_ms ||
+          integerValue(data?.time) ||
+          Date.now(),
+      upstream_host: 'api.bybit.com',
+      native_symbol: native,
+      quantity_unit: 'base_asset',
+    };
   }
-  const url = `https://api.bybit.com/v5/market/orderbook?category=linear&symbol=${encodeURIComponent(native)}&limit=${Math.max(1, Math.min(limit, 50))}`;
+
+  const url =
+      `https://api.bybit.com/v5/market/orderbook` +
+      `?category=${category}` +
+      `&symbol=${encodeURIComponent(native)}` +
+      `&limit=${Math.max(1, Math.min(limit, 50))}`;
   const data = await fetchJson(url);
-  if (integerValue(data?.retCode) !== 0 || !data?.result) throw new Error(`bybit_orderbook_${data?.retCode ?? 'invalid'}`);
-  const bids = normalizeLevels(data.result.b, { side: 'bid' });
-  const asks = normalizeLevels(data.result.a, { side: 'ask' });
-  return { bids, asks, timestamp_ms: integerValue(data.result.cts) || integerValue(data.result.ts) || integerValue(data?.time) || Date.now(), upstream_host: 'api.bybit.com', native_symbol: native };
+  if (integerValue(data?.retCode) !== 0 || !data?.result) {
+    throw new Error(
+      `bybit_orderbook_${data?.retCode ?? 'invalid'}`,
+    );
+  }
+  const converter = category === 'inverse'
+      ? (contracts, price) => contracts / price
+      : null;
+  const bids = normalizeLevels(data.result.b, {
+    side: 'bid',
+    quantityFromContracts: converter,
+    quantityUnit: 'base_asset',
+  });
+  const asks = normalizeLevels(data.result.a, {
+    side: 'ask',
+    quantityFromContracts: converter,
+    quantityUnit: 'base_asset',
+  });
+  return {
+    bids,
+    asks,
+    timestamp_ms:
+        integerValue(data.result.cts) ||
+        integerValue(data.result.ts) ||
+        integerValue(data?.time) ||
+        Date.now(),
+    upstream_host: 'api.bybit.com',
+    native_symbol: native,
+    quantity_unit: 'base_asset',
+  };
 }
 
 async function loadBitget(view, symbol, limit) {
@@ -787,40 +1029,112 @@ async function loadBitget(view, symbol, limit) {
 
 async function loadGate(view, symbol, limit) {
   const native = providerSymbol('gate', symbol);
-  const multiplier = await gateContractMultiplier(native);
-  const bases = ['https://fx-api.gateio.ws/api/v4', 'https://api.gateio.ws/api/v4'];
+  const settle = gateSettle(symbol);
+  const meta = await gateContractMeta(native);
+  const bases = [
+    'https://fx-api.gateio.ws/api/v4',
+    'https://api.gateio.ws/api/v4',
+  ];
   if (view === 'trades') {
-    const urls = bases.map((base) => `${base}/futures/usdt/trades?contract=${encodeURIComponent(native)}&limit=${limit}`);
+    const urls = bases.map((base) =>
+      `${base}/futures/${settle}/trades` +
+      `?contract=${encodeURIComponent(native)}` +
+      `&limit=${limit}`,
+    );
     const { data, url } = await fetchFirstJson(urls);
     if (!Array.isArray(data)) throw new Error('gate_trades_invalid');
     const items = data.map((row) => {
       const price = positiveNumber(row?.price);
-      const contractsSigned = numberValue(row?.size);
-      const contracts = contractsSigned == null ? null : Math.abs(contractsSigned);
-      const quantity = contracts == null ? null : contracts * multiplier;
-      const timeMs = integerValue(row?.create_time_ms) || integerValue(row?.create_time) * 1000;
-      const rawSide = String(row?.side || '').toLowerCase();
-      const side = rawSide === 'buy' || rawSide === 'sell'
-        ? rawSide
-        : contractsSigned != null && contractsSigned > 0 ? 'buy' : contractsSigned != null && contractsSigned < 0 ? 'sell' : '';
-      if (price == null || quantity == null || quantity <= 0 || timeMs <= 0 || !side) return null;
+      const contracts = positiveNumber(
+        row?.size ?? row?.amount,
+      );
+      const timeMs =
+          integerValue(row?.create_time_ms) ||
+          integerValue(row?.time_ms) ||
+          integerValue(row?.create_time) * 1000 ||
+          integerValue(row?.time) * 1000;
+      const rawSize = numberValue(row?.size ?? row?.amount);
+      const side =
+          rawSize != null
+              ? (rawSize >= 0 ? 'buy' : 'sell')
+              : String(row?.side || '').toLowerCase();
+      if (price == null ||
+          contracts == null ||
+          timeMs <= 0 ||
+          !['buy', 'sell'].includes(side)) {
+        return null;
+      }
+      if (settle === 'btc') {
+        return {
+          id: String(row?.id ??
+              `${timeMs}:${price}:${contracts}`),
+          time_ms: timeMs,
+          price,
+          quantity: contracts,
+          quantity_contracts: contracts,
+          quantity_unit: 'contracts',
+          side,
+        };
+      }
+      const multiplier = meta.multiplier ?? 1;
+      const quantity = contracts * multiplier;
       return {
-        id: String(row?.id ?? `${timeMs}:${price}:${quantity}`),
+        id: String(row?.id ??
+            `${timeMs}:${price}:${quantity}`),
         time_ms: timeMs,
         price,
         quantity,
         quantity_contracts: contracts,
+        quantity_unit: 'base_asset',
         quote_amount: price * quantity,
         side,
       };
     }).filter(Boolean);
-    return { items, timestamp_ms: items[0]?.time_ms || Date.now(), upstream_host: new URL(url).host, native_symbol: native, quantity_unit: 'base_asset', contract_multiplier: multiplier };
+    return {
+      items,
+      timestamp_ms: items[0]?.time_ms || Date.now(),
+      upstream_host: new URL(url).host,
+      native_symbol: native,
+      quantity_unit:
+          settle === 'btc' ? 'contracts' : 'base_asset',
+      contract_multiplier: meta.multiplier,
+    };
   }
-  const urls = bases.map((base) => `${base}/futures/usdt/order_book?contract=${encodeURIComponent(native)}&limit=${limit}&with_id=true`);
+
+  const urls = bases.map((base) =>
+    `${base}/futures/${settle}/order_book` +
+    `?contract=${encodeURIComponent(native)}` +
+    `&limit=${limit}&with_id=true`,
+  );
   const { data, url } = await fetchFirstJson(urls);
-  const bids = normalizeLevels(data?.bids, { side: 'bid', quantityMultiplier: multiplier, objectPriceKeys: ['p', 'price'], objectSizeKeys: ['s', 'size'] });
-  const asks = normalizeLevels(data?.asks, { side: 'ask', quantityMultiplier: multiplier, objectPriceKeys: ['p', 'price'], objectSizeKeys: ['s', 'size'] });
-  return { bids, asks, timestamp_ms: integerValue(data?.update) || Math.round((numberValue(data?.current) || 0) * 1000) || Date.now(), upstream_host: new URL(url).host, native_symbol: native, quantity_unit: 'base_asset', contract_multiplier: multiplier };
+  const quantityUnit =
+      settle === 'btc' ? 'contracts' : 'base_asset';
+  const multiplier =
+      quantityUnit === 'base_asset'
+          ? (meta.multiplier ?? 1)
+          : 1;
+  const bids = normalizeLevels(data?.bids, {
+    side: 'bid',
+    quantityMultiplier: multiplier,
+    quantityUnit,
+  });
+  const asks = normalizeLevels(data?.asks, {
+    side: 'ask',
+    quantityMultiplier: multiplier,
+    quantityUnit,
+  });
+  return {
+    bids,
+    asks,
+    timestamp_ms:
+        integerValue(data?.update) ||
+        integerValue(data?.current) ||
+        Date.now(),
+    upstream_host: new URL(url).host,
+    native_symbol: native,
+    quantity_unit: quantityUnit,
+    contract_multiplier: meta.multiplier,
+  };
 }
 
 async function loadSpotOkx(view, symbol, limit) {

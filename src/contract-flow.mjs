@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.15.24';
+const VERSION = '650.8.15.25';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -35,21 +35,51 @@ function splitSymbol(symbol) {
 function supportsNativeContract(provider, symbol) {
   const [, quote] = splitSymbol(symbol);
   if (quote === 'USDT') return PROVIDERS.has(provider);
-  if (quote === 'USDC') return provider === 'binance' || provider === 'bybit' || provider === 'bitget';
+  if (quote === 'USDC') {
+    return provider === 'binance' ||
+      provider === 'okx' ||
+      provider === 'bybit' ||
+      provider === 'bitget';
+  }
+  if (quote === 'USD') {
+    return provider === 'okx' ||
+      provider === 'bybit' ||
+      provider === 'bitget' ||
+      provider === 'gate';
+  }
   return false;
 }
 
 function nativeContractSymbol(provider, symbol) {
   const [base, quote] = splitSymbol(symbol);
-  if (!supportsNativeContract(provider, symbol)) throw new Error('unsupported_native_contract_quote');
-  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') return `${base}PERP`;
+  if (!supportsNativeContract(provider, symbol)) {
+    throw new Error('unsupported_native_contract_quote');
+  }
+  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') {
+    return `${base}PERP`;
+  }
+  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USD') {
+    return `${base}USD`;
+  }
   if (provider === 'okx') return `${base}-${quote}-SWAP`;
   if (provider === 'gate') return `${base}_${quote}`;
   return `${base}${quote}`;
 }
 
 function bitgetProductType(symbol) {
-  return splitSymbol(symbol)[1] === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES';
+  const [, quote] = splitSymbol(symbol);
+  if (quote === 'USDC') return 'USDC-FUTURES';
+  if (quote === 'USD') return 'COIN-FUTURES';
+  return 'USDT-FUTURES';
+}
+
+
+function bybitCategory(symbol) {
+  return splitSymbol(symbol)[1] === 'USD' ? 'inverse' : 'linear';
+}
+
+function gateSettle(symbol) {
+  return splitSymbol(symbol)[1] === 'USD' ? 'btc' : 'usdt';
 }
 
 function okxInstId(symbol) {
@@ -95,19 +125,36 @@ function normalizeTime(value) {
   return Math.round(parsed);
 }
 
-function tradeItem(time, price, size, side, sizeMultiplier = 1) {
+function tradeItem(
+  time,
+  price,
+  size,
+  side,
+  sizeMultiplier = 1,
+  explicitQuote = null,
+) {
   const ts = normalizeTime(time);
   const px = asNumber(price);
   const multiplier = Math.abs(asNumber(sizeMultiplier) ?? 1);
   const qty = Math.abs(asNumber(size) ?? 0) * multiplier;
   const normalizedSide = String(side || '').toLowerCase();
-  if (!ts || !px || px <= 0 || !qty || qty <= 0) return null;
+  const quote = Math.abs(asNumber(explicitQuote) ?? 0) || (px && qty ? px * qty : 0);
+  if (!ts || !px || px <= 0 || !qty || qty <= 0 || !quote || quote <= 0) return null;
   if (normalizedSide !== 'buy' && normalizedSide !== 'sell') return null;
-  return { time: ts, price: px, size: qty, quote: px * qty, side: normalizedSide };
+  return {
+    time: ts,
+    price: px,
+    size: qty,
+    quote,
+    side: normalizedSide,
+  };
 }
 
-function configFor(provider, symbol, quantityMultiplier = 1) {
+function configFor(provider, symbol, quantityMeta = {}) {
   const native = nativeContractSymbol(provider, symbol);
+  const [, quote] = splitSymbol(symbol);
+  const baseMultiplier = asNumber(quantityMeta.baseMultiplier) ?? 1;
+  const quoteMultiplier = asNumber(quantityMeta.quoteMultiplier);
   if (provider === 'binance') {
     return {
       url: `wss://fstream.binance.com/market/ws/${native.toLowerCase()}@aggTrade`,
@@ -116,7 +163,12 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
         const message = JSON.parse(raw.toString());
         const payload = message?.data ?? message;
         if (payload?.e !== 'aggTrade') return [];
-        const item = tradeItem(payload.T ?? payload.E, payload.p, payload.q, payload.m === true ? 'sell' : 'buy');
+        const item = tradeItem(
+          payload.T ?? payload.E,
+          payload.p,
+          payload.q,
+          payload.m === true ? 'sell' : 'buy',
+        );
         return item ? [item] : [];
       },
     };
@@ -133,7 +185,15 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
         if (message?.arg?.channel !== 'trades') return [];
         const items = [];
         for (const row of Array.isArray(message.data) ? message.data : []) {
-          const item = tradeItem(row.ts, row.px, row.sz, row.side, quantityMultiplier);
+          const price = asNumber(row.px);
+          const contracts = Math.abs(asNumber(row.sz) ?? 0);
+          let item = null;
+          if (price && contracts > 0 && quoteMultiplier && quoteMultiplier > 0) {
+            const quoteAmount = contracts * quoteMultiplier;
+            item = tradeItem(row.ts, price, quoteAmount / price, row.side, 1, quoteAmount);
+          } else {
+            item = tradeItem(row.ts, price, contracts, row.side, baseMultiplier);
+          }
           if (item) items.push(item);
         }
         return items;
@@ -142,7 +202,7 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
   }
   if (provider === 'bybit') {
     return {
-      url: 'wss://stream.bybit.com/v5/public/linear',
+      url: `wss://stream.bybit.com/v5/public/${bybitCategory(symbol)}`,
       subscriptions: [{ op: 'subscribe', args: [`publicTrade.${native}`] }],
       heartbeat: { op: 'ping' },
       parse(raw) {
@@ -150,7 +210,11 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
         if (!String(message?.topic || '').startsWith('publicTrade.')) return [];
         const items = [];
         for (const row of Array.isArray(message.data) ? message.data : []) {
-          const item = tradeItem(row.T ?? message.ts, row.p, row.v, row.S);
+          const price = asNumber(row.p);
+          const rawSize = Math.abs(asNumber(row.v) ?? 0);
+          const item = quote === 'USD' && price && rawSize > 0
+            ? tradeItem(row.T ?? message.ts, price, rawSize / price, row.S, 1, rawSize)
+            : tradeItem(row.T ?? message.ts, price, rawSize, row.S);
           if (item) items.push(item);
         }
         return items;
@@ -173,7 +237,12 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
             const item = tradeItem(row[0], row[1], row[2], row[3]);
             if (item) items.push(item);
           } else if (row && typeof row === 'object') {
-            const item = tradeItem(row.ts ?? message.ts, row.price ?? row.px, row.size ?? row.sz, row.side ?? row.S);
+            const item = tradeItem(
+              row.ts ?? message.ts,
+              row.price ?? row.px,
+              row.size ?? row.sz,
+              row.side ?? row.S,
+            );
             if (item) items.push(item);
           }
         }
@@ -183,7 +252,7 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
   }
   if (provider === 'gate') {
     return {
-      url: 'wss://fx-ws.gateio.ws/v4/ws/usdt',
+      url: `wss://fx-ws.gateio.ws/v4/ws/${gateSettle(symbol)}`,
       subscriptions: [{
         time: Math.floor(Date.now() / 1000),
         channel: 'futures.trades',
@@ -193,12 +262,21 @@ function configFor(provider, symbol, quantityMultiplier = 1) {
       parse(raw) {
         const message = JSON.parse(raw.toString());
         if (message?.channel !== 'futures.trades' || message?.event !== 'update') return [];
-        const rows = Array.isArray(message.result) ? message.result : (message.result ? [message.result] : []);
+        const rows = Array.isArray(message.result)
+          ? message.result
+          : (message.result ? [message.result] : []);
         const items = [];
         for (const row of rows) {
           const signedSize = asNumber(row.size ?? row.amount);
-          const side = row.side || (signedSize == null ? '' : signedSize >= 0 ? 'buy' : 'sell');
-          const item = tradeItem(row.create_time_ms ?? row.create_time ?? row.time_ms ?? row.time, row.price, signedSize, side, quantityMultiplier);
+          const side = row.side ||
+            (signedSize == null ? '' : signedSize >= 0 ? 'buy' : 'sell');
+          const item = tradeItem(
+            row.create_time_ms ?? row.create_time ?? row.time_ms ?? row.time,
+            row.price,
+            signedSize,
+            side,
+            baseMultiplier,
+          );
           if (item) items.push(item);
         }
         return items;
@@ -484,23 +562,41 @@ function ingest(state, items) {
 
 
 async function loadOkxContractMultiplier(state) {
-  if (state.provider !== 'okx') return 1;
-  if (state.okxContractMultiplier && state.okxContractMultiplier > 0) return state.okxContractMultiplier;
+  if (state.provider !== 'okx') return { baseMultiplier: 1, quoteMultiplier: null };
+  if ((state.okxContractBaseMultiplier ?? 0) > 0 ||
+      (state.okxContractQuoteMultiplier ?? 0) > 0) {
+    return {
+      baseMultiplier: state.okxContractBaseMultiplier,
+      quoteMultiplier: state.okxContractQuoteMultiplier,
+    };
+  }
   const instId = okxInstId(state.symbol);
   const payload = await firstWorkingJson([
     `https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`,
     `https://aws.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`,
   ], { timeoutMs: 8000 });
   const item = Array.isArray(payload?.data) ? payload.data[0] : null;
-  const [base] = splitSymbol(state.symbol);
+  const [base, quote] = splitSymbol(state.symbol);
   const ctVal = asNumber(item?.ctVal);
   const ctMult = asNumber(item?.ctMult) ?? 1;
-  const ctValCcy = String(item?.ctValCcy || '').toUpperCase();
-  if (ctVal == null || ctVal <= 0 || ctMult <= 0 || (ctValCcy && ctValCcy !== base)) {
+  const valueCurrency = String(item?.ctValCcy || '').toUpperCase();
+  if (ctVal == null || ctVal <= 0 || ctMult <= 0) {
     throw new Error('okx_contract_multiplier_missing');
   }
-  state.okxContractMultiplier = ctVal * ctMult;
-  return state.okxContractMultiplier;
+  const faceValue = ctVal * ctMult;
+  if (!valueCurrency || valueCurrency === base) {
+    state.okxContractBaseMultiplier = faceValue;
+    state.okxContractQuoteMultiplier = null;
+  } else if (valueCurrency === quote) {
+    state.okxContractBaseMultiplier = null;
+    state.okxContractQuoteMultiplier = faceValue;
+  } else {
+    throw new Error('okx_contract_multiplier_currency_unsupported');
+  }
+  return {
+    baseMultiplier: state.okxContractBaseMultiplier,
+    quoteMultiplier: state.okxContractQuoteMultiplier,
+  };
 }
 
 function scheduleOkxMultiplierRetry(state, reason) {
@@ -514,14 +610,19 @@ function scheduleOkxMultiplierRetry(state, reason) {
 
 async function loadGateContractMultiplier(state) {
   if (state.provider !== 'gate') return 1;
-  if (state.gateQuantoMultiplier && state.gateQuantoMultiplier > 0) return state.gateQuantoMultiplier;
+  if (state.gateQuantoMultiplier && state.gateQuantoMultiplier > 0) {
+    return state.gateQuantoMultiplier;
+  }
   const contract = gateSymbol(state.symbol);
+  const settle = gateSettle(state.symbol);
   const payload = await firstWorkingJson([
-    `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
-    `https://fx-api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
+    `https://api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
+    `https://fx-api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
   ], { timeoutMs: 8000 });
   const multiplier = asNumber(payload?.quanto_multiplier);
-  if (multiplier == null || multiplier <= 0) throw new Error('gate_contract_multiplier_missing');
+  if (multiplier == null || multiplier <= 0) {
+    throw new Error('gate_contract_multiplier_missing');
+  }
   state.gateQuantoMultiplier = multiplier;
   return multiplier;
 }
@@ -575,7 +676,9 @@ async function startStream(state) {
   if (state.connectingPromise) return state.connectingPromise;
   state.connectingPromise = (async () => {
     clearTimeout(state.reconnectTimer);
-    if (state.provider === 'okx' && !(state.okxContractMultiplier > 0)) {
+    if (state.provider === 'okx' &&
+        !((state.okxContractBaseMultiplier ?? 0) > 0) &&
+        !((state.okxContractQuoteMultiplier ?? 0) > 0)) {
       state.status = 'loading_contract_meta';
       if (!state.okxMultiplierPromise) {
         state.okxMultiplierPromise = loadOkxContractMultiplier(state)
@@ -605,10 +708,18 @@ async function startStream(state) {
       }
       return;
     }
-    const quantityMultiplier = state.provider === 'okx'
-      ? (state.okxContractMultiplier || 1)
-      : (state.provider === 'gate' ? (state.gateQuantoMultiplier || 1) : 1);
-    const cfg = configFor(state.provider, state.symbol, quantityMultiplier);
+    const quantityMeta = state.provider === 'okx'
+      ? {
+          baseMultiplier: state.okxContractBaseMultiplier,
+          quoteMultiplier: state.okxContractQuoteMultiplier,
+        }
+      : {
+          baseMultiplier: state.provider === 'gate'
+            ? (state.gateQuantoMultiplier || 1)
+            : 1,
+          quoteMultiplier: null,
+        };
+    const cfg = configFor(state.provider, state.symbol, quantityMeta);
     state.status = state.provider === 'binance' ? 'connect_queued' : 'connecting';
     state.error = '';
     if (state.provider === 'binance') {
@@ -716,7 +827,7 @@ function getState(provider, symbol) {
       oiCriticalPromise: null, oiCriticalScheduledAt: 0,
       ratioCriticalPromise: null, ratioCriticalFetchedAt: 0, ratioCriticalError: '',
       metricBackgroundTimer: null,
-      okxContractMultiplier: null, okxMultiplierPromise: null,
+      okxContractBaseMultiplier: null, okxContractQuoteMultiplier: null, okxMultiplierPromise: null,
       gateQuantoMultiplier: null, gateMultiplierPromise: null,
       historyLoaded: false, historyLoading: false, historyError: '',
     };
@@ -903,8 +1014,8 @@ async function fetchOkxContractMeta(symbol) {
 async function fetchBybitContractMeta(symbol) {
   const native = nativeContractSymbol('bybit', symbol);
   const raw = await firstWorkingJson([
-    `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(native)}`,
-    `https://api.bytick.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(native)}`,
+    `https://api.bybit.com/v5/market/tickers?category=${bybitCategory(state.symbol)}&symbol=${encodeURIComponent(native)}`,
+    `https://api.bytick.com/v5/market/tickers?category=${bybitCategory(state.symbol)}&symbol=${encodeURIComponent(native)}`,
   ], { timeoutMs: 5500 });
   const item = firstDataObject(raw);
   if (!item) throw new Error('bybit_contract_meta_empty');
@@ -916,7 +1027,7 @@ async function fetchBybitContractMeta(symbol) {
     last_funding_rate: item.fundingRate,
     next_funding_time: item.nextFundingTime,
     source_time: raw?.time,
-    source: 'bybit_linear_ticker',
+    source: `bybit_${bybitCategory(symbol)}_ticker`,
   });
 }
 
@@ -949,8 +1060,8 @@ async function fetchBitgetContractMeta(symbol) {
 async function fetchGateContractMeta(symbol) {
   const contract = gateSymbol(symbol);
   const raw = await firstWorkingJson([
-    `https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=${encodeURIComponent(contract)}`,
-    `https://fx-api.gateio.ws/api/v4/futures/usdt/tickers?contract=${encodeURIComponent(contract)}`,
+    `https://api.gateio.ws/api/v4/futures/${gateSettle(symbol)}/tickers?contract=${encodeURIComponent(contract)}`,
+    `https://fx-api.gateio.ws/api/v4/futures/${gateSettle(symbol)}/tickers?contract=${encodeURIComponent(contract)}`,
   ], { timeoutMs: 5500 });
   const item = Array.isArray(raw) ? raw[0] : firstDataObject(raw);
   if (!item) throw new Error('gate_contract_meta_empty');
@@ -1546,11 +1657,11 @@ async function fetchBybitMetricRows(state) {
   const hosts = ['https://api.bybit.com','https://api.bytick.com'];
   const accountRatioOfficiallyAvailable = quote === 'USDT';
   const requests = [
-    firstWorkingJson(hosts.map((host) => `${host}/v5/market/open-interest?category=linear&symbol=${encodeURIComponent(native)}&intervalTime=5min&limit=200`), { timeoutMs: 7000 }),
+    firstWorkingJson(hosts.map((host) => `${host}/v5/market/open-interest?category=${bybitCategory(state.symbol)}&symbol=${encodeURIComponent(native)}&intervalTime=5min&limit=200`), { timeoutMs: 7000 }),
   ];
   if (accountRatioOfficiallyAvailable) {
     requests.push(
-      firstWorkingJson(hosts.map((host) => `${host}/v5/market/account-ratio?category=linear&symbol=${encodeURIComponent(native)}&period=5min&limit=500`), { timeoutMs: 7000 }),
+      firstWorkingJson(hosts.map((host) => `${host}/v5/market/account-ratio?category=${bybitCategory(state.symbol)}&symbol=${encodeURIComponent(native)}&period=5min&limit=500`), { timeoutMs: 7000 }),
     );
   }
   const settled = await Promise.allSettled(requests);
@@ -1613,8 +1724,8 @@ async function fetchGateMetricRows(state) {
   const contract = gateSymbol(state.symbol);
   const multiplier = await loadGateContractMultiplier(state);
   const raw = await firstWorkingJson([
-    `https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
-    `https://fx-api.gateio.ws/api/v4/futures/usdt/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
+    `https://api.gateio.ws/api/v4/futures/${gateSettle(state.symbol)}/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
+    `https://fx-api.gateio.ws/api/v4/futures/${gateSettle(state.symbol)}/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
   ], { timeoutMs: 8000 });
   const map = new Map();
   for (const item of Array.isArray(raw) ? raw : []) {
@@ -1653,7 +1764,8 @@ function recentMetricFamilyStatus(state) {
     top_position: has(['top_position_long_short_ratio', 'top_position_long', 'top_position_short']),
   };
   const [, quote] = splitSymbol(state.symbol);
-  const bybitUsdcAccountRatioUnavailable = state.provider === 'bybit' && quote === 'USDC';
+  const bybitUsdcAccountRatioUnavailable =
+    state.provider === 'bybit' && quote !== 'USDT';
   const required = state.provider === 'binance' || state.provider === 'gate'
     ? ['oi', 'global_account', 'top_account', 'top_position']
     : bybitUsdcAccountRatioUnavailable
@@ -1663,7 +1775,7 @@ function recentMetricFamilyStatus(state) {
     ...status,
     global_account_official_unavailable: bybitUsdcAccountRatioUnavailable,
     unavailable_reason: bybitUsdcAccountRatioUnavailable
-      ? 'bybit_public_account_ratio_is_usdt_contract_only'
+      ? 'bybit_public_account_ratio_is_usdt_linear_contract_only'
       : '',
     required,
     complete: required.every((key) => status[key] === true),
@@ -1859,7 +1971,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_usdc_account_ratio_official_unavailable:true,bybit_usdc_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/contract-meta'){
     if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}

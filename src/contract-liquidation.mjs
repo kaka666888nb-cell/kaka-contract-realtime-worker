@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.24';
+const STEP_VERSION = '650.8.15.25';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();
@@ -131,7 +131,18 @@ function supportsNativeContract(provider, rawSymbol) {
   const compact = compactSymbol(rawSymbol);
   const quote = quoteFromCompact(compact);
   if (quote === 'USDT') return SUPPORTED_PROVIDERS.has(provider);
-  if (quote === 'USDC') return provider === 'binance' || provider === 'bybit' || provider === 'bitget';
+  if (quote === 'USDC') {
+    return provider === 'binance' ||
+      provider === 'okx' ||
+      provider === 'bybit' ||
+      provider === 'bitget';
+  }
+  if (quote === 'USD') {
+    return provider === 'okx' ||
+      provider === 'bybit' ||
+      provider === 'bitget' ||
+      provider === 'gate';
+  }
   return false;
 }
 
@@ -140,11 +151,34 @@ function providerSymbol(provider, rawSymbol) {
   const quote = quoteFromCompact(compact);
   const base = baseFromCompact(compact);
   if (!base || !quote) throw new Error('invalid_symbol');
-  if (!supportsNativeContract(provider, compact)) throw new Error('unsupported_native_contract_quote');
-  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') return `${base}PERP`;
+  if (!supportsNativeContract(provider, compact)) {
+    throw new Error('unsupported_native_contract_quote');
+  }
+  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') {
+    return `${base}PERP`;
+  }
+  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USD') {
+    return `${base}USD`;
+  }
   if (provider === 'okx') return `${base}-${quote}-SWAP`;
   if (provider === 'gate') return `${base}_${quote}`;
   return `${base}${quote}`;
+}
+
+
+function bybitCategory(symbol) {
+  return quoteFromCompact(compactSymbol(symbol)) === 'USD' ? 'inverse' : 'linear';
+}
+
+function gateSettle(symbol) {
+  return quoteFromCompact(compactSymbol(symbol)) === 'USD' ? 'btc' : 'usdt';
+}
+
+function bitgetInstType(symbol) {
+  const quote = quoteFromCompact(compactSymbol(symbol));
+  if (quote === 'USDC') return 'usdc-futures';
+  if (quote === 'USD') return 'coin-futures';
+  return 'usdt-futures';
 }
 
 function displaySymbolForNative(feed, nativeSymbol) {
@@ -230,23 +264,29 @@ async function fetchFirstJson(urls, timeoutMs = 8_000) {
 async function okxContractMultiplier(instId) {
   const key = `okx:${instId}`;
   const cached = META_CACHE.get(key);
-  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) return cached.multiplier;
-  const decoded = await fetchJson(`https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`);
+  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) return cached;
+  const decoded = await fetchJson(
+    `https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encodeURIComponent(instId)}`,
+  );
   const row = Array.isArray(decoded?.data) ? decoded.data[0] : null;
   const ctVal = positiveNumber(row?.ctVal) ?? 1;
   const ctMult = positiveNumber(row?.ctMult) ?? 1;
-  const multiplier = ctVal * ctMult;
-  META_CACHE.set(key, { multiplier, storedAt: Date.now() });
-  return multiplier;
+  const faceValue = ctVal * ctMult;
+  const valueCurrency = String(row?.ctValCcy || '').toUpperCase();
+  const meta = { faceValue, valueCurrency, storedAt: Date.now() };
+  META_CACHE.set(key, meta);
+  return meta;
 }
 
-async function gateContractMultiplier(contract) {
-  const key = `gate:${contract}`;
+async function gateContractMultiplier(contract, settle = 'usdt') {
+  const key = `gate:${settle}:${contract}`;
   const cached = META_CACHE.get(key);
-  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) return cached.multiplier;
+  if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) {
+    return cached.multiplier;
+  }
   const decoded = await fetchFirstJson([
-    `https://fx-api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
-    `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encodeURIComponent(contract)}`,
+    `https://fx-api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
+    `https://api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
   ]);
   const multiplier = positiveNumber(decoded?.quanto_multiplier) ?? 1;
   META_CACHE.set(key, { multiplier, storedAt: Date.now() });
@@ -660,14 +700,17 @@ function addEvent(feed, event) {
 }
 
 function websocketUrl(feed) {
-  const native = feed.requestedNativeSymbol;
   if (feed.provider === 'binance') {
     return 'wss://fstream.binance.com/market/ws/!forceOrder@arr';
   }
   if (feed.provider === 'okx') return 'wss://ws.okx.com:8443/ws/v5/public';
-  if (feed.provider === 'bybit') return 'wss://stream.bybit.com/v5/public/linear';
+  if (feed.provider === 'bybit') {
+    return `wss://stream.bybit.com/v5/public/${bybitCategory(feed.requestedDisplaySymbol)}`;
+  }
   if (feed.provider === 'bitget') return 'wss://ws.bitget.com/v3/ws/public';
-  if (feed.provider === 'gate') return 'wss://fx-ws.gateio.ws/v4/ws/usdt';
+  if (feed.provider === 'gate') {
+    return `wss://fx-ws.gateio.ws/v4/ws/${gateSettle(feed.requestedDisplaySymbol)}`;
+  }
   throw new Error('unsupported_provider');
 }
 
@@ -675,15 +718,26 @@ function subscribeFeed(feed) {
   const socket = feed.socket;
   if (feed.provider === 'binance') return true;
   if (feed.provider === 'okx') {
-    return sendWs(socket, { id: 'kaka640', op: 'subscribe', args: [{ channel: 'liquidation-orders', instType: 'SWAP' }] });
+    return sendWs(socket, {
+      id: 'kaka657',
+      op: 'subscribe',
+      args: [{ channel: 'liquidation-orders', instType: 'SWAP' }],
+    });
   }
   if (feed.provider === 'bybit') {
-    return sendWs(socket, { op: 'subscribe', args: [`allLiquidation.${feed.requestedNativeSymbol}`] });
+    return sendWs(socket, {
+      op: 'subscribe',
+      args: [`allLiquidation.${feed.requestedNativeSymbol}`],
+    });
   }
   if (feed.provider === 'bitget') {
-    const usdt = sendWs(socket, { op: 'subscribe', args: [{ instType: 'usdt-futures', topic: 'liquidation' }] });
-    const usdc = sendWs(socket, { op: 'subscribe', args: [{ instType: 'usdc-futures', topic: 'liquidation' }] });
-    return usdt || usdc;
+    const types = ['usdt-futures', 'usdc-futures', 'coin-futures'];
+    return types
+      .map((instType) => sendWs(socket, {
+        op: 'subscribe',
+        args: [{ instType, topic: 'liquidation' }],
+      }))
+      .some(Boolean);
   }
   if (feed.provider === 'gate') {
     return sendWs(socket, {
@@ -776,7 +830,10 @@ async function handleOkx(feed, data) {
     const native = String(group?.instId || '');
     const symbol = compactSymbol(native);
     if (!symbol || !Array.isArray(group?.details)) continue;
-    const multiplier = await okxContractMultiplier(native);
+    const contractMeta = await okxContractMultiplier(native);
+    const displaySymbol = compactSymbol(native);
+    const base = baseFromCompact(displaySymbol);
+    const quote = quoteFromCompact(displaySymbol);
     for (const detail of group.details) {
       const price = positiveNumber(detail?.bkPx);
       const contracts = positiveNumber(detail?.sz);
@@ -790,8 +847,18 @@ async function handleOkx(feed, data) {
           : orderSide === 'buy'
             ? 'short'
             : '';
-      const quantity = contracts == null ? null : contracts * multiplier;
-      if (price == null || quantity == null || quantity <= 0 || !liquidationSide) continue;
+      let quantity = null;
+      let notional = null;
+      if (contracts != null) {
+        if (!contractMeta.valueCurrency || contractMeta.valueCurrency === base) {
+          quantity = contracts * contractMeta.faceValue;
+          notional = price == null ? null : price * quantity;
+        } else if (contractMeta.valueCurrency === quote) {
+          notional = contracts * contractMeta.faceValue;
+          quantity = price == null ? null : notional / price;
+        }
+      }
+      if (price == null || quantity == null || quantity <= 0 || notional == null || !liquidationSide) continue;
       addEvent(feed, {
         id: `okx:${native}:${timeMs}:${liquidationSide}:${contracts}`,
         symbol,
@@ -800,7 +867,8 @@ async function handleOkx(feed, data) {
         price,
         quantity,
         quantity_contracts: contracts,
-        notional: price * quantity,
+        quantity_unit: 'base_asset',
+        notional,
         liquidation_side: liquidationSide,
         order_side: orderSide,
         price_type: 'bankruptcy',
@@ -816,17 +884,21 @@ async function handleBybit(feed, data) {
     const symbol = displaySymbolForNative(feed, native);
     const side = String(row?.S || '').toLowerCase();
     const price = positiveNumber(row?.p);
-    const quantity = positiveNumber(row?.v);
+    const rawQuantity = positiveNumber(row?.v);
     const timeMs = integerValue(row?.T) || integerValue(data?.ts) || Date.now();
-    if (!symbol || !['buy', 'sell'].includes(side) || price == null || quantity == null) continue;
+    const inverse = quoteFromCompact(symbol) === 'USD';
+    const notional = inverse ? rawQuantity : (price != null && rawQuantity != null ? price * rawQuantity : null);
+    const quantity = inverse && price != null && rawQuantity != null ? rawQuantity / price : rawQuantity;
+    if (!symbol || !['buy', 'sell'].includes(side) || price == null || quantity == null || notional == null) continue;
     addEvent(feed, {
-      id: `bybit:${symbol}:${timeMs}:${side}:${quantity}`,
+      id: `bybit:${symbol}:${timeMs}:${side}:${rawQuantity}`,
       symbol,
       native_symbol: String(row?.s || native),
       time_ms: timeMs,
       price,
       quantity,
-      notional: price * quantity,
+      notional,
+      quantity_unit: 'base_asset',
       liquidation_side: side === 'buy' ? 'long' : 'short',
       order_side: side,
       price_type: 'bankruptcy',
@@ -854,6 +926,7 @@ async function handleBitget(feed, data) {
       price,
       quantity,
       notional,
+      quantity_unit: 'base_asset',
       liquidation_side: side === 'buy' ? 'long' : 'short',
       order_side: side,
       price_type: 'liquidation',
@@ -871,7 +944,7 @@ async function handleGate(feed, data) {
     const price = positiveNumber(row?.price);
     const timeMs = integerValue(row?.time_ms) || integerValue(row?.time) * 1000 || integerValue(data?.time_ms) || Date.now();
     if (!symbol || signedContracts == null || signedContracts === 0 || contracts == null || price == null) continue;
-    const multiplier = await gateContractMultiplier(native);
+    const multiplier = await gateContractMultiplier(native, gateSettle(symbol));
     const quantity = contracts * multiplier;
     if (!Number.isFinite(quantity) || quantity <= 0) continue;
     addEvent(feed, {
@@ -882,6 +955,7 @@ async function handleGate(feed, data) {
       price,
       quantity,
       quantity_contracts: contracts,
+      quantity_unit: 'base_asset',
       notional: price * quantity,
       liquidation_side: signedContracts < 0 ? 'long' : 'short',
       order_side: signedContracts < 0 ? 'sell' : 'buy',
@@ -1172,6 +1246,13 @@ export async function handleContractLiquidation(req, res, url) {
     sendJson(res, 200, {
       ok: true,
       version: STEP_VERSION,
+      contract_quote_support: {
+        binance: ['USDT', 'USDC'],
+        okx: ['USDT', 'USDC', 'USD'],
+        bybit: ['USDT', 'USDC', 'USD'],
+        bitget: ['USDT', 'USDC', 'USD'],
+        gate: ['USDT', 'USD'],
+      },
       provider,
       market_type: 'contract',
       symbol,
