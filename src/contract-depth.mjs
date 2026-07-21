@@ -1,5 +1,5 @@
-// Step652.1D.1.1: add native FDUSD spot identity and Binance official spot depth/trades; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.20';
+// Step655: add native TUSD spot identity on top of Step653 FDUSD depth/trades; Binance contract REST remains disabled.
+const STEP_VERSION = '650.8.15.21';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -446,7 +446,7 @@ function compactSymbol(value) {
 
 function quoteFromCompact(symbol) {
   // Longest quote first so BTCFDUSD is parsed as BTC / FDUSD, never BTCFD / USD.
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD']) {
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'TUSD', 'USD']) {
     if (symbol.endsWith(quote) && symbol.length > quote.length) return quote;
   }
   return 'USDT';
@@ -1323,6 +1323,15 @@ export function getContractDepthHealth() {
     binance_contract_rest_disabled: true,
     binance_spot_depth_transport: 'official_data_api_rest_with_endpoint_cache_inflight_and_circuit',
     fdusd_spot_identity_enabled: true,
+    tusd_spot_identity_enabled: true,
+    tusd_spot_identity_examples: {
+      binance: providerSymbol('binance', 'BTCTUSD', 'spot'),
+      coinbase: providerSymbol('coinbase', 'BTCTUSD', 'spot'),
+      okx: providerSymbol('okx', 'BTCTUSD', 'spot'),
+      bybit: providerSymbol('bybit', 'BTCTUSD', 'spot'),
+      bitget: providerSymbol('bitget', 'BTCTUSD', 'spot'),
+      gate: providerSymbol('gate', 'BTCTUSD', 'spot'),
+    },
     binance_ws_symbols: BINANCE_WS_STATES.size,
     binance_ws_max_symbols: BINANCE_WS_MAX_SYMBOLS,
     binance_ws_connect_gap_ms: BINANCE_WS_CONNECT_GAP_MS,
