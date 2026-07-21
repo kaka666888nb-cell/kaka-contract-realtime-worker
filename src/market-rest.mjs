@@ -25,8 +25,14 @@ if (process.env.KAKA_DISABLE_BINANCE_MARKET_START !== '1') {
   startBinanceContractMarket();
 }
 
-const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
-const CONTRACT_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const SPOT_PROVIDER_LIST = Object.freeze([
+  'binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate',
+]);
+const CONTRACT_PROVIDER_LIST = Object.freeze([
+  'binance', 'okx', 'bybit', 'bitget', 'gate',
+]);
+const PROVIDERS = new Set(SPOT_PROVIDER_LIST);
+const CONTRACT_PROVIDERS = new Set(CONTRACT_PROVIDER_LIST);
 const COINBASE_BASE_URL = 'https://api.exchange.coinbase.com';
 const BYBIT_PUBLIC_REST_HOSTS = [
   'https://api.bybit.com',
@@ -1271,7 +1277,7 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
 }
 
 
-// Step650.8.15.25: calendar-month aggregation for safe Binance contract daily seeds.
+// Step650.8.15.26: calendar-month aggregation for safe Binance contract daily seeds.
 // A month is not a fixed 30-day duration, so use UTC year/month boundaries and never
 // interpolate or fabricate missing source candles.
 function aggregateCalendarMonths(sourceRows, provider, market, symbol) {
@@ -2028,7 +2034,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
       maxRestCalls: 1,
     });
 
-    // Step650.8.15.25: a sparse/empty direct monthly seed can occur when the current monthly
+    // Step650.8.15.26: a sparse/empty direct monthly seed can occur when the current monthly
     // archive is not yet available. Reuse the same safe seed chain for official daily candles
     // and aggregate them by real UTC calendar month. This sends no Render-direct Binance REST.
     if (interval === '1M' && seedRows.length < 3) {
@@ -2112,7 +2118,7 @@ async function assetQuoteSummary(rawBase) {
       );
 
       const spotGroups = await Promise.all(
-        SPOT_PROVIDERS.map(async (provider) => {
+        SPOT_PROVIDER_LIST.map(async (provider) => {
           try {
             return [provider, await universeCatalog(provider, 'spot')];
           } catch (_) {
@@ -2141,7 +2147,7 @@ async function assetQuoteSummary(rawBase) {
       }
 
       const contractGroups = await Promise.all(
-        CONTRACT_PROVIDERS.map(async (provider) => {
+        CONTRACT_PROVIDER_LIST.map(async (provider) => {
           try {
             return [provider, await universeCatalog(provider, 'contract')];
           } catch (_) {
@@ -2277,6 +2283,11 @@ export function getBinanceMarketRestHealth() {
     spot_market_data_host: 'data-api.binance.vision',
     binance_asset_quote_discovery_enabled: true,
     all_provider_asset_quote_discovery_enabled: true,
+    spot_provider_list: SPOT_PROVIDER_LIST,
+    contract_provider_list: CONTRACT_PROVIDER_LIST,
+    asset_quote_summary_provider_lists_ready:
+      SPOT_PROVIDER_LIST.length === 6 &&
+      CONTRACT_PROVIDER_LIST.length === 5,
     contract_quote_support: CONTRACT_QUOTES_BY_PROVIDER,
     binance_coin_m_usd_enabled: false,
     binance_asset_quote_candidates: BINANCE_COMMON_QUOTE_ASSETS,
@@ -2373,7 +2384,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -2385,7 +2396,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -2395,7 +2406,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -2404,7 +2415,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -2414,7 +2425,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         self_test: selfTest,
       });
       return true;
@@ -2430,7 +2441,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         checks: tests.length,
         tests,
       });
@@ -2445,7 +2456,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -2464,7 +2475,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -2585,7 +2596,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.25',
+        version: '650.8.15.26',
         provider,
         market_type: market,
         symbol,
