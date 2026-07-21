@@ -1,4 +1,5 @@
-const STEP_VERSION = '650.8.15.19';
+// Step652.1D.1.1: add native FDUSD spot identity and Binance official spot depth/trades; Binance contract REST remains disabled.
+const STEP_VERSION = '650.8.15.20';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -444,7 +445,8 @@ function compactSymbol(value) {
 }
 
 function quoteFromCompact(symbol) {
-  for (const quote of ['USDT', 'USDC', 'USD']) {
+  // Longest quote first so BTCFDUSD is parsed as BTC / FDUSD, never BTCFD / USD.
+  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD']) {
     if (symbol.endsWith(quote) && symbol.length > quote.length) return quote;
   }
   return 'USDT';
@@ -1125,6 +1127,54 @@ const coinbaseL2CleanupTimer = setInterval(() => {
 }, 10_000);
 coinbaseL2CleanupTimer.unref?.();
 
+async function loadSpotBinance(view, symbol, limit) {
+  const native = providerSymbol('binance', symbol, 'spot');
+  if (view === 'trades') {
+    // Spot only. This does not touch fapi or any Binance contract REST route.
+    const data = await fetchJson(
+      `https://data-api.binance.vision/api/v3/aggTrades?symbol=${encodeURIComponent(native)}&limit=${Math.min(limit, 100)}`,
+    );
+    if (!Array.isArray(data)) throw new Error('binance_spot_trades_invalid');
+    const items = data.map((row) => {
+      const price = positiveNumber(row?.p);
+      const quantity = positiveNumber(row?.q);
+      const timeMs = integerValue(row?.T);
+      // Binance m=true means buyer is maker, so the taker/aggressor side is sell.
+      const side = row?.m === true ? 'sell' : 'buy';
+      if (price == null || quantity == null || timeMs <= 0) return null;
+      return {
+        id: String(row?.a ?? `${timeMs}:${price}:${quantity}`),
+        time_ms: timeMs,
+        price,
+        quantity,
+        quote_amount: price * quantity,
+        side,
+      };
+    }).filter(Boolean);
+    return {
+      items,
+      timestamp_ms: items[0]?.time_ms || Date.now(),
+      upstream_host: 'data-api.binance.vision',
+      native_symbol: native,
+      transport: 'rest_public_spot_aggTrades',
+    };
+  }
+  const data = await fetchJson(
+    `https://data-api.binance.vision/api/v3/depth?symbol=${encodeURIComponent(native)}&limit=${Math.max(5, Math.min(limit, 20))}`,
+  );
+  const bids = normalizeLevels(data?.bids, { side: 'bid' }).slice(0, limit);
+  const asks = normalizeLevels(data?.asks, { side: 'ask' }).slice(0, limit);
+  if (!bids.length || !asks.length) throw new Error('binance_spot_orderbook_empty');
+  return {
+    bids,
+    asks,
+    timestamp_ms: Date.now(),
+    upstream_host: 'data-api.binance.vision',
+    native_symbol: native,
+    transport: 'rest_public_spot_depth',
+  };
+}
+
 async function loadSpotCoinbase(view, symbol, limit) {
   const native = providerSymbol('coinbase', symbol, 'spot');
   if (view === 'trades') {
@@ -1146,7 +1196,7 @@ async function loadSpotCoinbase(view, symbol, limit) {
 
 async function loadProviderData(provider, marketType, view, symbol, limit) {
   if (marketType === 'spot') {
-    if (provider === 'binance') throw new Error('binance_spot_depth_render_disabled');
+    if (provider === 'binance') return loadSpotBinance(view, symbol, limit);
     if (provider === 'coinbase') return loadSpotCoinbase(view, symbol, limit);
     if (provider === 'okx') return loadSpotOkx(view, symbol, limit);
     if (provider === 'bybit') return loadSpotBybit(view, symbol, limit);
@@ -1172,7 +1222,11 @@ function buildPayload(provider, marketType, view, requestedSymbol, limit, data, 
     native_symbol: data.native_symbol,
     view,
     limit,
-    source: provider === 'binance' ? `binance_official_public_contract_${view}_websocket` : `${provider}_official_public_${marketType}_${view}`,
+    source: provider === 'binance'
+      ? marketType === 'contract'
+        ? `binance_official_public_contract_${view}_websocket`
+        : `binance_official_public_spot_${view}`
+      : `${provider}_official_public_${marketType}_${view}`,
     transport: data.transport || 'rest',
     upstream_host: data.upstream_host || '',
     timestamp_ms: integerValue(data.timestamp_ms) || Date.now(),
@@ -1266,6 +1320,9 @@ export function getContractDepthHealth() {
   return {
     ok: true,
     version: STEP_VERSION,
+    binance_contract_rest_disabled: true,
+    binance_spot_depth_transport: 'official_data_api_rest_with_endpoint_cache_inflight_and_circuit',
+    fdusd_spot_identity_enabled: true,
     binance_ws_symbols: BINANCE_WS_STATES.size,
     binance_ws_max_symbols: BINANCE_WS_MAX_SYMBOLS,
     binance_ws_connect_gap_ms: BINANCE_WS_CONNECT_GAP_MS,
