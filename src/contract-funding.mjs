@@ -2,7 +2,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.14';
+const VERSION = '650.8.15.15';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -40,11 +40,24 @@ function splitSymbol(symbol) {
   return { base: symbol.replace(/USDT$/, ''), quote: 'USDT' };
 }
 
+function supportsNativeContract(provider, symbol) {
+  const { quote } = splitSymbol(symbol);
+  if (quote === 'USDT') return SUPPORTED.has(provider);
+  if (quote === 'USDC') return provider === 'binance' || provider === 'bybit' || provider === 'bitget';
+  return false;
+}
+
 function nativeSymbol(provider, symbol) {
   const { base, quote } = splitSymbol(symbol);
+  if (!supportsNativeContract(provider, symbol)) throw new Error('unsupported_native_contract_quote');
+  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') return `${base}PERP`;
   if (provider === 'okx') return `${base}-${quote}-SWAP`;
   if (provider === 'gate') return `${base}_${quote}`;
   return symbol;
+}
+
+function bitgetProductType(symbol) {
+  return splitSymbol(symbol).quote === 'USDC' ? 'usdc-futures' : 'usdt-futures';
 }
 
 function numberOrNull(value) {
@@ -315,9 +328,10 @@ async function fetchOkx(symbol, limit) {
 }
 
 async function fetchBybit(symbol, limit) {
+  const native = nativeSymbol('bybit', symbol);
   const { currentRaw, historyRaw, warnings } = await fetchPair(
-    `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`,
-    `https://api.bybit.com/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+    `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(native)}`,
+    `https://api.bybit.com/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(native)}&limit=${limit}`,
   );
   const item = Array.isArray(currentRaw?.result?.list) ? currentRaw.result.list[0] : null;
   const current = currentRow({
@@ -334,11 +348,12 @@ async function fetchBybit(symbol, limit) {
     rate: row?.fundingRate,
     time: row?.fundingRateTimestamp,
   })).filter(Boolean) : [];
-  return { current, history, warnings, source: 'bybit_official_public_funding_rest' };
+  return { current, history, warnings, source: 'bybit_official_public_funding_rest', native_symbol: native };
 }
 
 async function fetchBitget(symbol, limit) {
-  const q = `symbol=${encodeURIComponent(symbol)}&productType=usdt-futures`;
+  const native = nativeSymbol('bitget', symbol);
+  const q = `symbol=${encodeURIComponent(native)}&productType=${encodeURIComponent(bitgetProductType(symbol))}`;
   const { currentRaw, historyRaw, warnings } = await fetchPair(
     `https://api.bitget.com/api/v2/mix/market/current-fund-rate?${q}`,
     `https://api.bitget.com/api/v2/mix/market/history-fund-rate?${q}&pageSize=${limit}`,
@@ -357,7 +372,7 @@ async function fetchBitget(symbol, limit) {
     rate: row?.fundingRate,
     time: row?.fundingTime ?? row?.fundingRateTimestamp,
   })).filter(Boolean);
-  return { current, history, warnings, source: 'bitget_official_public_funding_rest' };
+  return { current, history, warnings, source: 'bitget_official_public_funding_rest', native_symbol: native };
 }
 
 async function fetchGate(symbol, limit) {
@@ -419,7 +434,7 @@ export async function handleContractFunding(req, res, url) {
   const provider = providerKey(url.searchParams.get('provider'));
   const symbol = canonicalSymbol(url.searchParams.get('symbol'));
   const limit = Math.max(1, Math.min(100, Number(url.searchParams.get('limit') || 24) || 24));
-  if (!SUPPORTED.has(provider) || !symbol) {
+  if (!SUPPORTED.has(provider) || !symbol || !supportsNativeContract(provider, symbol)) {
     sendJson(res, 400, { ok: false, version: VERSION, error: 'invalid_provider_or_symbol' });
     return true;
   }

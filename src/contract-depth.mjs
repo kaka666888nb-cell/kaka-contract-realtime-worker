@@ -1,5 +1,5 @@
-const STEP_VERSION = '650.8.15.14';
-const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const STEP_VERSION = '650.8.15.15';
+const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
 const CIRCUIT = new Map();
@@ -422,14 +422,35 @@ function baseFromCompact(symbol) {
   return symbol.endsWith(quote) ? symbol.slice(0, -quote.length) : symbol;
 }
 
-function providerSymbol(provider, rawSymbol) {
+function contractQuoteSupported(provider, quote) {
+  if (quote === 'USDT') return ['binance', 'okx', 'bybit', 'bitget', 'gate'].includes(provider);
+  if (quote === 'USDC') return ['binance', 'bybit', 'bitget'].includes(provider);
+  return false;
+}
+
+function providerSymbol(provider, rawSymbol, marketType = 'contract') {
   const compact = compactSymbol(rawSymbol);
   const quote = quoteFromCompact(compact);
   const base = baseFromCompact(compact);
   if (!base || !quote) throw new Error('invalid_symbol');
+  if (marketType === 'spot') {
+    if (provider === 'okx' || provider === 'coinbase') return `${base}-${quote}`;
+    if (provider === 'gate') return `${base}_${quote}`;
+    return `${base}${quote}`;
+  }
+  if (!contractQuoteSupported(provider, quote)) {
+    const error = new Error('unsupported_native_contract_quote');
+    error.statusCode = 400;
+    throw error;
+  }
+  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') return `${base}PERP`;
   if (provider === 'okx') return `${base}-${quote}-SWAP`;
   if (provider === 'gate') return `${base}_${quote}`;
   return `${base}${quote}`;
+}
+
+function bitgetProductType(rawSymbol) {
+  return quoteFromCompact(compactSymbol(rawSymbol)) === 'USDC' ? 'usdc-futures' : 'usdt-futures';
 }
 
 function numberValue(value) {
@@ -699,7 +720,7 @@ async function loadBybit(view, symbol, limit) {
 async function loadBitget(view, symbol, limit) {
   const native = providerSymbol('bitget', symbol);
   if (view === 'trades') {
-    const url = `https://api.bitget.com/api/v2/mix/market/fills?symbol=${encodeURIComponent(native)}&productType=usdt-futures&limit=${limit}`;
+    const url = `https://api.bitget.com/api/v2/mix/market/fills?symbol=${encodeURIComponent(native)}&productType=${encodeURIComponent(bitgetProductType(symbol))}&limit=${limit}`;
     const data = await fetchJson(url);
     if (String(data?.code || '') !== '00000' || !Array.isArray(data?.data)) throw new Error(`bitget_trades_${data?.code ?? 'invalid'}`);
     const items = data.data.map((row) => {
@@ -721,7 +742,7 @@ async function loadBitget(view, symbol, limit) {
     return { items, timestamp_ms: items[0]?.time_ms || integerValue(data?.requestTime) || Date.now(), upstream_host: 'api.bitget.com', native_symbol: native };
   }
   const requestLimit = limit <= 1 ? 1 : limit <= 5 ? 5 : limit <= 15 ? 15 : 50;
-  const url = `https://api.bitget.com/api/v2/mix/market/merge-depth?productType=usdt-futures&symbol=${encodeURIComponent(native)}&precision=scale0&limit=${requestLimit}`;
+  const url = `https://api.bitget.com/api/v2/mix/market/merge-depth?productType=${encodeURIComponent(bitgetProductType(symbol))}&symbol=${encodeURIComponent(native)}&precision=scale0&limit=${requestLimit}`;
   const data = await fetchJson(url);
   if (String(data?.code || '') !== '00000' || !data?.data) throw new Error(`bitget_orderbook_${data?.code ?? 'invalid'}`);
   const bids = normalizeLevels(data.data.bids, { side: 'bid' }).slice(0, limit);
@@ -767,26 +788,138 @@ async function loadGate(view, symbol, limit) {
   return { bids, asks, timestamp_ms: integerValue(data?.update) || Math.round((numberValue(data?.current) || 0) * 1000) || Date.now(), upstream_host: new URL(url).host, native_symbol: native, quantity_unit: 'base_asset', contract_multiplier: multiplier };
 }
 
-async function loadProviderData(provider, view, symbol, limit) {
+async function loadSpotOkx(view, symbol, limit) {
+  const native = providerSymbol('okx', symbol, 'spot');
+  if (view === 'trades') {
+    const data = await fetchJson(`https://www.okx.com/api/v5/market/trades?instId=${encodeURIComponent(native)}&limit=${Math.min(limit, 100)}`);
+    if (String(data?.code ?? '0') !== '0' || !Array.isArray(data?.data)) throw new Error(`okx_spot_trades_${data?.code ?? 'invalid'}`);
+    const items = data.data.map((row) => {
+      const price = positiveNumber(row?.px);
+      const quantity = positiveNumber(row?.sz);
+      const timeMs = integerValue(row?.ts);
+      const side = String(row?.side || '').toLowerCase();
+      if (price == null || quantity == null || timeMs <= 0 || !['buy', 'sell'].includes(side)) return null;
+      return { id: String(row?.tradeId ?? `${timeMs}:${price}:${quantity}`), time_ms: timeMs, price, quantity, quote_amount: price * quantity, side };
+    }).filter(Boolean);
+    return { items, timestamp_ms: items[0]?.time_ms || Date.now(), upstream_host: 'www.okx.com', native_symbol: native };
+  }
+  const data = await fetchJson(`https://www.okx.com/api/v5/market/books?instId=${encodeURIComponent(native)}&sz=${Math.max(1, Math.min(limit, 20))}`);
+  if (String(data?.code ?? '0') !== '0' || !Array.isArray(data?.data) || !data.data[0]) throw new Error(`okx_spot_orderbook_${data?.code ?? 'invalid'}`);
+  const row = data.data[0];
+  return { bids: normalizeLevels(row?.bids, { side: 'bid' }), asks: normalizeLevels(row?.asks, { side: 'ask' }), timestamp_ms: integerValue(row?.ts) || Date.now(), upstream_host: 'www.okx.com', native_symbol: native };
+}
+
+async function loadSpotBybit(view, symbol, limit) {
+  const native = providerSymbol('bybit', symbol, 'spot');
+  if (view === 'trades') {
+    const data = await fetchJson(`https://api.bybit.com/v5/market/recent-trade?category=spot&symbol=${encodeURIComponent(native)}&limit=${Math.min(limit, 60)}`);
+    if (integerValue(data?.retCode) !== 0 || !Array.isArray(data?.result?.list)) throw new Error(`bybit_spot_trades_${data?.retCode ?? 'invalid'}`);
+    const items = data.result.list.map((row) => {
+      const price = positiveNumber(row?.p ?? row?.price);
+      const quantity = positiveNumber(row?.v ?? row?.size);
+      const timeMs = integerValue(row?.T ?? row?.time);
+      const rawSide = String(row?.S ?? row?.side ?? '').toLowerCase();
+      const side = rawSide === 'buy' ? 'buy' : rawSide === 'sell' ? 'sell' : '';
+      if (price == null || quantity == null || timeMs <= 0 || !side) return null;
+      return { id: String(row?.i ?? row?.execId ?? `${timeMs}:${price}:${quantity}`), time_ms: timeMs, price, quantity, quote_amount: price * quantity, side };
+    }).filter(Boolean);
+    return { items, timestamp_ms: items[0]?.time_ms || integerValue(data?.time) || Date.now(), upstream_host: 'api.bybit.com', native_symbol: native };
+  }
+  const data = await fetchJson(`https://api.bybit.com/v5/market/orderbook?category=spot&symbol=${encodeURIComponent(native)}&limit=${Math.max(1, Math.min(limit, 50))}`);
+  if (integerValue(data?.retCode) !== 0 || !data?.result) throw new Error(`bybit_spot_orderbook_${data?.retCode ?? 'invalid'}`);
+  return { bids: normalizeLevels(data.result.b, { side: 'bid' }), asks: normalizeLevels(data.result.a, { side: 'ask' }), timestamp_ms: integerValue(data.result.cts) || integerValue(data.result.ts) || integerValue(data?.time) || Date.now(), upstream_host: 'api.bybit.com', native_symbol: native };
+}
+
+async function loadSpotBitget(view, symbol, limit) {
+  const native = providerSymbol('bitget', symbol, 'spot');
+  if (view === 'trades') {
+    const data = await fetchJson(`https://api.bitget.com/api/v2/spot/market/fills?symbol=${encodeURIComponent(native)}&limit=${Math.min(limit, 100)}`);
+    if (String(data?.code || '') !== '00000' || !Array.isArray(data?.data)) throw new Error(`bitget_spot_trades_${data?.code ?? 'invalid'}`);
+    const items = data.data.map((row) => {
+      const price = positiveNumber(row?.price);
+      const quantity = positiveNumber(row?.size);
+      const timeMs = integerValue(row?.ts);
+      const rawSide = String(row?.side || '').toLowerCase();
+      const side = rawSide === 'buy' ? 'buy' : rawSide === 'sell' ? 'sell' : '';
+      if (price == null || quantity == null || timeMs <= 0 || !side) return null;
+      return { id: String(row?.tradeId ?? `${timeMs}:${price}:${quantity}`), time_ms: timeMs, price, quantity, quote_amount: price * quantity, side };
+    }).filter(Boolean);
+    return { items, timestamp_ms: items[0]?.time_ms || integerValue(data?.requestTime) || Date.now(), upstream_host: 'api.bitget.com', native_symbol: native };
+  }
+  const data = await fetchJson(`https://api.bitget.com/api/v2/spot/market/orderbook?symbol=${encodeURIComponent(native)}&type=step0&limit=${Math.max(1, Math.min(limit, 50))}`);
+  if (String(data?.code || '') !== '00000' || !data?.data) throw new Error(`bitget_spot_orderbook_${data?.code ?? 'invalid'}`);
+  return { bids: normalizeLevels(data.data.bids, { side: 'bid' }).slice(0, limit), asks: normalizeLevels(data.data.asks, { side: 'ask' }).slice(0, limit), timestamp_ms: integerValue(data.data.ts) || integerValue(data?.requestTime) || Date.now(), upstream_host: 'api.bitget.com', native_symbol: native };
+}
+
+async function loadSpotGate(view, symbol, limit) {
+  const native = providerSymbol('gate', symbol, 'spot');
+  if (view === 'trades') {
+    const data = await fetchJson(`https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(native)}&limit=${Math.min(limit, 100)}`);
+    if (!Array.isArray(data)) throw new Error('gate_spot_trades_invalid');
+    const items = data.map((row) => {
+      const price = positiveNumber(row?.price);
+      const quantity = positiveNumber(row?.amount ?? row?.size);
+      const timeMs = integerValue(row?.create_time_ms) || integerValue(row?.time_ms) || integerValue(row?.create_time) * 1000 || integerValue(row?.time) * 1000;
+      const rawSide = String(row?.side || '').toLowerCase();
+      const side = rawSide === 'buy' ? 'buy' : rawSide === 'sell' ? 'sell' : '';
+      if (price == null || quantity == null || timeMs <= 0 || !side) return null;
+      return { id: String(row?.id ?? `${timeMs}:${price}:${quantity}`), time_ms: timeMs, price, quantity, quote_amount: price * quantity, side };
+    }).filter(Boolean);
+    return { items, timestamp_ms: items[0]?.time_ms || Date.now(), upstream_host: 'api.gateio.ws', native_symbol: native };
+  }
+  const data = await fetchJson(`https://api.gateio.ws/api/v4/spot/order_book?currency_pair=${encodeURIComponent(native)}&limit=${Math.max(1, Math.min(limit, 50))}&with_id=true`);
+  return { bids: normalizeLevels(data?.bids, { side: 'bid' }).slice(0, limit), asks: normalizeLevels(data?.asks, { side: 'ask' }).slice(0, limit), timestamp_ms: integerValue(data?.update) || integerValue(data?.current) || Date.now(), upstream_host: 'api.gateio.ws', native_symbol: native };
+}
+
+async function loadSpotCoinbase(view, symbol, limit) {
+  const native = providerSymbol('coinbase', symbol, 'spot');
+  if (view === 'trades') {
+    const data = await fetchJson(`https://api.exchange.coinbase.com/products/${encodeURIComponent(native)}/trades`);
+    if (!Array.isArray(data)) throw new Error('coinbase_spot_trades_invalid');
+    const items = data.slice(0, limit).map((row) => {
+      const price = positiveNumber(row?.price);
+      const quantity = positiveNumber(row?.size);
+      const timeMs = Date.parse(String(row?.time || ''));
+      const makerSide = String(row?.side || '').toLowerCase();
+      const side = makerSide === 'buy' ? 'sell' : makerSide === 'sell' ? 'buy' : '';
+      if (price == null || quantity == null || !Number.isFinite(timeMs) || timeMs <= 0 || !side) return null;
+      return { id: String(row?.trade_id ?? `${timeMs}:${price}:${quantity}`), time_ms: timeMs, price, quantity, quote_amount: price * quantity, side };
+    }).filter(Boolean);
+    return { items, timestamp_ms: items[0]?.time_ms || Date.now(), upstream_host: 'api.exchange.coinbase.com', native_symbol: native };
+  }
+  const data = await fetchJson(`https://api.exchange.coinbase.com/products/${encodeURIComponent(native)}/book?level=2`);
+  return { bids: normalizeLevels(data?.bids, { side: 'bid' }).slice(0, limit), asks: normalizeLevels(data?.asks, { side: 'ask' }).slice(0, limit), timestamp_ms: Date.now(), upstream_host: 'api.exchange.coinbase.com', native_symbol: native };
+}
+
+async function loadProviderData(provider, marketType, view, symbol, limit) {
+  if (marketType === 'spot') {
+    if (provider === 'binance') throw new Error('binance_spot_depth_render_disabled');
+    if (provider === 'coinbase') return loadSpotCoinbase(view, symbol, limit);
+    if (provider === 'okx') return loadSpotOkx(view, symbol, limit);
+    if (provider === 'bybit') return loadSpotBybit(view, symbol, limit);
+    if (provider === 'bitget') return loadSpotBitget(view, symbol, limit);
+    if (provider === 'gate') return loadSpotGate(view, symbol, limit);
+    throw new Error('unsupported_spot_provider');
+  }
   if (provider === 'binance') return loadBinance(view, symbol, limit);
   if (provider === 'okx') return loadOkx(view, symbol, limit);
   if (provider === 'bybit') return loadBybit(view, symbol, limit);
   if (provider === 'bitget') return loadBitget(view, symbol, limit);
   if (provider === 'gate') return loadGate(view, symbol, limit);
-  throw new Error('unsupported_provider');
+  throw new Error('unsupported_contract_provider');
 }
 
-function buildPayload(provider, view, requestedSymbol, limit, data, cacheState = 'miss') {
+function buildPayload(provider, marketType, view, requestedSymbol, limit, data, cacheState = 'miss') {
   const common = {
     ok: true,
     version: STEP_VERSION,
     provider,
-    market_type: 'contract',
+    market_type: marketType,
     symbol: compactSymbol(requestedSymbol),
     native_symbol: data.native_symbol,
     view,
     limit,
-    source: provider === 'binance' ? `binance_official_public_contract_${view}_websocket` : `${provider}_official_public_contract_${view}`,
+    source: provider === 'binance' ? `binance_official_public_contract_${view}_websocket` : `${provider}_official_public_${marketType}_${view}`,
     transport: data.transport || 'rest',
     upstream_host: data.upstream_host || '',
     timestamp_ms: integerValue(data.timestamp_ms) || Date.now(),
@@ -817,9 +950,9 @@ function buildPayload(provider, view, requestedSymbol, limit, data, cacheState =
   };
 }
 
-async function resolveCached(provider, view, symbol, limit) {
-  const key = `${provider}|${view}|${compactSymbol(symbol)}|${limit}`;
-  const circuitKey = `${provider}|${view}|${compactSymbol(symbol)}`;
+async function resolveCached(provider, marketType, view, symbol, limit) {
+  const key = `${provider}|${marketType}|${view}|${compactSymbol(symbol)}|${limit}`;
+  const circuitKey = `${provider}|${marketType}|${view}|${compactSymbol(symbol)}`;
   const freshMs = view === 'trades' ? TRADES_FRESH_MS : ORDERBOOK_FRESH_MS;
   const now = Date.now();
   const cached = RESPONSE_CACHE.get(key);
@@ -841,9 +974,9 @@ async function resolveCached(provider, view, symbol, limit) {
 
   let pending = INFLIGHT.get(key);
   if (!pending) {
-    pending = loadProviderData(provider, view, symbol, limit)
+    pending = loadProviderData(provider, marketType, view, symbol, limit)
       .then((data) => {
-        const payload = buildPayload(provider, view, symbol, limit, data, 'miss');
+        const payload = buildPayload(provider, marketType, view, symbol, limit, data, 'miss');
         const hasData = view === 'trades' ? payload.items.length > 0 : payload.bids.length > 0 && payload.asks.length > 0;
         const quietBinanceTradeStream = provider === 'binance' && view === 'trades' && payload.connected === true;
         if (!hasData && !quietBinanceTradeStream) throw new Error(`empty_${view}`);
@@ -910,10 +1043,11 @@ export async function handleContractDepth(req, res, url) {
   }
 
   const provider = normalizeProvider(url.searchParams.get('provider'));
+  const marketType = String(url.searchParams.get('market_type') || 'contract').trim().toLowerCase() === 'spot' ? 'spot' : 'contract';
   const view = String(url.searchParams.get('view') || 'orderbook').trim().toLowerCase() === 'trades' ? 'trades' : 'orderbook';
   const symbol = compactSymbol(url.searchParams.get('symbol'));
   const limit = clampLimit(view, url.searchParams.get('limit'));
-  if (!SUPPORTED_PROVIDERS.has(provider)) {
+  if (!SUPPORTED_PROVIDERS.has(provider) || (marketType === 'contract' && provider === 'coinbase')) {
     sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider });
     return true;
   }
@@ -923,16 +1057,17 @@ export async function handleContractDepth(req, res, url) {
   }
 
   try {
-    const payload = await resolveCached(provider, view, symbol, limit);
+    const payload = await resolveCached(provider, marketType, view, symbol, limit);
     sendJson(res, 200, payload, { 'x-kaka-cache': payload.cache_state || 'miss' });
   } catch (error) {
-    const statusCode = Number(error?.statusCode || 0) === 503 ? 503 : 502;
+    const rawStatus = Number(error?.statusCode || 0);
+    const statusCode = rawStatus === 400 ? 400 : rawStatus === 503 ? 503 : 502;
     const retryAfterSeconds = Number(error?.retryAfterSeconds || 0);
     sendJson(res, statusCode, {
       ok: false,
       version: STEP_VERSION,
       provider,
-      market_type: 'contract',
+      market_type: marketType,
       symbol,
       view,
       error: error?.message || 'contract_depth_upstream_failed',

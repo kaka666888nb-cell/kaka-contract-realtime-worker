@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.3';
+const STEP_VERSION = '650.8.15.15';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();
@@ -127,14 +127,37 @@ function baseFromCompact(symbol) {
   return symbol.endsWith(quote) ? symbol.slice(0, -quote.length) : symbol;
 }
 
+function supportsNativeContract(provider, rawSymbol) {
+  const compact = compactSymbol(rawSymbol);
+  const quote = quoteFromCompact(compact);
+  if (quote === 'USDT') return SUPPORTED_PROVIDERS.has(provider);
+  if (quote === 'USDC') return provider === 'binance' || provider === 'bybit' || provider === 'bitget';
+  return false;
+}
+
 function providerSymbol(provider, rawSymbol) {
   const compact = compactSymbol(rawSymbol);
   const quote = quoteFromCompact(compact);
   const base = baseFromCompact(compact);
   if (!base || !quote) throw new Error('invalid_symbol');
+  if (!supportsNativeContract(provider, compact)) throw new Error('unsupported_native_contract_quote');
+  if ((provider === 'bybit' || provider === 'bitget') && quote === 'USDC') return `${base}PERP`;
   if (provider === 'okx') return `${base}-${quote}-SWAP`;
   if (provider === 'gate') return `${base}_${quote}`;
   return `${base}${quote}`;
+}
+
+function displaySymbolForNative(feed, nativeSymbol) {
+  const normalizedNative = compactSymbol(nativeSymbol);
+  for (const display of feed.accessBySymbol.keys()) {
+    try {
+      if (compactSymbol(providerSymbol(feed.provider, display)) === normalizedNative) return display;
+    } catch (_) {}
+  }
+  if (feed.requestedDisplaySymbol && compactSymbol(feed.requestedNativeSymbol) === normalizedNative) {
+    return feed.requestedDisplaySymbol;
+  }
+  return normalizedNative;
 }
 
 function numberValue(value) {
@@ -283,6 +306,7 @@ function createFeed(provider, symbol) {
   const feed = {
     key,
     provider,
+    requestedDisplaySymbol: compactSymbol(symbol),
     requestedNativeSymbol: providerSymbol(provider, symbol),
     socket: null,
     connecting: null,
@@ -657,7 +681,9 @@ function subscribeFeed(feed) {
     return sendWs(socket, { op: 'subscribe', args: [`allLiquidation.${feed.requestedNativeSymbol}`] });
   }
   if (feed.provider === 'bitget') {
-    return sendWs(socket, { op: 'subscribe', args: [{ instType: 'usdt-futures', topic: 'liquidation' }] });
+    const usdt = sendWs(socket, { op: 'subscribe', args: [{ instType: 'usdt-futures', topic: 'liquidation' }] });
+    const usdc = sendWs(socket, { op: 'subscribe', args: [{ instType: 'usdc-futures', topic: 'liquidation' }] });
+    return usdt || usdc;
   }
   if (feed.provider === 'gate') {
     return sendWs(socket, {
@@ -786,7 +812,8 @@ async function handleOkx(feed, data) {
 async function handleBybit(feed, data) {
   if (!String(data?.topic || '').startsWith('allLiquidation.') || !Array.isArray(data?.data)) return;
   for (const row of data.data) {
-    const symbol = compactSymbol(row?.s);
+    const native = compactSymbol(row?.s);
+    const symbol = displaySymbolForNative(feed, native);
     const side = String(row?.S || '').toLowerCase();
     const price = positiveNumber(row?.p);
     const quantity = positiveNumber(row?.v);
@@ -795,7 +822,7 @@ async function handleBybit(feed, data) {
     addEvent(feed, {
       id: `bybit:${symbol}:${timeMs}:${side}:${quantity}`,
       symbol,
-      native_symbol: String(row?.s || symbol),
+      native_symbol: String(row?.s || native),
       time_ms: timeMs,
       price,
       quantity,
@@ -810,7 +837,8 @@ async function handleBybit(feed, data) {
 async function handleBitget(feed, data) {
   if (String(data?.arg?.topic || '') !== 'liquidation' || !Array.isArray(data?.data)) return;
   for (const row of data.data) {
-    const symbol = compactSymbol(row?.symbol);
+    const native = compactSymbol(row?.symbol);
+    const symbol = displaySymbolForNative(feed, native);
     if (!symbol) continue;
     const side = String(row?.side || '').toLowerCase();
     const price = positiveNumber(row?.price);
@@ -821,7 +849,7 @@ async function handleBitget(feed, data) {
     addEvent(feed, {
       id: `bitget:${symbol}:${timeMs}:${side}:${notional}`,
       symbol,
-      native_symbol: String(row?.symbol || symbol),
+      native_symbol: String(row?.symbol || native),
       time_ms: timeMs,
       price,
       quantity,
@@ -1119,8 +1147,8 @@ export async function handleContractLiquidation(req, res, url) {
     sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider });
     return true;
   }
-  if (!symbol) {
-    sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'invalid_symbol' });
+  if (!symbol || !supportsNativeContract(provider, symbol)) {
+    sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'invalid_symbol_or_quote' });
     return true;
   }
 
