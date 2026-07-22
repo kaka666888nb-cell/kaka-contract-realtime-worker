@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.15.30';
+const VERSION = '650.8.15.31';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -13,6 +13,9 @@ const GATE_CONTRACT_STATS_INTERVAL = '5m';
 // Gate official SDK validates list_contract_stats limit in the range 1..100.
 // Step660.2.1 incorrectly requested 288 and therefore received no live rows.
 const GATE_CONTRACT_STATS_LIMIT = 100;
+// Gate official BTC-margined perpetual specification:
+// one BTC_USD inverse contract has a face value of 1 USD.
+const GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT = 1;
 
 function providerKey(raw) {
   const value = String(raw || '').trim().toLowerCase().replaceAll('gate.io', 'gate');
@@ -108,6 +111,23 @@ function okxInstId(symbol) {
 function gateSymbol(symbol) {
   const [base, quote] = splitSymbol(symbol);
   return `${base}_${quote}`;
+}
+
+function gateInverseQuoteValuePerContract(symbol) {
+  const [base, quote] = splitSymbol(symbol);
+  if (base === 'BTC' && quote === 'USD') {
+    return GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT;
+  }
+  return null;
+}
+
+function gateContractSizingReady(state) {
+  if (!state || state.provider !== 'gate') return true;
+  const inverseQuoteValue = gateInverseQuoteValuePerContract(state.symbol);
+  if (inverseQuoteValue && inverseQuoteValue > 0) {
+    return state.gateQuoteValuePerContract === inverseQuoteValue;
+  }
+  return Boolean(state.gateQuantoMultiplier && state.gateQuantoMultiplier > 0);
 }
 
 function asNumber(value) {
@@ -288,13 +308,41 @@ function configFor(provider, symbol, quantityMeta = {}) {
           const signedSize = asNumber(row.size ?? row.amount);
           const side = row.side ||
             (signedSize == null ? '' : signedSize >= 0 ? 'buy' : 'sell');
-          const item = tradeItem(
-            row.create_time_ms ?? row.create_time ?? row.time_ms ?? row.time,
-            row.price,
-            signedSize,
-            side,
-            baseMultiplier,
-          );
+          const price = asNumber(row.price);
+          const contracts = Math.abs(signedSize ?? 0);
+          let item = null;
+          if (quote === 'USD') {
+            const quoteValue =
+              Math.abs(asNumber(quoteMultiplier) ?? 0);
+            const quoteAmount =
+              contracts > 0 && quoteValue > 0
+                ? contracts * quoteValue
+                : 0;
+            item = price && price > 0 && quoteAmount > 0
+              ? tradeItem(
+                  row.create_time_ms ??
+                    row.create_time ??
+                    row.time_ms ??
+                    row.time,
+                  price,
+                  quoteAmount / price,
+                  side,
+                  1,
+                  quoteAmount,
+                )
+              : null;
+          } else {
+            item = tradeItem(
+              row.create_time_ms ??
+                row.create_time ??
+                row.time_ms ??
+                row.time,
+              price,
+              signedSize,
+              side,
+              baseMultiplier,
+            );
+          }
           if (item) items.push(item);
         }
         return items;
@@ -626,23 +674,89 @@ function scheduleOkxMultiplierRetry(state, reason) {
   }
 }
 
-async function loadGateContractMultiplier(state) {
-  if (state.provider !== 'gate') return 1;
-  if (state.gateQuantoMultiplier && state.gateQuantoMultiplier > 0) {
-    return state.gateQuantoMultiplier;
+async function loadGateContractSizing(state) {
+  if (state.provider !== 'gate') {
+    return {
+      mode: 'base_multiplier',
+      baseMultiplier: 1,
+      quoteValuePerContract: null,
+      source: 'not_gate',
+    };
   }
+
+  const inverseQuoteValue = gateInverseQuoteValuePerContract(state.symbol);
+  if (inverseQuoteValue && inverseQuoteValue > 0) {
+    state.gateQuantoMultiplier = null;
+    state.gateQuoteValuePerContract = inverseQuoteValue;
+    state.gateContractSizingMode = 'inverse_quote_face_value';
+    state.gateContractSizingSource =
+      'gate_official_btc_usd_one_usd_per_contract';
+    state.gateContractSizingError = '';
+    return {
+      mode: state.gateContractSizingMode,
+      baseMultiplier: null,
+      quoteValuePerContract: inverseQuoteValue,
+      source: state.gateContractSizingSource,
+    };
+  }
+
+  if (state.gateQuantoMultiplier && state.gateQuantoMultiplier > 0) {
+    return {
+      mode: 'direct_base_multiplier',
+      baseMultiplier: state.gateQuantoMultiplier,
+      quoteValuePerContract: null,
+      source: state.gateContractSizingSource ||
+        'gate_contract_multiplier_cache',
+    };
+  }
+
   const contract = gateSymbol(state.symbol);
   const settle = gateSettle(state.symbol);
-  const payload = await firstWorkingJson([
+  const urls = [
     `https://api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
     `https://fx-api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
-  ], { timeoutMs: 8000 });
-  const multiplier = asNumber(payload?.quanto_multiplier);
-  if (multiplier == null || multiplier <= 0) {
-    throw new Error('gate_contract_multiplier_missing');
+    `https://api.gateio.ws/api/v4/futures/${settle}/contracts`,
+    `https://fx-api.gateio.ws/api/v4/futures/${settle}/contracts`,
+  ];
+  const errors = [];
+
+  for (const url of urls) {
+    try {
+      const payload = await fetchJson(url, { timeoutMs: 8000 });
+      const row = Array.isArray(payload)
+        ? payload.find(
+            (item) =>
+              String(item?.name || '').trim().toUpperCase() === contract,
+          )
+        : payload;
+      const multiplier = firstFinite(
+        row?.quanto_multiplier,
+        row?.contract_multiplier,
+        row?.multiplier,
+      );
+      if (multiplier && multiplier > 0) {
+        state.gateQuantoMultiplier = multiplier;
+        state.gateQuoteValuePerContract = null;
+        state.gateContractSizingMode = 'direct_base_multiplier';
+        state.gateContractSizingSource = url;
+        state.gateContractSizingError = '';
+        return {
+          mode: state.gateContractSizingMode,
+          baseMultiplier: multiplier,
+          quoteValuePerContract: null,
+          source: url,
+        };
+      }
+      errors.push(`missing_multiplier:${url}`);
+    } catch (error) {
+      errors.push(String(error?.message || error));
+    }
   }
-  state.gateQuantoMultiplier = multiplier;
-  return multiplier;
+
+  state.gateContractSizingError =
+    errors.join(' | ').slice(0, 700) ||
+    'gate_contract_multiplier_missing';
+  throw new Error(state.gateContractSizingError);
 }
 
 function scheduleGateMultiplierRetry(state, reason) {
@@ -711,10 +825,10 @@ async function startStream(state) {
       }
       return;
     }
-    if (state.provider === 'gate' && !(state.gateQuantoMultiplier > 0)) {
+    if (state.provider === 'gate' && !gateContractSizingReady(state)) {
       state.status = 'loading_contract_meta';
       if (!state.gateMultiplierPromise) {
-        state.gateMultiplierPromise = loadGateContractMultiplier(state)
+        state.gateMultiplierPromise = loadGateContractSizing(state)
           .then(() => {
             state.gateMultiplierPromise = null;
             if (states.get(state.key) === state && Date.now() - state.lastRequestedAt <= IDLE_CLOSE_MS) startStream(state).catch(() => {});
@@ -733,9 +847,11 @@ async function startStream(state) {
         }
       : {
           baseMultiplier: state.provider === 'gate'
-            ? (state.gateQuantoMultiplier || 1)
+            ? state.gateQuantoMultiplier
             : 1,
-          quoteMultiplier: null,
+          quoteMultiplier: state.provider === 'gate'
+            ? state.gateQuoteValuePerContract
+            : null,
         };
     const cfg = configFor(state.provider, state.symbol, quantityMeta);
     state.status = state.provider === 'binance' ? 'connect_queued' : 'connecting';
@@ -846,7 +962,12 @@ function getState(provider, symbol) {
       ratioCriticalPromise: null, ratioCriticalFetchedAt: 0, ratioCriticalError: '',
       metricBackgroundTimer: null,
       okxContractBaseMultiplier: null, okxContractQuoteMultiplier: null, okxMultiplierPromise: null,
-      gateQuantoMultiplier: null, gateMultiplierPromise: null,
+      gateQuantoMultiplier: null,
+      gateQuoteValuePerContract: null,
+      gateContractSizingMode: '',
+      gateContractSizingSource: '',
+      gateContractSizingError: '',
+      gateMultiplierPromise: null,
       gateOfficialFlowRows: new Map(),
       gateOfficialFlowUpdatedAt: 0,
       gateContractStatsFetchedAt: 0,
@@ -1783,80 +1904,173 @@ function parseGateContractStatItem(
   {
     provider = 'gate',
     symbol = 'BTCUSD',
-    multiplier = 1,
+    multiplier = null,
+    quoteValuePerContract = null,
     fallbackPrice = null,
   } = {},
 ) {
   const sourceTime = item?.time ?? item?.timestamp ?? Date.now();
   const row = emptyMetricRow(provider, symbol, sourceTime);
+  const [, quote] = splitSymbol(symbol);
+  const inverseUsd = quote === 'USD';
   const safeMultiplier = Math.abs(asNumber(multiplier) ?? 0);
-  const markPrice = firstFinite(item?.mark_price, item?.markPrice, fallbackPrice);
+  const safeQuoteValue = Math.abs(
+    asNumber(quoteValuePerContract) ??
+      gateInverseQuoteValuePerContract(symbol) ??
+      0,
+  );
+  const markPrice = firstFinite(
+    item?.mark_price,
+    item?.markPrice,
+    fallbackPrice,
+  );
 
   const contracts = Math.abs(asNumber(item?.open_interest) ?? 0);
-  const baseAmount = contracts > 0 && safeMultiplier > 0
-    ? contracts * safeMultiplier
-    : null;
   const explicitQuoteValue = firstFinite(
     item?.open_interest_usd,
     item?.open_interest_usd_new,
     item?.open_interest_value,
     item?.open_interest_quote,
   );
-  row.open_interest = baseAmount && baseAmount > 0 ? baseAmount : null;
-  row.open_interest_value = explicitQuoteValue && explicitQuoteValue > 0
-    ? explicitQuoteValue
-    : (baseAmount && markPrice && markPrice > 0 ? baseAmount * markPrice : null);
+  const derivedQuoteValue =
+    inverseUsd && contracts > 0 && safeQuoteValue > 0
+      ? contracts * safeQuoteValue
+      : null;
+  const quoteNotional =
+    explicitQuoteValue && explicitQuoteValue > 0
+      ? explicitQuoteValue
+      : derivedQuoteValue;
+  const baseAmount = inverseUsd
+    ? (
+        quoteNotional &&
+        quoteNotional > 0 &&
+        markPrice &&
+        markPrice > 0
+          ? quoteNotional / markPrice
+          : null
+      )
+    : (
+        contracts > 0 && safeMultiplier > 0
+          ? contracts * safeMultiplier
+          : null
+      );
 
-  // Gate ContractStat current schema (2026-04+): lsr_account/top_lsr_* remain
-  // official ratio fields, while long_users/short_users and the top long/short
-  // parts provide counts/sizes. Keep both generations compatible.
+  row.open_interest =
+    baseAmount && baseAmount > 0 ? baseAmount : null;
+  row.open_interest_value =
+    quoteNotional && quoteNotional > 0
+      ? quoteNotional
+      : (
+          baseAmount && markPrice && markPrice > 0
+            ? baseAmount * markPrice
+            : null
+        );
+
   applyRatioFromParts(
     row,
     'global',
-    item?.lsr_account ?? item?.long_short_ratio ?? item?.long_short_account_ratio,
-    item?.long_users ?? item?.long_account ?? item?.long_ratio,
-    item?.short_users ?? item?.short_account ?? item?.short_ratio,
+    item?.lsr_account ??
+      item?.long_short_ratio ??
+      item?.long_short_account_ratio,
+    item?.long_users ??
+      item?.long_account ??
+      item?.long_ratio,
+    item?.short_users ??
+      item?.short_account ??
+      item?.short_ratio,
   );
   applyRatioFromParts(
     row,
     'top_account',
-    item?.top_lsr_account ?? item?.top_long_short_account_ratio,
-    item?.top_long_account ?? item?.top_long_users,
-    item?.top_short_account ?? item?.top_short_users,
+    item?.top_lsr_account ??
+      item?.top_long_short_account_ratio,
+    item?.top_long_account ??
+      item?.top_long_users,
+    item?.top_short_account ??
+      item?.top_short_users,
   );
   applyRatioFromParts(
     row,
     'top_position',
-    item?.top_lsr_size ?? item?.top_long_short_position_ratio,
+    item?.top_lsr_size ??
+      item?.top_long_short_position_ratio,
     item?.top_long_size,
     item?.top_short_size,
   );
 
-  const longTakerContracts = Math.abs(asNumber(item?.long_taker_size) ?? 0);
-  const shortTakerContracts = Math.abs(asNumber(item?.short_taker_size) ?? 0);
-  const buyQuote = longTakerContracts > 0 && safeMultiplier > 0 && markPrice > 0
-    ? longTakerContracts * safeMultiplier * markPrice
-    : null;
-  const sellQuote = shortTakerContracts > 0 && safeMultiplier > 0 && markPrice > 0
-    ? shortTakerContracts * safeMultiplier * markPrice
-    : null;
-  const explicitTakerRatio = asNumber(item?.lsr_taker ?? item?.long_short_taker_ratio);
-  const ratio = explicitTakerRatio && explicitTakerRatio > 0
-    ? explicitTakerRatio
-    : (buyQuote && sellQuote && sellQuote > 0 ? buyQuote / sellQuote : null);
+  const longTakerContracts =
+    Math.abs(asNumber(item?.long_taker_size) ?? 0);
+  const shortTakerContracts =
+    Math.abs(asNumber(item?.short_taker_size) ?? 0);
+  const buyQuote = inverseUsd
+    ? (
+        longTakerContracts > 0 && safeQuoteValue > 0
+          ? longTakerContracts * safeQuoteValue
+          : null
+      )
+    : (
+        longTakerContracts > 0 &&
+        safeMultiplier > 0 &&
+        markPrice > 0
+          ? longTakerContracts * safeMultiplier * markPrice
+          : null
+      );
+  const sellQuote = inverseUsd
+    ? (
+        shortTakerContracts > 0 && safeQuoteValue > 0
+          ? shortTakerContracts * safeQuoteValue
+          : null
+      )
+    : (
+        shortTakerContracts > 0 &&
+        safeMultiplier > 0 &&
+        markPrice > 0
+          ? shortTakerContracts * safeMultiplier * markPrice
+          : null
+      );
+  const explicitTakerRatio = asNumber(
+    item?.lsr_taker ??
+      item?.long_short_taker_ratio,
+  );
+  const ratio =
+    explicitTakerRatio && explicitTakerRatio > 0
+      ? explicitTakerRatio
+      : (
+          buyQuote && sellQuote && sellQuote > 0
+            ? buyQuote / sellQuote
+            : null
+        );
   const start = metricBucketStart(sourceTime);
-  const flow = (buyQuote && buyQuote > 0) || (sellQuote && sellQuote > 0) || (ratio && ratio > 0)
-    ? {
-        start,
-        end: start + FIVE_MIN_MS,
-        buyQuote: buyQuote && buyQuote > 0 ? buyQuote : 0,
-        sellQuote: sellQuote && sellQuote > 0 ? sellQuote : 0,
-        buySellRatio: ratio && ratio > 0 ? ratio : null,
-        source: 'gate_contract_stats_official_taker_aggregate_v1',
-      }
-    : null;
-  row.source = 'gate_contract_stats_current_schema_v1';
-  return { metric: row, flow, markPrice };
+  const flowRow =
+    (buyQuote && buyQuote > 0) ||
+    (sellQuote && sellQuote > 0) ||
+    (ratio && ratio > 0)
+      ? {
+          start,
+          end: start + FIVE_MIN_MS,
+          buyQuote: buyQuote && buyQuote > 0 ? buyQuote : 0,
+          sellQuote: sellQuote && sellQuote > 0 ? sellQuote : 0,
+          buySellRatio: ratio && ratio > 0 ? ratio : null,
+          source: inverseUsd
+            ? 'gate_contract_stats_inverse_one_usd_per_contract'
+            : 'gate_contract_stats_direct_multiplier',
+        }
+      : null;
+  row.source = inverseUsd
+    ? 'gate_contract_stats_inverse_quote_face_value_v1'
+    : 'gate_contract_stats_current_schema_v2';
+  return {
+    metric: row,
+    flow: flowRow,
+    markPrice,
+    sizingMode: inverseUsd
+      ? 'inverse_quote_face_value'
+      : 'direct_base_multiplier',
+    quoteValuePerContract:
+      inverseUsd ? safeQuoteValue : null,
+    baseMultiplier:
+      inverseUsd ? null : safeMultiplier,
+  };
 }
 
 function updateGateOfficialFlowRows(state, flowRows) {
@@ -1907,8 +2121,8 @@ function gateUsdFlowSelfTest() {
   const parsed = parseGateContractStatItem({
     time: 1_700_000_000,
     open_interest: '100',
-    open_interest_usd: '660',
-    mark_price: '66000',
+    open_interest_usd: '100',
+    mark_price: '50000',
     lsr_account: '1.5',
     top_lsr_account: '1.25',
     top_lsr_size: '1.2',
@@ -1920,31 +2134,46 @@ function gateUsdFlowSelfTest() {
     top_short_size: '45.4545455',
     long_taker_size: '6',
     short_taker_size: '4',
-  }, { multiplier: 0.0001, fallbackPrice: 66000 });
+  }, {
+    symbol: 'BTCUSD',
+    multiplier: null,
+    quoteValuePerContract:
+      GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,
+    fallbackPrice: 50000,
+  });
   const metric = parsed.metric;
-  const flow = parsed.flow;
-  const close = (a, b, epsilon = 1e-9) => Number.isFinite(a) && Math.abs(a - b) <= epsilon;
+  const flowRow = parsed.flow;
+  const close = (a, b, epsilon = 1e-9) =>
+    Number.isFinite(a) && Math.abs(a - b) <= epsilon;
   const tests = [
-    ['open_interest_base', close(metric.open_interest, 0.01)],
-    ['open_interest_quote', close(metric.open_interest_value, 660)],
-    ['global_ratio_current_fields', close(metric.global_long_short_ratio, 1.5)],
-    ['top_account_legacy_ratio', close(metric.top_account_long_short_ratio, 1.25)],
-    ['top_position_legacy_ratio', close(metric.top_position_long_short_ratio, 1.2)],
-    ['taker_buy_quote', close(flow?.buyQuote, 39.6)],
-    ['taker_sell_quote', close(flow?.sellQuote, 26.4)],
-    ['taker_ratio', close(flow?.buySellRatio, 1.5)],
+    ['inverse_no_quanto_multiplier', parsed.baseMultiplier == null],
+    ['inverse_face_value_one_usd',
+      close(parsed.quoteValuePerContract, 1)],
+    ['open_interest_base', close(metric.open_interest, 0.002)],
+    ['open_interest_quote', close(metric.open_interest_value, 100)],
+    ['global_ratio_current_fields',
+      close(metric.global_long_short_ratio, 1.5)],
+    ['top_account_legacy_ratio',
+      close(metric.top_account_long_short_ratio, 1.25)],
+    ['top_position_legacy_ratio',
+      close(metric.top_position_long_short_ratio, 1.2)],
+    ['taker_buy_quote', close(flowRow?.buyQuote, 6)],
+    ['taker_sell_quote', close(flowRow?.sellQuote, 4)],
+    ['taker_ratio', close(flowRow?.buySellRatio, 1.5)],
   ].map(([name, ok]) => ({ name, ok: ok === true }));
-  return { ok: tests.every((item) => item.ok), checks: tests.length, tests };
+  return {
+    ok: tests.every((item) => item.ok),
+    checks: tests.length,
+    tests,
+  };
 }
 
 async function fetchGateMetricRows(state) {
   const contract = gateSymbol(state.symbol);
   const settle = gateSettle(state.symbol);
   try {
-    // Multiplier and ContractStat are independent public requests, so acquire
-    // them concurrently. This keeps Gate first paint inside the route wait.
-    const [multiplier, statsResult] = await Promise.all([
-      loadGateContractMultiplier(state),
+    const [sizing, statsResult] = await Promise.all([
+      loadGateContractSizing(state),
       firstWorkingNonEmptyArrayJson([
         `https://api.gateio.ws/api/v4/futures/${settle}/contract_stats?contract=${encodeURIComponent(contract)}&interval=${encodeURIComponent(GATE_CONTRACT_STATS_INTERVAL)}&limit=${GATE_CONTRACT_STATS_LIMIT}`,
         `https://fx-api.gateio.ws/api/v4/futures/${settle}/contract_stats?contract=${encodeURIComponent(contract)}&interval=${encodeURIComponent(GATE_CONTRACT_STATS_INTERVAL)}&limit=${GATE_CONTRACT_STATS_LIMIT}`,
@@ -1963,11 +2192,15 @@ async function fetchGateMetricRows(state) {
       const parsed = parseGateContractStatItem(item, {
         provider: state.provider,
         symbol: state.symbol,
-        multiplier,
+        multiplier: sizing.baseMultiplier,
+        quoteValuePerContract:
+          sizing.quoteValuePerContract,
         fallbackPrice,
       });
       const merged = mergeMetricRow(map, parsed.metric);
-      if (merged && parsed.flow) officialFlowRows.push(parsed.flow);
+      if (merged && parsed.flow) {
+        officialFlowRows.push(parsed.flow);
+      }
     }
     const metricRows = [...map.values()];
     if (metricRows.length === 0) {
@@ -1980,6 +2213,9 @@ async function fetchGateMetricRows(state) {
     state.gateContractStatsFlowCount = officialFlowRows.length;
     state.gateContractStatsSource = statsResult.url;
     state.gateContractStatsError = '';
+    state.gateContractSizingMode = sizing.mode;
+    state.gateContractSizingSource = sizing.source;
+    state.gateContractSizingError = '';
     return metricRows;
   } catch (error) {
     state.gateContractStatsFetchedAt = Date.now();
@@ -2258,7 +2494,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
@@ -2294,6 +2530,12 @@ export async function handleContractFlow(req,res,url){
         official_flow_rows:officialRows.length,
         ratio_types:ratioTypes,
         latest_oi:latestOi,
+        sizing_mode:state.gateContractSizingMode,
+        quote_value_per_contract:
+          state.gateQuoteValuePerContract,
+        base_multiplier:state.gateQuantoMultiplier,
+        sizing_source:state.gateContractSizingSource,
+        sizing_error:state.gateContractSizingError,
         source:state.gateContractStatsSource,
         error:state.gateContractStatsError,
       });
@@ -2311,6 +2553,12 @@ export async function handleContractFlow(req,res,url){
         raw_rows:state.gateContractStatsRowCount,
         metric_rows:state.gateContractStatsMetricCount,
         official_flow_rows:state.gateContractStatsFlowCount,
+        sizing_mode:state.gateContractSizingMode,
+        quote_value_per_contract:
+          state.gateQuoteValuePerContract,
+        base_multiplier:state.gateQuantoMultiplier,
+        sizing_source:state.gateContractSizingSource,
+        sizing_error:state.gateContractSizingError,
         source:state.gateContractStatsSource,
         error:String(error?.message||error).slice(0,700),
       });
@@ -2414,6 +2662,12 @@ export async function handleContractFlow(req,res,url){
       raw_rows:state.gateContractStatsRowCount,
       metric_rows:state.gateContractStatsMetricCount,
       official_flow_rows:state.gateContractStatsFlowCount,
+      sizing_mode:state.gateContractSizingMode,
+      quote_value_per_contract:
+        state.gateQuoteValuePerContract,
+      base_multiplier:state.gateQuantoMultiplier,
+      sizing_source:state.gateContractSizingSource,
+      sizing_error:state.gateContractSizingError,
       source:state.gateContractStatsSource,
       error:state.gateContractStatsError,
     };
