@@ -2,7 +2,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.28';
+const VERSION = '650.8.15.29';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
