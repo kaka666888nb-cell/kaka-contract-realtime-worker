@@ -1,5 +1,5 @@
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.29';
+const STEP_VERSION = '650.8.15.30';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();

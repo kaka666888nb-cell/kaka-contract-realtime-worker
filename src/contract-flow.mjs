@@ -2,13 +2,17 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 
-const VERSION = '650.8.15.29';
+const VERSION = '650.8.15.30';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const IDLE_CLOSE_MS = 12 * 60 * 1000;
 const RECONNECT_MAX_MS = 30000;
+const GATE_CONTRACT_STATS_INTERVAL = '5m';
+// Gate official SDK validates list_contract_stats limit in the range 1..100.
+// Step660.2.1 incorrectly requested 288 and therefore received no live rows.
+const GATE_CONTRACT_STATS_LIMIT = 100;
 
 function providerKey(raw) {
   const value = String(raw || '').trim().toLowerCase().replaceAll('gate.io', 'gate');
@@ -845,6 +849,12 @@ function getState(provider, symbol) {
       gateQuantoMultiplier: null, gateMultiplierPromise: null,
       gateOfficialFlowRows: new Map(),
       gateOfficialFlowUpdatedAt: 0,
+      gateContractStatsFetchedAt: 0,
+      gateContractStatsRowCount: 0,
+      gateContractStatsMetricCount: 0,
+      gateContractStatsFlowCount: 0,
+      gateContractStatsSource: '',
+      gateContractStatsError: '',
       historyLoaded: false, historyLoading: false, historyError: '',
     };
     states.set(key, state);
@@ -1565,6 +1575,25 @@ async function firstWorkingJson(urls, options = {}) {
   throw new Error(errors.join(' | ').slice(0, 700) || 'all_upstreams_failed');
 }
 
+async function firstWorkingNonEmptyArrayJson(urls, options = {}) {
+  const errors = [];
+  for (const url of urls) {
+    try {
+      const payload = await fetchJson(url, options);
+      if (Array.isArray(payload) && payload.length > 0) {
+        return { payload, url };
+      }
+      errors.push(`empty_array:${url}`);
+    } catch (error) {
+      errors.push(String(error?.message || error));
+    }
+  }
+  throw new Error(
+    errors.join(' | ').slice(0, 700) ||
+    'all_upstream_arrays_empty',
+  );
+}
+
 async function fetchBinanceMetricRows(state) {
   const native = nativeContractSymbol('binance', state.symbol);
   const host = 'https://fapi.binance.com';
@@ -1910,31 +1939,57 @@ function gateUsdFlowSelfTest() {
 
 async function fetchGateMetricRows(state) {
   const contract = gateSymbol(state.symbol);
-  const multiplier = await loadGateContractMultiplier(state);
-  const raw = await firstWorkingJson([
-    `https://api.gateio.ws/api/v4/futures/${gateSettle(state.symbol)}/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
-    `https://fx-api.gateio.ws/api/v4/futures/${gateSettle(state.symbol)}/contract_stats?contract=${encodeURIComponent(contract)}&interval=5m&limit=288`,
-  ], { timeoutMs: 8000 });
-  const fastMeta = getContractMetaFast('gate', state.symbol);
-  const fallbackPrice = firstFinite(
-    fastMeta?.mark_price,
-    fastMeta?.last_price,
-    state.lastPrice,
-  );
-  const map = new Map();
-  const officialFlowRows = [];
-  for (const item of Array.isArray(raw) ? raw : []) {
-    const parsed = parseGateContractStatItem(item, {
-      provider: state.provider,
-      symbol: state.symbol,
-      multiplier,
-      fallbackPrice,
-    });
-    const merged = mergeMetricRow(map, parsed.metric);
-    if (merged && parsed.flow) officialFlowRows.push(parsed.flow);
+  const settle = gateSettle(state.symbol);
+  try {
+    // Multiplier and ContractStat are independent public requests, so acquire
+    // them concurrently. This keeps Gate first paint inside the route wait.
+    const [multiplier, statsResult] = await Promise.all([
+      loadGateContractMultiplier(state),
+      firstWorkingNonEmptyArrayJson([
+        `https://api.gateio.ws/api/v4/futures/${settle}/contract_stats?contract=${encodeURIComponent(contract)}&interval=${encodeURIComponent(GATE_CONTRACT_STATS_INTERVAL)}&limit=${GATE_CONTRACT_STATS_LIMIT}`,
+        `https://fx-api.gateio.ws/api/v4/futures/${settle}/contract_stats?contract=${encodeURIComponent(contract)}&interval=${encodeURIComponent(GATE_CONTRACT_STATS_INTERVAL)}&limit=${GATE_CONTRACT_STATS_LIMIT}`,
+      ], { timeoutMs: 8000 }),
+    ]);
+    const raw = statsResult.payload;
+    const fastMeta = getContractMetaFast('gate', state.symbol);
+    const fallbackPrice = firstFinite(
+      fastMeta?.mark_price,
+      fastMeta?.last_price,
+      state.lastPrice,
+    );
+    const map = new Map();
+    const officialFlowRows = [];
+    for (const item of raw) {
+      const parsed = parseGateContractStatItem(item, {
+        provider: state.provider,
+        symbol: state.symbol,
+        multiplier,
+        fallbackPrice,
+      });
+      const merged = mergeMetricRow(map, parsed.metric);
+      if (merged && parsed.flow) officialFlowRows.push(parsed.flow);
+    }
+    const metricRows = [...map.values()];
+    if (metricRows.length === 0) {
+      throw new Error('gate_contract_stats_parsed_empty');
+    }
+    updateGateOfficialFlowRows(state, officialFlowRows);
+    state.gateContractStatsFetchedAt = Date.now();
+    state.gateContractStatsRowCount = raw.length;
+    state.gateContractStatsMetricCount = metricRows.length;
+    state.gateContractStatsFlowCount = officialFlowRows.length;
+    state.gateContractStatsSource = statsResult.url;
+    state.gateContractStatsError = '';
+    return metricRows;
+  } catch (error) {
+    state.gateContractStatsFetchedAt = Date.now();
+    state.gateContractStatsRowCount = 0;
+    state.gateContractStatsMetricCount = 0;
+    state.gateContractStatsFlowCount = 0;
+    state.gateContractStatsError =
+      String(error?.message || error).slice(0, 700);
+    throw error;
   }
-  updateGateOfficialFlowRows(state, officialFlowRows);
-  return [...map.values()];
 }
 
 async function fetchProviderMetricRows(state) {
@@ -2036,7 +2091,8 @@ function metricPayloadFromState(state) {
 async function fetchVenueMetrics(state) {
   await loadPersistedMetrics(state);
   const now = Date.now();
-  const latest = [...state.metricRows.keys()].sort((a, b) => b - a)[0] || 0;
+  const latest = [...state.metricRows.values()]
+    .reduce((maxValue, row) => Math.max(maxValue, metricRowStart(row)), 0);
   const statusBefore = recentMetricFamilyStatus(state);
   const fullFresh = statusBefore.complete && latest && now - latest < METRIC_REFRESH_MS + 30000;
   const partialRetryInterval = state.metricPartialRetryCount < 2 ? 60000 : METRIC_REFRESH_MS;
@@ -2202,11 +2258,64 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_multiplier:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
     sendJson(res,selfTest.ok?200:500,{ok:selfTest.ok,version:VERSION,self_test:selfTest});return true;
+  }
+  if(url.pathname==='/api/gate-contract-stats-live-test'){
+    const symbol=symbolKey(url.searchParams.get('symbol')||'BTCUSD');
+    if(!symbol||!supportsNativeContract('gate',symbol)){
+      sendJson(res,400,{ok:false,version:VERSION,error:'invalid_gate_symbol'});return true;
+    }
+    const state=getState('gate',symbol);
+    try{
+      const rows=await fetchGateMetricRows(state);
+      const metrics=metricPayloadFromState({
+        ...state,
+        metricRows:new Map(rows.map((row)=>[metricKey(row),row])),
+      });
+      const officialRows=gateOfficialFlowFallbackRows(state);
+      const latestOi=metrics.oi_rows.at(-1)||null;
+      const ratioTypes=[...new Set(metrics.ratio_rows.map((row)=>row.ratio_type))];
+      sendJson(res,200,{
+        ok:true,
+        version:VERSION,
+        provider:'gate',
+        symbol,
+        native_symbol:gateSymbol(symbol),
+        settle:gateSettle(symbol),
+        interval:GATE_CONTRACT_STATS_INTERVAL,
+        requested_limit:GATE_CONTRACT_STATS_LIMIT,
+        official_max_limit:100,
+        raw_rows:state.gateContractStatsRowCount,
+        metric_rows:rows.length,
+        official_flow_rows:officialRows.length,
+        ratio_types:ratioTypes,
+        latest_oi:latestOi,
+        source:state.gateContractStatsSource,
+        error:state.gateContractStatsError,
+      });
+    }catch(error){
+      sendJson(res,502,{
+        ok:false,
+        version:VERSION,
+        provider:'gate',
+        symbol,
+        native_symbol:gateSymbol(symbol),
+        settle:gateSettle(symbol),
+        interval:GATE_CONTRACT_STATS_INTERVAL,
+        requested_limit:GATE_CONTRACT_STATS_LIMIT,
+        official_max_limit:100,
+        raw_rows:state.gateContractStatsRowCount,
+        metric_rows:state.gateContractStatsMetricCount,
+        official_flow_rows:state.gateContractStatsFlowCount,
+        source:state.gateContractStatsSource,
+        error:String(error?.message||error).slice(0,700),
+      });
+    }
+    return true;
   }
   if(url.pathname==='/api/contract-meta'){
     if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}
@@ -2269,7 +2378,7 @@ export async function handleContractFlow(req,res,url){
     if(provider==='gate'){
       waits.push(Promise.race([
         gateMetricFirstPaintPromise||Promise.resolve(null),
-        new Promise((resolve)=>setTimeout(resolve,Math.min(4200,Math.max(1800,waitMs)))),
+        new Promise((resolve)=>setTimeout(resolve,Math.min(5000,Math.max(2500,waitMs)))),
       ]));
     }
     if(provider==='binance'&&!hasFreshRatioFamily(state,'global')){
@@ -2294,6 +2403,21 @@ export async function handleContractFlow(req,res,url){
   payload.background_refresh=true;
   payload.metric_refresh_pending=Boolean(state.metricFetchPromise||state.oiCriticalPromise||state.ratioCriticalPromise||state.metricLoading);
   payload.metric_error=state.metricError||'';
+  if(provider==='gate'){
+    payload.gate_contract_stats={
+      interval:GATE_CONTRACT_STATS_INTERVAL,
+      requested_limit:GATE_CONTRACT_STATS_LIMIT,
+      official_max_limit:100,
+      fetched_at:state.gateContractStatsFetchedAt
+        ?new Date(state.gateContractStatsFetchedAt).toISOString()
+        :null,
+      raw_rows:state.gateContractStatsRowCount,
+      metric_rows:state.gateContractStatsMetricCount,
+      official_flow_rows:state.gateContractStatsFlowCount,
+      source:state.gateContractStatsSource,
+      error:state.gateContractStatsError,
+    };
+  }
   payload.long_short_first_paint={
     transport:'authenticated_edge_relay_critical_global_first',
     global_ready:hasFreshRatioFamily(state,'global'),
