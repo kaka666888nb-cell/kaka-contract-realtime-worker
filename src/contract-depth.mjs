@@ -1,5 +1,5 @@
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.32';
+const STEP_VERSION = '650.8.15.33';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -755,7 +755,9 @@ function normalizeLevels(
       rawPrice = ['price', 'p', 'px']
         .map((key) => raw[key])
         .find((value) => value != null);
-      rawSize = ['quantity', 'size', 'amount', 'q', 'sz']
+      // Gate futures order_book levels use { p, s }.
+      // Keep every existing provider alias and include the official Gate s field.
+      rawSize = ['quantity', 'size', 'amount', 'q', 'sz', 's']
         .map((key) => raw[key])
         .find((value) => value != null);
     }
@@ -1906,6 +1908,7 @@ export function getContractDepthHealth() {
     gate_inverse_contract_count_preserved: true,
     gate_inverse_quote_amount_preserved: true,
     gate_inverse_trades_same_sizing: true,
+    gate_orderbook_size_field_s_supported: true,
     gate_inverse_depth_self_test:
       gateInverseDepthSelfTest(),
     coinbase_level2_active_routes: [...COINBASE_L2_STATES.values()].map((state) => ({
