@@ -876,13 +876,14 @@ async function universe(provider, market, requestedQuote = 'USDT') {
   return catalog.filter((row) => row.quote_asset === quote);
 }
 
-function tickerVolumeSemantics(provider, market, item, last) {
+function tickerVolumeSemantics(provider, market, item, last, quote = 'USDT') {
   let baseVolume = null;
   let quoteVolume = null;
   let contractCount = null;
   let quoteVolumeUsd = null;
   let baseSource = null;
   let quoteSource = null;
+  const safeQuote = normalizedQuote(quote, 'USDT');
 
   if (provider === 'binance') {
     baseVolume = num(item.base_volume_24h ?? item.volume_24h ?? item.volume);
@@ -900,10 +901,20 @@ function tickerVolumeSemantics(provider, market, item, last) {
     baseSource = 'coinbase_base_volume';
     quoteSource = 'coinbase_quote_turnover';
   } else if (provider === 'bybit') {
-    baseVolume = num(item.base_volume_24h ?? item.volume24h);
-    quoteVolume = num(item.quote_volume_24h ?? item.turnover24h);
-    baseSource = 'bybit_volume24h';
-    quoteSource = 'bybit_turnover24h';
+    const inverse = market === 'contract' && safeQuote === 'USD';
+    if (inverse) {
+      // Bybit inverse: volume24h is quote/USD volume and turnover24h is
+      // base-coin turnover. Linear contracts use the opposite unit order.
+      baseVolume = num(item.base_volume_24h ?? item.turnover24h);
+      quoteVolume = num(item.quote_volume_24h ?? item.volume24h);
+      baseSource = 'bybit_inverse_turnover24h_base';
+      quoteSource = 'bybit_inverse_volume24h_quote';
+    } else {
+      baseVolume = num(item.base_volume_24h ?? item.volume24h);
+      quoteVolume = num(item.quote_volume_24h ?? item.turnover24h);
+      baseSource = 'bybit_linear_or_spot_volume24h_base';
+      quoteSource = 'bybit_linear_or_spot_turnover24h_quote';
+    }
   } else if (provider === 'bitget') {
     baseVolume = num(item.base_volume_24h ?? item.baseVolume);
     quoteVolume = num(item.quote_volume_24h ?? item.quoteVolume);
@@ -981,6 +992,60 @@ function tickerVolumeSemantics(provider, market, item, last) {
   };
 }
 
+function tickerOpenInterestSemantics(provider, market, quote, item, last) {
+  let amount = num(item.openInterest ?? item.holdingAmount ?? item.open_interest);
+  let value = num(item.openInterestValue ?? item.open_interest_value);
+  let amountUnit = item.open_interest_unit || null;
+  let valueUnit = item.open_interest_value_unit || null;
+  const safeQuote = normalizedQuote(quote, 'USDT');
+
+  if (market !== 'contract') {
+    return {
+      open_interest: amount,
+      open_interest_value: value,
+      open_interest_unit: amountUnit,
+      open_interest_value_unit: valueUnit,
+    };
+  }
+
+  if (provider === 'bybit') {
+    if (safeQuote === 'USD') {
+      // Bybit inverse: openInterest is USD/quote amount and
+      // openInterestValue is the converted base-coin amount.
+      amountUnit = 'quote_asset';
+      valueUnit = 'base_asset';
+      if (value === null && amount !== null && last !== null && last > 0) {
+        value = amount / last;
+      }
+    } else {
+      amountUnit = 'base_asset';
+      valueUnit = 'quote_asset';
+      if (value === null && amount !== null && last !== null && last > 0) {
+        value = amount * last;
+      }
+    }
+  } else if (provider === 'bitget') {
+    // Bitget holdingAmount is documented as base-coin position size.
+    amountUnit = 'base_asset';
+    valueUnit = 'quote_asset';
+    if (value === null && amount !== null && last !== null && last > 0) {
+      value = amount * last;
+    }
+  } else if (amount !== null || value !== null) {
+    // Binance, OKX and Gate normalized ticker/meta paths expose base amount
+    // plus quote/USD value. Explicit upstream unit fields still take priority.
+    amountUnit ||= 'base_asset';
+    valueUnit ||= 'quote_asset';
+  }
+
+  return {
+    open_interest: amount,
+    open_interest_value: value,
+    open_interest_unit: amount === null ? null : amountUnit,
+    open_interest_value_unit: value === null ? null : valueUnit,
+  };
+}
+
 function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
   const nativeSymbol = compact(rawSymbol);
   const symbol = compact(displaySymbol || nativeSymbol);
@@ -1003,7 +1068,15 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
     percent = ((last - open) / open) * 100;
   }
 
-  const volumes = tickerVolumeSemantics(provider, market, item, last);
+  const [, quote] = split(symbol);
+  const volumes = tickerVolumeSemantics(provider, market, item, last, quote);
+  const openInterest = tickerOpenInterestSemantics(
+    provider,
+    market,
+    quote,
+    item,
+    last,
+  );
   return {
     provider,
     market_type: market,
@@ -1027,11 +1100,10 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
     high_24h: num(item.high_24h ?? item.highPrice ?? item.high24h ?? item.highPrice24h),
     low_24h: num(item.low_24h ?? item.lowPrice ?? item.low24h ?? item.lowPrice24h),
     funding_rate: num(item.fundingRate),
-    open_interest: num(item.openInterest ?? item.holdingAmount),
-    open_interest_value: num(item.openInterestValue),
-    open_interest_unit: item.openInterestValue != null
-      ? 'base_or_provider_defined_with_value'
-      : null,
+    open_interest: openInterest.open_interest,
+    open_interest_value: openInterest.open_interest_value,
+    open_interest_unit: openInterest.open_interest_unit,
+    open_interest_value_unit: openInterest.open_interest_value_unit,
     source: `${provider}_official_public_ticker_render`,
     cached_at: new Date().toISOString(),
   };
@@ -1278,7 +1350,7 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
 }
 
 
-// Step650.8.15.27: calendar-month aggregation for safe Binance contract daily seeds.
+// Step650.8.15.28: calendar-month aggregation for safe Binance contract daily seeds.
 // A month is not a fixed 30-day duration, so use UTC year/month boundaries and never
 // interpolate or fabricate missing source candles.
 function aggregateCalendarMonths(sourceRows, provider, market, symbol) {
@@ -2035,7 +2107,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
       maxRestCalls: 1,
     });
 
-    // Step650.8.15.27: a sparse/empty direct monthly seed can occur when the current monthly
+    // Step650.8.15.28: a sparse/empty direct monthly seed can occur when the current monthly
     // archive is not yet available. Reuse the same safe seed chain for official daily candles
     // and aggregate them by real UTC calendar month. This sends no Render-direct Binance REST.
     if (interval === '1M' && seedRows.length < 3) {
@@ -2206,6 +2278,7 @@ function marketUnitSelfTest() {
     'spot',
     { volume: '2', quoteVolume: '200' },
     100,
+    'USDT',
   );
   add(
     'binance_spot_base_and_quote',
@@ -2213,16 +2286,80 @@ function marketUnitSelfTest() {
     binance,
   );
 
-  const bybit = tickerVolumeSemantics(
+  const coinbase = tickerVolumeSemantics(
+    'coinbase',
+    'spot',
+    { volume: '2.5', quote_volume_24h: '250' },
+    100,
+    'USD',
+  );
+  add(
+    'coinbase_spot_base_and_quote',
+    coinbase.base_volume_24h === 2.5 && coinbase.quote_volume_24h === 250,
+    coinbase,
+  );
+
+  const bybitLinear = tickerVolumeSemantics(
     'bybit',
     'contract',
     { volume24h: '3', turnover24h: '300' },
     100,
+    'USDT',
   );
   add(
-    'bybit_volume_and_turnover',
-    bybit.base_volume_24h === 3 && bybit.quote_volume_24h === 300,
-    bybit,
+    'bybit_linear_volume_and_turnover',
+    bybitLinear.base_volume_24h === 3 &&
+      bybitLinear.quote_volume_24h === 300 &&
+      bybitLinear.base_volume_source === 'bybit_linear_or_spot_volume24h_base',
+    bybitLinear,
+  );
+
+  const bybitInverse = tickerVolumeSemantics(
+    'bybit',
+    'contract',
+    { volume24h: '300', turnover24h: '3' },
+    100,
+    'USD',
+  );
+  add(
+    'bybit_inverse_volume_and_turnover_swapped',
+    bybitInverse.base_volume_24h === 3 &&
+      bybitInverse.quote_volume_24h === 300 &&
+      bybitInverse.base_volume_source === 'bybit_inverse_turnover24h_base' &&
+      bybitInverse.quote_volume_source === 'bybit_inverse_volume24h_quote',
+    bybitInverse,
+  );
+
+  const bybitLinearOi = tickerOpenInterestSemantics(
+    'bybit',
+    'contract',
+    'USDT',
+    { openInterest: '2', openInterestValue: '200' },
+    100,
+  );
+  add(
+    'bybit_linear_open_interest_units',
+    bybitLinearOi.open_interest === 2 &&
+      bybitLinearOi.open_interest_value === 200 &&
+      bybitLinearOi.open_interest_unit === 'base_asset' &&
+      bybitLinearOi.open_interest_value_unit === 'quote_asset',
+    bybitLinearOi,
+  );
+
+  const bybitInverseOi = tickerOpenInterestSemantics(
+    'bybit',
+    'contract',
+    'USD',
+    { openInterest: '200', openInterestValue: '2' },
+    100,
+  );
+  add(
+    'bybit_inverse_open_interest_units',
+    bybitInverseOi.open_interest === 200 &&
+      bybitInverseOi.open_interest_value === 2 &&
+      bybitInverseOi.open_interest_unit === 'quote_asset' &&
+      bybitInverseOi.open_interest_value_unit === 'base_asset',
+    bybitInverseOi,
   );
 
   const bitget = tickerVolumeSemantics(
@@ -2230,6 +2367,7 @@ function marketUnitSelfTest() {
     'contract',
     { baseVolume: '4', quoteVolume: '400', usdtVolume: '401' },
     100,
+    'USD',
   );
   add(
     'bitget_base_quote_usdt_separated',
@@ -2239,21 +2377,48 @@ function marketUnitSelfTest() {
     bitget,
   );
 
-  const okx = tickerVolumeSemantics(
+  const okxSpot = tickerVolumeSemantics(
+    'okx',
+    'spot',
+    { vol24h: '5', volCcy24h: '500' },
+    100,
+    'USD',
+  );
+  add(
+    'okx_spot_base_and_quote',
+    okxSpot.base_volume_24h === 5 && okxSpot.quote_volume_24h === 500,
+    okxSpot,
+  );
+
+  const okxContract = tickerVolumeSemantics(
     'okx',
     'contract',
     { vol24h: '10', volCcy24h: '0.1', volCcyQuote24h: '10000' },
     100000,
+    'USD',
   );
   add(
     'okx_contract_count_base_quote_separated',
-    okx.contract_count_24h === 10 &&
-      okx.base_volume_24h === 0.1 &&
-      okx.quote_volume_24h === 10000,
-    okx,
+    okxContract.contract_count_24h === 10 &&
+      okxContract.base_volume_24h === 0.1 &&
+      okxContract.quote_volume_24h === 10000,
+    okxContract,
   );
 
-  const gate = tickerVolumeSemantics(
+  const gateSpot = tickerVolumeSemantics(
+    'gate',
+    'spot',
+    { base_volume: '6', quote_volume: '600' },
+    100,
+    'USD',
+  );
+  add(
+    'gate_spot_base_and_quote',
+    gateSpot.base_volume_24h === 6 && gateSpot.quote_volume_24h === 600,
+    gateSpot,
+  );
+
+  const gateContract = tickerVolumeSemantics(
     'gate',
     'contract',
     {
@@ -2262,13 +2427,14 @@ function marketUnitSelfTest() {
       volume_24h_quote: '200',
     },
     100000,
+    'USD',
   );
   add(
     'gate_contract_count_base_quote_separated',
-    gate.contract_count_24h === 20 &&
-      gate.base_volume_24h === 0.002 &&
-      gate.quote_volume_24h === 200,
-    gate,
+    gateContract.contract_count_24h === 20 &&
+      gateContract.base_volume_24h === 0.002 &&
+      gateContract.quote_volume_24h === 200,
+    gateContract,
   );
 
   return {
@@ -2391,7 +2557,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -2403,7 +2569,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -2413,7 +2579,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -2422,7 +2588,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -2432,7 +2598,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         self_test: selfTest,
       });
       return true;
@@ -2448,7 +2614,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         checks: tests.length,
         tests,
       });
@@ -2463,7 +2629,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -2482,7 +2648,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -2603,7 +2769,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.27',
+        version: '650.8.15.28',
         provider,
         market_type: market,
         symbol,
