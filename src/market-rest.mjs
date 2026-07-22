@@ -660,10 +660,11 @@ async function fetchUniverse(
   } else if (provider === 'bitget') {
     if (market === 'contract') {
       const category = bitgetContractCategory(quoteFilter);
+      // Step658.2.3: Bitget当前公开合约目录以官方v2 contracts为准。
+      // 不再让字段体系不同的v3响应在“非空”时提前截断v2回退。
       const urls = [
-        `https://api.bitget.com/api/v3/market/instruments?category=${encodeURIComponent(category)}`,
-        `https://api.bitget.com/api/v2/mix/market/contracts?productType=${encodeURIComponent(category)}`,
         `https://api.bitget.com/api/v2/mix/market/contracts?productType=${encodeURIComponent(category.toLowerCase())}`,
+        `https://api.bitget.com/api/v2/mix/market/contracts?productType=${encodeURIComponent(category)}`,
       ];
       let lastError = null;
       let items = [];
@@ -1143,10 +1144,10 @@ async function tickers(provider, market, wantedSymbols = []) {
       `ticker:${provider}:${market}:${requestedQuote}`,
       MARKET_TICKER_CACHE_TTL_MS,
       async () => {
+        // Step658.2.3: Ticker与目录使用同一套官方v2 productType身份。
         const urls = [
-          `https://api.bitget.com/api/v3/market/tickers?category=${encodeURIComponent(category)}`,
-          `https://api.bitget.com/api/v2/mix/market/tickers?productType=${encodeURIComponent(category)}`,
           `https://api.bitget.com/api/v2/mix/market/tickers?productType=${encodeURIComponent(category.toLowerCase())}`,
+          `https://api.bitget.com/api/v2/mix/market/tickers?productType=${encodeURIComponent(category)}`,
         ];
         let lastError = null;
         for (const url of urls) {
@@ -1277,7 +1278,7 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
 }
 
 
-// Step650.8.15.26: calendar-month aggregation for safe Binance contract daily seeds.
+// Step650.8.15.27: calendar-month aggregation for safe Binance contract daily seeds.
 // A month is not a fixed 30-day duration, so use UTC year/month boundaries and never
 // interpolate or fabricate missing source candles.
 function aggregateCalendarMonths(sourceRows, provider, market, symbol) {
@@ -2034,7 +2035,7 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
       maxRestCalls: 1,
     });
 
-    // Step650.8.15.26: a sparse/empty direct monthly seed can occur when the current monthly
+    // Step650.8.15.27: a sparse/empty direct monthly seed can occur when the current monthly
     // archive is not yet available. Reuse the same safe seed chain for official daily candles
     // and aggregate them by real UTC calendar month. This sends no Render-direct Binance REST.
     if (interval === '1M' && seedRows.length < 3) {
@@ -2283,6 +2284,12 @@ export function getBinanceMarketRestHealth() {
     spot_market_data_host: 'data-api.binance.vision',
     binance_asset_quote_discovery_enabled: true,
     all_provider_asset_quote_discovery_enabled: true,
+    bitget_contract_official_v2_only: true,
+    bitget_contract_product_types: Object.freeze([
+      'USDT-FUTURES',
+      'USDC-FUTURES',
+      'COIN-FUTURES',
+    ]),
     spot_provider_list: SPOT_PROVIDER_LIST,
     contract_provider_list: CONTRACT_PROVIDER_LIST,
     asset_quote_summary_provider_lists_ready:
@@ -2384,7 +2391,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -2396,7 +2403,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -2406,7 +2413,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -2415,7 +2422,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -2425,7 +2432,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         self_test: selfTest,
       });
       return true;
@@ -2441,7 +2448,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         checks: tests.length,
         tests,
       });
@@ -2456,7 +2463,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -2475,7 +2482,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -2596,7 +2603,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.26',
+        version: '650.8.15.27',
         provider,
         market_type: market,
         symbol,
