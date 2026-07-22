@@ -1,5 +1,5 @@
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.31';
+const STEP_VERSION = '650.8.15.32';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -12,6 +12,10 @@ const STALE_MS = 20_000;
 const META_FRESH_MS = 6 * 60 * 60_000;
 const TRANSIENT_COOLDOWN_MS = 90_000;
 const RESTRICTED_COOLDOWN_MS = 30 * 60_000;
+
+// Gate official BTC-M perpetual sizing:
+// BTC_USD is an inverse contract with a face value of 1 USD per contract.
+const GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT = 1;
 
 const BINANCE_WS_STATES = new Map();
 const BINANCE_WS_MAX_SYMBOLS = 24;
@@ -483,6 +487,114 @@ function gateSettle(rawSymbol) {
     : 'usdt';
 }
 
+function gateInverseQuoteValuePerContract(rawSymbol) {
+  const compact = compactSymbol(rawSymbol);
+  const base = baseFromCompact(compact);
+  const quote = quoteFromCompact(compact);
+  if (base === 'BTC' && quote === 'USD') {
+    return GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT;
+  }
+  return null;
+}
+
+function gateInverseContractAmounts(
+  contractsValue,
+  priceValue,
+  quoteValuePerContract =
+      GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,
+) {
+  const contracts = Math.abs(numberValue(contractsValue) ?? 0);
+  const price = positiveNumber(priceValue);
+  const faceValue = positiveNumber(quoteValuePerContract);
+  if (
+    contracts <= 0 ||
+    price == null ||
+    faceValue == null
+  ) {
+    return null;
+  }
+  const quoteAmount = contracts * faceValue;
+  const baseQuantity = quoteAmount / price;
+  if (
+    !Number.isFinite(quoteAmount) ||
+    quoteAmount <= 0 ||
+    !Number.isFinite(baseQuantity) ||
+    baseQuantity <= 0
+  ) {
+    return null;
+  }
+  return {
+    contracts,
+    quote_amount: quoteAmount,
+    base_quantity: baseQuantity,
+  };
+}
+
+function gateInverseDepthSelfTest() {
+  const amounts = gateInverseContractAmounts(100, 50_000, 1);
+  const levels = normalizeLevels(
+    [{ p: '50000', s: '100' }],
+    {
+      side: 'bid',
+      quantityUnit: 'base_asset',
+      quantityFromContracts: (contracts, price) =>
+        gateInverseContractAmounts(
+          contracts,
+          price,
+          GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,
+        )?.base_quantity ?? 0,
+    },
+  );
+  const row = levels[0] || null;
+  const close = (a, b, epsilon = 1e-10) =>
+    Number.isFinite(a) &&
+    Number.isFinite(b) &&
+    Math.abs(a - b) <= epsilon;
+  const tests = [
+    [
+      'face_value_one_usd',
+      gateInverseQuoteValuePerContract('BTCUSD') === 1,
+    ],
+    [
+      'no_face_value_for_usdt',
+      gateInverseQuoteValuePerContract('BTCUSDT') == null,
+    ],
+    [
+      'quote_amount_from_contracts',
+      close(amounts?.quote_amount, 100),
+    ],
+    [
+      'base_amount_from_quote_and_price',
+      close(amounts?.base_quantity, 0.002),
+    ],
+    [
+      'depth_quantity_unit_base',
+      row?.quantity_unit === 'base_asset',
+    ],
+    [
+      'depth_contract_count_preserved',
+      close(row?.quantity_contracts, 100),
+    ],
+    [
+      'depth_quote_amount_preserved',
+      close(row?.quote_amount, 100),
+    ],
+    [
+      'depth_base_times_price_equals_quote',
+      close(
+        Number(row?.quantity) * Number(row?.price),
+        Number(row?.quote_amount),
+        1e-8,
+      ),
+    ],
+  ].map(([name, ok]) => ({ name, ok: ok === true }));
+  return {
+    ok: tests.every((item) => item.ok),
+    checks: tests.length,
+    tests,
+  };
+}
+
 function providerSymbol(provider, rawSymbol, marketType = 'contract') {
   const compact = compactSymbol(rawSymbol);
   const quote = quoteFromCompact(compact);
@@ -732,16 +844,43 @@ async function gateContractMeta(contract) {
   if (cached && Date.now() - cached.storedAt <= META_FRESH_MS) {
     return cached.meta;
   }
+
   const settle = gateSettle(contract);
+  const inverseQuoteValue =
+    gateInverseQuoteValuePerContract(contract);
+  if (settle === 'btc' && inverseQuoteValue != null) {
+    const meta = {
+      type: 'inverse',
+      multiplier: null,
+      quote_value_per_contract: inverseQuoteValue,
+      settle,
+      source:
+        'gate_official_btc_usd_one_usd_per_contract',
+      network_request_used: false,
+    };
+    CONTRACT_META_CACHE.set(key, {
+      meta,
+      storedAt: Date.now(),
+    });
+    return meta;
+  }
+
   const urls = [
     `https://fx-api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
     `https://api.gateio.ws/api/v4/futures/${settle}/contracts/${encodeURIComponent(contract)}`,
   ];
-  const { data } = await fetchFirstJson(urls, 8_000);
+  const { data, url } = await fetchFirstJson(urls, 8_000);
   const meta = {
     type: String(data?.type || '').toLowerCase(),
-    multiplier: positiveNumber(data?.quanto_multiplier),
+    multiplier: positiveNumber(
+      data?.quanto_multiplier ??
+      data?.contract_multiplier ??
+      data?.multiplier,
+    ),
+    quote_value_per_contract: null,
     settle,
+    source: url,
+    network_request_used: true,
   };
   CONTRACT_META_CACHE.set(key, {
     meta,
@@ -1031,10 +1170,13 @@ async function loadGate(view, symbol, limit) {
   const native = providerSymbol('gate', symbol);
   const settle = gateSettle(symbol);
   const meta = await gateContractMeta(native);
+  const inverseQuoteValue =
+    positiveNumber(meta?.quote_value_per_contract);
   const bases = [
     'https://fx-api.gateio.ws/api/v4',
     'https://api.gateio.ws/api/v4',
   ];
+
   if (view === 'trades') {
     const urls = bases.map((base) =>
       `${base}/futures/${settle}/trades` +
@@ -1042,7 +1184,9 @@ async function loadGate(view, symbol, limit) {
       `&limit=${limit}`,
     );
     const { data, url } = await fetchFirstJson(urls);
-    if (!Array.isArray(data)) throw new Error('gate_trades_invalid');
+    if (!Array.isArray(data)) {
+      throw new Error('gate_trades_invalid');
+    }
     const items = data.map((row) => {
       const price = positiveNumber(row?.price);
       const contracts = positiveNumber(
@@ -1058,16 +1202,44 @@ async function loadGate(view, symbol, limit) {
           rawSize != null
               ? (rawSize >= 0 ? 'buy' : 'sell')
               : String(row?.side || '').toLowerCase();
-      if (price == null ||
-          contracts == null ||
-          timeMs <= 0 ||
-          !['buy', 'sell'].includes(side)) {
+      if (
+        price == null ||
+        contracts == null ||
+        timeMs <= 0 ||
+        !['buy', 'sell'].includes(side)
+      ) {
         return null;
       }
+
       if (settle === 'btc') {
+        const amounts = gateInverseContractAmounts(
+          contracts,
+          price,
+          inverseQuoteValue,
+        );
+        if (!amounts) return null;
         return {
-          id: String(row?.id ??
-              `${timeMs}:${price}:${contracts}`),
+          id: String(
+            row?.id ??
+            `${timeMs}:${price}:${amounts.contracts}`,
+          ),
+          time_ms: timeMs,
+          price,
+          quantity: amounts.base_quantity,
+          quantity_contracts: amounts.contracts,
+          quantity_unit: 'base_asset',
+          quote_amount: amounts.quote_amount,
+          quote_amount_unit: 'quote_asset',
+          side,
+        };
+      }
+
+      const multiplier = positiveNumber(meta?.multiplier);
+      if (multiplier == null) {
+        return {
+          id: String(
+            row?.id ?? `${timeMs}:${price}:${contracts}`,
+          ),
           time_ms: timeMs,
           price,
           quantity: contracts,
@@ -1076,28 +1248,36 @@ async function loadGate(view, symbol, limit) {
           side,
         };
       }
-      const multiplier = meta.multiplier ?? 1;
       const quantity = contracts * multiplier;
       return {
-        id: String(row?.id ??
-            `${timeMs}:${price}:${quantity}`),
+        id: String(
+          row?.id ?? `${timeMs}:${price}:${quantity}`,
+        ),
         time_ms: timeMs,
         price,
         quantity,
         quantity_contracts: contracts,
         quantity_unit: 'base_asset',
         quote_amount: price * quantity,
+        quote_amount_unit: 'quote_asset',
         side,
       };
     }).filter(Boolean);
+
     return {
       items,
       timestamp_ms: items[0]?.time_ms || Date.now(),
       upstream_host: new URL(url).host,
       native_symbol: native,
       quantity_unit:
-          settle === 'btc' ? 'contracts' : 'base_asset',
-      contract_multiplier: meta.multiplier,
+          settle === 'btc' || meta?.multiplier != null
+              ? 'base_asset'
+              : 'contracts',
+      contract_multiplier: meta?.multiplier,
+      quote_value_per_contract: inverseQuoteValue,
+      contract_meta_source: meta?.source || '',
+      contract_meta_network_request_used:
+          meta?.network_request_used === true,
     };
   }
 
@@ -1107,22 +1287,60 @@ async function loadGate(view, symbol, limit) {
     `&limit=${limit}&with_id=true`,
   );
   const { data, url } = await fetchFirstJson(urls);
-  const quantityUnit =
-      settle === 'btc' ? 'contracts' : 'base_asset';
-  const multiplier =
-      quantityUnit === 'base_asset'
-          ? (meta.multiplier ?? 1)
-          : 1;
-  const bids = normalizeLevels(data?.bids, {
-    side: 'bid',
-    quantityMultiplier: multiplier,
-    quantityUnit,
-  });
-  const asks = normalizeLevels(data?.asks, {
-    side: 'ask',
-    quantityMultiplier: multiplier,
-    quantityUnit,
-  });
+
+  let quantityUnit = 'contracts';
+  let bids;
+  let asks;
+  if (settle === 'btc') {
+    if (inverseQuoteValue == null) {
+      throw new Error(
+        'gate_inverse_quote_value_per_contract_missing',
+      );
+    }
+    quantityUnit = 'base_asset';
+    const quantityFromContracts = (contracts, price) =>
+      gateInverseContractAmounts(
+        contracts,
+        price,
+        inverseQuoteValue,
+      )?.base_quantity ?? 0;
+    bids = normalizeLevels(data?.bids, {
+      side: 'bid',
+      quantityFromContracts,
+      quantityUnit,
+    });
+    asks = normalizeLevels(data?.asks, {
+      side: 'ask',
+      quantityFromContracts,
+      quantityUnit,
+    });
+  } else {
+    const multiplier = positiveNumber(meta?.multiplier);
+    if (multiplier == null) {
+      quantityUnit = 'contracts';
+      bids = normalizeLevels(data?.bids, {
+        side: 'bid',
+        quantityUnit,
+      });
+      asks = normalizeLevels(data?.asks, {
+        side: 'ask',
+        quantityUnit,
+      });
+    } else {
+      quantityUnit = 'base_asset';
+      bids = normalizeLevels(data?.bids, {
+        side: 'bid',
+        quantityMultiplier: multiplier,
+        quantityUnit,
+      });
+      asks = normalizeLevels(data?.asks, {
+        side: 'ask',
+        quantityMultiplier: multiplier,
+        quantityUnit,
+      });
+    }
+  }
+
   return {
     bids,
     asks,
@@ -1133,7 +1351,11 @@ async function loadGate(view, symbol, limit) {
     upstream_host: new URL(url).host,
     native_symbol: native,
     quantity_unit: quantityUnit,
-    contract_multiplier: meta.multiplier,
+    contract_multiplier: meta?.multiplier,
+    quote_value_per_contract: inverseQuoteValue,
+    contract_meta_source: meta?.source || '',
+    contract_meta_network_request_used:
+        meta?.network_request_used === true,
   };
 }
 
@@ -1549,13 +1771,28 @@ function buildPayload(provider, marketType, view, requestedSymbol, limit, data, 
     quantity_unit: data.quantity_unit || 'base_asset',
     connected: data.connected === true,
     if_contract_multiplier: data.contract_multiplier,
+    if_quote_value_per_contract:
+      data.quote_value_per_contract,
+    contract_meta_source:
+      data.contract_meta_source || '',
+    contract_meta_network_request_used:
+      data.contract_meta_network_request_used === true,
   };
   if (data.upstream_symbol) common.upstream_symbol = String(data.upstream_symbol);
   if (data.alias_mode) common.alias_mode = String(data.alias_mode);
-  if (common.if_contract_multiplier == null) delete common.if_contract_multiplier;
-  else {
-    common.contract_multiplier = common.if_contract_multiplier;
+  if (common.if_contract_multiplier == null) {
     delete common.if_contract_multiplier;
+  } else {
+    common.contract_multiplier =
+      common.if_contract_multiplier;
+    delete common.if_contract_multiplier;
+  }
+  if (common.if_quote_value_per_contract == null) {
+    delete common.if_quote_value_per_contract;
+  } else {
+    common.quote_value_per_contract =
+      common.if_quote_value_per_contract;
+    delete common.if_quote_value_per_contract;
   }
   if (view === 'trades') return { ...common, items: Array.isArray(data.items) ? data.items.slice(0, limit) : [] };
   const bids = Array.isArray(data.bids) ? data.bids.slice(0, limit) : [];
@@ -1660,6 +1897,17 @@ export function getContractDepthHealth() {
     coinbase_level2_symbols: COINBASE_L2_STATES.size,
     coinbase_level2_connections: [...COINBASE_L2_STATES.values()].filter((state) => wsReady(state.socket)).length,
     coinbase_level2_max_symbols: COINBASE_L2_MAX_SYMBOLS,
+    gate_btc_usd_inverse_depth_enabled: true,
+    gate_btc_usd_quote_value_per_contract:
+      GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,
+    gate_inverse_depth_requires_contract_meta_network:
+      false,
+    gate_inverse_depth_quantity_unit: 'base_asset',
+    gate_inverse_contract_count_preserved: true,
+    gate_inverse_quote_amount_preserved: true,
+    gate_inverse_trades_same_sizing: true,
+    gate_inverse_depth_self_test:
+      gateInverseDepthSelfTest(),
     coinbase_level2_active_routes: [...COINBASE_L2_STATES.values()].map((state) => ({
       requested_symbol: state.requestedNative,
       subscribed_symbol: state.subscribeNative,
@@ -1675,6 +1923,27 @@ export function getContractDepthHealth() {
 }
 
 export async function handleContractDepth(req, res, url) {
+  if (url.pathname === '/api/gate-depth-self-test') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, {
+        ok: false,
+        version: STEP_VERSION,
+        error: 'method_not_allowed',
+      });
+      return true;
+    }
+    const selfTest = gateInverseDepthSelfTest();
+    sendJson(
+      res,
+      selfTest.ok ? 200 : 500,
+      {
+        ok: selfTest.ok,
+        version: STEP_VERSION,
+        self_test: selfTest,
+      },
+    );
+    return true;
+  }
   if (url.pathname !== '/api/contract-depth') return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
