@@ -1,3 +1,25 @@
+# Step650.8.15.34 / App Step664.1
+
+## Current change
+
+- Removes the built-in 12-symbol contract-flow whitelist.
+- Reuses the existing guarded/cached real USDT contract catalogs for Binance, OKX, Bybit, Bitget and Gate.
+- Collects public trade WebSocket flow in bounded rotating batches, so the worker does not open hundreds of symbol sockets at once.
+- Adds `GET /api/contract-flow/market-snapshot` for the App data page.
+- Missing taker data remains null; it is never replaced with zero or another venue.
+- CVD quote notional and base-asset quantity are separate fields and units.
+- Binance contract REST remains hard-disabled.
+
+## Deployment for this step
+
+1. Run `step664_1_contract_flow_base_cvd_columns.sql` in Supabase SQL Editor.
+2. Replace the current Render worker repository with this package and deploy the same service.
+3. Preserve every existing environment variable. No new mandatory secret is required.
+4. After Render is live, check `/health`, `/api/contract-flow/health`, and `/api/contract-flow/market-snapshot`.
+5. Only then replace the App `lib/main.dart` with the Step664.1 file.
+
+The sections below are historical notes retained from the previous stable worker.
+
 # Kaka Web3 Contract Realtime Worker — Step650.8.15.3 / Step651.2D.3
 
 ## Step651.2D.3 Render outbound-bandwidth containment
