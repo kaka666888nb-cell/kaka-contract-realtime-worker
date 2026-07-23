@@ -1,8 +1,9 @@
 import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
+import { getMarketUniverseRows } from './market-rest.mjs';
 
-const VERSION = '650.8.15.33';
+const VERSION = '650.8.15.34';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -380,9 +381,41 @@ function flowRawByteLength(raw) {
   if (ArrayBuffer.isView(raw)) return raw.byteLength;
   return Buffer.byteLength(String(raw ?? ''), 'utf8');
 }
-const CORE_SYMBOLS = String(process.env.KAKA_FLOW_CORE_SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,DOTUSDT,LTCUSDT')
+// Step650.8.15.34: there is no built-in 12-symbol whitelist anymore.
+// Optional pinned symbols are operator supplied only; the default is empty.
+const PINNED_SYMBOLS = String(process.env.KAKA_FLOW_PINNED_SYMBOLS || '')
   .split(',').map(symbolKey).filter((value) => value && value.endsWith('USDT'));
-const CORE_SYMBOL_SET = new Set(CORE_SYMBOLS);
+const PINNED_SYMBOL_SET = new Set(PINNED_SYMBOLS);
+const FLOW_SCAN_ENABLED = process.env.KAKA_FLOW_SCAN_ENABLED !== '0';
+const FLOW_SCAN_ROTATION_MS = Math.max(
+  FIVE_MIN_MS + 30_000,
+  Number(process.env.KAKA_FLOW_SCAN_ROTATION_MS || 390_000),
+);
+const FLOW_SCAN_CATALOG_TTL_MS = Math.max(
+  10 * 60_000,
+  Number(process.env.KAKA_FLOW_SCAN_CATALOG_TTL_MS || 30 * 60_000),
+);
+const FLOW_SCAN_BATCH_BY_PROVIDER = Object.freeze({
+  binance: Math.max(1, Math.min(BINANCE_FLOW_MAX_STATES - 2, Number(process.env.KAKA_FLOW_SCAN_BINANCE_BATCH || 18))),
+  okx: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_OKX_BATCH || 8)),
+  bybit: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_BYBIT_BATCH || 8)),
+  bitget: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_BITGET_BATCH || 8)),
+  gate: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_GATE_BATCH || 8)),
+});
+const flowScanState = {
+  started: false,
+  timer: null,
+  running: null,
+  cycle: 0,
+  last_started_at: 0,
+  last_completed_at: 0,
+  last_error: '',
+  cursors: Object.fromEntries([...PROVIDERS].map((provider) => [provider, 0])),
+  catalogs: Object.fromEntries([...PROVIDERS].map((provider) => [provider, []])),
+  catalog_loaded_at: Object.fromEntries([...PROVIDERS].map((provider) => [provider, 0])),
+  active_symbols: Object.fromEntries([...PROVIDERS].map((provider) => [provider, []])),
+  errors: Object.fromEntries([...PROVIDERS].map((provider) => [provider, ''])),
+};
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 const PERSISTENCE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
@@ -439,6 +472,8 @@ function emptyBucket(start) {
     histogram: emptyHistogram(),
     buyQuote: 0,
     sellQuote: 0,
+    buyBase: 0,
+    sellBase: 0,
     buyCount: 0,
     sellCount: 0,
     tradeCount: 0,
@@ -450,11 +485,13 @@ function addTradeToBucket(bucket, trade) {
   const isBuy = trade.side === 'buy';
   if (isBuy) {
     bucket.buyQuote += trade.quote;
+    bucket.buyBase += trade.size;
     bucket.buyCount += 1;
     bucket.histogram.buyQuote[index] += trade.quote;
     bucket.histogram.buyCount[index] += 1;
   } else {
     bucket.sellQuote += trade.quote;
+    bucket.sellBase += trade.size;
     bucket.sellCount += 1;
     bucket.histogram.sellQuote[index] += trade.quote;
     bucket.histogram.sellCount[index] += 1;
@@ -479,6 +516,7 @@ function finalizeBucket(bucket, provider, symbol) {
   const row = {
     provider, symbol, bucket_time: new Date(bucket.start).toISOString(), bucket_end_time: new Date(bucket.end).toISOString(),
     buy_quote: bucket.buyQuote, sell_quote: bucket.sellQuote,
+    buy_base: bucket.buyBase, sell_base: bucket.sellBase,
     large_buy_quote: 0, large_sell_quote: 0,
     medium_buy_quote: 0, medium_sell_quote: 0,
     small_buy_quote: 0, small_sell_quote: 0,
@@ -510,11 +548,14 @@ function normalizePersistedRow(row) {
   const end = normalizeTime(row.bucket_end_time) || (start ? start + FIVE_MIN_MS : 0);
   if (!start) return null;
   const numberKeys = [
-    'buy_quote','sell_quote','large_buy_quote','large_sell_quote','medium_buy_quote','medium_sell_quote','small_buy_quote','small_sell_quote',
+    'buy_quote','sell_quote','buy_base','sell_base','large_buy_quote','large_sell_quote','medium_buy_quote','medium_sell_quote','small_buy_quote','small_sell_quote',
     'large_buy_count','large_sell_count','medium_buy_count','medium_sell_count','small_buy_count','small_sell_count','trade_count','p70_quote','p95_quote'
   ];
   const next = { ...row, start, end };
-  for (const key of numberKeys) next[key] = asNumber(row[key]) ?? 0;
+  for (const key of numberKeys) {
+    const value = asNumber(row[key]);
+    next[key] = (key === 'buy_base' || key === 'sell_base') ? value : (value ?? 0);
+  }
   return next;
 }
 
@@ -530,18 +571,26 @@ async function flushPersistQueue() {
   for (const row of rows) persistQueue.delete(`${row.provider}:${row.symbol}:${row.bucket_time}`);
   persistFlushPromise = (async () => {
     try {
-      const response = await fetch(`${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?on_conflict=provider,symbol,bucket_time`, {
-        method: 'POST',
-        headers: {
-          apikey: SUPABASE_SERVICE_ROLE_KEY,
-          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-          'content-type': 'application/json',
-          prefer: 'resolution=merge-duplicates,return=minimal',
-        },
-        body: JSON.stringify(rows),
-        signal: AbortSignal.timeout(15000),
+      const endpoint = `${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?on_conflict=provider,symbol,bucket_time`;
+      const headers = {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'content-type': 'application/json',
+        prefer: 'resolution=merge-duplicates,return=minimal',
+      };
+      let response = await fetch(endpoint, {
+        method: 'POST', headers, body: JSON.stringify(rows), signal: AbortSignal.timeout(15000),
       });
-      if (!response.ok) throw new Error(`persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
+      if (!response.ok) {
+        const text = await response.text();
+        const baseColumnsMissing = response.status === 400 && /buy_base|sell_base|column/i.test(text);
+        if (!baseColumnsMissing) throw new Error(`persist_http_${response.status}:${text.slice(0, 180)}`);
+        const compatibleRows = rows.map(({ buy_base, sell_base, ...row }) => row);
+        response = await fetch(endpoint, {
+          method: 'POST', headers, body: JSON.stringify(compatibleRows), signal: AbortSignal.timeout(15000),
+        });
+        if (!response.ok) throw new Error(`persist_compat_http_${response.status}:${(await response.text()).slice(0, 180)}`);
+      }
     } catch (error) {
       for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
       console.error(`[Step615.5] flow bucket persist failed: ${error?.message || error}`);
@@ -911,6 +960,7 @@ async function startStream(state) {
 
 function closeAndDeleteState(state, reason = 'evicted') {
   if (!state) return;
+  finalizeReadyBuckets(state, Date.now() + 20_000);
   clearInterval(state.heartbeatTimer);
   clearTimeout(state.reconnectTimer);
   clearTimeout(state.metricBackgroundTimer);
@@ -928,7 +978,7 @@ function ensureStateCapacity(provider, symbol) {
     const binanceStates = [...states.values()].filter((state) => state.provider === 'binance');
     if (binanceStates.length >= BINANCE_FLOW_MAX_STATES) {
       const candidates = binanceStates
-        .filter((state) => !CORE_SYMBOL_SET.has(state.symbol))
+        .filter((state) => !PINNED_SYMBOL_SET.has(state.symbol))
         .sort((a, b) => a.lastRequestedAt - b.lastRequestedAt);
       if (candidates.length) {
         closeAndDeleteState(candidates[0], 'binance_capacity');
@@ -942,19 +992,20 @@ function ensureStateCapacity(provider, symbol) {
   }
   if (states.size < MAX_ACTIVE_STATES) return;
   const candidates = [...states.values()]
-    .filter((state) => !CORE_SYMBOL_SET.has(state.symbol))
+    .filter((state) => !PINNED_SYMBOL_SET.has(state.symbol))
     .sort((a, b) => a.lastRequestedAt - b.lastRequestedAt);
   if (candidates.length) closeAndDeleteState(candidates[0], 'capacity');
 }
 
-function getState(provider, symbol) {
+function getState(provider, symbol, { source = 'client' } = {}) {
   ensureStateCapacity(provider, symbol);
   const key = `${provider}:${symbol}`;
   let state = states.get(key);
   if (!state) {
     state = {
       key, provider, symbol, openBuckets: new Map(), completedBuckets: new Map(), recentIds: new Set(), waiters: new Set(),
-      ws: null, status: 'idle', error: '', lastTradeAt: 0, lastPrice: null, lastRequestedAt: Date.now(), reconnectAttempt: 0,
+      ws: null, status: 'idle', error: '', lastTradeAt: 0, lastPrice: null, lastRequestedAt: Date.now(),
+      lastClientRequestedAt: 0, scanManaged: false, scanTouchedAt: 0, reconnectAttempt: 0,
       reconnectTimer: null, heartbeatTimer: null, connectingPromise: null,
       metricRows: new Map(), metricLoaded: false, metricLoading: false, metricError: '', metricFetchedAt: 0,
       metricFetchPromise: null, metricCooldownUntil: 0, metricPartialRetryCount: 0,
@@ -980,10 +1031,136 @@ function getState(provider, symbol) {
     };
     states.set(key, state);
   }
-  state.lastRequestedAt = Date.now();
-  loadPersistedHistory(state).catch(() => {});
+  const requestedAt = Date.now();
+  state.lastRequestedAt = requestedAt;
+  if (source === 'scanner') {
+    state.scanManaged = true;
+    state.scanTouchedAt = requestedAt;
+  } else {
+    state.lastClientRequestedAt = requestedAt;
+    state.scanManaged = false;
+  }
+  if (source !== 'scanner') loadPersistedHistory(state).catch(() => {});
   startStream(state).catch(() => {});
   return state;
+}
+
+function flowScanStatusPayload() {
+  const directoryTotals = {};
+  const activeCounts = {};
+  for (const provider of PROVIDERS) {
+    directoryTotals[provider] = flowScanState.catalogs[provider]?.length || 0;
+    activeCounts[provider] = (flowScanState.active_symbols[provider] || []).length;
+  }
+  return {
+    enabled: FLOW_SCAN_ENABLED,
+    mode: 'full_universe_rotating_bounded_websocket',
+    fixed_symbol_whitelist: false,
+    pinned_symbols: PINNED_SYMBOLS,
+    rotation_ms: FLOW_SCAN_ROTATION_MS,
+    cycle: flowScanState.cycle,
+    running: Boolean(flowScanState.running),
+    last_started_at: flowScanState.last_started_at ? new Date(flowScanState.last_started_at).toISOString() : null,
+    last_completed_at: flowScanState.last_completed_at ? new Date(flowScanState.last_completed_at).toISOString() : null,
+    last_error: flowScanState.last_error,
+    directory_total_by_provider: directoryTotals,
+    active_by_provider: activeCounts,
+    active_symbols_by_provider: flowScanState.active_symbols,
+    provider_errors: flowScanState.errors,
+  };
+}
+
+async function loadFlowScanCatalog(provider) {
+  const now = Date.now();
+  const current = flowScanState.catalogs[provider] || [];
+  if (current.length && now - (flowScanState.catalog_loaded_at[provider] || 0) < FLOW_SCAN_CATALOG_TTL_MS) {
+    return current;
+  }
+  const rows = await getMarketUniverseRows(provider, 'contract', 'USDT');
+  const symbols = [...new Set(
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => symbolKey(row?.symbol))
+      .filter((symbol) => symbol && symbol.endsWith('USDT') && supportsNativeContract(provider, symbol)),
+  )].sort();
+  flowScanState.catalogs[provider] = symbols;
+  flowScanState.catalog_loaded_at[provider] = now;
+  if ((flowScanState.cursors[provider] || 0) >= symbols.length) flowScanState.cursors[provider] = 0;
+  return symbols;
+}
+
+function nextFlowScanBatch(provider, symbols) {
+  if (!symbols.length) return [];
+  const size = Math.max(1, Math.min(symbols.length, FLOW_SCAN_BATCH_BY_PROVIDER[provider] || 1));
+  let cursor = Math.max(0, flowScanState.cursors[provider] || 0) % symbols.length;
+  const batch = [];
+  for (let index = 0; index < size; index += 1) {
+    batch.push(symbols[(cursor + index) % symbols.length]);
+  }
+  flowScanState.cursors[provider] = (cursor + size) % symbols.length;
+  return batch;
+}
+
+function releasePreviousFlowScanStates(provider, keepSymbols) {
+  const keep = new Set(keepSymbols);
+  for (const state of [...states.values()]) {
+    if (state.provider !== provider || !state.scanManaged || keep.has(state.symbol)) continue;
+    if (state.lastClientRequestedAt && Date.now() - state.lastClientRequestedAt < IDLE_CLOSE_MS) {
+      state.scanManaged = false;
+      continue;
+    }
+    closeAndDeleteState(state, 'full_universe_rotation');
+  }
+}
+
+async function runContractFlowUniverseScanCycle() {
+  if (!FLOW_SCAN_ENABLED) return flowScanStatusPayload();
+  if (flowScanState.running) return await flowScanState.running;
+  flowScanState.running = (async () => {
+    flowScanState.last_started_at = Date.now();
+    flowScanState.last_error = '';
+    for (const provider of PROVIDERS) {
+      try {
+        const catalog = await loadFlowScanCatalog(provider);
+        const batch = nextFlowScanBatch(provider, catalog);
+        releasePreviousFlowScanStates(provider, batch);
+        const activated = [];
+        for (const symbol of batch) {
+          try {
+            getState(provider, symbol, { source: 'scanner' });
+            activated.push(symbol);
+            // Avoid opening every provider shard in the same event-loop tick.
+            await new Promise((resolve) => setTimeout(resolve, 80));
+          } catch (error) {
+            flowScanState.errors[provider] = String(error?.message || error).slice(0, 180);
+            break;
+          }
+        }
+        flowScanState.active_symbols[provider] = activated;
+        if (activated.length) flowScanState.errors[provider] = '';
+      } catch (error) {
+        flowScanState.errors[provider] = String(error?.message || error).slice(0, 180);
+      }
+    }
+    flowScanState.cycle += 1;
+    flowScanState.last_completed_at = Date.now();
+    await flushPersistQueue();
+    return flowScanStatusPayload();
+  })().catch((error) => {
+    flowScanState.last_error = String(error?.message || error).slice(0, 300);
+    return flowScanStatusPayload();
+  }).finally(() => {
+    flowScanState.running = null;
+  });
+  return await flowScanState.running;
+}
+
+export function startContractFlowUniverseScanner() {
+  if (flowScanState.started || !FLOW_SCAN_ENABLED) return;
+  flowScanState.started = true;
+  const startTimer = setTimeout(() => runContractFlowUniverseScanCycle().catch(() => {}), 2500);
+  startTimer.unref?.();
+  flowScanState.timer = setInterval(() => runContractFlowUniverseScanCycle().catch(() => {}), FLOW_SCAN_ROTATION_MS);
+  flowScanState.timer.unref?.();
 }
 
 function provisionalRows(state) {
@@ -2440,11 +2617,27 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     sample_count:bucket.samples,
     aggregate_source: useGateOfficialAggregate ? 'gate_contract_stats' : 'public_trades',
   }));
-  let cumulative=0;
-  const cvdRows = flowBuckets.map((bucket)=>{ cumulative += bucket.net_quote_volume; return {
-    source_time:new Date(bucket.start_time_ms).toISOString(), open_time:new Date(bucket.start_time_ms).toISOString(),
-    delta_quote:bucket.net_quote_volume, delta_volume:bucket.net_quote_volume, cvd_quote:cumulative, cvd:cumulative,
-  };});
+  let cumulativeQuote=0;
+  let cumulativeBase=0;
+  const cvdRows = flowBuckets.map((bucket)=>{
+    cumulativeQuote += bucket.net_quote_volume;
+    const sourceRows = rows.filter((row) => row.start >= bucket.start_time_ms && row.start < bucket.end_time_ms);
+    const baseReady = sourceRows.length > 0 && sourceRows.every((row) => asNumber(row.buy_base) != null && asNumber(row.sell_base) != null);
+    const deltaBase = baseReady
+      ? sourceRows.reduce((sum, row) => sum + (asNumber(row.buy_base) - asNumber(row.sell_base)), 0)
+      : null;
+    if (deltaBase != null) cumulativeBase += deltaBase;
+    return {
+      source_time:new Date(bucket.start_time_ms).toISOString(), open_time:new Date(bucket.start_time_ms).toISOString(),
+      delta_quote:bucket.net_quote_volume,
+      delta_volume:deltaBase,
+      delta_base:deltaBase,
+      cvd_quote:cumulativeQuote,
+      cvd:deltaBase == null ? null : cumulativeBase,
+      cvd_base_unit:splitSymbol(state.symbol)[0],
+      cvd_quote_unit:splitSymbol(state.symbol)[1],
+    };
+  });
   return {
     ok:true, version:VERSION, provider:state.provider, symbol:state.symbol,
     source:'render_exchange_websocket_supabase_5m', scope:historyComplete?'rolling_24h':'building_24h', history_complete:historyComplete,
@@ -2463,6 +2656,97 @@ function summarize(state, venueMetrics = { oi_rows: [], ratio_rows: [] }) {
     metrics:{ oi_rows:Array.isArray(venueMetrics.oi_rows)?venueMetrics.oi_rows:[], ratio_rows:Array.isArray(venueMetrics.ratio_rows)?venueMetrics.ratio_rows:[], taker_rows:takerRows, cvd_rows:cvdRows },
     generated_at:new Date().toISOString(),
   };
+}
+
+function flowSnapshotRow(raw, { provisional = false } = {}) {
+  if (!raw || typeof raw !== 'object') return null;
+  const provider = providerKey(raw.provider);
+  const symbol = symbolKey(raw.symbol);
+  if (!provider || !symbol) return null;
+  const [base, quote] = splitSymbol(symbol);
+  const buyQuote = asNumber(raw.buy_quote);
+  const sellQuote = asNumber(raw.sell_quote);
+  const buyBase = asNumber(raw.buy_base);
+  const sellBase = asNumber(raw.sell_base);
+  const tradeCount = asNumber(raw.trade_count);
+  if (!(tradeCount > 0) || buyQuote == null || sellQuote == null) return null;
+  const largeBuy = asNumber(raw.large_buy_quote);
+  const largeSell = asNumber(raw.large_sell_quote);
+  return {
+    provider,
+    symbol,
+    base_asset: base,
+    quote_asset: quote,
+    bucket_time: raw.bucket_time || (raw.start ? new Date(raw.start).toISOString() : null),
+    bucket_end_time: raw.bucket_end_time || (raw.end ? new Date(raw.end).toISOString() : null),
+    taker_buy_quote_volume: buyQuote,
+    taker_sell_quote_volume: sellQuote,
+    taker_net_quote_volume: buyQuote - sellQuote,
+    cvd_delta_quote: buyQuote - sellQuote,
+    cvd_quote_unit: quote,
+    cvd_delta_base: buyBase != null && sellBase != null ? buyBase - sellBase : null,
+    cvd_base_unit: base,
+    large_buy_quote: largeBuy,
+    large_sell_quote: largeSell,
+    large_net_quote: largeBuy != null && largeSell != null ? largeBuy - largeSell : null,
+    trade_count: tradeCount,
+    p70_quote: asNumber(raw.p70_quote),
+    p95_quote: asNumber(raw.p95_quote),
+    source: String(raw.source || 'render_exchange_websocket_histogram'),
+    updated_at: raw.updated_at || new Date().toISOString(),
+    provisional,
+  };
+}
+
+async function loadLatestPersistedFlowSnapshot(maxAgeMs) {
+  if (!PERSISTENCE_ENABLED) return [];
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const query = new URLSearchParams({
+    select: '*',
+    bucket_time: `gte.${cutoff}`,
+    order: 'bucket_time.desc',
+    limit: '10000',
+  });
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?${query}`, {
+    headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
+    signal: AbortSignal.timeout(15000),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`market_flow_snapshot_http_${response.status}:${text.slice(0,180)}`);
+  const rows = JSON.parse(text);
+  const latest = new Map();
+  for (const raw of Array.isArray(rows) ? rows : []) {
+    const row = flowSnapshotRow(raw);
+    if (!row) continue;
+    const key = `${row.provider}:${row.symbol}`;
+    if (!latest.has(key)) latest.set(key, row);
+  }
+  return [...latest.values()];
+}
+
+async function buildFullUniverseFlowSnapshot({ maxAgeMs = 20 * 60_000 } = {}) {
+  const byKey = new Map();
+  try {
+    for (const row of await loadLatestPersistedFlowSnapshot(maxAgeMs)) {
+      byKey.set(`${row.provider}:${row.symbol}`, row);
+    }
+  } catch (error) {
+    flowScanState.last_error = String(error?.message || error).slice(0, 300);
+  }
+  for (const state of states.values()) {
+    const latest = mergeRowsFor24h(state).at(-1);
+    const row = flowSnapshotRow(latest, { provisional: Boolean(latest && latest.end > Date.now()) });
+    if (!row) continue;
+    byKey.set(`${row.provider}:${row.symbol}`, row);
+  }
+  const rows = [...byKey.values()].sort((a, b) => {
+    const an = Math.abs(asNumber(a.taker_net_quote_volume) || 0);
+    const bn = Math.abs(asNumber(b.taker_net_quote_volume) || 0);
+    return bn - an || a.provider.localeCompare(b.provider) || a.symbol.localeCompare(b.symbol);
+  });
+  const coveredByProvider = Object.fromEntries([...PROVIDERS].map((provider) => [provider, 0]));
+  for (const row of rows) coveredByProvider[row.provider] = (coveredByProvider[row.provider] || 0) + 1;
+  return { rows, coveredByProvider };
 }
 
 function sendJson(res,status,body){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','access-control-allow-origin':'*'});res.end(JSON.stringify(body));}
@@ -2486,6 +2770,8 @@ export function getContractFlowHealth() {
     binance_ws_connect_window_blocks: binanceFlowWsStats.window_blocks,
     binance_ws_capacity_rejections: binanceFlowWsStats.capacity_rejections,
     production_ws_only: true,
+    fixed_symbol_whitelist: false,
+    full_universe_scan: flowScanStatusPayload(),
     websocket_ingress: Object.fromEntries(
       Object.entries(flowWsTrafficByProvider).map(([provider, value]) => [provider, { ...value }]),
     ),
@@ -2494,7 +2780,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
@@ -2592,9 +2878,31 @@ export async function handleContractFlow(req,res,url){
     return true;
   }
   if(url.pathname==='/api/contract-flow/warm'){
-    let started=0;
-    for(const provider of PROVIDERS)for(const symbol of CORE_SYMBOLS){const state=getState(provider,symbol);state.lastRequestedAt=Date.now();started+=1;}
-    sendJson(res,200,{ok:true,version:VERSION,started,persistence_enabled:PERSISTENCE_ENABLED,core_symbols:CORE_SYMBOLS,time:new Date().toISOString()});return true;
+    startContractFlowUniverseScanner();
+    const scan=await runContractFlowUniverseScanCycle();
+    const started=Object.values(scan.active_by_provider||{}).reduce((sum,value)=>sum+(Number(value)||0),0);
+    sendJson(res,200,{ok:true,version:VERSION,started,persistence_enabled:PERSISTENCE_ENABLED,fixed_symbol_whitelist:false,full_universe_scan:scan,time:new Date().toISOString()});return true;
+  }
+  if(url.pathname==='/api/contract-flow/market-snapshot'){
+    if(req.method!=='GET'){sendJson(res,405,{ok:false,version:VERSION,error:'method_not_allowed'});return true;}
+    startContractFlowUniverseScanner();
+    runContractFlowUniverseScanCycle().catch(()=>{});
+    const maxAgeMinutes=Math.max(5,Math.min(180,Number(url.searchParams.get('max_age_minutes')||20)));
+    const providerFilter=providerKey(url.searchParams.get('provider'));
+    const snapshot=await buildFullUniverseFlowSnapshot({maxAgeMs:maxAgeMinutes*60_000});
+    const rows=providerFilter?snapshot.rows.filter((row)=>row.provider===providerFilter):snapshot.rows;
+    sendJson(res,200,{
+      ok:true,
+      version:VERSION,
+      quote_asset:'USDT',
+      rows,
+      total_rows:rows.length,
+      covered_by_provider:snapshot.coveredByProvider,
+      full_universe_scan:flowScanStatusPayload(),
+      source:'five_platform_full_universe_rotating_public_trade_websocket_plus_supabase_5m',
+      generated_at:new Date().toISOString(),
+    });
+    return true;
   }
   if(url.pathname!=='/api/contract-flow')return false;
   if(req.method!=='GET'&&req.method!=='POST'){sendJson(res,405,{ok:false,error:'method_not_allowed'});return true;}

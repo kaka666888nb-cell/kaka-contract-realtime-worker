@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { getContractFlowHealth, handleContractFlow } from './contract-flow.mjs';
+import { getContractFlowHealth, handleContractFlow, startContractFlowUniverseScanner } from './contract-flow.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
 import { getBinanceLiquidationWsHealth, handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding } from './contract-funding.mjs';
@@ -12,8 +12,9 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.33';
+const STEP_VERSION = '650.8.15.34';
 installProviderGovernorFetch({ role: 'parent-http-api' });
+startContractFlowUniverseScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -282,6 +283,7 @@ const server = http.createServer(async (req, res) => {
       contract_providers: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
       contract_flow: '/api/contract-flow',
       contract_flow_warm: '/api/contract-flow/warm',
+      contract_flow_market_snapshot: '/api/contract-flow/market-snapshot',
       contract_meta: '/api/contract-meta',
       contract_depth: '/api/contract-depth',
       contract_depth_health: getContractDepthHealth(),

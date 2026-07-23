@@ -876,6 +876,21 @@ async function universe(provider, market, requestedQuote = 'USDT') {
   return catalog.filter((row) => row.quote_asset === quote);
 }
 
+
+// Step650.8.15.34: expose the same guarded/cached real market catalog to the
+// contract-flow rotator. This does not add a second exchange request path.
+export async function getMarketUniverseRows(
+  provider,
+  market = 'contract',
+  quote = 'USDT',
+) {
+  const safeProvider = providerKey(provider);
+  const safeMarket = marketKey(market);
+  if (!safeProvider) return [];
+  assertProviderMarket(safeProvider, safeMarket);
+  return await universe(safeProvider, safeMarket, quote);
+}
+
 function tickerVolumeSemantics(provider, market, item, last, quote = 'USDT') {
   let baseVolume = null;
   let quoteVolume = null;
