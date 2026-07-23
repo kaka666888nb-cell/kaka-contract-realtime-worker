@@ -1,4 +1,4 @@
-# Step650.8.15.34 / App Step664.1
+# Step650.8.15.35 / App Step664.1
 
 ## Current change
 
@@ -86,3 +86,13 @@ The already deployed Edge relay remains unchanged. It is a separately isolated e
 7. Only after it reports READY, run the one-time 2Z auxiliary validation.
 
 Do not redeploy Supabase Edge, change environment variables, modify App `main.dart`, run SQL/Cron, change `pubspec.yaml`, or run `flutter clean` for this step.
+
+
+## Step650.8.15.35 snapshot read-only fix
+
+- `GET /api/contract-flow/market-snapshot` is now read-only.
+- Refreshing the global or provider-filtered snapshot no longer advances the rotating scanner.
+- The scheduled scanner and the explicit `/api/contract-flow/warm` endpoint remain available.
+- This prevents repeated diagnostics/App reads from replacing the guarded Binance batch before its WebSocket connection queue finishes.
+- Health exposes `market_snapshot_rotates_scan: false`.
+- Snapshot responses expose `snapshot_triggers_rotation: false`.
