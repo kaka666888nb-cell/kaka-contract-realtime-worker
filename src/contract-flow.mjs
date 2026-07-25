@@ -3,7 +3,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const VERSION = '650.8.15.35';
+const VERSION = '650.8.15.36';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -433,7 +433,7 @@ const CONTRACT_META_RETRY_MS = 90 * 1000;
 const CONTRACT_META_RESTRICTED_RETRY_MS = 30 * 60 * 1000;
 const contractMetaCache = new Map();
 const BINANCE_OI_CRITICAL_TTL_MS = 4 * 60 * 1000;
-const BINANCE_OI_CRITICAL_DELAY_MS = 900;
+const BINANCE_OI_CRITICAL_DELAY_MS = 0;
 const BINANCE_RATIO_CRITICAL_TTL_MS = 5 * 60 * 1000;
 const BINANCE_RATIO_FIRST_PAINT_WAIT_MS = 3200;
 const BINANCE_RATIO_CRITICAL_LIMIT = 3;
@@ -2737,6 +2737,32 @@ async function buildFullUniverseFlowSnapshot({ maxAgeMs = 20 * 60_000 } = {}) {
     const latest = mergeRowsFor24h(state).at(-1);
     const row = flowSnapshotRow(latest, { provisional: Boolean(latest && latest.end > Date.now()) });
     if (!row) continue;
+    const liveMeta = mergeContractMetaWithOpenInterest(
+      getContractMetaFast(state.provider, state.symbol),
+      state,
+    );
+    if (liveMeta) {
+      for (const key of [
+        'open_interest',
+        'contract_oi',
+        'open_interest_value',
+        'contract_oi_value',
+        'open_interest_unit',
+        'open_interest_value_unit',
+        'open_interest_source_time',
+        'last_funding_rate',
+        'funding_rate',
+        'last_funding_rate_percent',
+        'funding_rate_percent',
+        'next_funding_time',
+        'mark_price',
+        'index_price',
+        'source_time',
+      ]) {
+        const value = liveMeta[key];
+        if (value !== null && value !== undefined && value !== '') row[key] = value;
+      }
+    }
     byKey.set(`${row.provider}:${row.symbol}`, row);
   }
   const rows = [...byKey.values()].sort((a, b) => {
@@ -2780,7 +2806,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_background_edge_relay',binance_long_short_first_paint:'critical_edge_relay_global_first',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,market_snapshot_rotates_scan:false,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,market_snapshot_rotates_scan:false,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
@@ -2916,17 +2942,16 @@ export async function handleContractFlow(req,res,url){
   const state=getState(provider,symbol);
   loadPersistedHistory(state).catch(()=>{});
   loadPersistedMetrics(state).catch(()=>{});
+  let oiFirstPaintPromise=null;
   let ratioFirstPaintPromise=null;
   if(provider==='binance'){
-    // Step650.8.15.14: start the all-account ratio before the OI helper. Both still
-    // use the authenticated Edge governor, but global L/S gets the first critical
-    // slot so the funds/long-short page does not wait for the 45-second App poll.
+    // Step650.8.15.36: OI is the row-level field required by unusual/funding/OI
+    // lists, so it acquires the authenticated Edge critical lane first. Ratio is
+    // still scheduled in the same request but cannot starve OI first paint.
+    oiFirstPaintPromise=refreshBinanceOpenInterestCritical(state).catch(()=>null);
     ratioFirstPaintPromise=refreshBinanceLongShortCritical(state).catch(()=>null);
   }
-  // Start meta/OI only after the ratio promise has acquired or queued its first
-  // critical slot. The persistent markPrice WebSocket still supplies meta first paint.
   scheduleContractMetaRefresh(provider,symbol);
-  if(provider==='binance') refreshBinanceOpenInterestCritical(state).catch(()=>{});
   const gateMetricFirstPaintPromise=provider==='gate'
     ? fetchVenueMetrics(state).catch(()=>null)
     : null;
@@ -2940,6 +2965,12 @@ export async function handleContractFlow(req,res,url){
         new Promise((resolve)=>setTimeout(resolve,Math.min(5000,Math.max(2500,waitMs)))),
       ]));
     }
+    if(provider==='binance'&&!latestOpenInterestPatch(state)){
+      waits.push(Promise.race([
+        oiFirstPaintPromise||Promise.resolve(null),
+        new Promise((resolve)=>setTimeout(resolve,Math.max(2500,waitMs))),
+      ]));
+    }
     if(provider==='binance'&&!hasFreshRatioFamily(state,'global')){
       const ratioWaitMs=Math.min(BINANCE_RATIO_FIRST_PAINT_WAIT_MS,Math.max(1800,waitMs));
       waits.push(Promise.race([
@@ -2948,9 +2979,6 @@ export async function handleContractFlow(req,res,url){
       ]));
     }
     await Promise.all(waits);
-  }
-  if(provider==='binance'&&waitMs>0&&!latestOpenInterestPatch(state)){
-    try{await Promise.race([refreshBinanceOpenInterestCritical(state),new Promise((resolve)=>setTimeout(resolve,Math.min(1200,waitMs)))]);}catch(_){}
   }
 
   const venueMetrics=metricPayloadFromState(state);

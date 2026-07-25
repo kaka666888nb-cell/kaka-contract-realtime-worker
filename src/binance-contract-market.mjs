@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.3';
+const VERSION = '650.8.15.36';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -461,7 +461,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.3' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.36' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -531,7 +531,7 @@ async function capturePeriodicSnapshot(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.3' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.36' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -860,6 +860,52 @@ export function getBinanceContractRealtimeMeta(symbol) {
   const meta = realtimeMetaBySymbol.get(normalized) || null;
   if (!ticker && !meta) return null;
   return mergeNonNull(ticker, meta);
+}
+
+export async function ensureBinanceContractRealtimeMeta(
+  symbol,
+  { waitMs = 6500, requireFundingSchedule = false } = {},
+) {
+  startBinanceContractMarket();
+  const normalized = compact(symbol);
+  if (!normalized) return null;
+
+  const current = () => {
+    const ticker = tickerBySymbol.get(normalized) || null;
+    const meta = realtimeMetaBySymbol.get(normalized) || null;
+    if (!ticker && !meta) return null;
+    return mergeNonNull(ticker, meta);
+  };
+  const complete = (row) => {
+    if (!row) return false;
+    const rate = finite(row.last_funding_rate ?? row.funding_rate);
+    if (rate == null) return false;
+    if (!requireFundingSchedule) return true;
+    const nextMs = Date.parse(String(row.next_funding_time || ''));
+    return Number.isFinite(nextMs) && nextMs > Date.now();
+  };
+
+  let row = current();
+  if (complete(row)) return row;
+
+  // Step650.8.15.36: funding/OI first paint must not wait for the next
+  // one-minute periodic mark-price snapshot. Reuse the same official all-market
+  // WebSocket, coalesce concurrent callers, and still close after one payload.
+  const state = streamStatus('markPrice');
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+  const capture = capturePeriodicSnapshot('markPrice').catch(() => null);
+  await Promise.race([
+    capture,
+    new Promise((resolve) => {
+      const timer = setTimeout(resolve, Math.max(0, Number(waitMs) || 0));
+      timer.unref?.();
+    }),
+  ]);
+  row = current();
+  return row;
 }
 
 export function getBinanceContractMarketHealth() {

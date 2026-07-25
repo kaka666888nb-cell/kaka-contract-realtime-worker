@@ -1,24 +1,23 @@
-# Step650.8.15.35 / App Step664.1
+# Step650.8.15.36 / App Step737.3
 
-## Current change
+## Advanced OI/funding completion
 
-- Removes the built-in 12-symbol contract-flow whitelist.
-- Reuses the existing guarded/cached real USDT contract catalogs for Binance, OKX, Bybit, Bitget and Gate.
-- Collects public trade WebSocket flow in bounded rotating batches, so the worker does not open hundreds of symbol sockets at once.
-- Adds `GET /api/contract-flow/market-snapshot` for the App data page.
-- Missing taker data remains null; it is never replaced with zero or another venue.
-- CVD quote notional and base-asset quantity are separate fields and units.
-- Binance contract REST remains hard-disabled.
+- Binance `/api/contract-flow` gives OI the first authenticated Edge critical slot and waits within the existing bounded `wait_ms` window.
+- `/api/contract-funding?history_mode=none` skips history requests for all non-Binance providers.
+- A Binance funding request can trigger the existing one-shot all-market mark-price WebSocket immediately instead of waiting for the next 60-second snapshot.
+- Bitget settlement uses the official `/api/v2/mix/market/funding-time` endpoint (`nextFundingTime`, `ratePeriod`).
+- The existing flow market snapshot overlays live OI, funding and next-funding fields for active exact provider+symbol states.
+- Binance futures REST remains disabled on Render; no account/trading endpoint is added.
 
-## Deployment for this step
+## Deployment
 
-1. Run `step664_1_contract_flow_base_cvd_columns.sql` in Supabase SQL Editor.
-2. Replace the current Render worker repository with this package and deploy the same service.
-3. Preserve every existing environment variable. No new mandatory secret is required.
-4. After Render is live, check `/health`, `/api/contract-flow/health`, and `/api/contract-flow/market-snapshot`.
-5. Only then replace the App `lib/main.dart` with the Step664.1 file.
+1. Replace the current GitHub worker repository with this complete package and redeploy the same Render service.
+2. Preserve all existing environment variables. No new secret, SQL, Edge Function or Cron is required.
+3. After deployment, check `/health`, `/api/contract-flow/health` and `/api/contract-funding/health`.
+4. Then replace the App `lib/main.dart` with Step737.3 and run the real-phone checks.
 
-The sections below are historical notes retained from the previous stable worker.
+The sections below are historical notes retained only for architecture context.
+
 
 # Kaka Web3 Contract Realtime Worker — Step650.8.15.3 / Step651.2D.3
 

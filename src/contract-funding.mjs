@@ -1,8 +1,11 @@
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
-import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
+import {
+  ensureBinanceContractRealtimeMeta,
+  getBinanceContractRealtimeMeta,
+} from './binance-contract-market.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.33';
+const VERSION = '650.8.15.36';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -10,7 +13,7 @@ const FRESH_MS = 30_000;
 const STALE_MS = 10 * 60_000;
 const BINANCE_HISTORY_REFRESH_MS = 5 * 60_000;
 const BINANCE_HISTORY_BACKGROUND_DELAY_MS = 10_000;
-const BINANCE_REALTIME_WAIT_MS = 1_800;
+const BINANCE_REALTIME_WAIT_MS = 6_500;
 const BINANCE_HISTORY_REFRESH = new Map();
 
 function sendJson(res, status, payload) {
@@ -191,20 +194,21 @@ async function fetchBinancePair(currentUrl, historyUrl) {
   return { currentRaw, historyRaw, warnings };
 }
 
-async function fetchPair(currentUrl, historyUrl) {
+async function fetchPair(currentUrl, historyUrl, { includeHistory = true } = {}) {
   const [currentResult, historyResult] = await Promise.allSettled([
     fetchJson(currentUrl),
-    fetchJson(historyUrl),
+    includeHistory && historyUrl ? fetchJson(historyUrl) : Promise.resolve(null),
   ]);
-  if (currentResult.status === 'rejected' && historyResult.status === 'rejected') {
-    throw new Error(`current:${currentResult.reason?.message || currentResult.reason};history:${historyResult.reason?.message || historyResult.reason}`);
+  if (currentResult.status === 'rejected' &&
+      (includeHistory ? historyResult.status === 'rejected' : true)) {
+    throw new Error(`current:${currentResult.reason?.message || currentResult.reason}${includeHistory ? `;history:${historyResult.reason?.message || historyResult.reason}` : ''}`);
   }
   return {
     currentRaw: currentResult.status === 'fulfilled' ? currentResult.value : null,
     historyRaw: historyResult.status === 'fulfilled' ? historyResult.value : null,
     warnings: [
       currentResult.status === 'rejected' ? `current:${currentResult.reason?.message || currentResult.reason}` : null,
-      historyResult.status === 'rejected' ? `history:${historyResult.reason?.message || historyResult.reason}` : null,
+      includeHistory && historyResult.status === 'rejected' ? `history:${historyResult.reason?.message || historyResult.reason}` : null,
     ].filter(Boolean),
   };
 }
@@ -229,14 +233,15 @@ function binanceRealtimeCurrent(symbol) {
 
 async function waitForBinanceRealtimeCurrent(symbol, waitMs = BINANCE_REALTIME_WAIT_MS) {
   const immediate = binanceRealtimeCurrent(symbol);
-  if (immediate) return immediate;
-  const deadline = Date.now() + Math.max(0, waitMs);
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    const row = binanceRealtimeCurrent(symbol);
-    if (row) return row;
+  const immediateNext = Date.parse(String(immediate?.next_funding_time || ''));
+  if (immediate && Number.isFinite(immediateNext) && immediateNext > Date.now()) {
+    return immediate;
   }
-  return null;
+  await ensureBinanceContractRealtimeMeta(symbol, {
+    waitMs,
+    requireFundingSchedule: true,
+  });
+  return binanceRealtimeCurrent(symbol);
 }
 
 async function fetchBinanceFundingHistory(symbol, limit) {
@@ -337,11 +342,12 @@ async function fetchBinance(symbol, limit) {
   };
 }
 
-async function fetchOkx(symbol, limit) {
+async function fetchOkx(symbol, limit, { includeHistory = true } = {}) {
   const native = nativeSymbol('okx', symbol);
   const { currentRaw, historyRaw, warnings } = await fetchPair(
     `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(native)}`,
     `https://www.okx.com/api/v5/public/funding-rate-history?instId=${encodeURIComponent(native)}&limit=${limit}`,
+    { includeHistory },
   );
   const item = Array.isArray(currentRaw?.data) ? currentRaw.data[0] : null;
   const current = currentRow({
@@ -358,11 +364,12 @@ async function fetchOkx(symbol, limit) {
   return { current, history, warnings, source: 'okx_official_public_funding_rest', native_symbol: native };
 }
 
-async function fetchBybit(symbol, limit) {
+async function fetchBybit(symbol, limit, { includeHistory = true } = {}) {
   const native = nativeSymbol('bybit', symbol);
   const { currentRaw, historyRaw, warnings } = await fetchPair(
     `https://api.bybit.com/v5/market/tickers?category=${bybitCategory(symbol)}&symbol=${encodeURIComponent(native)}`,
     `https://api.bybit.com/v5/market/funding/history?category=${bybitCategory(symbol)}&symbol=${encodeURIComponent(native)}&limit=${limit}`,
+    { includeHistory },
   );
   const item = Array.isArray(currentRaw?.result?.list) ? currentRaw.result.list[0] : null;
   const current = currentRow({
@@ -382,20 +389,41 @@ async function fetchBybit(symbol, limit) {
   return { current, history, warnings, source: 'bybit_official_public_funding_rest', native_symbol: native };
 }
 
-async function fetchBitget(symbol, limit) {
+async function fetchBitget(symbol, limit, { includeHistory = true } = {}) {
   const native = nativeSymbol('bitget', symbol);
   const q = `symbol=${encodeURIComponent(native)}&productType=${encodeURIComponent(bitgetProductType(symbol))}`;
-  const { currentRaw, historyRaw, warnings } = await fetchPair(
-    `https://api.bitget.com/api/v2/mix/market/current-fund-rate?${q}`,
-    `https://api.bitget.com/api/v2/mix/market/history-fund-rate?${q}&pageSize=${limit}`,
-  );
+  const [currentResult, fundingTimeResult, historyResult] = await Promise.allSettled([
+    fetchJson(`https://api.bitget.com/api/v2/mix/market/current-fund-rate?${q}`),
+    fetchJson(`https://api.bitget.com/api/v2/mix/market/funding-time?${q}`),
+    includeHistory
+      ? fetchJson(`https://api.bitget.com/api/v2/mix/market/history-fund-rate?${q}&pageSize=${limit}`)
+      : Promise.resolve(null),
+  ]);
+  if (currentResult.status === 'rejected' &&
+      fundingTimeResult.status === 'rejected' &&
+      (!includeHistory || historyResult.status === 'rejected')) {
+    throw new Error([
+      `current:${currentResult.reason?.message || currentResult.reason}`,
+      `funding_time:${fundingTimeResult.reason?.message || fundingTimeResult.reason}`,
+      includeHistory ? `history:${historyResult.reason?.message || historyResult.reason}` : null,
+    ].filter(Boolean).join(';'));
+  }
+  const currentRaw = currentResult.status === 'fulfilled' ? currentResult.value : null;
+  const fundingTimeRaw = fundingTimeResult.status === 'fulfilled' ? fundingTimeResult.value : null;
+  const historyRaw = historyResult.status === 'fulfilled' ? historyResult.value : null;
+  const warnings = [
+    currentResult.status === 'rejected' ? `current:${currentResult.reason?.message || currentResult.reason}` : null,
+    fundingTimeResult.status === 'rejected' ? `funding_time:${fundingTimeResult.reason?.message || fundingTimeResult.reason}` : null,
+    includeHistory && historyResult.status === 'rejected' ? `history:${historyResult.reason?.message || historyResult.reason}` : null,
+  ].filter(Boolean);
   const item = Array.isArray(currentRaw?.data) ? currentRaw.data[0] : currentRaw?.data;
+  const timeItem = Array.isArray(fundingTimeRaw?.data) ? fundingTimeRaw.data[0] : fundingTimeRaw?.data;
   const current = currentRow({
     provider: 'bitget', symbol,
     rate: item?.fundingRate,
-    nextTime: item?.nextUpdate ?? item?.nextFundingTime,
-    sourceTime: currentRaw?.requestTime,
-    intervalHours: item?.fundingRateInterval,
+    nextTime: timeItem?.nextFundingTime ?? item?.nextFundingTime ?? item?.nextUpdate,
+    sourceTime: fundingTimeRaw?.requestTime ?? currentRaw?.requestTime,
+    intervalHours: timeItem?.ratePeriod ?? item?.fundingRateInterval,
   });
   const list = Array.isArray(historyRaw?.data) ? historyRaw.data : (Array.isArray(historyRaw?.data?.list) ? historyRaw.data.list : []);
   const history = list.map((row) => historyRow({
@@ -403,14 +431,21 @@ async function fetchBitget(symbol, limit) {
     rate: row?.fundingRate,
     time: row?.fundingTime ?? row?.fundingRateTimestamp,
   })).filter(Boolean);
-  return { current, history, warnings, source: 'bitget_official_public_funding_rest', native_symbol: native };
+  return {
+    current,
+    history,
+    warnings,
+    source: 'bitget_official_public_current_funding_plus_next_funding_time_rest',
+    native_symbol: native,
+  };
 }
 
-async function fetchGate(symbol, limit) {
+async function fetchGate(symbol, limit, { includeHistory = true } = {}) {
   const native = nativeSymbol('gate', symbol);
   const { currentRaw: contractRaw, historyRaw, warnings } = await fetchPair(
     `https://api.gateio.ws/api/v4/futures/${gateSettle(symbol)}/contracts/${encodeURIComponent(native)}`,
     `https://api.gateio.ws/api/v4/futures/${gateSettle(symbol)}/funding_rate?contract=${encodeURIComponent(native)}&limit=${limit}`,
+    { includeHistory },
   );
   const current = currentRow({
     provider: 'gate', symbol,
@@ -430,13 +465,13 @@ async function fetchGate(symbol, limit) {
   return { current, history, warnings, source: 'gate_official_public_funding_rest', native_symbol: native };
 }
 
-async function load(provider, symbol, limit) {
+async function load(provider, symbol, limit, { includeHistory = true } = {}) {
   switch (provider) {
     case 'binance': return fetchBinance(symbol, limit);
-    case 'okx': return fetchOkx(symbol, limit);
-    case 'bybit': return fetchBybit(symbol, limit);
-    case 'bitget': return fetchBitget(symbol, limit);
-    case 'gate': return fetchGate(symbol, limit);
+    case 'okx': return fetchOkx(symbol, limit, { includeHistory });
+    case 'bybit': return fetchBybit(symbol, limit, { includeHistory });
+    case 'bitget': return fetchBitget(symbol, limit, { includeHistory });
+    case 'gate': return fetchGate(symbol, limit, { includeHistory });
     default: throw new Error('unsupported_provider');
   }
 }
@@ -452,6 +487,9 @@ export async function handleContractFunding(req, res, url) {
       binance_current_transport: 'mark_price_websocket',
       binance_history_transport: 'authenticated_edge_relay_background',
       first_paint_waits_for_history: false,
+      current_only_mode_skips_history_requests: true,
+      binance_current_on_demand_mark_price_snapshot: true,
+      bitget_next_funding_time_endpoint: '/api/v2/mix/market/funding-time',
       native_contract_quotes: {
         USDT: ['binance','okx','bybit','bitget','gate'],
         USDC: ['binance','okx','bybit','bitget'],
@@ -475,10 +513,11 @@ export async function handleContractFunding(req, res, url) {
     sendJson(res, 400, { ok: false, version: VERSION, error: 'invalid_provider_or_symbol' });
     return true;
   }
-  const key = `${provider}|${symbol}|${limit}`;
+  const includeHistory = String(url.searchParams.get('history_mode') || '').toLowerCase() !== 'none';
+  const key = `${provider}|${symbol}|${limit}|${includeHistory ? 'history' : 'current'}`;
   if (provider === 'binance') {
     await serveBinanceFunding(res, symbol, limit, key, {
-      scheduleHistory: String(url.searchParams.get('history_mode') || '').toLowerCase() !== 'none',
+      scheduleHistory: includeHistory,
     });
     return true;
   }
@@ -490,7 +529,7 @@ export async function handleContractFunding(req, res, url) {
   }
   let pending = INFLIGHT.get(key);
   if (!pending) {
-    pending = load(provider, symbol, limit)
+    pending = load(provider, symbol, limit, { includeHistory })
       .then((data) => {
         const payload = {
           ok: true,
