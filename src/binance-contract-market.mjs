@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.36';
+const VERSION = '650.8.15.38';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -461,7 +461,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.36' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.38' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -531,7 +531,7 @@ async function capturePeriodicSnapshot(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.36' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.38' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -888,7 +888,7 @@ export async function ensureBinanceContractRealtimeMeta(
   let row = current();
   if (complete(row)) return row;
 
-  // Step650.8.15.36: funding/OI first paint must not wait for the next
+  // Step650.8.15.38: funding/OI first paint must not wait for the next
   // one-minute periodic mark-price snapshot. Reuse the same official all-market
   // WebSocket, coalesce concurrent callers, and still close after one payload.
   const state = streamStatus('markPrice');

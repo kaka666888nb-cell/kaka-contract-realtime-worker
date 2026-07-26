@@ -1,97 +1,40 @@
-# Step650.8.15.36 / App Step737.3
+# Kaka Contract Realtime Worker 650.8.15.38 / Step764.1
 
-## Advanced OI/funding completion
+This release replaces the first Step764 raw-history implementation with a bounded shared-bucket store.
 
-- Binance `/api/contract-flow` gives OI the first authenticated Edge critical slot and waits within the existing bounded `wait_ms` window.
-- `/api/contract-funding?history_mode=none` skips history requests for all non-Binance providers.
-- A Binance funding request can trigger the existing one-shot all-market mark-price WebSocket immediately instead of waiting for the next 60-second snapshot.
-- Bitget settlement uses the official `/api/v2/mix/market/funding-time` endpoint (`nextFundingTime`, `ratePeriod`).
-- The existing flow market snapshot overlays live OI, funding and next-funding fields for active exact provider+symbol states.
-- Binance futures REST remains disabled on Render; no account/trading endpoint is added.
+## Shared fund-flow history
 
-## Deployment
+- Existing full-universe public-trade WebSocket scanner continues writing verified 5-minute rows to `app_contract_flow_5m_cache`.
+- Supabase RPC `kaka_refresh_contract_flow_15m_cache` aggregates only recent raw rows into private table `app_contract_flow_15m_cache`.
+- `GET /api/contract-flow/history?period=15m&hours=168` reads at most about 672 persisted 15-minute rows instead of repeatedly downloading tens of thousands of raw rows.
+- Render refreshes the shared 15-minute table at most once per five-minute boundary and merges concurrent callers.
+- The endpoint response is cached for five minutes; a verified stale response may be retained for up to thirty minutes if Supabase is temporarily unavailable.
+- App users all read the same backend buckets. The history endpoint never opens an exchange REST or WebSocket connection.
 
-1. Replace the current GitHub worker repository with this complete package and redeploy the same Render service.
-2. Preserve all existing environment variables. No new secret, SQL, Edge Function or Cron is required.
-3. After deployment, check `/health`, `/api/contract-flow/health` and `/api/contract-funding/health`.
-4. Then replace the App `lib/main.dart` with Step737.3 and run the real-phone checks.
+## Retention and cleanup
 
-The sections below are historical notes retained only for architecture context.
+- Raw flow and position 5-minute rows: 8 days.
+- Shared 15-minute rows: 31 days.
+- Cleanup RPC runs once after startup and then at most once every six hours.
+- Render memory history cache is capped at 8 keys and expired after 30 minutes.
+- Existing active stream limits, idle eviction, persistence queue coalescing and Binance REST prohibition remain unchanged.
 
+## Exchange request protection retained
 
-# Kaka Web3 Contract Realtime Worker — Step650.8.15.3 / Step651.2D.3
-
-## Step651.2D.3 Render outbound-bandwidth containment
-
-- Replaces the continuous Binance all-market `!ticker@arr` and `!markPrice@arr@1s` downloads with official one-shot snapshots once per 60 seconds.
-- Disables the redundant continuous all-market `!bookTicker` stream; the 24h ticker snapshot already supplies the list price and the detail Kline WebSocket supplies realtime detail price.
-- Keeps the low-volume `!contractInfo` stream for listing/status changes.
-- Keeps the 15-minute Supabase last-correct snapshot persistence from Step651.2D.2.
-- Does not call Binance REST from Render, does not change Kline WebSockets, contract flow, funding calculations, depth, liquidation, App code, SQL, Storage, Edge or Cron.
-- Adds health metadata `websocket_modes` and `market_snapshot_intervals_seconds` for deployment verification.
-
-Step650.8.15.3 is a Render-only auxiliary-data first-paint repair built on the validated Step650.8.13 Binance USDⓈ-M WebSocket migration.
-
-
-## Step651.2D.2 bandwidth containment
-
-- Throttles the full Binance contract last-known-good snapshot upload from every 30 seconds to every 15 minutes.
-- Stops ticker/book/mark-price events from falsely marking the market universe dirty when symbol identity did not change.
-- Adds read-only byte/message counters for Binance market WebSocket streams, contract-flow WebSockets, and snapshot persistence.
-- Does not change App APIs, contract-flow sampling, funding, depth, liquidation, Kline, Edge relay, SQL, environment variables, or direct Binance REST protections.
-
-## Current architecture
-
-- Binance contract universe and 24h ticker: official production `/market` WebSocket plus last-known-good Supabase snapshot.
-- Binance best bid/ask and depth: official production `/public` WebSocket.
-- Binance mark price, index price, current funding rate and next funding time: official global mark-price `/market` WebSocket.
-- Binance completed Kline history: official `data.binance.vision` USD-M archive.
-- Exact near-current Kline bridge and allowlisted auxiliary HTTP: authenticated Supabase Edge relay.
-- Binance current candle, aggregate trades, flow and liquidation: official production WebSocket.
-- Render direct Binance REST: hard-disabled before network in both parent and child processes.
-- No synthetic candles, interpolation, cross-exchange substitution or client-controlled validation end time.
-
-The already deployed Edge relay remains unchanged. It is a separately isolated egress path, not a represented fixed/dedicated IP.
-
-## Step650.8.15.3 changes
-
-- Funding first paint reads current funding, mark price and index price from the official mark-price WebSocket and does not wait for history.
-- Funding history is stale-while-revalidate and refreshes in the background through the existing authenticated Edge allowlist.
-- Contract meta first paint reuses the same exact mark-price snapshot and adds current open interest from stale cache or a critical-priority Edge refresh.
-- Contract flow returns a valid HTTP 200 partial snapshot immediately; it no longer waits for full ratio/OI history before first paint.
-- Binance critical auxiliary requests use a 2500 ms lane, Kline remains the highest priority 3000 ms lane, and slow auxiliary history remains on the 12000 ms lane while preserving one active Edge request globally.
-- Quiet Binance aggTrade windows return HTTP 200 with an empty list and `empty_reason=no_recent_trade_event` instead of leaving the App spinner on a 502/timeout.
-- Existing `/market` and `/public` WebSocket migration, arbitrary-symbol 240-row Kline first paint, route ownership fix, persistent validation state and zero direct Render Binance REST are preserved.
-
-## Health endpoints
-
-- `/health`
-- `/ws-health`
-- `/api/binance-contract-market-health`
-- `/api/binance-contract-kline-seed-health`
-- `/api/binance-contract-kline-relay-health`
-- `/api/contract-funding/health`
-- `/api/contract-flow/health`
-- `/api/contract-depth/health`
+- Main flow collection uses public trade WebSockets, not repeated REST polling.
+- Scanner rotation defaults to 390 seconds.
+- Per-cycle batches: Binance 18, OKX 8, Bybit 8, Bitget 8, Gate 8.
+- Maximum active flow states: 80; Binance maximum: 24.
+- Binance WebSocket connect gap: 2.5 seconds; maximum 40 attempts per five minutes.
+- Repeated App reads of `/market-snapshot` do not rotate the scanner.
+- Provider REST governor still merges identical in-flight requests and applies Retry-After, cooldowns and negative cache.
 
 ## Deployment
 
-1. Completely close Kaka Web3 and quit `flutter run`.
-2. Overwrite the existing Render worker repository with this package.
-3. Deploy the same Render service: `kaka-contract-realtime-worker`.
-4. Preserve all existing environment variables.
-5. Wait at least three minutes after Render reports the service live.
-6. Run the Step650.8.15.3 health-only audit.
-7. Only after it reports READY, run the one-time 2Z auxiliary validation.
+1. Run `supabase/STEP764_1_后台共享资金桶存储与清理.sql` once in Supabase SQL Editor.
+2. Deploy this complete Render repository.
+3. Confirm `/api/contract-flow/health` reports version `650.8.15.38`, table `app_contract_flow_15m_cache`, raw retention 8 days and aggregate retention 31 days.
+4. Confirm `/api/contract-flow/history?period=15m&hours=168` returns `ok: true`.
+5. Install the Step764.1 App main.dart.
 
-Do not redeploy Supabase Edge, change environment variables, modify App `main.dart`, run SQL/Cron, change `pubspec.yaml`, or run `flutter clean` for this step.
-
-
-## Step650.8.15.35 snapshot read-only fix
-
-- `GET /api/contract-flow/market-snapshot` is now read-only.
-- Refreshing the global or provider-filtered snapshot no longer advances the rotating scanner.
-- The scheduled scanner and the explicit `/api/contract-flow/warm` endpoint remain available.
-- This prevents repeated diagnostics/App reads from replacing the guarded Binance batch before its WebSocket connection queue finishes.
-- Health exposes `market_snapshot_rotates_scan: false`.
-- Snapshot responses expose `snapshot_triggers_rotation: false`.
+No new exchange source, Cron, Edge Function or environment variable is required.

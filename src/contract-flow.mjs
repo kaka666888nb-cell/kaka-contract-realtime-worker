@@ -3,7 +3,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const VERSION = '650.8.15.36';
+const VERSION = '650.8.15.38';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -1155,6 +1155,7 @@ async function runContractFlowUniverseScanCycle() {
 }
 
 export function startContractFlowUniverseScanner() {
+  startSharedFlowMaintenance();
   if (flowScanState.started || !FLOW_SCAN_ENABLED) return;
   flowScanState.started = true;
   const startTimer = setTimeout(() => runContractFlowUniverseScanCycle().catch(() => {}), 2500);
@@ -2724,6 +2725,293 @@ async function loadLatestPersistedFlowSnapshot(maxAgeMs) {
   return [...latest.values()];
 }
 
+
+const SHARED_FLOW_BUCKET_TABLE = 'app_contract_flow_15m_cache';
+const SHARED_FLOW_REFRESH_RPC = 'kaka_refresh_contract_flow_15m_cache';
+const SHARED_FLOW_CLEANUP_RPC = 'kaka_cleanup_contract_flow_cache';
+const SHARED_FLOW_HISTORY_CACHE_TTL_MS = 5 * 60_000;
+const SHARED_FLOW_HISTORY_STALE_MS = 30 * 60_000;
+const SHARED_FLOW_HISTORY_CACHE_MAX = 8;
+const SHARED_FLOW_REFRESH_MIN_MS = 4 * 60_000;
+const SHARED_FLOW_CLEANUP_INTERVAL_MS = 6 * 60 * 60_000;
+const sharedFlowHistoryCache = new Map();
+const sharedFlowHistoryInflight = new Map();
+const sharedFlowMaintenance = {
+  started: false,
+  refreshTimer: null,
+  cleanupTimer: null,
+  refreshInflight: null,
+  cleanupInflight: null,
+  lastRefreshAttemptAt: 0,
+  lastRefreshSuccessAt: 0,
+  lastRefreshError: '',
+  lastRefreshResult: null,
+  lastCleanupAttemptAt: 0,
+  lastCleanupSuccessAt: 0,
+  lastCleanupError: '',
+  lastCleanupResult: null,
+};
+
+function sharedHistoryCacheKey(hours) {
+  return `15m:${hours}`;
+}
+
+function sharedSupabaseHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    ...extra,
+  };
+}
+
+async function callSharedFlowRpc(name, body, timeoutMs = 30000) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${name}`, {
+    method: 'POST',
+    headers: sharedSupabaseHeaders({
+      accept: 'application/json',
+      'content-type': 'application/json',
+    }),
+    body: JSON.stringify(body || {}),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${name}_http_${response.status}:${text.slice(0, 240)}`);
+  }
+  if (!text.trim()) return null;
+  try { return JSON.parse(text); }
+  catch (_) { return text; }
+}
+
+function pruneSharedFlowHistoryCache(now = Date.now()) {
+  for (const [key, entry] of sharedFlowHistoryCache) {
+    if (!entry || now - entry.cachedAt > SHARED_FLOW_HISTORY_STALE_MS) {
+      sharedFlowHistoryCache.delete(key);
+    }
+  }
+  while (sharedFlowHistoryCache.size > SHARED_FLOW_HISTORY_CACHE_MAX) {
+    const oldestKey = [...sharedFlowHistoryCache.entries()]
+      .sort((a, b) => (a[1]?.cachedAt || 0) - (b[1]?.cachedAt || 0))[0]?.[0];
+    if (!oldestKey) break;
+    sharedFlowHistoryCache.delete(oldestKey);
+  }
+}
+
+async function refreshSharedFlowBucketStore({ force = false, hours = 2 } = {}) {
+  if (!PERSISTENCE_ENABLED) return { ok: false, skipped: 'persistence_disabled' };
+  const now = Date.now();
+  if (!force && sharedFlowMaintenance.lastRefreshSuccessAt &&
+      now - sharedFlowMaintenance.lastRefreshSuccessAt < SHARED_FLOW_REFRESH_MIN_MS) {
+    return { ok: true, skipped: 'refresh_cooldown', last_success_at: new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString() };
+  }
+  if (sharedFlowMaintenance.refreshInflight) return await sharedFlowMaintenance.refreshInflight;
+  sharedFlowMaintenance.lastRefreshAttemptAt = now;
+  const promise = (async () => {
+    try {
+      // Only Supabase is touched here. No exchange REST/WebSocket is opened by history refresh.
+      const result = await callSharedFlowRpc(
+        SHARED_FLOW_REFRESH_RPC,
+        { p_hours: Math.max(1, Math.min(168, Number(hours) || 2)) },
+        45000,
+      );
+      sharedFlowMaintenance.lastRefreshSuccessAt = Date.now();
+      sharedFlowMaintenance.lastRefreshError = '';
+      sharedFlowMaintenance.lastRefreshResult = result;
+      // A successful bucket refresh invalidates only the tiny Render response cache.
+      sharedFlowHistoryCache.clear();
+      return { ok: true, result };
+    } catch (error) {
+      sharedFlowMaintenance.lastRefreshError = String(error?.message || error).slice(0, 300);
+      throw error;
+    }
+  })().finally(() => { sharedFlowMaintenance.refreshInflight = null; });
+  sharedFlowMaintenance.refreshInflight = promise;
+  return await promise;
+}
+
+async function cleanupSharedFlowPersistence() {
+  if (!PERSISTENCE_ENABLED) return { ok: false, skipped: 'persistence_disabled' };
+  if (sharedFlowMaintenance.cleanupInflight) return await sharedFlowMaintenance.cleanupInflight;
+  sharedFlowMaintenance.lastCleanupAttemptAt = Date.now();
+  const promise = (async () => {
+    try {
+      const result = await callSharedFlowRpc(SHARED_FLOW_CLEANUP_RPC, {}, 45000);
+      sharedFlowMaintenance.lastCleanupSuccessAt = Date.now();
+      sharedFlowMaintenance.lastCleanupError = '';
+      sharedFlowMaintenance.lastCleanupResult = result;
+      pruneSharedFlowHistoryCache();
+      return { ok: true, result };
+    } catch (error) {
+      sharedFlowMaintenance.lastCleanupError = String(error?.message || error).slice(0, 300);
+      throw error;
+    }
+  })().finally(() => { sharedFlowMaintenance.cleanupInflight = null; });
+  sharedFlowMaintenance.cleanupInflight = promise;
+  return await promise;
+}
+
+function scheduleNextSharedFlowRefresh() {
+  if (!sharedFlowMaintenance.started) return;
+  if (sharedFlowMaintenance.refreshTimer) clearTimeout(sharedFlowMaintenance.refreshTimer);
+  const now = Date.now();
+  const fiveMinutes = 5 * 60_000;
+  const nextBoundary = (Math.floor(now / fiveMinutes) + 1) * fiveMinutes;
+  const delay = Math.max(5000, nextBoundary + 45_000 - now);
+  sharedFlowMaintenance.refreshTimer = setTimeout(async () => {
+    try { await refreshSharedFlowBucketStore({ force: true, hours: 2 }); }
+    catch (error) { console.error(`[Step${VERSION}] shared flow bucket refresh failed: ${error?.message || error}`); }
+    scheduleNextSharedFlowRefresh();
+  }, delay);
+  sharedFlowMaintenance.refreshTimer.unref?.();
+}
+
+function startSharedFlowMaintenance() {
+  if (sharedFlowMaintenance.started || !PERSISTENCE_ENABLED) return;
+  sharedFlowMaintenance.started = true;
+  scheduleNextSharedFlowRefresh();
+  const initialCleanup = setTimeout(() => {
+    cleanupSharedFlowPersistence().catch((error) => {
+      console.error(`[Step${VERSION}] shared flow cache cleanup failed: ${error?.message || error}`);
+    });
+  }, 90_000);
+  initialCleanup.unref?.();
+  sharedFlowMaintenance.cleanupTimer = setInterval(() => {
+    cleanupSharedFlowPersistence().catch((error) => {
+      console.error(`[Step${VERSION}] shared flow cache cleanup failed: ${error?.message || error}`);
+    });
+  }, SHARED_FLOW_CLEANUP_INTERVAL_MS);
+  sharedFlowMaintenance.cleanupTimer.unref?.();
+}
+
+function normalizeSharedFlowBucket(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const start = normalizeTime(raw.bucket_start);
+  if (!start) return null;
+  const end = normalizeTime(raw.bucket_end) || start + 15 * 60_000;
+  const providers = Array.isArray(raw.providers)
+    ? raw.providers.map(providerKey).filter(Boolean)
+    : [];
+  return {
+    id: String(raw.id || `shared_contract_flow_15m:${start}`),
+    bucket_start: new Date(start).toISOString(),
+    bucket_end: new Date(end).toISOString(),
+    close_after: raw.close_after || new Date(end + 2 * 60_000).toISOString(),
+    quote_asset: 'USDT',
+    taker_buy_quote_volume: asNumber(raw.taker_buy_quote_volume) || 0,
+    taker_sell_quote_volume: asNumber(raw.taker_sell_quote_volume) || 0,
+    taker_net_quote_volume: asNumber(raw.taker_net_quote_volume) || 0,
+    cvd_delta_quote: asNumber(raw.cvd_delta_quote),
+    cvd_sample_count: asNumber(raw.cvd_sample_count) || 0,
+    trade_count: asNumber(raw.trade_count) || 0,
+    sample_count: asNumber(raw.sample_count) || 0,
+    pair_count: asNumber(raw.pair_count) || 0,
+    provider_count: asNumber(raw.provider_count) || providers.length,
+    providers,
+    observed_5m_bucket_count: asNumber(raw.observed_5m_bucket_count) || 0,
+    complete_5m_bucket_count: asNumber(raw.complete_5m_bucket_count) || 0,
+    expected_5m_bucket_count: asNumber(raw.expected_5m_bucket_count) || 3,
+    bucket_closed: raw.bucket_closed === true,
+    provisional: raw.provisional !== false,
+    latest_sample_at: raw.latest_sample_at || null,
+    source: String(raw.source || 'render_shared_persisted_15m_cache'),
+    updated_at: raw.updated_at || null,
+  };
+}
+
+async function loadPersistedSharedFlowBuckets(hours) {
+  if (!PERSISTENCE_ENABLED) return [];
+  const safeHours = Math.max(1, Math.min(168, Number(hours) || 168));
+  const cutoff = new Date(Date.now() - safeHours * 60 * 60 * 1000).toISOString();
+  const query = new URLSearchParams({
+    select: '*',
+    bucket_start: `gte.${cutoff}`,
+    order: 'bucket_start.asc',
+    limit: '1000',
+  });
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${SHARED_FLOW_BUCKET_TABLE}?${query}`, {
+    headers: sharedSupabaseHeaders({ accept: 'application/json' }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`shared_flow_bucket_history_http_${response.status}:${text.slice(0, 240)}`);
+  }
+  const decoded = JSON.parse(text);
+  return (Array.isArray(decoded) ? decoded : [])
+    .map(normalizeSharedFlowBucket)
+    .filter(Boolean);
+}
+
+function buildSharedFlowHistoryPayload(rows, hours) {
+  const normalized = (Array.isArray(rows) ? rows : [])
+    .map((row) => normalizeSharedFlowBucket(row) || row)
+    .filter(Boolean)
+    .sort((a, b) => (normalizeTime(b.bucket_start) || 0) - (normalizeTime(a.bucket_start) || 0));
+  const completeRows = normalized.filter((row) => row.provisional !== true && row.bucket_closed === true);
+  const providerCoverage = Object.fromEntries([...PROVIDERS].map((provider) => [provider, 0]));
+  for (const row of completeRows) {
+    for (const provider of row.providers || []) {
+      if (providerCoverage[provider] != null) providerCoverage[provider] += 1;
+    }
+  }
+  return {
+    rows: normalized,
+    complete_rows: completeRows.length,
+    provisional_rows: normalized.length - completeRows.length,
+    raw_rows: normalized.reduce((sum, row) => sum + (asNumber(row.sample_count) || 0), 0),
+    stored_15m_rows: normalized.length,
+    provider_coverage: providerCoverage,
+    period: '15m',
+    hours,
+    generated_at: new Date().toISOString(),
+    source: 'render_shared_persisted_15m_table_cached_five_minutes',
+    storage_table: SHARED_FLOW_BUCKET_TABLE,
+    raw_retention_days: 8,
+    aggregate_retention_days: 31,
+  };
+}
+
+async function getSharedFlowHistory({ hours = 168 } = {}) {
+  const safeHours = Math.max(1, Math.min(168, Number(hours) || 168));
+  const key = sharedHistoryCacheKey(safeHours);
+  const now = Date.now();
+  pruneSharedFlowHistoryCache(now);
+  const cached = sharedFlowHistoryCache.get(key);
+  if (cached && now - cached.cachedAt < SHARED_FLOW_HISTORY_CACHE_TTL_MS) {
+    return { ...cached.payload, cache_hit: true, cache_age_ms: now - cached.cachedAt };
+  }
+  if (sharedFlowHistoryInflight.has(key)) return sharedFlowHistoryInflight.get(key);
+  const promise = (async () => {
+    try {
+      await refreshSharedFlowBucketStore({ hours: 2 });
+      const rows = await loadPersistedSharedFlowBuckets(safeHours);
+      const payload = {
+        ...buildSharedFlowHistoryPayload(rows, safeHours),
+        cache_hit: false,
+        cache_age_ms: 0,
+      };
+      sharedFlowHistoryCache.set(key, { cachedAt: Date.now(), payload });
+      pruneSharedFlowHistoryCache();
+      return payload;
+    } catch (error) {
+      const stale = sharedFlowHistoryCache.get(key) || cached;
+      if (stale && Date.now() - stale.cachedAt < SHARED_FLOW_HISTORY_STALE_MS) {
+        return {
+          ...stale.payload,
+          cache_hit: true,
+          cache_stale: true,
+          cache_age_ms: Date.now() - stale.cachedAt,
+          warning: 'shared_history_refresh_failed_stale_cache_retained',
+          refresh_error: String(error?.message || error).slice(0, 240),
+        };
+      }
+      throw error;
+    }
+  })().finally(() => sharedFlowHistoryInflight.delete(key));
+  sharedFlowHistoryInflight.set(key, promise);
+  return await promise;
+}
+
 async function buildFullUniverseFlowSnapshot({ maxAgeMs = 20 * 60_000 } = {}) {
   const byKey = new Map();
   try {
@@ -2806,7 +3094,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,market_snapshot_rotates_scan:false,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,market_snapshot_rotates_scan:false,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
@@ -2908,6 +3196,24 @@ export async function handleContractFlow(req,res,url){
     const scan=await runContractFlowUniverseScanCycle();
     const started=Object.values(scan.active_by_provider||{}).reduce((sum,value)=>sum+(Number(value)||0),0);
     sendJson(res,200,{ok:true,version:VERSION,started,persistence_enabled:PERSISTENCE_ENABLED,fixed_symbol_whitelist:false,full_universe_scan:scan,time:new Date().toISOString()});return true;
+  }
+  if(url.pathname==='/api/contract-flow/history'){
+    if(req.method!=='GET'){sendJson(res,405,{ok:false,version:VERSION,error:'method_not_allowed'});return true;}
+    const period=String(url.searchParams.get('period')||'15m').trim().toLowerCase();
+    if(period!=='15m'){
+      sendJson(res,400,{ok:false,version:VERSION,error:'unsupported_period',supported_periods:['15m']});return true;
+    }
+    const hours=Math.max(1,Math.min(168,Number(url.searchParams.get('hours')||168)));
+    if(!PERSISTENCE_ENABLED){
+      sendJson(res,200,{ok:true,version:VERSION,period:'15m',hours,rows:[],complete_rows:0,provisional_rows:0,raw_rows:0,provider_coverage:Object.fromEntries([...PROVIDERS].map((provider)=>[provider,0])),source:'persistence_disabled',warning:'shared_history_persistence_disabled',generated_at:new Date().toISOString()});return true;
+    }
+    try{
+      const history=await getSharedFlowHistory({hours});
+      sendJson(res,200,{ok:true,version:VERSION,...history});
+    }catch(error){
+      sendJson(res,502,{ok:false,version:VERSION,error:'shared_flow_history_unavailable',detail:String(error?.message||error).slice(0,500)});
+    }
+    return true;
   }
   if(url.pathname==='/api/contract-flow/market-snapshot'){
     if(req.method!=='GET'){sendJson(res,405,{ok:false,version:VERSION,error:'method_not_allowed'});return true;}
