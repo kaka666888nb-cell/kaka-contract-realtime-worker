@@ -1,36 +1,21 @@
-# Kaka Contract Realtime Worker 650.8.15.41 / Step767.2
+# Kaka Contract Realtime Worker
 
-This release unifies five-provider contract funding history under one bounded backend owner.
+## 650.8.15.42 / Step768
 
-## Shared funding history
+This release adds bounded, shared five-provider liquidation hour buckets.
 
-- Existing `GET /api/contract-funding` current/history compatibility remains.
-- New read-only `GET /api/contract-funding/history?provider=okx&symbol=BTCUSDT&limit=24` reads only persisted Supabase history and starts zero exchange requests.
-- Successful Binance, OKX, Bybit, Bitget and Gate history reads are upserted by exact `provider + market_type + symbol + funding_time`.
-- Render merges identical in-flight requests, caches persisted exact-key reads for five minutes and may retain a verified stale response for at most thirty minutes.
-- A single backend rotation runs once per hour. Each provider keeps BTC/ETH when available plus four persistent directory-rotation symbols. This is at most thirty small history requests per hour across all five venues, independent of App user count.
-- Rotation cursors are persisted in `app_contract_funding_rotation_state`, so a Render restart does not reset every provider to the same first symbols.
-- Step767.2 normalizes every funding-cache write to `market_type=contract`, deduplicates legacy aliases such as `usdt_perpetual`, and keeps the old Binance core-four Cron temporarily for parallel comparison without logical duplicate growth.
-- Step767.2 also treats non-positive historical mark/index prices as unavailable (`null`) instead of a fabricated zero, while the App renders `—`.
+### Shared liquidation history
 
-## Retention
+- `GET /api/contract-liquidation/history?hours=6&limit=2500`
+- `GET /api/contract-liquidation/health`
+- Storage: `app_contract_liquidation_1h_cache`
+- Exact identity: `provider + market_type + symbol + bucket_start`
+- Aggregate retention: 15 days
+- Raw liquidation events are **not** persisted
+- History reads use Supabase only and start zero exchange requests
+- Five-minute Render response cache with in-flight coalescing
+- Verified stale response retained for up to 30 minutes on Supabase failure
+- Queue-coalesced writes flushed once per minute
+- Cleanup on startup and at most once every six hours
 
-- Current funding cache stale identities: 7 days.
-- Funding history: 31 days.
-- Cleanup runs after startup and then at most once every six hours.
-- No new Cron, Edge Function or environment variable is required.
-
-## Existing safety retained
-
-- Binance contract REST on Render remains hard disabled.
-- Binance history continues through the authenticated Edge relay background lane.
-- Non-Binance REST continues through the existing provider governor with exact-key in-flight merge, Retry-After handling, hard cooldown and negative cache.
-- App detail history is served from the shared history endpoint first; direct Supabase read is only a compatibility fallback.
-
-## Deployment
-
-1. Run `supabase/STEP767_1_资金费率历史身份归一与空结果修复.sql` once.
-2. Deploy this complete Render repository.
-3. Confirm `/api/contract-funding/health` reports `650.8.15.41`, persistence enabled and background rotation status.
-4. Confirm `/api/contract-funding/history?provider=binance&symbol=BTCUSDT&limit=24` returns `ok: true` and `exchange_requests_started: 0`.
-5. Install Step767.2 App main.dart.
+Existing single-venue live liquidation, funding, flow, depth, Kline and Binance REST guards remain unchanged.

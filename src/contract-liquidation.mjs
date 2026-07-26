@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.33';
+const STEP_VERSION = '650.8.15.42';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();
@@ -42,6 +42,410 @@ let binanceLiquidationConnectChain = Promise.resolve();
 let binanceLiquidationLastConnectAt = 0;
 const binanceLiquidationWsStats = { attempts: 0, waits: 0, window_blocks: 0 };
 let WS_CTOR_PROMISE = null;
+
+
+// Step768: shared bounded liquidation hour buckets.
+// Raw public liquidation events remain process-memory only. Only exact
+// provider+symbol hourly aggregates are persisted and served to all users.
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+const LIQUIDATION_PERSISTENCE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+const LIQUIDATION_HOUR_TABLE = 'app_contract_liquidation_1h_cache';
+const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_cache';
+const LIQUIDATION_HISTORY_ROUTE = '/api/contract-liquidation/history';
+const LIQUIDATION_HEALTH_ROUTE = '/api/contract-liquidation/health';
+const LIQUIDATION_HOUR_RETENTION_DAYS = 15;
+const LIQUIDATION_CLOSE_GRACE_MS = 2 * 60_000;
+const LIQUIDATION_PERSIST_FLUSH_MS = 60_000;
+const LIQUIDATION_PERSIST_QUEUE_MAX = 5000;
+const LIQUIDATION_HISTORY_CACHE_TTL_MS = 5 * 60_000;
+const LIQUIDATION_HISTORY_STALE_MS = 30 * 60_000;
+const LIQUIDATION_HISTORY_CACHE_MAX = 64;
+const liquidationPersistQueue = new Map();
+const liquidationPersistGate = new Map();
+const liquidationHistoryCache = new Map();
+const liquidationHistoryInflight = new Map();
+let liquidationPersistInflight = null;
+const liquidationPersistenceHealth = {
+  last_flush_at: 0,
+  last_flush_rows: 0,
+  flush_error: '',
+  last_cleanup_at: 0,
+  cleanup_error: '',
+  persisted_rows_total: 0,
+};
+
+function liquidationSupabaseHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    ...extra,
+  };
+}
+
+function liquidationIso(timeMs) {
+  const value = Number(timeMs || 0);
+  return value > 0 ? new Date(value).toISOString() : null;
+}
+
+function liquidationBucketCoverage(state, bucket, now = Date.now()) {
+  const startMs = Number(bucket?.start_ms || 0);
+  const endMs = Number(bucket?.end_ms || 0);
+  const observedSinceMs = Number(state?.observedSinceMs || state?.createdAt || now);
+  const lastGapAtMs = Number(state?.lastGapAtMs || 0);
+  const bucketClosed = endMs > 0 && now >= endMs + LIQUIDATION_CLOSE_GRACE_MS;
+  const startedBeforeBucket = observedSinceMs > 0 && observedSinceMs <= startMs;
+  const gapInsideBucket = lastGapAtMs >= startMs && lastGapAtMs <= endMs + LIQUIDATION_CLOSE_GRACE_MS;
+  return {
+    bucket_closed: bucketClosed,
+    provisional: !bucketClosed,
+    coverage_complete: bucketClosed && startedBeforeBucket && !gapInsideBucket,
+    observed_since_ms: observedSinceMs || null,
+    last_gap_at_ms: lastGapAtMs || null,
+  };
+}
+
+function liquidationPersistRow(state, bucket, now = Date.now()) {
+  if (!state || !bucket || Number(bucket.event_count || 0) <= 0) return null;
+  const provider = normalizeProvider(state.provider);
+  const symbol = compactSymbol(state.symbol);
+  const startMs = Number(bucket.start_ms || 0);
+  const endMs = Number(bucket.end_ms || 0);
+  if (!SUPPORTED_PROVIDERS.has(provider) || !symbol || startMs <= 0 || endMs <= startMs) return null;
+  const largest = bucket.largest_event || null;
+  const coverage = liquidationBucketCoverage(state, bucket, now);
+  return {
+    provider,
+    market_type: 'contract',
+    symbol,
+    quote_asset: quoteFromCompact(symbol),
+    bucket_start: liquidationIso(startMs),
+    bucket_end: liquidationIso(endMs),
+    long_notional: Math.max(0, Number(bucket.long_notional || 0)),
+    short_notional: Math.max(0, Number(bucket.short_notional || 0)),
+    total_notional: Math.max(0, Number(bucket.total_notional || 0)),
+    long_count: Math.max(0, Math.trunc(Number(bucket.long_count || 0))),
+    short_count: Math.max(0, Math.trunc(Number(bucket.short_count || 0))),
+    event_count: Math.max(0, Math.trunc(Number(bucket.event_count || 0))),
+    largest_event_id: largest ? String(largest.id || '') || null : null,
+    largest_event_side: largest && ['long', 'short'].includes(String(largest.liquidation_side || '').toLowerCase())
+      ? String(largest.liquidation_side).toLowerCase()
+      : null,
+    largest_event_notional: largest ? positiveNumber(largest.notional) : null,
+    largest_event_price: largest ? positiveNumber(largest.price) : null,
+    largest_event_time: largest ? liquidationIso(largest.time_ms) : null,
+    latest_event_time: liquidationIso(bucket.latest_event_time_ms || largest?.time_ms || endMs),
+    bucket_closed: coverage.bucket_closed,
+    provisional: coverage.provisional,
+    coverage_complete: coverage.coverage_complete,
+    observed_since: liquidationIso(coverage.observed_since_ms),
+    last_gap_at: liquidationIso(coverage.last_gap_at_ms),
+    source: 'render_public_liquidation_ws_hour_bucket_v1',
+    cached_at: new Date(now).toISOString(),
+  };
+}
+
+function liquidationPersistSignature(row) {
+  return JSON.stringify([
+    row.event_count,
+    row.long_count,
+    row.short_count,
+    Number(row.total_notional || 0).toFixed(8),
+    row.largest_event_id || '',
+    row.bucket_closed === true,
+    row.coverage_complete === true,
+  ]);
+}
+
+function capLiquidationPersistQueue() {
+  while (liquidationPersistQueue.size > LIQUIDATION_PERSIST_QUEUE_MAX) {
+    const first = liquidationPersistQueue.keys().next().value;
+    if (!first) break;
+    liquidationPersistQueue.delete(first);
+  }
+}
+
+function queueLiquidationHourBucket(state, bucket, now = Date.now()) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) return;
+  const row = liquidationPersistRow(state, bucket, now);
+  if (!row) return;
+  const key = `${row.provider}|${row.symbol}|${row.bucket_start}`;
+  const signature = liquidationPersistSignature(row);
+  const gate = liquidationPersistGate.get(key);
+  if (gate?.signature === signature && now - Number(gate.at || 0) < 5 * 60_000) return;
+  liquidationPersistQueue.set(key, { row, signature });
+  capLiquidationPersistQueue();
+}
+
+async function upsertLiquidationHourRows(rows) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED || rows.length === 0) return 0;
+  let written = 0;
+  for (let index = 0; index < rows.length; index += 250) {
+    const chunk = rows.slice(index, index + 250);
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/${LIQUIDATION_HOUR_TABLE}?on_conflict=provider,market_type,symbol,bucket_start`,
+      {
+        method: 'POST',
+        headers: liquidationSupabaseHeaders({
+          'content-type': 'application/json',
+          prefer: 'resolution=merge-duplicates,return=minimal',
+        }),
+        body: JSON.stringify(chunk),
+        signal: AbortSignal.timeout(15000),
+      },
+    );
+    const responseText = await response.text();
+    if (!response.ok) throw new Error(`liquidation_hour_upsert_http_${response.status}:${responseText.slice(0, 220)}`);
+    written += chunk.length;
+  }
+  return written;
+}
+
+async function flushLiquidationPersistQueue() {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED || liquidationPersistInflight || liquidationPersistQueue.size === 0) {
+    return liquidationPersistInflight;
+  }
+  const batch = [...liquidationPersistQueue.entries()].slice(0, 1000);
+  for (const [key] of batch) liquidationPersistQueue.delete(key);
+  liquidationPersistInflight = (async () => {
+    try {
+      const written = await upsertLiquidationHourRows(batch.map((entry) => entry[1].row));
+      const now = Date.now();
+      for (const [key, entry] of batch) liquidationPersistGate.set(key, { signature: entry.signature, at: now });
+      liquidationPersistenceHealth.last_flush_at = now;
+      liquidationPersistenceHealth.last_flush_rows = written;
+      liquidationPersistenceHealth.persisted_rows_total += written;
+      liquidationPersistenceHealth.flush_error = '';
+      liquidationHistoryCache.clear();
+      return written;
+    } catch (error) {
+      for (const [key, entry] of batch) {
+        if (!liquidationPersistQueue.has(key)) liquidationPersistQueue.set(key, entry);
+      }
+      capLiquidationPersistQueue();
+      liquidationPersistenceHealth.flush_error = String(error?.message || error).slice(0, 300);
+      throw error;
+    } finally {
+      liquidationPersistInflight = null;
+    }
+  })();
+  return liquidationPersistInflight;
+}
+
+function queueRecentLiquidationHourBuckets(now = Date.now()) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) return;
+  const cutoff = now - 3 * HOUR_BUCKET_MS;
+  for (const state of STATS.values()) {
+    for (const bucket of state.hourBuckets.values()) {
+      if (Number(bucket.end_ms || 0) >= cutoff) queueLiquidationHourBucket(state, bucket, now);
+    }
+  }
+}
+
+async function cleanupLiquidationPersistence() {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) return null;
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${LIQUIDATION_CLEANUP_RPC}`, {
+    method: 'POST',
+    headers: liquidationSupabaseHeaders({ 'content-type': 'application/json', accept: 'application/json' }),
+    body: '{}',
+    signal: AbortSignal.timeout(15000),
+  });
+  const responseText = await response.text();
+  if (!response.ok) throw new Error(`liquidation_cleanup_http_${response.status}:${responseText.slice(0, 220)}`);
+  liquidationPersistenceHealth.last_cleanup_at = Date.now();
+  liquidationPersistenceHealth.cleanup_error = '';
+  try { return JSON.parse(responseText); } catch (_) { return responseText; }
+}
+
+function pruneLiquidationHistoryCache(now = Date.now()) {
+  for (const [key, entry] of liquidationHistoryCache) {
+    if (!entry || now - Number(entry.cachedAt || 0) > LIQUIDATION_HISTORY_STALE_MS) liquidationHistoryCache.delete(key);
+  }
+  while (liquidationHistoryCache.size > LIQUIDATION_HISTORY_CACHE_MAX) {
+    const oldest = [...liquidationHistoryCache.entries()].sort((a, b) => Number(a[1]?.cachedAt || 0) - Number(b[1]?.cachedAt || 0))[0]?.[0];
+    if (!oldest) break;
+    liquidationHistoryCache.delete(oldest);
+  }
+}
+
+function normalizePersistedLiquidationHour(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const provider = normalizeProvider(raw.provider);
+  const symbol = compactSymbol(raw.symbol);
+  const startMs = Date.parse(String(raw.bucket_start || ''));
+  const endMs = Date.parse(String(raw.bucket_end || ''));
+  if (!SUPPORTED_PROVIDERS.has(provider) || !symbol || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
+  const row = {
+    provider,
+    market_type: 'contract',
+    symbol,
+    quote_asset: String(raw.quote_asset || quoteFromCompact(symbol)).toUpperCase(),
+    bucket_start: new Date(startMs).toISOString(),
+    bucket_end: new Date(endMs).toISOString(),
+    bucket_start_ms: startMs,
+    bucket_end_ms: endMs,
+    long_notional: Math.max(0, Number(raw.long_notional || 0)),
+    short_notional: Math.max(0, Number(raw.short_notional || 0)),
+    total_notional: Math.max(0, Number(raw.total_notional || 0)),
+    long_count: Math.max(0, Math.trunc(Number(raw.long_count || 0))),
+    short_count: Math.max(0, Math.trunc(Number(raw.short_count || 0))),
+    event_count: Math.max(0, Math.trunc(Number(raw.event_count || 0))),
+    largest_event_id: raw.largest_event_id ? String(raw.largest_event_id) : null,
+    largest_event_side: ['long', 'short'].includes(String(raw.largest_event_side || '').toLowerCase())
+      ? String(raw.largest_event_side).toLowerCase()
+      : null,
+    largest_event_notional: positiveNumber(raw.largest_event_notional),
+    largest_event_price: positiveNumber(raw.largest_event_price),
+    largest_event_time: raw.largest_event_time || null,
+    latest_event_time: raw.latest_event_time || null,
+    bucket_closed: raw.bucket_closed === true,
+    provisional: raw.provisional === true,
+    coverage_complete: raw.coverage_complete === true,
+    observed_since: raw.observed_since || null,
+    last_gap_at: raw.last_gap_at || null,
+    source: String(raw.source || 'render_public_liquidation_ws_hour_bucket_v1'),
+    cached_at: raw.cached_at || null,
+  };
+  return row.event_count > 0 && row.total_notional > 0 ? row : null;
+}
+
+async function readPersistedLiquidationHours({ hours = 6, provider = '', symbol = '', limit = 2500 } = {}) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) throw new Error('liquidation_history_persistence_disabled');
+  const safeHours = Math.max(1, Math.min(336, Math.trunc(Number(hours) || 6)));
+  const safeProvider = normalizeProvider(provider);
+  const safeSymbol = compactSymbol(symbol);
+  const safeLimit = Math.max(1, Math.min(5000, Math.trunc(Number(limit) || 2500)));
+  const key = `${safeHours}|${safeProvider}|${safeSymbol}|${safeLimit}`;
+  const now = Date.now();
+  pruneLiquidationHistoryCache(now);
+  const cached = liquidationHistoryCache.get(key);
+  if (cached && now - cached.cachedAt < LIQUIDATION_HISTORY_CACHE_TTL_MS) {
+    return { ...cached.payload, cache_hit: true, cache_age_ms: now - cached.cachedAt };
+  }
+  if (liquidationHistoryInflight.has(key)) return await liquidationHistoryInflight.get(key);
+  const pending = (async () => {
+    try {
+      const query = new URLSearchParams({
+        select: 'provider,market_type,symbol,quote_asset,bucket_start,bucket_end,long_notional,short_notional,total_notional,long_count,short_count,event_count,largest_event_id,largest_event_side,largest_event_notional,largest_event_price,largest_event_time,latest_event_time,bucket_closed,provisional,coverage_complete,observed_since,last_gap_at,source,cached_at',
+        bucket_start: `gte.${new Date(now - safeHours * HOUR_BUCKET_MS).toISOString()}`,
+        order: 'bucket_start.desc,provider.asc,symbol.asc',
+        limit: String(safeLimit),
+      });
+      if (safeProvider) query.set('provider', `eq.${safeProvider}`);
+      if (safeSymbol) query.set('symbol', `eq.${safeSymbol}`);
+      const response = await fetch(`${SUPABASE_URL}/rest/v1/${LIQUIDATION_HOUR_TABLE}?${query}`, {
+        headers: liquidationSupabaseHeaders({ accept: 'application/json' }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const responseText = await response.text();
+      if (!response.ok) throw new Error(`liquidation_history_store_http_${response.status}:${responseText.slice(0, 220)}`);
+      const decoded = JSON.parse(responseText);
+      const rows = (Array.isArray(decoded) ? decoded : []).map(normalizePersistedLiquidationHour).filter(Boolean);
+      const providers = [...new Set(rows.map((row) => row.provider))].sort();
+      const pairs = new Set(rows.map((row) => `${row.provider}|${row.symbol}`));
+      const summary = rows.reduce((acc, row) => {
+        acc.long_notional += row.long_notional;
+        acc.short_notional += row.short_notional;
+        acc.total_notional += row.total_notional;
+        acc.long_count += row.long_count;
+        acc.short_count += row.short_count;
+        acc.event_count += row.event_count;
+        if (!acc.largest_event || Number(row.largest_event_notional || 0) > Number(acc.largest_event.largest_event_notional || 0)) {
+          acc.largest_event = row.largest_event_notional ? {
+            provider: row.provider,
+            symbol: row.symbol,
+            largest_event_id: row.largest_event_id,
+            largest_event_side: row.largest_event_side,
+            largest_event_notional: row.largest_event_notional,
+            largest_event_price: row.largest_event_price,
+            largest_event_time: row.largest_event_time,
+          } : acc.largest_event;
+        }
+        return acc;
+      }, { long_notional: 0, short_notional: 0, total_notional: 0, long_count: 0, short_count: 0, event_count: 0, largest_event: null });
+      const payload = {
+        rows,
+        row_count: rows.length,
+        provider_coverage: providers,
+        provider_count: providers.length,
+        pair_count: pairs.size,
+        summary,
+        hours: safeHours,
+        provider: safeProvider || null,
+        symbol: safeSymbol || null,
+        persistence_enabled: true,
+        cache_hit: false,
+        cache_age_ms: 0,
+      };
+      liquidationHistoryCache.set(key, { cachedAt: Date.now(), payload });
+      pruneLiquidationHistoryCache();
+      return payload;
+    } catch (error) {
+      const stale = liquidationHistoryCache.get(key) || cached;
+      if (stale && Date.now() - stale.cachedAt < LIQUIDATION_HISTORY_STALE_MS) {
+        return {
+          ...stale.payload,
+          cache_hit: true,
+          cache_stale: true,
+          cache_age_ms: Date.now() - stale.cachedAt,
+          warning: 'persisted_liquidation_history_read_failed_stale_retained',
+          read_error: String(error?.message || error).slice(0, 260),
+        };
+      }
+      throw error;
+    }
+  })().finally(() => liquidationHistoryInflight.delete(key));
+  liquidationHistoryInflight.set(key, pending);
+  return await pending;
+}
+
+export function getContractLiquidationPersistenceHealth() {
+  return {
+    ok: true,
+    version: STEP_VERSION,
+    persistence_enabled: LIQUIDATION_PERSISTENCE_ENABLED,
+    history_endpoint: LIQUIDATION_HISTORY_ROUTE,
+    storage_table: LIQUIDATION_HOUR_TABLE,
+    raw_events_persisted: false,
+    aggregate_period: '1h',
+    aggregate_retention_days: LIQUIDATION_HOUR_RETENTION_DAYS,
+    close_grace_seconds: Math.trunc(LIQUIDATION_CLOSE_GRACE_MS / 1000),
+    persist_flush_seconds: Math.trunc(LIQUIDATION_PERSIST_FLUSH_MS / 1000),
+    persist_queue: liquidationPersistQueue.size,
+    persist_inflight: Boolean(liquidationPersistInflight),
+    history_cache_entries: liquidationHistoryCache.size,
+    history_inflight_entries: liquidationHistoryInflight.size,
+    history_cache_ttl_seconds: Math.trunc(LIQUIDATION_HISTORY_CACHE_TTL_MS / 1000),
+    history_stale_seconds: Math.trunc(LIQUIDATION_HISTORY_STALE_MS / 1000),
+    exchange_requests_started_by_history_reads: 0,
+    ...liquidationPersistenceHealth,
+  };
+}
+
+if (LIQUIDATION_PERSISTENCE_ENABLED) {
+  const persistTimer = setInterval(() => {
+    queueRecentLiquidationHourBuckets();
+    flushLiquidationPersistQueue().catch((error) => {
+      console.error(`[Step${STEP_VERSION}] liquidation hour flush failed: ${error?.message || error}`);
+    });
+  }, LIQUIDATION_PERSIST_FLUSH_MS);
+  persistTimer.unref?.();
+  const cleanupTimer = setInterval(() => {
+    cleanupLiquidationPersistence().catch((error) => {
+      liquidationPersistenceHealth.cleanup_error = String(error?.message || error).slice(0, 300);
+      console.error(`[Step${STEP_VERSION}] liquidation cleanup failed: ${error?.message || error}`);
+    });
+  }, 6 * 60 * 60_000);
+  cleanupTimer.unref?.();
+  const startupPersistenceTimer = setTimeout(() => {
+    queueRecentLiquidationHourBuckets();
+    flushLiquidationPersistQueue().catch(() => {});
+    cleanupLiquidationPersistence().catch((error) => {
+      liquidationPersistenceHealth.cleanup_error = String(error?.message || error).slice(0, 300);
+    });
+  }, 5_000);
+  startupPersistenceTimer.unref?.();
+}
 
 async function resolveWebSocketCtor() {
   if (!WS_CTOR_PROMISE) {
@@ -419,6 +823,7 @@ function createBucket(startMs, durationMs) {
     long_count: 0,
     short_count: 0,
     event_count: 0,
+    latest_event_time_ms: 0,
     largest_event: null,
   };
 }
@@ -442,6 +847,7 @@ function applyEventToBucket(bucket, row) {
   const side = String(row?.liquidation_side || '').toLowerCase();
   bucket.total_notional += value;
   bucket.event_count += 1;
+  bucket.latest_event_time_ms = Math.max(Number(bucket.latest_event_time_ms || 0), integerValue(row?.time_ms));
   if (side === 'long') {
     bucket.long_notional += value;
     bucket.long_count += 1;
@@ -462,6 +868,7 @@ function mergeBucketInto(target, bucket) {
   target.long_count += Number(bucket.long_count || 0);
   target.short_count += Number(bucket.short_count || 0);
   target.event_count += Number(bucket.event_count || 0);
+  target.latest_event_time_ms = Math.max(Number(target.latest_event_time_ms || 0), Number(bucket.latest_event_time_ms || 0));
   const candidate = bucket.largest_event;
   if (candidate && (!target.largest_event || Number(candidate.notional || 0) > Number(target.largest_event.notional || 0))) {
     target.largest_event = cloneLargestEvent(candidate);
@@ -543,7 +950,9 @@ function updateStats(row, observedSinceMs = null) {
   state.lastEventAt = Math.max(state.lastEventAt || 0, timeMs);
   applyEventToBucket(bucketFor(state.minuteBuckets, timeMs, MINUTE_BUCKET_MS), row);
   applyEventToBucket(bucketFor(state.quarterBuckets, timeMs, QUARTER_BUCKET_MS), row);
-  applyEventToBucket(bucketFor(state.hourBuckets, timeMs, HOUR_BUCKET_MS), row);
+  const hourBucket = bucketFor(state.hourBuckets, timeMs, HOUR_BUCKET_MS);
+  applyEventToBucket(hourBucket, row);
+  queueLiquidationHourBucket(state, hourBucket);
   state.recentEvents.unshift({ ...row });
   state.recentEvents.sort((a, b) => integerValue(b.time_ms) - integerValue(a.time_ms));
   if (state.recentEvents.length > MAX_EVENTS_PER_SYMBOL) {
@@ -1195,7 +1604,7 @@ const bootstrapTimer = setTimeout(() => {
 bootstrapTimer.unref?.();
 
 export async function handleContractLiquidation(req, res, url) {
-  if (url.pathname !== '/api/contract-liquidation') return false;
+  if (!['/api/contract-liquidation', LIQUIDATION_HISTORY_ROUTE, LIQUIDATION_HEALTH_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -1208,6 +1617,59 @@ export async function handleContractLiquidation(req, res, url) {
   }
   if (req.method !== 'GET') {
     sendJson(res, 405, { ok: false, version: STEP_VERSION, error: 'method_not_allowed' });
+    return true;
+  }
+
+  if (url.pathname === LIQUIDATION_HEALTH_ROUTE) {
+    sendJson(res, 200, {
+      ...getContractLiquidationPersistenceHealth(),
+      streams: FEEDS.size,
+      stats_states: STATS.size,
+      time: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  if (url.pathname === LIQUIDATION_HISTORY_ROUTE) {
+    if (!LIQUIDATION_PERSISTENCE_ENABLED) {
+      sendJson(res, 503, { ok: false, version: STEP_VERSION, error: 'liquidation_history_persistence_disabled' });
+      return true;
+    }
+    const providerFilter = normalizeProvider(url.searchParams.get('provider'));
+    const symbolFilter = compactSymbol(url.searchParams.get('symbol'));
+    if (providerFilter && !SUPPORTED_PROVIDERS.has(providerFilter)) {
+      sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider: providerFilter });
+      return true;
+    }
+    try {
+      const persisted = await readPersistedLiquidationHours({
+        hours: url.searchParams.get('hours'),
+        provider: providerFilter,
+        symbol: symbolFilter,
+        limit: url.searchParams.get('limit'),
+      });
+      sendJson(res, 200, {
+        ok: true,
+        version: STEP_VERSION,
+        source: 'render_shared_persisted_five_provider_liquidation_hour_buckets',
+        market_type: 'contract',
+        ...persisted,
+        storage_table: LIQUIDATION_HOUR_TABLE,
+        aggregate_period: '1h',
+        aggregate_retention_days: LIQUIDATION_HOUR_RETENTION_DAYS,
+        raw_events_persisted: false,
+        exchange_requests_started: 0,
+        timestamp_ms: Date.now(),
+      });
+    } catch (error) {
+      sendJson(res, 502, {
+        ok: false,
+        version: STEP_VERSION,
+        error: String(error?.message || error),
+        reason: 'persisted_liquidation_history_unavailable',
+        exchange_requests_started: 0,
+      });
+    }
     return true;
   }
 
@@ -1268,7 +1730,9 @@ export async function handleContractLiquidation(req, res, url) {
         quarter_hour_buckets_hours: 24,
         hourly_buckets_days: 14,
         raw_events_persisted: false,
-        process_memory_only: true,
+        process_memory_only_for_raw_events: true,
+        persisted_hour_bucket_table: LIQUIDATION_HOUR_TABLE,
+        persisted_hour_bucket_retention_days: LIQUIDATION_HOUR_RETENTION_DAYS,
       },
       available_periods: Object.keys(PERIODS),
       service_started_at_ms: SERVICE_STARTED_AT_MS,

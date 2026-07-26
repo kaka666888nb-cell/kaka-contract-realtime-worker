@@ -2,7 +2,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { getContractFlowHealth, handleContractFlow, startContractFlowUniverseScanner } from './contract-flow.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
-import { getBinanceLiquidationWsHealth, handleContractLiquidation } from './contract-liquidation.mjs';
+import { getBinanceLiquidationWsHealth, getContractLiquidationPersistenceHealth, handleContractLiquidation } from './contract-liquidation.mjs';
 import { handleContractFunding, startContractFundingHistoryMaintainer } from './contract-funding.mjs';
 import { beginBinanceRestShutdown, getBinanceRestGuardHealth, runWithBinanceRequestSignal } from './binance-rest-guard.mjs';
 import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
@@ -12,7 +12,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.41';
+const STEP_VERSION = '650.8.15.42';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -292,6 +292,9 @@ const server = http.createServer(async (req, res) => {
       binance_liquidation_ws_health: getBinanceLiquidationWsHealth(),
       contract_depth_views: ['orderbook', 'trades'],
       contract_liquidation: '/api/contract-liquidation',
+      contract_liquidation_history: '/api/contract-liquidation/history',
+      contract_liquidation_health: '/api/contract-liquidation/health',
+      contract_liquidation_persistence_health: getContractLiquidationPersistenceHealth(),
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
       contract_liquidation_scope: 'single_provider_single_symbol',
       contract_funding: '/api/contract-funding',
@@ -513,6 +516,9 @@ const server = http.createServer(async (req, res) => {
         contract_liquidation_page_visible_polling: true,
         contract_liquidation_memory_aggregation: true,
         contract_liquidation_raw_persistence: false,
+        contract_liquidation_hour_bucket_persistence: true,
+        contract_liquidation_hour_bucket_retention_days: 15,
+        contract_liquidation_history_reads_open_exchange_connection: false,
         contract_liquidation_short_bucket_minutes: 15,
         contract_liquidation_hour_bucket_retention_days: 14,
         contract_liquidation_max_period_days: 14,
