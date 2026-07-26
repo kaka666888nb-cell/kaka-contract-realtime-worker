@@ -1,4 +1,4 @@
-const STEP_VERSION = '650.8.15.42';
+const STEP_VERSION = '650.8.15.46';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
 const FEEDS = new Map();
@@ -54,6 +54,12 @@ const LIQUIDATION_HOUR_TABLE = 'app_contract_liquidation_1h_cache';
 const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_cache';
 const LIQUIDATION_HISTORY_ROUTE = '/api/contract-liquidation/history';
 const LIQUIDATION_HEALTH_ROUTE = '/api/contract-liquidation/health';
+const LIQUIDATION_CURRENT_ROUTE = '/api/contract-liquidation/current-snapshot';
+const LIQUIDATION_SHARED_TARGETS_PER_PROVIDER = 3;
+const LIQUIDATION_SHARED_ROTATION_MS = 30 * 60_000;
+const LIQUIDATION_SHARED_CACHE_TTL_MS = 5_000;
+const LIQUIDATION_SHARED_PROVIDER_ORDER = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+let liquidationSharedCurrentCache = { cachedAt: 0, payload: null };
 const LIQUIDATION_HOUR_RETENTION_DAYS = 15;
 const LIQUIDATION_CLOSE_GRACE_MS = 2 * 60_000;
 const LIQUIDATION_PERSIST_FLUSH_MS = 60_000;
@@ -399,12 +405,179 @@ async function readPersistedLiquidationHours({ hours = 6, provider = '', symbol 
   return await pending;
 }
 
+
+function liquidationSharedRound(now = Date.now()) {
+  return Math.max(0, Math.floor(Math.max(0, now - SERVICE_STARTED_AT_MS) / LIQUIDATION_SHARED_ROTATION_MS));
+}
+
+function liquidationSharedCandidateSymbols(provider, now = Date.now()) {
+  const safePool = [...new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', ...CORE_SYMBOLS])]
+    .map(compactSymbol)
+    .filter(Boolean);
+  const connectedPool = safePool.filter((symbol) => {
+    const feed = FEEDS.get(feedKey(provider, symbol));
+    return Boolean(feed && wsReady(feed.socket) && feed.ready);
+  });
+  const pool = connectedPool.length >= LIQUIDATION_SHARED_TARGETS_PER_PROVIDER
+    ? connectedPool
+    : safePool;
+  const activity = pool.map((symbol) => {
+    const state = getStats(provider, symbol, { create: false });
+    const total = state ? Number(buildStatistics(state, '15m', now).total_notional || 0) : 0;
+    return { symbol, total };
+  }).sort((a, b) => b.total - a.total || a.symbol.localeCompare(b.symbol));
+  const high = activity.find((entry) => entry.total > 0)?.symbol
+    || (pool.includes('BTCUSDT') ? 'BTCUSDT' : pool[0]);
+  const selected = [];
+  if (high) selected.push({ symbol: high, role: 'high_activity' });
+  const rotating = pool.filter((symbol) => symbol !== high);
+  const round = liquidationSharedRound(now);
+  const providerOffset = Math.max(0, LIQUIDATION_SHARED_PROVIDER_ORDER.indexOf(provider));
+  const cursor = rotating.length > 0
+    ? ((round * 2) + providerOffset * 3) % rotating.length
+    : 0;
+  for (let offset = 0; offset < rotating.length && selected.length < LIQUIDATION_SHARED_TARGETS_PER_PROVIDER; offset += 1) {
+    const symbol = rotating[(cursor + offset) % rotating.length];
+    if (!selected.some((entry) => entry.symbol === symbol)) {
+      selected.push({ symbol, role: 'rotated_core' });
+    }
+  }
+  for (const symbol of pool) {
+    if (selected.length >= LIQUIDATION_SHARED_TARGETS_PER_PROVIDER) break;
+    if (!selected.some((entry) => entry.symbol === symbol)) {
+      selected.push({ symbol, role: 'core_fill' });
+    }
+  }
+  return selected.slice(0, LIQUIDATION_SHARED_TARGETS_PER_PROVIDER);
+}
+
+function buildSharedCurrentLiquidationRow(provider, candidate, slot, round, now = Date.now()) {
+  const symbol = compactSymbol(candidate?.symbol);
+  const feed = FEEDS.get(feedKey(provider, symbol));
+  const observedSinceMs = Number(
+    feed?.openedAt
+      || (GLOBAL_FEED_PROVIDERS.has(provider) ? SERVICE_STARTED_AT_MS : now),
+  );
+  const state = getStats(provider, symbol, { observedSinceMs });
+  const statistics = buildStatistics(state, '15m', now);
+  const cutoff = now - PERIODS['15m'].durationMs;
+  const items = (state?.recentEvents || feedEvents(feed || { eventsBySymbol: new Map() }, symbol))
+    .filter((row) => integerValue(row?.time_ms) >= cutoff)
+    .slice(0, 8)
+    .map((row) => ({ ...row }));
+  const connected = Boolean(feed && wsReady(feed.socket) && feed.ready);
+  const info = feed || sourceInfo(provider);
+  return {
+    id: `contract_liquidation_shared:${provider}:${symbol}`,
+    provider,
+    market_type: 'contract',
+    symbol,
+    native_symbol: providerSymbol(provider, symbol),
+    quote_asset: quoteFromCompact(symbol),
+    quote_symbol: quoteFromCompact(symbol),
+    period: '15m',
+    connected,
+    source: info.source || null,
+    transport: info.transport || null,
+    upstream_host: info.upstream_host || null,
+    coverage: info.coverage || null,
+    coverage_start_ms: statistics.coverage_start_ms,
+    coverage_end_ms: statistics.coverage_end_ms,
+    covered_ms: statistics.covered_ms,
+    coverage_complete: statistics.coverage_complete === true,
+    total_notional: Number(statistics.total_notional || 0),
+    long_notional: Number(statistics.long_notional || 0),
+    short_notional: Number(statistics.short_notional || 0),
+    event_count: Math.max(0, Math.trunc(Number(statistics.event_count || 0))),
+    long_count: Math.max(0, Math.trunc(Number(statistics.long_count || 0))),
+    short_count: Math.max(0, Math.trunc(Number(statistics.short_count || 0))),
+    last_event_at_ms: Number(state?.lastEventAt || 0) || null,
+    session_started_at_ms: Number(feed?.openedAt || 0) || null,
+    service_started_at_ms: SERVICE_STARTED_AT_MS,
+    timestamp_ms: now,
+    source_time: new Date(now).toISOString(),
+    observed_at: new Date(now).toISOString(),
+    items,
+    backend_shared: true,
+    shared_round: round,
+    shared_slot: slot,
+    selection_role: String(candidate?.role || 'core_fill'),
+  };
+}
+
+function buildSharedCurrentLiquidationSnapshot(now = Date.now()) {
+  const round = liquidationSharedRound(now);
+  const rows = [];
+  const providerCoverage = {};
+  for (const provider of LIQUIDATION_SHARED_PROVIDER_ORDER) {
+    const candidates = liquidationSharedCandidateSymbols(provider, now);
+    const venueRows = candidates.map((candidate, index) =>
+      buildSharedCurrentLiquidationRow(provider, candidate, index + 1, round, now));
+    rows.push(...venueRows);
+    providerCoverage[provider] = {
+      rows: venueRows.length,
+      connected: venueRows.filter((row) => row.connected === true).length,
+      complete: venueRows.filter((row) => row.coverage_complete === true).length,
+      event_pairs: venueRows.filter((row) => Number(row.event_count || 0) > 0).length,
+      events: venueRows.reduce((sum, row) => sum + Number(row.event_count || 0), 0),
+    };
+  }
+  return {
+    rows,
+    row_count: rows.length,
+    provider_coverage: providerCoverage,
+    provider_count: Object.values(providerCoverage).filter((item) => Number(item.rows || 0) > 0).length,
+    connected_provider_count: Object.values(providerCoverage).filter((item) => Number(item.connected || 0) > 0).length,
+    shared_round: round,
+    targets_per_provider: LIQUIDATION_SHARED_TARGETS_PER_PROVIDER,
+    rotation_minutes: Math.trunc(LIQUIDATION_SHARED_ROTATION_MS / 60_000),
+    core_symbol_pool: [...new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', ...CORE_SYMBOLS])],
+    generated_at: new Date(now).toISOString(),
+  };
+}
+
+function getSharedCurrentLiquidationSnapshot(now = Date.now()) {
+  const cached = liquidationSharedCurrentCache;
+  if (cached.payload && now - Number(cached.cachedAt || 0) < LIQUIDATION_SHARED_CACHE_TTL_MS) {
+    return {
+      ...cached.payload,
+      cache_hit: true,
+      cache_age_ms: now - cached.cachedAt,
+    };
+  }
+  const payload = buildSharedCurrentLiquidationSnapshot(now);
+  liquidationSharedCurrentCache = { cachedAt: now, payload };
+  return { ...payload, cache_hit: false, cache_age_ms: 0 };
+}
+
+export function getContractLiquidationSharedCurrentHealth() {
+  const now = Date.now();
+  const snapshot = getSharedCurrentLiquidationSnapshot(now);
+  return {
+    current_snapshot_endpoint: LIQUIDATION_CURRENT_ROUTE,
+    current_snapshot_targets_per_provider: LIQUIDATION_SHARED_TARGETS_PER_PROVIDER,
+    current_snapshot_rotation_minutes: Math.trunc(LIQUIDATION_SHARED_ROTATION_MS / 60_000),
+    current_snapshot_rows: snapshot.row_count,
+    current_snapshot_connected_provider_count: snapshot.connected_provider_count,
+    current_snapshot_shared_round: snapshot.shared_round,
+    current_snapshot_reads_start_exchange_connections: false,
+    current_snapshot_exchange_connections_started_per_read: 0,
+    current_snapshot_scales_with_users: false,
+    current_snapshot_cache_ttl_seconds: Math.trunc(LIQUIDATION_SHARED_CACHE_TTL_MS / 1000),
+  };
+}
+
 export function getContractLiquidationPersistenceHealth() {
   return {
     ok: true,
     version: STEP_VERSION,
     persistence_enabled: LIQUIDATION_PERSISTENCE_ENABLED,
     history_endpoint: LIQUIDATION_HISTORY_ROUTE,
+    current_snapshot_endpoint: LIQUIDATION_CURRENT_ROUTE,
+    current_snapshot_targets_per_provider: LIQUIDATION_SHARED_TARGETS_PER_PROVIDER,
+    current_snapshot_rotation_minutes: Math.trunc(LIQUIDATION_SHARED_ROTATION_MS / 60_000),
+    current_snapshot_reads_start_exchange_connections: false,
+    current_snapshot_scales_with_users: false,
     storage_table: LIQUIDATION_HOUR_TABLE,
     raw_events_persisted: false,
     aggregate_period: '1h',
@@ -1585,7 +1758,10 @@ function markCoreFeed(feed) {
 async function bootstrapCollection() {
   for (const provider of ['binance', 'okx', 'bitget']) {
     const feed = markCoreFeed(getFeed(provider, 'BTCUSDT'));
-    touchFeed(feed, 'BTCUSDT');
+    for (const symbol of [...new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', ...CORE_SYMBOLS])]) {
+      touchFeed(feed, symbol);
+      getStats(provider, symbol, { observedSinceMs: Date.now() });
+    }
     ensureFeed(feed).catch(() => {});
   }
   for (const provider of ['bybit', 'gate']) {
@@ -1604,7 +1780,7 @@ const bootstrapTimer = setTimeout(() => {
 bootstrapTimer.unref?.();
 
 export async function handleContractLiquidation(req, res, url) {
-  if (!['/api/contract-liquidation', LIQUIDATION_HISTORY_ROUTE, LIQUIDATION_HEALTH_ROUTE].includes(url.pathname)) return false;
+  if (!['/api/contract-liquidation', LIQUIDATION_HISTORY_ROUTE, LIQUIDATION_HEALTH_ROUTE, LIQUIDATION_CURRENT_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -1626,6 +1802,25 @@ export async function handleContractLiquidation(req, res, url) {
       streams: FEEDS.size,
       stats_states: STATS.size,
       time: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  if (url.pathname === LIQUIDATION_CURRENT_ROUTE) {
+    const snapshot = getSharedCurrentLiquidationSnapshot(Date.now());
+    sendJson(res, 200, {
+      ok: true,
+      version: STEP_VERSION,
+      source: 'render_shared_bounded_five_provider_liquidation_current_snapshot',
+      market_type: 'contract',
+      period: '15m',
+      ...snapshot,
+      aggregation_scope: 'backend_shared_five_provider_three_core_targets',
+      raw_events_persisted: false,
+      exchange_connections_started: 0,
+      exchange_requests_started: 0,
+      shared_feeds_do_not_scale_with_users: true,
+      timestamp_ms: Date.now(),
     });
     return true;
   }

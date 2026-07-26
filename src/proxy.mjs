@@ -12,7 +12,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.45';
+const STEP_VERSION = '650.8.15.46';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -294,10 +294,11 @@ const server = http.createServer(async (req, res) => {
       contract_depth_views: ['orderbook', 'trades'],
       contract_liquidation: '/api/contract-liquidation',
       contract_liquidation_history: '/api/contract-liquidation/history',
+      contract_liquidation_current_snapshot: '/api/contract-liquidation/current-snapshot',
       contract_liquidation_health: '/api/contract-liquidation/health',
       contract_liquidation_persistence_health: getContractLiquidationPersistenceHealth(),
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
-      contract_liquidation_scope: 'single_provider_single_symbol',
+      contract_liquidation_scope: 'single_provider_single_symbol_plus_backend_shared_five_by_three',
       contract_funding: '/api/contract-funding',
       contract_funding_history: '/api/contract-funding/history',
       contract_funding_health: '/api/contract-funding/health',
@@ -673,5 +674,5 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + single-venue liquidation statistics + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + single-venue liquidation statistics + shared five-platform liquidation current snapshot + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

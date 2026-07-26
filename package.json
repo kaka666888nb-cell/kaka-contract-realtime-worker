@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.45",
+  "version": "650.8.15.46",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,5 +10,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.45 / Step770 shared current funding, mark/index and basis persistence"
+  "description": "Kaka contract realtime worker 650.8.15.46 / Step771 shared current liquidation snapshot"
 }
