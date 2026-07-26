@@ -1,11 +1,14 @@
-# Kaka Contract Realtime Worker 650.8.15.46 / Step771
+# Kaka Contract Realtime Worker 650.8.15.47 / Step773
 
-Step771 moves the Data-page current liquidation 5×3 observation from per-user exact reads to one backend-shared bounded snapshot.
+Step773 adds a bounded backend-shared current USDT spot snapshot for the Data page.
 
-- `GET /api/contract-liquidation/current-snapshot` returns 15-minute current observations for five venues and up to three shared core targets per venue.
-- The snapshot reuses the existing persistent official liquidation WebSocket feeds and never opens a new exchange connection while serving a read.
-- One high-activity target plus two backend-rotated core targets are selected per venue every 30 minutes.
-- Current rows preserve provider, symbol, connection state, coverage completeness, long/short notional, event counts and recent verified events.
-- `exchange_connections_started=0` and `exchange_requests_started=0` on shared reads; exchange connections do not scale with App users.
-- Existing single-provider exact endpoint and shared persisted 1-hour history remain available for detail/fallback workflows.
-- No new SQL, Cron, Edge function, environment variable or pubspec change is required.
+- Endpoint: `GET /api/spot-market/current-snapshot`
+- Health: `GET /api/spot-market/health`
+- Five providers: Binance, OKX, Bybit, Bitget, Gate
+- Per provider: 4 high-activity pairs + 16 rotating directory pairs
+- Background scan interval: 5 minutes, one provider at a time
+- Snapshot reads start zero exchange requests and zero exchange connections
+- Empty or failed provider scans never overwrite the last verified rows
+- Existing contract flow, funding, liquidation, depth, market, Kline, and Binance contract REST guards remain unchanged
+
+No new SQL, Edge function, Cron job, environment variable, or persistent raw spot event storage is required.

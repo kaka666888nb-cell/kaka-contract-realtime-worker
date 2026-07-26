@@ -2844,6 +2844,8 @@ export async function handleMarketApi(req, res, url) {
   }
 }
 
+export { tickers };
+
 export const _test = {
   aggregateTradesToSecondRows,
   identityMap,
