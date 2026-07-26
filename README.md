@@ -1,4 +1,4 @@
-# Kaka Contract Realtime Worker 650.8.15.39 / Step767
+# Kaka Contract Realtime Worker 650.8.15.40 / Step767.1
 
 This release unifies five-provider contract funding history under one bounded backend owner.
 
@@ -10,7 +10,7 @@ This release unifies five-provider contract funding history under one bounded ba
 - Render merges identical in-flight requests, caches persisted exact-key reads for five minutes and may retain a verified stale response for at most thirty minutes.
 - A single backend rotation runs once per hour. Each provider keeps BTC/ETH when available plus four persistent directory-rotation symbols. This is at most thirty small history requests per hour across all five venues, independent of App user count.
 - Rotation cursors are persisted in `app_contract_funding_rotation_state`, so a Render restart does not reset every provider to the same first symbols.
-- The old Binance core-four Cron remains temporarily for parallel comparison; exact upsert keys prevent duplicate history rows.
+- Step767.1 normalizes every funding-cache write to `market_type=contract`, deduplicates legacy aliases such as `usdt_perpetual`, and keeps the old Binance core-four Cron temporarily for parallel comparison without logical duplicate growth.
 
 ## Retention
 
@@ -28,8 +28,8 @@ This release unifies five-provider contract funding history under one bounded ba
 
 ## Deployment
 
-1. Run `supabase/STEP767_五平台资金费率共享历史持久化与清理.sql` once.
+1. Run `supabase/STEP767_1_资金费率历史身份归一与空结果修复.sql` once.
 2. Deploy this complete Render repository.
-3. Confirm `/api/contract-funding/health` reports `650.8.15.39`, persistence enabled and background rotation status.
+3. Confirm `/api/contract-funding/health` reports `650.8.15.40`, persistence enabled and background rotation status.
 4. Confirm `/api/contract-funding/history?provider=binance&symbol=BTCUSDT&limit=24` returns `ok: true` and `exchange_requests_started: 0`.
-5. Install Step767 App main.dart.
+5. Install Step767.1 App main.dart.

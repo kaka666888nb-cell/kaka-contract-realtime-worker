@@ -6,7 +6,7 @@ import {
 import { getMarketUniverseRows } from './market-rest.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.39';
+const VERSION = '650.8.15.40';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -17,7 +17,7 @@ const BINANCE_HISTORY_BACKGROUND_DELAY_MS = 10_000;
 const BINANCE_REALTIME_WAIT_MS = 6_500;
 const BINANCE_HISTORY_REFRESH = new Map();
 
-// Step767: five-provider shared funding history persistence.
+// Step767.1: five-provider shared funding history persistence.
 // Public history is fetched once by the backend, upserted by exact identity,
 // retained with a bounded policy and served to all App users from Supabase.
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
@@ -161,7 +161,6 @@ async function readPersistedFundingBundle(provider, symbol, limit = 24) {
       const currentQuery = new URLSearchParams({
         select: 'provider,market_type,symbol,mark_price,index_price,last_funding_rate,last_funding_rate_percent,next_funding_time,source_time,cached_at',
         provider: `eq.${safeProvider}`,
-        market_type: 'eq.contract',
         symbol: `eq.${safeSymbol}`,
         order: 'cached_at.desc',
         limit: '1',
@@ -169,7 +168,6 @@ async function readPersistedFundingBundle(provider, symbol, limit = 24) {
       const historyQuery = new URLSearchParams({
         select: 'provider,market_type,symbol,funding_time,funding_rate,funding_rate_percent,mark_price,cached_at',
         provider: `eq.${safeProvider}`,
-        market_type: 'eq.contract',
         symbol: `eq.${safeSymbol}`,
         order: 'funding_time.desc',
         limit: String(safeLimit),
@@ -1040,6 +1038,7 @@ export async function handleContractFunding(req, res, url) {
       },
       old_binance_cron_parallel_observation_retained: true,
       history_reads_open_exchange_connection: false,
+      persisted_history_read_market_type_mode: 'dedicated_funding_table_provider_symbol_compat_then_normalize_contract',
       cache_entries: CACHE.size,
       inflight_entries: INFLIGHT.size,
       binance_history_refreshes: BINANCE_HISTORY_REFRESH.size,
@@ -1088,6 +1087,7 @@ export async function handleContractFunding(req, res, url) {
         history_retention_days: 31,
         current_retention_days: 7,
         exchange_requests_started: 0,
+        persisted_history_read_market_type_mode: 'provider_symbol_compat',
         cache_hit: bundle.cache_hit === true,
         cache_stale: bundle.cache_stale === true,
         cache_age_ms: bundle.cache_age_ms || 0,
