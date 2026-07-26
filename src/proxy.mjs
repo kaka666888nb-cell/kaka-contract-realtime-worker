@@ -12,7 +12,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.42';
+const STEP_VERSION = '650.8.15.43';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -285,6 +285,7 @@ const server = http.createServer(async (req, res) => {
       contract_flow: '/api/contract-flow',
       contract_flow_warm: '/api/contract-flow/warm',
       contract_flow_market_snapshot: '/api/contract-flow/market-snapshot',
+      contract_flow_current_snapshot: '/api/contract-flow/current-snapshot',
       contract_meta: '/api/contract-meta',
       contract_depth: '/api/contract-depth',
       contract_depth_health: getContractDepthHealth(),
