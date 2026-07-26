@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { getContractFlowHealth, handleContractFlow, startContractFlowUniverseScanner } from './contract-flow.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
 import { getBinanceLiquidationWsHealth, handleContractLiquidation } from './contract-liquidation.mjs';
-import { handleContractFunding } from './contract-funding.mjs';
+import { handleContractFunding, startContractFundingHistoryMaintainer } from './contract-funding.mjs';
 import { beginBinanceRestShutdown, getBinanceRestGuardHealth, runWithBinanceRequestSignal } from './binance-rest-guard.mjs';
 import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
 import { getBinanceContractKlineRelayHealth } from './binance-contract-kline-relay.mjs';
@@ -12,9 +12,10 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.38';
+const STEP_VERSION = '650.8.15.39';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
+startContractFundingHistoryMaintainer();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -294,6 +295,7 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
       contract_liquidation_scope: 'single_provider_single_symbol',
       contract_funding: '/api/contract-funding',
+      contract_funding_history: '/api/contract-funding/history',
       contract_funding_health: '/api/contract-funding/health',
       binance_contract_market_health: '/api/binance-contract-market-health',
       binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
@@ -522,6 +524,13 @@ const server = http.createServer(async (req, res) => {
         binance_contract_funding_history_transport: 'authenticated_edge_relay_background',
         binance_contract_funding_first_paint_waits_for_history: false,
         contract_funding_cache_seconds: 30,
+        contract_funding_shared_history_persistence: true,
+        contract_funding_shared_history_endpoint: '/api/contract-funding/history',
+        contract_funding_history_retention_days: 31,
+        contract_funding_current_retention_days: 7,
+        contract_funding_background_rotation_interval_minutes: 60,
+        contract_funding_background_rotation_batch_per_provider: 4,
+        contract_funding_history_reads_open_exchange_connection: false,
         gate_next_funding_source: 'futures_contract_funding_next_apply',
         liquidation_public_feeds: {
           binance: 'all_market_forceOrder',
