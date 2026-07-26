@@ -6,7 +6,7 @@ import {
 import { getMarketUniverseRows } from './market-rest.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.40';
+const VERSION = '650.8.15.41';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -17,7 +17,7 @@ const BINANCE_HISTORY_BACKGROUND_DELAY_MS = 10_000;
 const BINANCE_REALTIME_WAIT_MS = 6_500;
 const BINANCE_HISTORY_REFRESH = new Map();
 
-// Step767.1: five-provider shared funding history persistence.
+// Step767.2: five-provider shared funding history persistence.
 // Public history is fetched once by the backend, upserted by exact identity,
 // retained with a bounded policy and served to all App users from Supabase.
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
@@ -614,6 +614,11 @@ function numberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function positivePriceOrNull(value) {
+  const n = numberOrNull(value);
+  return n != null && n > 0 ? n : null;
+}
+
 function msValue(value) {
   if (typeof value === 'string' && value.trim() && !Number.isFinite(Number(value))) {
     const parsed = Date.parse(value);
@@ -641,8 +646,8 @@ function currentRow({ provider, symbol, rate, nextTime, mark, index, sourceTime,
     last_funding_rate_percent: decimal == null ? null : decimal * 100,
     funding_rate_percent: decimal == null ? null : decimal * 100,
     next_funding_time: iso(nextTime),
-    mark_price: numberOrNull(mark),
-    index_price: numberOrNull(index),
+    mark_price: positivePriceOrNull(mark),
+    index_price: positivePriceOrNull(index),
     funding_interval_hours: numberOrNull(intervalHours),
     source_time: iso(sourceTime) || new Date().toISOString(),
     cached_at: new Date().toISOString(),
@@ -660,7 +665,7 @@ function historyRow({ provider, symbol, rate, time, mark }) {
     funding_time: fundingTime,
     funding_rate: decimal,
     funding_rate_percent: decimal * 100,
-    mark_price: numberOrNull(mark),
+    mark_price: positivePriceOrNull(mark),
     cached_at: new Date().toISOString(),
   };
 }
@@ -1039,6 +1044,7 @@ export async function handleContractFunding(req, res, url) {
       old_binance_cron_parallel_observation_retained: true,
       history_reads_open_exchange_connection: false,
       persisted_history_read_market_type_mode: 'dedicated_funding_table_provider_symbol_compat_then_normalize_contract',
+      missing_mark_and_index_price_zero_normalized_to_null: true,
       cache_entries: CACHE.size,
       inflight_entries: INFLIGHT.size,
       binance_history_refreshes: BINANCE_HISTORY_REFRESH.size,
