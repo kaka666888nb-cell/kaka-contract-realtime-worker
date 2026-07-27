@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.53",
+  "version": "650.8.15.54",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,5 +10,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.53 / Step781.2.2 OKX timestamp pagination and shared Bybit 1-second history"
+  "description": "Kaka contract realtime worker 650.8.15.54 / Step781.2.3 all-platform 1-second history gate repair: Bybit normalizer, Coinbase CB-AFTER and Bitget idLessThan pagination"
 }

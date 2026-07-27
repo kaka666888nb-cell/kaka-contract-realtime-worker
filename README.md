@@ -1,3 +1,7 @@
+# Step781.2.3 / Render 650.8.15.54
+
+Repairs the four verified Step781.2.2 gate failures without changing the App-side one-second history behavior. Bybit child rows are normalized by the declared market Kline normalizer, so spot and contract shared WebSocket history no longer fail with `normalizeMarketKlineRows is not defined`. Coinbase spot older history follows the Exchange cursor contract using the response `CB-AFTER` cursor and the next request `after` parameter. Bitget contract older history walks the official `idLessThan` cursor using the oldest trade id from the previous page. Pagination is bounded to eight pages; backend empty-second fabrication remains disabled.
+
 # Step781.2.2 / Render 650.8.15.53
 
 Fixes the three remaining verified one-second older-page failures. OKX history-trades now uses the documented timestamp pagination mode (`type=2`, `after=<timestamp>`). Bybit no longer sends ignored `startTime/endTime` parameters to the recent-trade endpoint; the child maintains a bounded exact-symbol publicTrade WebSocket history for spot and contract, with BTCUSDT/ETHUSDT hot targets and ten-minute on-demand leases. No empty seconds are fabricated by the backend.
