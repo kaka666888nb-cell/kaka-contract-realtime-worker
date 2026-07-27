@@ -23,6 +23,7 @@ const KLINE_MIN_REQUEST_GAP_MS = 3_000;
 const CRITICAL_AUX_MIN_REQUEST_GAP_MS = 2_500;
 const GLOBAL_MIN_REQUEST_GAP_MS = 1_000;
 const MAX_QUEUE_WAIT_MS = 25_000;
+const KLINE_MAX_QUEUE_WAIT_MS = 35_000;
 const MAX_PENDING = 6;
 const RESTRICTED_FALLBACK_MS = 30 * 60_000;
 const BAN_SAFETY_MS = 90_000;
@@ -55,6 +56,7 @@ const stats = {
   queue_waits: 0,
   queue_timeouts: 0,
   queue_rejections: 0,
+  ordinary_success_persistence_skipped: 0,
   client_abort_blocks: 0,
   validation_starts: 0,
   validation_start_blocks: 0,
@@ -330,6 +332,12 @@ function laneGapMs(lane) {
   return MIN_REQUEST_GAP_MS;
 }
 
+function queueWaitMsForLane(lane) {
+  return lane === 'kline'
+    ? KLINE_MAX_QUEUE_WAIT_MS
+    : MAX_QUEUE_WAIT_MS;
+}
+
 function nextWaiterIndex() {
   let bestIndex = -1;
   let bestPriority = -Infinity;
@@ -423,13 +431,14 @@ async function acquireSlot(signal = null, { lane = 'auxiliary', priority = 0 } =
       clearTimeout(waiter.timeout);
       reject(new Error('binance_kline_relay_client_aborted_in_queue'));
     };
+    const queueWaitMs = queueWaitMsForLane(safeLane);
     waiter.timeout = setTimeout(() => {
       if (waiter.done) return;
       waiter.done = true;
       stats.queue_timeouts += 1;
       signal?.removeEventListener('abort', waiter.abort);
       reject(new Error('binance_kline_relay_queue_timeout'));
-    }, MAX_QUEUE_WAIT_MS);
+    }, queueWaitMs);
     waiter.timeout.unref?.();
     signal?.addEventListener('abort', waiter.abort, { once: true });
     waiters.push(waiter);
@@ -531,13 +540,16 @@ async function invokeAuthenticatedEdgeRelay(body, { signal = null, sourceLabel =
       error: '',
       last_success_at: Date.now(),
     };
-    // Serialize telemetry before a validation-completion write can advance the
-    // durable sequence. A late older write must never roll validation_next_index back.
-    try {
-      await persistStateStrict();
-    } catch (error) {
-      stats.last_error = String(error?.message || error);
-    }
+    // Step781.2.5: an ordinary successful market-data request must not keep
+    // ownership of the single Edge relay slot while writing telemetry back to
+    // Supabase. That extra snapshot I/O can take up to 8 seconds and previously
+    // pushed a visible 1-second Kline request beyond the bounded queue timeout.
+    // Safety-critical writes are still synchronous in markRestricted(), and
+    // validation advancement is still persisted by the dedicated validation
+    // completion path after the network request returns. Ordinary success
+    // counters remain available in process health and are intentionally not
+    // persisted here, avoiding both queue blocking and stale-write rollback.
+    stats.ordinary_success_persistence_skipped += 1;
     return payload;
   } catch (error) {
     if (error?.name === 'AbortError') {
@@ -789,6 +801,10 @@ export function getBinanceContractKlineRelayHealth() {
     critical_aux_min_request_gap_ms: CRITICAL_AUX_MIN_REQUEST_GAP_MS,
     global_min_request_gap_ms: GLOBAL_MIN_REQUEST_GAP_MS,
     kline_priority_enabled: true,
+    kline_max_queue_wait_ms: KLINE_MAX_QUEUE_WAIT_MS,
+    auxiliary_max_queue_wait_ms: MAX_QUEUE_WAIT_MS,
+    ordinary_success_persistence_blocks_queue: false,
+    restriction_persistence_strict: true,
     max_pending: MAX_PENDING,
     prior_validated_symbols: PRIOR_VALIDATED_SYMBOLS,
     validation_sequence: VALIDATION_SEQUENCE,
@@ -806,3 +822,10 @@ export function getBinanceContractKlineRelayHealth() {
     time: nowIso(now),
   };
 }
+
+
+export const _test = {
+  queueWaitMsForLane,
+  ordinarySuccessPersistenceBlocksQueue: false,
+  restrictionPersistenceStrict: true,
+};
