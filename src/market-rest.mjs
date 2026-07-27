@@ -1,4 +1,3 @@
-import http from 'node:http';
 import {
   getBinanceContractMarketHealth,
   getBinanceContractTickers,
@@ -1895,66 +1894,206 @@ function dedupePublicTrades(items) {
   return rows;
 }
 
+function secondHistoryIsOlderRequest(end) {
+  const safeEnd = Number(end);
+  return Number.isFinite(safeEnd) && safeEnd < Date.now() - 8_000;
+}
+
+function secondHistoryWindowStart(end, wanted, {
+  minMs = 5 * 60_000,
+  maxMs = 60 * 60_000,
+  perWantedMs = 3_000,
+} = {}) {
+  const safeEnd = Number.isFinite(Number(end))
+    ? Number(end)
+    : Date.now();
+  const span = Math.max(
+    minMs,
+    Math.min(
+      maxMs,
+      Math.max(1, Number(wanted) || 1) * perWantedMs,
+    ),
+  );
+  return Math.max(0, safeEnd - span);
+}
+
 async function recentPublicTrades(provider, market, symbol, end, limit) {
   const wanted = Math.max(100, Math.min(5000, Number(limit) || 1000));
   const trades = [];
+  const historical = secondHistoryIsOlderRequest(end);
+
   if (provider === 'binance') {
     const base = market === 'contract'
       ? 'https://fapi.binance.com/fapi/v1/aggTrades'
       : 'https://data-api.binance.vision/api/v3/aggTrades';
     let beforeId = null;
     let pages = 0;
-    const maxPages = 1; // One bounded REST page; realtime seconds continue over shared WebSocket.
+    const maxPages = 1;
     while (trades.length < wanted && pages < maxPages) {
-      const pageLimit = Math.min(1000, Math.max(100, wanted - trades.length));
+      const pageLimit = Math.min(
+        1000,
+        Math.max(100, wanted - trades.length),
+      );
       let url;
       if (beforeId == null) {
-        url = `${base}?symbol=${symbol}&endTime=${Math.max(1, end)}&limit=${pageLimit}`;
+        url =
+          `${base}?symbol=${symbol}` +
+          `&endTime=${Math.max(1, end)}` +
+          `&limit=${pageLimit}`;
       } else {
         const fromId = Math.max(0, beforeId - pageLimit);
-        url = `${base}?symbol=${symbol}&fromId=${fromId}&limit=${pageLimit}`;
+        url =
+          `${base}?symbol=${symbol}` +
+          `&fromId=${fromId}` +
+          `&limit=${pageLimit}`;
       }
       const payload = market === 'contract'
-        ? await binanceRestJsonFetch(url, 20_000, 'legacy_contract_agg_trades')
-        : await binanceRestJsonFetch(url, 20_000, 'spot_agg_trades');
+        ? await binanceRestJsonFetch(
+            url,
+            20_000,
+            'legacy_contract_agg_trades',
+          )
+        : await binanceRestJsonFetch(
+            url,
+            20_000,
+            'spot_agg_trades',
+          );
       const page = Array.isArray(payload) ? payload : [];
       if (!page.length) break;
       let oldestId = null;
       for (const item of page) {
-        const trade = publicTrade(item.T ?? item.E, item.p, item.q, item.a ?? item.id);
-        if (trade && trade.time <= end + 5_000) trades.push(trade);
+        const trade = publicTrade(
+          item.T ?? item.E,
+          item.p,
+          item.q,
+          item.a ?? item.id,
+        );
+        if (trade && trade.time <= end + 5_000) {
+          trades.push(trade);
+        }
         const id = Number(item.a ?? item.id);
-        if (Number.isFinite(id)) oldestId = oldestId == null ? id : Math.min(oldestId, id);
+        if (Number.isFinite(id)) {
+          oldestId =
+            oldestId == null ? id : Math.min(oldestId, id);
+        }
       }
-      if (oldestId == null || oldestId <= 0 || oldestId === beforeId) break;
+      if (
+        oldestId == null ||
+        oldestId <= 0 ||
+        oldestId === beforeId
+      ) {
+        break;
+      }
       beforeId = oldestId;
       pages += 1;
     }
   } else if (provider === 'coinbase') {
     const productId = coinbaseProductId(symbol);
-    const payload = await jsonFetch(`${COINBASE_BASE_URL}/products/${encodeURIComponent(productId)}/trades`, 20_000);
-    for (const item of Array.isArray(payload) ? payload : []) {
-      const trade = publicTrade(item.time, item.price, item.size, item.trade_id);
-      if (trade && trade.time <= end + 5_000) trades.push(trade);
-    }
-  } else if (provider === 'okx') {
     const payload = await jsonFetch(
-      `https://www.okx.com/api/v5/market/trades?instId=${encodeURIComponent(okxId(symbol, market))}&limit=500`,
+      `${COINBASE_BASE_URL}/products/` +
+      `${encodeURIComponent(productId)}/trades`,
       20_000,
     );
+    for (const item of Array.isArray(payload) ? payload : []) {
+      const trade = publicTrade(
+        item.time,
+        item.price,
+        item.size,
+        item.trade_id,
+      );
+      if (trade && trade.time <= end + 5_000) {
+        trades.push(trade);
+      }
+    }
+  } else if (provider === 'okx') {
+    const instrument = okxId(symbol, market);
     const multiplier = market === 'contract'
       ? await marketContractBaseMultiplier('okx', symbol)
       : 1;
-    for (const item of payload.data || []) {
-      const rawSize = num(item.sz);
-      const baseSize = rawSize === null || multiplier === null
-        ? null
-        : rawSize * multiplier;
-      const trade = publicTrade(item.ts, item.px, baseSize, item.tradeId);
-      if (trade && trade.time <= end + 5_000) {
-        trade.raw_contract_count = market === 'contract' ? Math.abs(rawSize || 0) : null;
-        trade.quantity_unit = 'base_asset';
-        trades.push(trade);
+
+    if (historical) {
+      let cursor = String(Math.max(1, Math.floor(Number(end))));
+      let previousCursor = '';
+      for (
+        let pageIndex = 0;
+        pageIndex < 5 && trades.length < wanted;
+        pageIndex += 1
+      ) {
+        const payload = await jsonFetch(
+          `https://www.okx.com/api/v5/market/history-trades` +
+          `?instId=${encodeURIComponent(instrument)}` +
+          `&after=${encodeURIComponent(cursor)}` +
+          `&limit=100`,
+          20_000,
+        );
+        const page = Array.isArray(payload?.data)
+          ? payload.data
+          : [];
+        if (!page.length) break;
+
+        for (const item of page) {
+          const rawSize = num(item.sz);
+          const baseSize =
+            rawSize === null || multiplier === null
+              ? null
+              : rawSize * multiplier;
+          const trade = publicTrade(
+            item.ts,
+            item.px,
+            baseSize,
+            item.tradeId,
+          );
+          if (trade && trade.time <= end + 5_000) {
+            trade.raw_contract_count =
+              market === 'contract'
+                ? Math.abs(rawSize || 0)
+                : null;
+            trade.quantity_unit = 'base_asset';
+            trades.push(trade);
+          }
+        }
+
+        const oldest = page[page.length - 1] || null;
+        const nextCursor = String(
+          oldest?.tradeId ?? oldest?.ts ?? '',
+        ).trim();
+        if (
+          !nextCursor ||
+          nextCursor === cursor ||
+          nextCursor === previousCursor
+        ) {
+          break;
+        }
+        previousCursor = cursor;
+        cursor = nextCursor;
+      }
+    } else {
+      const payload = await jsonFetch(
+        `https://www.okx.com/api/v5/market/trades` +
+        `?instId=${encodeURIComponent(instrument)}` +
+        `&limit=500`,
+        20_000,
+      );
+      for (const item of payload.data || []) {
+        const rawSize = num(item.sz);
+        const baseSize =
+          rawSize === null || multiplier === null
+            ? null
+            : rawSize * multiplier;
+        const trade = publicTrade(
+          item.ts,
+          item.px,
+          baseSize,
+          item.tradeId,
+        );
+        if (trade && trade.time <= end + 5_000) {
+          trade.raw_contract_count =
+            market === 'contract'
+              ? Math.abs(rawSize || 0)
+              : null;
+          trade.quantity_unit = 'base_asset';
+          trades.push(trade);
+        }
       }
     }
   } else if (provider === 'bybit') {
@@ -1963,18 +2102,47 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       : 'spot';
     const maxLimit = market === 'contract' ? 1000 : 60;
     const identity = market === 'contract'
-      ? await resolveNativeMarketIdentity(provider, market, symbol)
+      ? await resolveNativeMarketIdentity(
+          provider,
+          market,
+          symbol,
+        )
       : { native_symbol: symbol };
-    const nativeSymbol = compact(identity.native_symbol || symbol);
+    const nativeSymbol = compact(
+      identity.native_symbol || symbol,
+    );
+
+    const params = new URLSearchParams({
+      category,
+      symbol: nativeSymbol,
+      limit: String(maxLimit),
+    });
+    if (historical) {
+      params.set(
+        'startTime',
+        String(secondHistoryWindowStart(end, wanted)),
+      );
+      params.set(
+        'endTime',
+        String(Math.max(1, Math.floor(Number(end)))),
+      );
+    }
+
     const payload = await bybitPublicJson(
-      `/v5/market/recent-trade?category=${category}&symbol=${encodeURIComponent(nativeSymbol)}&limit=${maxLimit}`,
-      { requireRows: true, timeout: 20_000 },
+      `/v5/market/recent-trade?${params.toString()}`,
+      {
+        requireRows: true,
+        timeout: 20_000,
+      },
     );
     for (const item of payloadRows(payload)) {
       const price = num(item.price ?? item.p);
       const rawSize = num(item.size ?? item.v);
-      const baseSize = category === 'inverse' &&
-              price !== null && price > 0 && rawSize !== null
+      const baseSize =
+        category === 'inverse' &&
+        price !== null &&
+        price > 0 &&
+        rawSize !== null
           ? Math.abs(rawSize) / price
           : rawSize;
       const trade = publicTrade(
@@ -1995,52 +2163,128 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     let nativeSymbol = symbol;
     let productType = 'USDT-FUTURES';
     if (market === 'contract') {
-      const identity = await resolveNativeMarketIdentity(provider, market, symbol);
-      nativeSymbol = compact(identity.native_symbol || symbol);
-      const quote = normalizedQuote(identity.quote_asset || split(compact(symbol))[1], 'USDT');
+      const identity = await resolveNativeMarketIdentity(
+        provider,
+        market,
+        symbol,
+      );
+      nativeSymbol = compact(
+        identity.native_symbol || symbol,
+      );
+      const quote = normalizedQuote(
+        identity.quote_asset ||
+          split(compact(symbol))[1],
+        'USDT',
+      );
       productType = bitgetContractCategory(quote);
     }
-    const url = market === 'contract'
-      ? `https://api.bitget.com/api/v2/mix/market/fills?symbol=${encodeURIComponent(nativeSymbol)}&productType=${encodeURIComponent(productType)}&limit=100`
-      : `https://api.bitget.com/api/v2/spot/market/fills?symbol=${encodeURIComponent(nativeSymbol)}&limit=500`;
+
+    let url;
+    if (historical) {
+      const startTime = secondHistoryWindowStart(
+        end,
+        wanted,
+        {
+          minMs: 10 * 60_000,
+          maxMs: 6 * 60 * 60_000,
+          perWantedMs: 5_000,
+        },
+      );
+      url = market === 'contract'
+        ? `https://api.bitget.com/api/v2/mix/market/fills-history` +
+          `?symbol=${encodeURIComponent(nativeSymbol)}` +
+          `&productType=${encodeURIComponent(productType)}` +
+          `&limit=1000` +
+          `&startTime=${Math.floor(startTime)}` +
+          `&endTime=${Math.max(1, Math.floor(Number(end)))}`
+        : `https://api.bitget.com/api/v2/spot/market/fills-history` +
+          `?symbol=${encodeURIComponent(nativeSymbol)}` +
+          `&limit=1000` +
+          `&startTime=${Math.floor(startTime)}` +
+          `&endTime=${Math.max(1, Math.floor(Number(end)))}`;
+    } else {
+      url = market === 'contract'
+        ? `https://api.bitget.com/api/v2/mix/market/fills` +
+          `?symbol=${encodeURIComponent(nativeSymbol)}` +
+          `&productType=${encodeURIComponent(productType)}` +
+          `&limit=100`
+        : `https://api.bitget.com/api/v2/spot/market/fills` +
+          `?symbol=${encodeURIComponent(nativeSymbol)}` +
+          `&limit=500`;
+    }
+
     let payload = await jsonFetch(url, 20_000);
     let items = payloadRows(payload);
-    if (market === 'contract' && items.length === 0) {
+    if (
+      !historical &&
+      market === 'contract' &&
+      items.length === 0
+    ) {
       payload = await jsonFetch(
-        `https://api.bitget.com/api/v3/market/fills?category=${encodeURIComponent(productType)}&symbol=${encodeURIComponent(nativeSymbol)}&limit=100`,
+        `https://api.bitget.com/api/v3/market/fills` +
+        `?category=${encodeURIComponent(productType)}` +
+        `&symbol=${encodeURIComponent(nativeSymbol)}` +
+        `&limit=100`,
         20_000,
       );
       items = payloadRows(payload);
     }
+
     for (const item of items) {
-      const trade = publicTrade(item.ts, item.price, item.size, item.tradeId ?? item.execId);
-      if (trade && trade.time <= end + 5_000) trades.push(trade);
+      const trade = publicTrade(
+        item.ts,
+        item.price,
+        item.size,
+        item.tradeId ?? item.execId,
+      );
+      if (trade && trade.time <= end + 5_000) {
+        trades.push(trade);
+      }
     }
   } else if (provider === 'gate') {
     const raw = gateId(symbol);
     const quote = split(compact(symbol))[1];
     const settle = gateContractSettle(quote);
     const url = market === 'contract'
-      ? `https://api.gateio.ws/api/v4/futures/${settle}/trades?contract=${encodeURIComponent(raw)}&limit=1000&to=${Math.floor(end / 1000)}`
-      : `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${encodeURIComponent(raw)}&limit=1000`;
+      ? `https://api.gateio.ws/api/v4/futures/${settle}/trades` +
+        `?contract=${encodeURIComponent(raw)}` +
+        `&limit=1000&to=${Math.floor(end / 1000)}`
+      : `https://api.gateio.ws/api/v4/spot/trades` +
+        `?currency_pair=${encodeURIComponent(raw)}` +
+        `&limit=1000`;
     const payload = await jsonFetch(url, 20_000);
     const multiplier =
       market === 'contract' && quote !== 'USD'
-        ? await marketContractBaseMultiplier('gate', symbol)
+        ? await marketContractBaseMultiplier(
+            'gate',
+            symbol,
+          )
         : 1;
     for (const item of Array.isArray(payload) ? payload : []) {
-      const timestamp = item.create_time_ms ?? item.time_ms ?? item.create_time ?? item.time;
+      const timestamp =
+        item.create_time_ms ??
+        item.time_ms ??
+        item.create_time ??
+        item.time;
       const rawSize = num(item.amount ?? item.size);
       const price = num(item.price);
-      const baseSize = rawSize === null || price === null || price <= 0
-        ? null
-        : (market === 'contract' && quote === 'USD'
-            ? Math.abs(rawSize) / price
-            : Math.abs(rawSize) * multiplier);
-      const trade = publicTrade(timestamp, price, baseSize, item.id);
+      const baseSize =
+        rawSize === null || price === null || price <= 0
+          ? null
+          : market === 'contract' && quote === 'USD'
+              ? Math.abs(rawSize) / price
+              : Math.abs(rawSize) * multiplier;
+      const trade = publicTrade(
+        timestamp,
+        price,
+        baseSize,
+        item.id,
+      );
       if (trade && trade.time <= end + 5_000) {
         trade.raw_contract_count =
-            market === 'contract' ? Math.abs(rawSize || 0) : null;
+          market === 'contract'
+            ? Math.abs(rawSize || 0)
+            : null;
         trade.quantity_unit = 'base_asset';
         if (market === 'contract' && quote === 'USD') {
           trade.quote_amount = Math.abs(rawSize || 0);
@@ -2049,6 +2293,7 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       }
     }
   }
+
   return dedupePublicTrades(trades).slice(-wanted);
 }
 
@@ -2095,72 +2340,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
     .slice(-limit);
 }
 
-
-const KAKA_REALTIME_CHILD_PORT =
-  Number(process.env.KAKA_CHILD_PORT || 10001);
-
-function fetchBinanceContractSecondHistoryFromChild({
-  symbol,
-  end,
-  limit,
-  waitMs = 4_500,
-}) {
-  return new Promise((resolve, reject) => {
-    const params = new URLSearchParams({
-      symbol,
-      end_time: String(end),
-      limit: String(limit),
-      wait_ms: String(waitMs),
-    });
-    const request = http.get({
-      hostname: '127.0.0.1',
-      port: KAKA_REALTIME_CHILD_PORT,
-      path:
-        '/internal/binance-contract-second-history?' +
-        params.toString(),
-      headers: {
-        accept: 'application/json',
-        'x-kaka-internal-child': '1',
-      },
-    }, (response) => {
-      const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
-        if ((response.statusCode || 500) >= 400) {
-          reject(new Error(
-            `second_history_child_${response.statusCode}:` +
-            body.slice(0, 240),
-          ));
-          return;
-        }
-        try {
-          const decoded = JSON.parse(body);
-          resolve(Array.isArray(decoded?.rows) ? decoded.rows : []);
-        } catch (_) {
-          reject(new Error('second_history_child_invalid_json'));
-        }
-      });
-    });
-    request.setTimeout(8_000, () => {
-      request.destroy(new Error('second_history_child_timeout'));
-    });
-    request.on('error', reject);
-  });
-}
-
 async function fetchSecondMarketKlines(provider, market, symbol, end, limit) {
-  // Binance合约1秒历史禁止Render直连Futures REST。
-  // 统一读取实时子进程按精确symbol维护的共享官方1秒K线环形历史。
-  if (provider === 'binance' && market === 'contract') {
-    return fetchBinanceContractSecondHistoryFromChild({
-      symbol,
-      end,
-      limit: Math.min(1200, Math.max(20, limit)),
-      waitMs: 4_500,
-    });
-  }
-
   // Binance Spot公开K线原生支持1s，直接读取最多1000根真实历史，避免以成交分页近似。
   if (provider === 'binance' && market === 'spot') {
     return fetchNativeMarketKlines(provider, market, symbol, '1s', end, Math.min(1000, limit));
@@ -2552,6 +2732,20 @@ export function getBinanceMarketRestHealth() {
     shared_inflight_entries: binanceSharedInflight.size,
     shared_cache_max: BINANCE_SHARED_CACHE_MAX,
     contract_second_history_max_rest_pages: 1,
+    one_second_history_end_time_pagination: {
+      binance_spot: 'native_1s_kline_end_time',
+      binance_contract: 'protected_archive_edge_live_chain',
+      coinbase_spot: 'public_trade_history',
+      gate_spot: 'public_trade_history',
+      gate_contract: 'public_trade_history_to_time',
+      okx_spot: 'history_trades_after_timestamp',
+      okx_contract: 'history_trades_after_timestamp',
+      bybit_spot: 'recent_trade_start_end_time',
+      bybit_contract: 'recent_trade_start_end_time',
+      bitget_spot: 'fills_history_start_end_time',
+      bitget_contract: 'fills_history_start_end_time',
+    },
+    one_second_history_app_direct_left_backfill_required: true,
     synthetic_one_second_candles: false,
     ...binanceMarketRestStats,
   };
@@ -2638,7 +2832,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -2650,7 +2844,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -2660,7 +2854,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -2669,7 +2863,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -2679,7 +2873,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         self_test: selfTest,
       });
       return true;
@@ -2695,7 +2889,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         checks: tests.length,
         tests,
       });
@@ -2710,7 +2904,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -2729,7 +2923,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -2850,7 +3044,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.51',
+        version: '650.8.15.52',
         provider,
         market_type: market,
         symbol,
