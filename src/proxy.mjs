@@ -9,13 +9,14 @@ import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed
 import { getBinanceContractKlineRelayHealth } from './binance-contract-kline-relay.mjs';
 import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurrentSnapshotScanner } from './spot-current-snapshot.mjs';
+import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ticker.mjs';
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.49';
+const STEP_VERSION = '650.8.15.50';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -293,6 +294,9 @@ const server = http.createServer(async (req, res) => {
       spot_current_snapshot: '/api/spot-market/current-snapshot',
       spot_current_snapshot_health: '/api/spot-market/health',
       spot_current_snapshot_state: getSpotCurrentSnapshotHealth(),
+      spot_exact_ticker: '/api/spot-market/exact-ticker',
+      spot_exact_ticker_health: '/api/spot-market/exact-ticker-health',
+      spot_exact_ticker_state: getSpotExactTickerHealth(),
       spot_flow_shared_history: '/api/spot-flow/history',
       spot_flow_shared_history_health: '/api/spot-flow/history-health',
       spot_flow_shared_history_state: getSpotFlowHistoryHealth(),
@@ -637,6 +641,7 @@ const server = http.createServer(async (req, res) => {
     // queued/paced work; an already-started upstream request is still fully observed.
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
+      if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowHistory(req, res, url)) return true;
       if (await handleMarketApi(req, res, url)) return true;
