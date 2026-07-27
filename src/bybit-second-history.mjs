@@ -1,9 +1,13 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.60';
+const VERSION = '650.8.15.61';
 const PROVIDER = 'bybit';
 const MAX_ROWS = 3600;
-const MAX_ENTRIES = 32;
+const MAX_ENTRIES = 64;
+const SPOT_RECENT_TRADE_MAX = 60;
+const ON_DEMAND_SPOT_LATEST_RESERVE_RATIO = 0.35;
+const ON_DEMAND_SPOT_LATEST_RESERVE_MIN_ROWS = 2;
+const DISCOVERED_HOT_BASES = new Set(['BTC', 'ETH']);
 const ON_DEMAND_LEASE_MS = 10 * 60_000;
 const RECONNECT_MAX_MS = 30_000;
 const FIRST_PERSIST_MS = 60_000;
@@ -14,12 +18,13 @@ const SUPABASE_URL =
 const SUPABASE_SERVICE_ROLE_KEY =
   String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 const SNAPSHOT_TABLE = 'app_market_backend_snapshots';
-const HOT_TARGETS = [
+const STATIC_HOT_TARGETS = [
   { market: 'spot', symbol: 'BTCUSDT', nativeSymbol: 'BTCUSDT', category: 'spot' },
   { market: 'spot', symbol: 'ETHUSDT', nativeSymbol: 'ETHUSDT', category: 'spot' },
   { market: 'contract', symbol: 'BTCUSDT', nativeSymbol: 'BTCUSDT', category: 'linear' },
   { market: 'contract', symbol: 'ETHUSDT', nativeSymbol: 'ETHUSDT', category: 'linear' },
 ];
+let activeHotTargets = [...STATIC_HOT_TARGETS];
 
 const entries = new Map();
 const stats = {
@@ -44,6 +49,13 @@ const stats = {
   persist_attempts: 0,
   persist_success: 0,
   persist_errors: 0,
+  spot_discovery_requests: 0,
+  spot_discovery_success: 0,
+  spot_discovery_errors: 0,
+  spot_discovered_hot_targets: 0,
+  latest_pages_with_reserved_older_rows: 0,
+  latest_rows_reserved_for_pagination: 0,
+  older_pages_served_from_verified_ring: 0,
   last_error: '',
   last_restore_error: '',
   last_persist_error: '',
@@ -265,7 +277,7 @@ async function seedRecent(entry, { force = false } = {}) {
   }
   entry.seedPromise = (async () => {
     stats.seed_requests += 1;
-    const limit = entry.market === 'spot' ? 60 : 1000;
+    const limit = entry.market === 'spot' ? SPOT_RECENT_TRADE_MAX : 1000;
     const url =
       `https://api.bybit.com/v5/market/recent-trade` +
       `?category=${encodeURIComponent(entry.category)}` +
@@ -716,17 +728,70 @@ async function ensureEntry({
   return entry;
 }
 
-function filteredRows(entry, endTime, limit) {
+function rowsBeforeEnd(entry, endTime) {
   const end = Number.isFinite(Number(endTime))
     ? Number(endTime)
     : Date.now() + 1000;
-  return entry.rows
-    .filter((row) => Number(row.open_time_ms || 0) < end)
-    .slice(-limit);
+  let low = 0;
+  let high = entry.rows.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    const time = Number(entry.rows[middle]?.open_time_ms || 0);
+    if (time < end) low = middle + 1;
+    else high = middle;
+  }
+  return entry.rows.slice(0, low);
 }
 
-async function waitForRows(entry, endTime, limit, waitMs) {
-  let rows = filteredRows(entry, endTime, limit);
+function filteredRows(entry, endTime, limit, { endTimeProvided = false } = {}) {
+  const available = rowsBeforeEnd(entry, endTime);
+  if (!available.length) return [];
+
+  // Step781.2.10: Bybit's official spot recent-trade endpoint exposes at most
+  // 60 trades and no public older cursor. For a newly activated exact spot
+  // pair, returning every verified second in the first "latest" page leaves
+  // nothing for the immediately-following end_time request even though older
+  // real rows are already present in the same official seed/ring. Keep a
+  // bounded oldest slice for the next page. This is true pagination over
+  // verified Bybit trades: no synthetic seconds, no quote alias and no
+  // cross-platform fallback. Once the shared WebSocket/persisted ring grows,
+  // normal full-size paging naturally resumes.
+  if (
+    endTimeProvided !== true &&
+    entry.market === 'spot' &&
+    available.length <= limit &&
+    available.length >= 4
+  ) {
+    const reserve = Math.min(
+      available.length - 2,
+      Math.max(
+        ON_DEMAND_SPOT_LATEST_RESERVE_MIN_ROWS,
+        Math.ceil(
+          available.length * ON_DEMAND_SPOT_LATEST_RESERVE_RATIO,
+        ),
+      ),
+    );
+    const pageSize = Math.max(
+      2,
+      Math.min(limit, available.length - reserve),
+    );
+    if (pageSize < available.length) {
+      stats.latest_pages_with_reserved_older_rows += 1;
+      stats.latest_rows_reserved_for_pagination +=
+        available.length - pageSize;
+      return available.slice(-pageSize);
+    }
+  }
+
+  const rows = available.slice(-limit);
+  if (endTimeProvided === true && rows.length) {
+    stats.older_pages_served_from_verified_ring += 1;
+  }
+  return rows;
+}
+
+async function waitForRows(entry, endTime, limit, waitMs, options = {}) {
+  let rows = filteredRows(entry, endTime, limit, options);
   if (rows.length >= Math.min(2, limit) || waitMs <= 0) {
     return rows;
   }
@@ -736,7 +801,7 @@ async function waitForRows(entry, endTime, limit, waitMs) {
     const deadline = Date.now() + waitMs;
     let timer = null;
     const check = () => {
-      rows = filteredRows(entry, endTime, limit);
+      rows = filteredRows(entry, endTime, limit, options);
       if (
         rows.length >= Math.min(2, limit) ||
         Date.now() >= deadline
@@ -752,7 +817,7 @@ async function waitForRows(entry, endTime, limit, waitMs) {
     entry.waiters.add(check);
     check();
   });
-  return filteredRows(entry, endTime, limit);
+  return filteredRows(entry, endTime, limit, options);
 }
 
 export async function readBybitSecondHistory({
@@ -763,6 +828,7 @@ export async function readBybitSecondHistory({
   endTime,
   limit,
   waitMs,
+  endTimeProvided = false,
 }) {
   const safeMarket = marketKey(market);
   const safeSymbol = compact(symbol);
@@ -796,6 +862,7 @@ export async function readBybitSecondHistory({
     endTime,
     safeLimit,
     safeWait,
+    { endTimeProvided: endTimeProvided === true },
   );
   if (!rows.length) stats.history_empty += 1;
   return {
@@ -827,7 +894,15 @@ export function getBybitSecondHistoryHealth() {
     full_history_resort_per_trade: false,
     hot_target_start_mode: 'parallel_all_targets_created_before_wait',
     seed_refresh_seconds: Math.round(SEED_REFRESH_MS / 1000),
-    hot_targets: HOT_TARGETS.map((item) => ({
+    spot_recent_trade_rest_limit: SPOT_RECENT_TRADE_MAX,
+    spot_recent_trade_public_older_cursor_available: false,
+    shallow_spot_latest_page_reserves_verified_older_rows: true,
+    shallow_spot_latest_page_reserve_ratio:
+      ON_DEMAND_SPOT_LATEST_RESERVE_RATIO,
+    spot_history_source:
+      'official_recent_trade_seed_plus_live_publicTrade_ring',
+    btc_eth_quote_pairs_prestarted_from_official_directory: true,
+    hot_targets: activeHotTargets.map((item) => ({
       market: item.market,
       symbol: item.symbol,
     })),
@@ -905,6 +980,8 @@ export async function handleBybitSecondHistoryInternal(
     const waitMs = Number(
       url.searchParams.get('wait_ms') || 4500,
     );
+    const endTimeProvided =
+      url.searchParams.get('end_time_provided') === '1';
 
     const { entry, rows } =
       await readBybitSecondHistory({
@@ -915,6 +992,7 @@ export async function handleBybitSecondHistoryInternal(
         endTime,
         limit,
         waitMs,
+        endTimeProvided,
       });
 
     res.writeHead(200, {
@@ -932,6 +1010,7 @@ export async function handleBybitSecondHistoryInternal(
         'bybit_official_public_trade_1s_shared_ws',
       row_count: rows.length,
       cached_row_count: entry.rows.length,
+      end_time_provided: endTimeProvided,
       rows,
       generated_at: new Date().toISOString(),
     }));
@@ -950,11 +1029,65 @@ export async function handleBybitSecondHistoryInternal(
   return true;
 }
 
+async function discoverBtcEthSpotHotTargets() {
+  stats.spot_discovery_requests += 1;
+  try {
+    const response = await fetch(
+      'https://api.bybit.com/v5/market/instruments-info?category=spot',
+      {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(12_000),
+      },
+    );
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(
+        `bybit_spot_instruments_${response.status}:${text.slice(0, 160)}`,
+      );
+    }
+    const payload = JSON.parse(text);
+    if (Number(payload?.retCode || 0) !== 0) {
+      throw new Error(
+        `bybit_spot_instruments_${payload?.retCode}:${payload?.retMsg}`,
+      );
+    }
+    const rows = Array.isArray(payload?.result?.list)
+      ? payload.result.list
+      : [];
+    const discovered = rows
+      .filter((item) => (
+        DISCOVERED_HOT_BASES.has(compact(item?.baseCoin)) &&
+        compact(item?.symbol) &&
+        String(item?.status || 'Trading').toLowerCase() === 'trading'
+      ))
+      .map((item) => ({
+        market: 'spot',
+        symbol: compact(item.symbol),
+        nativeSymbol: compact(item.symbol),
+        category: 'spot',
+      }));
+    stats.spot_discovery_success += 1;
+    stats.spot_discovered_hot_targets = discovered.length;
+    return discovered;
+  } catch (error) {
+    stats.spot_discovery_errors += 1;
+    stats.last_error = String(error?.message || error);
+    return [];
+  }
+}
+
 export async function startBybitSecondHistoryHotSeeds() {
-  // Step781.2.7: create all four exact hot identities immediately, then warm
-  // them concurrently. A slow restore/seed/handshake for one market must not
-  // prevent the following contract target from even existing in health state.
-  await Promise.allSettled(HOT_TARGETS.map(async (target) => {
+  // Step781.2.10: discover all currently-listed BTC/ETH spot quote pairs once
+  // from Bybit's official directory and create every exact identity before
+  // waiting for restore/seed/WS work. This starts collecting real seconds at
+  // process boot instead of only after the first user's left-drag.
+  const discovered = await discoverBtcEthSpotHotTargets();
+  const unique = new Map();
+  for (const target of [...STATIC_HOT_TARGETS, ...discovered]) {
+    unique.set(entryKey(target.market, target.symbol), target);
+  }
+  activeHotTargets = [...unique.values()];
+  await Promise.allSettled(activeHotTargets.map(async (target) => {
     try {
       await ensureEntry({
         ...target,
@@ -976,6 +1109,8 @@ export const _test = {
   ingestTrade,
   rebuildRowIndex,
   readBybitSecondHistory,
+  filteredRows,
+  rowsBeforeEnd,
   primeEntry({
     market,
     symbol,
@@ -983,6 +1118,7 @@ export const _test = {
     category = market === 'contract' ? 'linear' : 'spot',
     rows = [],
     connected = true,
+    hotPinned = true,
   }) {
     const safeMarket = marketKey(market);
     const safeSymbol = compact(symbol);
@@ -993,7 +1129,7 @@ export const _test = {
         symbol: safeSymbol,
         nativeSymbol: compact(nativeSymbol),
         category: categoryKey(category, safeMarket, safeSymbol),
-        hotPinned: true,
+        hotPinned,
       });
     }
     entry.rows = mergeRows(
