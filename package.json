@@ -1,15 +1,16 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.56",
+  "version": "650.8.15.57",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/proxy.mjs",
     "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs",
-    "test:step781.2.5": "node tests/step781_2_5_selftest.mjs"
+    "test:step781.2.5": "node tests/step781_2_5_selftest.mjs",
+    "test:step781.2.6": "node tests/step781_2_6_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.56 / Step781.2.5 root-cause repair: explicit end_time history mode, Bitget cursor precedence compliance, and Binance 1-second Kline relay priority without success-persistence queue blocking"
+  "description": "Kaka contract realtime worker 650.8.15.57 / Step781.2.6 Coinbase official per-match realtime fallback and App 1-second wall-clock/history-window repair"
 }

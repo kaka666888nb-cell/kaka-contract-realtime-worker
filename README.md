@@ -1,9 +1,11 @@
-# Step781.2.5 / Render 650.8.15.56
+# Step781.2.6 / Render 650.8.15.57
 
-Root-cause repair for the two remaining Step781.2.4 all-platform 1-second history gate failures.
+Phone-validation repair after Step781.2.5 passed the all-platform one-second history gate.
 
-- Explicit `end_time` now defines a 1-second history request. The backend no longer guesses history mode from `Date.now() - 8s`, which failed when a latest page contained only a few recent seconds.
-- Bitget contract history follows the official parameter precedence: the first request uses `startTime` + `endTime`; later requests use only `idLessThan`. Keeping the time range on later pages caused Bitget to ignore the cursor.
-- Binance contract 1-second aggregate-trade reads now enter the existing high-priority Kline relay lane instead of the auxiliary lane. Ordinary successful relay calls no longer hold the single relay slot during non-safety telemetry persistence. Restriction and validation state writes remain strict and synchronous.
+- Coinbase spot one-second realtime now uses the official Coinbase Exchange `ticker` channel, which updates per match, plus `heartbeat`. If that upstream connection closes, the worker falls back to the official Advanced Trade `market_trades` + `heartbeats` feed.
+- Coinbase public market-channel `USDC` identity is mapped to the corresponding `USD` product only for the upstream subscription; the App/provider/symbol identity remains exact and unchanged.
+- The visible App page owns empty natural seconds. Its zero-volume wall-clock carry is independent from WebSocket reconnects in portrait and fullscreen, so reconnecting cannot stop horizontal time advancement.
+- One left-edge gesture on a one-second chart automatically continues through up to four strict older pages, targeting about 90 seconds of genuine time coverage. Each page is published incrementally; the user does not need to drag four separate times.
+- Render still never fabricates empty seconds. Gap rows are generated only inside the App between verified same-provider trade seconds, with zero volume, and real trades replace the same-second carry.
 
-Existing protections remain unchanged: no synthetic empty seconds in Render, exact provider/market/symbol identity, bounded pagination, empty results never overwrite verified data, and Binance contract direct Render REST remains permanently disabled.
+Existing protections remain unchanged: exact provider/market/symbol identity, strict older-time progress, bounded requests, empty results never overwrite verified data, and Binance contract direct Render REST remains permanently disabled.
