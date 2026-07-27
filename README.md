@@ -1,11 +1,11 @@
-# Step781.2.6 / Render 650.8.15.57
+# Step781.2.7 / Render 650.8.15.58
 
-Phone-validation repair after Step781.2.5 passed the all-platform one-second history gate.
+Production root-cause repair after the Step781.2.6 gate exposed a blocked Bybit realtime child and one false Binance window failure.
 
-- Coinbase spot one-second realtime now uses the official Coinbase Exchange `ticker` channel, which updates per match, plus `heartbeat`. If that upstream connection closes, the worker falls back to the official Advanced Trade `market_trades` + `heartbeats` feed.
-- Coinbase public market-channel `USDC` identity is mapped to the corresponding `USD` product only for the upstream subscription; the App/provider/symbol identity remains exact and unchanged.
-- The visible App page owns empty natural seconds. Its zero-volume wall-clock carry is independent from WebSocket reconnects in portrait and fullscreen, so reconnecting cannot stop horizontal time advancement.
-- One left-edge gesture on a one-second chart automatically continues through up to four strict older pages, targeting about 90 seconds of genuine time coverage. Each page is published incrementally; the user does not need to drag four separate times.
-- Render still never fabricates empty seconds. Gap rows are generated only inside the App between verified same-provider trade seconds, with zero volume, and real trades replace the same-second carry.
+- Bybit public-trade one-second history no longer scans, filters, normalizes, and sorts the full 3600-row ring for every incoming trade. Each exact market+symbol now keeps a millisecond bucket index; an existing second is updated in O(1), and only a genuinely new out-of-order second uses binary insertion.
+- All four pinned Bybit hot targets (spot/contract BTCUSDT and ETHUSDT) are created immediately and warmed in parallel. A slow restore, seed, or handshake for one target cannot prevent the following contract target from existing.
+- The child remains responsive while high-activity spot and contract trades are ingested, so health/history reads no longer wait behind full-history rebuild work.
+- The one-second history gate now validates the actual goal: bounded requests must cover at least 45 seconds of older time with real distinct seconds. It no longer incorrectly requires two pages when a single Binance page already covers the App's approximately 90-second target.
+- Step781.2.6 Coinbase official per-match realtime, App-owned empty-second wall clock, and portrait/fullscreen bounded 90-second backfill remain unchanged.
 
-Existing protections remain unchanged: exact provider/market/symbol identity, strict older-time progress, bounded requests, empty results never overwrite verified data, and Binance contract direct Render REST remains permanently disabled.
+Existing protections remain unchanged: exact provider/market/symbol identity, strict older-time progress, bounded requests, empty results never overwrite verified data, Render never fabricates empty seconds, and Binance contract direct Render REST remains permanently disabled.
