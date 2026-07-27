@@ -9,11 +9,12 @@ import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed
 import { getBinanceContractKlineRelayHealth } from './binance-contract-kline-relay.mjs';
 import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurrentSnapshotScanner } from './spot-current-snapshot.mjs';
+import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.47';
+const STEP_VERSION = '650.8.15.48';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -291,6 +292,9 @@ const server = http.createServer(async (req, res) => {
       spot_current_snapshot: '/api/spot-market/current-snapshot',
       spot_current_snapshot_health: '/api/spot-market/health',
       spot_current_snapshot_state: getSpotCurrentSnapshotHealth(),
+      spot_flow_shared_history: '/api/spot-flow/history',
+      spot_flow_shared_history_health: '/api/spot-flow/history-health',
+      spot_flow_shared_history_state: getSpotFlowHistoryHealth(),
       contract_meta: '/api/contract-meta',
       contract_depth: '/api/contract-depth',
       contract_depth_health: getContractDepthHealth(),
@@ -499,6 +503,11 @@ const server = http.createServer(async (req, res) => {
         data_page_spot_current_snapshot_targets_per_provider: 20,
         data_page_spot_current_snapshot_reads_open_exchange_request: false,
         data_page_spot_current_snapshot_scales_with_users: false,
+        spot_capital_shared_history_endpoint: '/api/spot-flow/history',
+        spot_capital_shared_history_cache_ttl_seconds: 120,
+        spot_capital_shared_history_stale_seconds: 900,
+        spot_capital_same_exact_key_reads_share_cache_and_inflight: true,
+        spot_capital_app_three_direct_kline_history_reads_removed: true,
         contract_depth_cache_ms: 1200,
         contract_depth_stale_seconds: 20,
         contract_depth_page_visible_only: true,
@@ -618,6 +627,7 @@ const server = http.createServer(async (req, res) => {
     // queued/paced work; an already-started upstream request is still fully observed.
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
+      if (await handleSpotFlowHistory(req, res, url)) return true;
       if (await handleMarketApi(req, res, url)) return true;
       if (await handleContractDepth(req, res, url)) return true;
       if (await handleContractFunding(req, res, url)) return true;

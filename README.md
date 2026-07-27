@@ -1,14 +1,19 @@
-# Kaka Contract Realtime Worker 650.8.15.47 / Step773
+# Kaka Contract Realtime Worker
 
-Step773 adds a bounded backend-shared current USDT spot snapshot for the Data page.
+Version **650.8.15.48 / Step777**.
 
-- Endpoint: `GET /api/spot-market/current-snapshot`
-- Health: `GET /api/spot-market/health`
-- Five providers: Binance, OKX, Bybit, Bitget, Gate
-- Per provider: 4 high-activity pairs + 16 rotating directory pairs
-- Background scan interval: 5 minutes, one provider at a time
-- Snapshot reads start zero exchange requests and zero exchange connections
-- Empty or failed provider scans never overwrite the last verified rows
-- Existing contract flow, funding, liquidation, depth, market, Kline, and Binance contract REST guards remain unchanged
+Step777 adds a shared exact-key spot taker-flow history endpoint:
 
-No new SQL, Edge function, Cron job, environment variable, or persistent raw spot event storage is required.
+- `GET /api/spot-flow/history?provider=binance&symbol=BTCUSDT`
+- `GET /api/spot-flow/history-health`
+- One backend build reads the existing normalized `1m × 300`, `5m × 320`, and `1h × 180` spot Kline windows.
+- Same provider+symbol reads share a 2-minute cache and in-flight request; verified stale results may be used for at most 15 minutes.
+- Builds are globally bounded to 2 active and 32 queued.
+- Empty or failed builds never overwrite a verified non-empty stale payload.
+- This removes the App's three direct per-user Kline history reads on the spot capital page.
+
+Unchanged boundaries:
+
+- Binance contract direct REST remains hard disabled.
+- No new SQL, Edge, Cron, environment variables, or persistent raw trade history.
+- Current spot snapshot, contract flow, funding, liquidation, depth, trades, Klines and WebSocket routes remain intact.
