@@ -450,7 +450,7 @@ function compactSymbol(value) {
 
 function quoteFromCompact(symbol) {
   // Longest quote first so BTCFDUSD is parsed as BTC / FDUSD, never BTCFD / USD.
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'TRY', 'BRL', 'AUD', 'CAD']) {
+  for (const quote of ['FDUSD', 'PYUSD', 'USDT', 'USDC', 'USD1', 'TUSD', 'BUSD', 'EURC', 'DAI', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'KRW', 'TRY', 'BRL', 'AUD', 'CAD', 'SGD', 'HKD', 'CHF', 'MXN', 'PLN']) {
     if (symbol.endsWith(quote) && symbol.length > quote.length) return quote;
   }
   return 'USDT';

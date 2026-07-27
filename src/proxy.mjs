@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.58';
+const STEP_VERSION = '650.8.15.60';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -309,7 +309,20 @@ const server = http.createServer(async (req, res) => {
       one_second_history_app_direct_left_backfill_required: true,
       coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat',
       coinbase_one_second_empty_seconds_owned_by_app: true,
+      coinbase_spot_usdt_realtime_supported: true,
+      coinbase_all_directory_quotes_realtime_supported: true,
+      all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
+      coinbase_usdt_directory_not_cross_aliased_to_usd: true,
+      coinbase_eur_realtime_supported: true,
+      coinbase_trade_history_page_limit: 1000,
+      coinbase_trade_history_max_pages_per_request: 12,
+      coinbase_trade_history_cursor_checkpoint_reuse: true,
+      coinbase_trade_history_no_three_minute_wall: true,
+      coinbase_asset_ticker_shared_live_source: 'exchange_product_ticker_last_trade_plus_stats',
+      asset_market_tab_count_uses_visible_rows: true,
       one_second_history_drag_window_target_seconds: 90,
+      coinbase_one_second_history_drag_window_target_seconds: 300,
+      coinbase_one_second_history_drag_max_pages: 8,
       bybit_second_history_indexed_bucket_updates: true,
       bybit_hot_targets_parallel_start: true,
       one_second_history_window_passes_by_time_span_not_page_count: true,
@@ -386,9 +399,23 @@ const server = http.createServer(async (req, res) => {
         gate_rate_limit_reset_header_detection: true,
         coinbase_public_rest_guard_below_official_10rps: true,
         coinbase_one_second_realtime_transport: 'official_exchange_ticker_per_match_plus_heartbeat',
+        coinbase_spot_usdt_realtime_supported: true,
+      coinbase_all_directory_quotes_realtime_supported: true,
+      all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
+      coinbase_usdt_directory_not_cross_aliased_to_usd: true,
+      coinbase_eur_realtime_supported: true,
+      coinbase_trade_history_page_limit: 1000,
+      coinbase_trade_history_max_pages_per_request: 12,
+      coinbase_trade_history_cursor_checkpoint_reuse: true,
+      coinbase_trade_history_no_three_minute_wall: true,
+        coinbase_asset_ticker_shared_live_source: 'exchange_product_ticker_last_trade_plus_stats',
+        coinbase_asset_ticker_app_fresh_cache_ms: 1200,
+        asset_market_tab_count_uses_visible_rows: true,
         coinbase_public_usdc_alias_to_usd_for_market_channels: true,
         one_second_wall_clock_transport_reconnect_independent: true,
         one_second_history_drag_window_target_seconds: 90,
+      coinbase_one_second_history_drag_window_target_seconds: 300,
+      coinbase_one_second_history_drag_max_pages: 8,
         one_second_history_drag_max_pages: 4,
         bybit_second_history_indexed_bucket_updates: true,
         bybit_hot_targets_parallel_start: true,

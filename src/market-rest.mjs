@@ -45,7 +45,32 @@ const marketUniverseCache = new Map();
 const marketTickerCache = new Map();
 const marketCacheInflight = new Map();
 const coinbaseTickerCache = new Map();
-const COINBASE_TICKER_TTL_MS = 5_000;
+const coinbaseStatsCache = new Map();
+// Step781.2.8: current price follows the official last-trade ticker snapshot;
+// 24h statistics are cached separately because they do not need per-refresh reads.
+const COINBASE_TICKER_TTL_MS = 1_500;
+const COINBASE_STATS_TTL_MS = 30_000;
+// Step781.2.9: Coinbase trade history is cursor based. A historical request
+// must not restart at the newest trade on every drag; otherwise high-activity
+// USD books hit a practical ~3 minute wall. Keep only lightweight cursor/time
+// checkpoints, never raw trade history, so sequential left-drag requests resume
+// from the nearest verified older page while remaining bounded.
+const COINBASE_TRADE_PAGE_LIMIT = 1_000;
+const COINBASE_TRADE_MAX_PAGES_PER_REQUEST = 12;
+const COINBASE_TRADE_CURSOR_TTL_MS = 6 * 60 * 60_000;
+const COINBASE_TRADE_CURSOR_MAX_PRODUCTS = 96;
+const COINBASE_TRADE_CURSOR_MAX_CHECKPOINTS = 192;
+const coinbaseTradeCursorStates = new Map();
+const coinbaseTradeHistoryStats = {
+  requests: 0,
+  latest_requests: 0,
+  historical_requests: 0,
+  pages: 0,
+  cursor_checkpoint_hits: 0,
+  cursor_checkpoint_misses: 0,
+  cursor_checkpoints_written: 0,
+  cursor_evictions: 0,
+};
 const BINANCE_SHARED_CACHE_MAX = 256;
 const binanceSharedCache = new Map();
 const binanceSharedInflight = new Map();
@@ -137,17 +162,22 @@ function compact(raw) {
     .replace(/_UMCBL$/i, '')
     .replace(/[^A-Z0-9]/g, '');
 }
+// Step781.2.9: one shared exact spot quote identity set for directory,
+// ticker, native WebSocket symbol and 1-second history pagination.
+// Order matters: longest USD/EUR suffixes must precede USD/EUR.
+const SUPPORTED_EXACT_QUOTE_ASSETS = Object.freeze([
+  'FDUSD', 'PYUSD', 'USDT', 'USDC', 'USD1', 'TUSD', 'BUSD', 'EURC',
+  'DAI', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'KRW',
+  'TRY', 'BRL', 'AUD', 'CAD', 'SGD', 'HKD', 'CHF', 'MXN', 'PLN',
+]);
 function split(symbol) {
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'TRY', 'BRL', 'AUD', 'CAD']) {
-    if (symbol.endsWith(quote)) return [symbol.slice(0, -quote.length), quote];
+  for (const quote of SUPPORTED_EXACT_QUOTE_ASSETS) {
+    if (symbol.endsWith(quote) && symbol.length > quote.length) {
+      return [symbol.slice(0, -quote.length), quote];
+    }
   }
   return [symbol, 'USDT'];
 }
-const SUPPORTED_EXACT_QUOTE_ASSETS = Object.freeze([
-  'FDUSD', 'USDT', 'USDC', 'USD1', 'USD',
-  'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY',
-  'TRY', 'BRL', 'AUD', 'CAD',
-]);
 
 function normalizedQuote(raw, fallback = 'USDT') {
   const value = String(raw || '').trim().toUpperCase();
@@ -1159,25 +1189,74 @@ async function mapLimit(values, concurrency, mapper) {
   return results;
 }
 
+async function coinbaseStats(productId) {
+  const cacheKey = String(productId || '').toUpperCase();
+  const cached = coinbaseStatsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < COINBASE_STATS_TTL_MS) {
+    return cached.value;
+  }
+  try {
+    const value = await jsonFetch(
+      `${COINBASE_BASE_URL}/products/${encodeURIComponent(productId)}/stats`,
+    );
+    coinbaseStatsCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  } catch (error) {
+    if (cached?.value) return cached.value;
+    throw error;
+  }
+}
+
 async function coinbaseTicker(symbol) {
   const normalized = compact(symbol);
   const cacheKey = normalized;
   const cached = coinbaseTickerCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < COINBASE_TICKER_TTL_MS) return cached.row;
+  if (cached && Date.now() - cached.at < COINBASE_TICKER_TTL_MS) {
+    return cached.row;
+  }
   const productId = coinbaseProductId(normalized);
-  const stats = await jsonFetch(`${COINBASE_BASE_URL}/products/${encodeURIComponent(productId)}/stats`);
-  const last = num(stats.last);
-  const open = num(stats.open);
-  const baseVolume = num(stats.volume);
+
+  // Step781.2.8: /ticker is the official snapshot of the last trade. Keep the
+  // slower 24h /stats payload on its own cache so a stale stats response can
+  // never freeze the current price shown in the App asset-market list.
+  let live = null;
+  let liveError = null;
+  try {
+    live = await jsonFetch(
+      `${COINBASE_BASE_URL}/products/${encodeURIComponent(productId)}/ticker`,
+    );
+  } catch (error) {
+    liveError = error;
+  }
+  let stats = null;
+  try {
+    stats = await coinbaseStats(productId);
+  } catch (error) {
+    if (!live?.price) throw liveError || error;
+    stats = {};
+  }
+  const last = num(live?.price ?? stats?.last);
+  const open = num(stats?.open);
+  const baseVolume = num(stats?.volume ?? live?.volume);
   const row = tickerRow('coinbase', 'spot', {
     last,
     open,
-    high_24h: stats.high,
-    low_24h: stats.low,
+    high_24h: stats?.high,
+    low_24h: stats?.low,
     base_volume_24h: baseVolume,
-    quote_volume_24h: last !== null && baseVolume !== null ? last * baseVolume : null,
+    quote_volume_24h:
+      last !== null && baseVolume !== null ? last * baseVolume : null,
   }, normalized);
-  if (!row) throw new Error(`Coinbase ticker unavailable for ${productId}`);
+  if (!row) {
+    throw liveError || new Error(`Coinbase ticker unavailable for ${productId}`);
+  }
+  row.source = live?.price != null
+    ? 'coinbase_exchange_product_ticker_live_plus_stats'
+    : 'coinbase_exchange_stats_last_trade_fallback';
+  row.source_time = live?.time || row.cached_at;
+  row.trade_id = live?.trade_id ?? null;
+  row.best_bid = num(live?.bid);
+  row.best_ask = num(live?.ask);
   coinbaseTickerCache.set(cacheKey, { at: Date.now(), row });
   return row;
 }
@@ -1989,13 +2068,124 @@ function normalizeMarketKlineRows(
   );
 }
 
+function pruneCoinbaseTradeCursorStates() {
+  const now = Date.now();
+  for (const [productId, state] of coinbaseTradeCursorStates.entries()) {
+    if (now - Number(state?.updatedAt || 0) > COINBASE_TRADE_CURSOR_TTL_MS) {
+      coinbaseTradeCursorStates.delete(productId);
+      coinbaseTradeHistoryStats.cursor_evictions += 1;
+    }
+  }
+  while (coinbaseTradeCursorStates.size > COINBASE_TRADE_CURSOR_MAX_PRODUCTS) {
+    const oldestKey = coinbaseTradeCursorStates.keys().next().value;
+    if (oldestKey == null) break;
+    coinbaseTradeCursorStates.delete(oldestKey);
+    coinbaseTradeHistoryStats.cursor_evictions += 1;
+  }
+}
+
+function coinbaseTradeCursorState(productId) {
+  pruneCoinbaseTradeCursorStates();
+  let state = coinbaseTradeCursorStates.get(productId);
+  if (!state) {
+    state = { checkpoints: [], updatedAt: Date.now() };
+    coinbaseTradeCursorStates.set(productId, state);
+  } else {
+    // Refresh Map insertion order for bounded LRU behavior.
+    coinbaseTradeCursorStates.delete(productId);
+    coinbaseTradeCursorStates.set(productId, state);
+    state.updatedAt = Date.now();
+  }
+  return state;
+}
+
+function rememberCoinbaseTradeCursorCheckpoint(
+  productId,
+  { after, oldestTime, newestTime },
+) {
+  const cursor = String(after || '');
+  if (!cursor || !Number.isFinite(oldestTime) || !Number.isFinite(newestTime)) {
+    return;
+  }
+  const state = coinbaseTradeCursorState(productId);
+  const duplicateIndex = state.checkpoints.findIndex(
+    (item) => String(item?.after || '') === cursor,
+  );
+  if (duplicateIndex >= 0) state.checkpoints.splice(duplicateIndex, 1);
+  state.checkpoints.push({
+    after: cursor,
+    oldestTime: Number(oldestTime),
+    newestTime: Number(newestTime),
+    at: Date.now(),
+  });
+  state.checkpoints.sort(
+    (a, b) => Number(b.oldestTime) - Number(a.oldestTime),
+  );
+  if (state.checkpoints.length > COINBASE_TRADE_CURSOR_MAX_CHECKPOINTS) {
+    state.checkpoints.splice(
+      0,
+      state.checkpoints.length - COINBASE_TRADE_CURSOR_MAX_CHECKPOINTS,
+    );
+  }
+  state.updatedAt = Date.now();
+  coinbaseTradeHistoryStats.cursor_checkpoints_written += 1;
+}
+
+function coinbaseTradeStartCursor(productId, end, historical) {
+  if (!historical || !Number.isFinite(Number(end))) return '';
+  const state = coinbaseTradeCursorStates.get(productId);
+  const checkpoints = Array.isArray(state?.checkpoints)
+    ? state.checkpoints
+    : [];
+  // A checkpoint's `after` points to the page immediately older than the page
+  // whose oldest time is recorded. Choose the closest checkpoint that is still
+  // newer than the requested boundary; this cannot skip the target page.
+  const eligible = checkpoints
+    .filter((item) => Number(item?.oldestTime) > Number(end))
+    .sort((a, b) => Number(a.oldestTime) - Number(b.oldestTime));
+  const selected = eligible[0];
+  if (selected?.after) {
+    coinbaseTradeHistoryStats.cursor_checkpoint_hits += 1;
+    return String(selected.after);
+  }
+  coinbaseTradeHistoryStats.cursor_checkpoint_misses += 1;
+  return '';
+}
+
+function getCoinbaseTradeHistoryHealth() {
+  pruneCoinbaseTradeCursorStates();
+  let checkpoints = 0;
+  for (const state of coinbaseTradeCursorStates.values()) {
+    checkpoints += Array.isArray(state?.checkpoints)
+      ? state.checkpoints.length
+      : 0;
+  }
+  return {
+    page_limit: COINBASE_TRADE_PAGE_LIMIT,
+    max_pages_per_request: COINBASE_TRADE_MAX_PAGES_PER_REQUEST,
+    cursor_checkpoint_reuse: true,
+    cursor_state_entries: coinbaseTradeCursorStates.size,
+    cursor_checkpoints: checkpoints,
+    no_latest_restart_three_minute_wall: true,
+    ...coinbaseTradeHistoryStats,
+  };
+}
+
 async function fetchCoinbasePublicTradePage(
   productId,
   afterCursor = '',
-  limit = 100,
+  limit = COINBASE_TRADE_PAGE_LIMIT,
 ) {
   const params = new URLSearchParams({
-    limit: String(Math.max(1, Math.min(100, Number(limit) || 100))),
+    limit: String(
+      Math.max(
+        1,
+        Math.min(
+          COINBASE_TRADE_PAGE_LIMIT,
+          Number(limit) || COINBASE_TRADE_PAGE_LIMIT,
+        ),
+      ),
+    ),
   });
   if (afterCursor) params.set('after', String(afterCursor));
   const url =
@@ -2062,7 +2252,10 @@ function secondHistoryWindowStart(end, wanted, {
   return Math.max(0, safeEnd - span);
 }
 
-async function recentPublicTrades(provider, market, symbol, end, limit, { endTimeProvided = false } = {}) {
+async function recentPublicTrades(
+  provider, market, symbol, end, limit,
+  { endTimeProvided = false, secondBucketTarget = null } = {},
+) {
   const wanted = Math.max(100, Math.min(5000, Number(limit) || 1000));
   const trades = [];
   // An explicit end_time is the API contract for left-history pagination.
@@ -2137,20 +2330,43 @@ async function recentPublicTrades(provider, market, symbol, end, limit, { endTim
     }
   } else if (provider === 'coinbase') {
     const productId = coinbaseProductId(symbol);
-    let afterCursor = '';
+    coinbaseTradeHistoryStats.requests += 1;
+    if (historical) {
+      coinbaseTradeHistoryStats.historical_requests += 1;
+    } else {
+      coinbaseTradeHistoryStats.latest_requests += 1;
+    }
+    let afterCursor = coinbaseTradeStartCursor(
+      productId,
+      end,
+      historical,
+    );
     let previousCursor = '';
-    const maxPages = historical ? 8 : 1;
+    const maxPages = historical
+      ? COINBASE_TRADE_MAX_PAGES_PER_REQUEST
+      : 1;
+    // `wanted` is a trade budget. For 1-second candles the upstream caller uses
+    // roughly 8 trades per desired second; count accepted unique seconds as the
+    // actual completion signal so high- and low-activity books both terminate.
+    const requestedSecondBuckets = Number(secondBucketTarget);
+    const targetSecondBuckets = Number.isFinite(requestedSecondBuckets)
+      ? Math.max(120, Math.min(1_000, Math.floor(requestedSecondBuckets)))
+      : Math.max(120, Math.min(1_000, Math.ceil(wanted / 8)));
+    const acceptedSeconds = new Set();
     for (
       let pageIndex = 0;
-      pageIndex < maxPages && trades.length < wanted;
+      pageIndex < maxPages;
       pageIndex += 1
     ) {
       const page = await fetchCoinbasePublicTradePage(
         productId,
         afterCursor,
-        100,
+        COINBASE_TRADE_PAGE_LIMIT,
       );
+      coinbaseTradeHistoryStats.pages += 1;
       if (!page.rows.length) break;
+      let pageOldestTime = null;
+      let pageNewestTime = null;
       for (const item of page.rows) {
         const trade = publicTrade(
           item.time,
@@ -2158,13 +2374,30 @@ async function recentPublicTrades(provider, market, symbol, end, limit, { endTim
           item.size,
           item.trade_id,
         );
-        if (trade && trade.time <= end + 5_000) {
+        if (!trade) continue;
+        pageOldestTime = pageOldestTime == null
+          ? trade.time
+          : Math.min(pageOldestTime, trade.time);
+        pageNewestTime = pageNewestTime == null
+          ? trade.time
+          : Math.max(pageNewestTime, trade.time);
+        const boundarySlack = historical ? 0 : 5_000;
+        if (trade.time <= end + boundarySlack) {
           trades.push(trade);
+          acceptedSeconds.add(Math.floor(trade.time / 1_000));
         }
       }
       const nextCursor = String(page.after || '');
+      rememberCoinbaseTradeCursorCheckpoint(productId, {
+        after: nextCursor,
+        oldestTime: pageOldestTime,
+        newestTime: pageNewestTime,
+      });
+      const crossedBoundary =
+        Number.isFinite(pageOldestTime) && pageOldestTime <= end;
       if (
         !historical ||
+        (crossedBoundary && acceptedSeconds.size >= targetSecondBuckets) ||
         !nextCursor ||
         nextCursor === afterCursor ||
         nextCursor === previousCursor
@@ -2546,7 +2779,11 @@ async function recentPublicTrades(provider, market, symbol, end, limit, { endTim
     }
   }
 
-  return dedupePublicTrades(trades).slice(-wanted);
+  const deduped = dedupePublicTrades(trades);
+  // Coinbase is already bounded to at most 12 x 1000 official trades. Keep
+  // the whole bounded scan so a high-activity page does not lose older second
+  // buckets merely because more than `wanted` trades occurred in the window.
+  return provider === 'coinbase' ? deduped : deduped.slice(-wanted);
 }
 
 function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limit) {
@@ -2731,7 +2968,10 @@ async function fetchSecondMarketKlines(provider, market, symbol, end, limit, opt
     symbol,
     end,
     tradeLimit,
-    { endTimeProvided: options.endTimeProvided === true },
+    {
+      endTimeProvided: options.endTimeProvided === true,
+      secondBucketTarget: limit,
+    },
   );
   return aggregateTradesToSecondRows(trades, provider, market, symbol, end, limit);
 }
@@ -2809,17 +3049,11 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
 }
 
 
-const BINANCE_COMMON_QUOTE_ASSETS = Object.freeze([
-  'USDT', 'USDC', 'FDUSD', 'USD1', 'USD',
-  'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY',
-  'TRY', 'BRL', 'AUD', 'CAD',
-]);
-
-const ASSET_QUOTE_CANDIDATES = Object.freeze([
-  'USDT', 'USDC', 'FDUSD', 'USD1', 'USD',
-  'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY',
-  'TRY', 'BRL', 'AUD', 'CAD',
-]);
+// Step781.2.9: asset quote discovery must use the same exact quote set as
+// directory identity, ticker, realtime and Kline history. Actual menus still
+// include only quotes returned by official provider catalogs with count > 0.
+const BINANCE_COMMON_QUOTE_ASSETS = SUPPORTED_EXACT_QUOTE_ASSETS;
+const ASSET_QUOTE_CANDIDATES = SUPPORTED_EXACT_QUOTE_ASSETS;
 
 async function assetQuoteSummary(rawBase) {
   const base = compact(rawBase);
@@ -3133,6 +3367,19 @@ export function getBinanceMarketRestHealth() {
     bybit_second_history_indexed_bucket_updates: true,
     bybit_hot_targets_parallel_start: true,
     one_second_history_window_passes_by_time_span_not_page_count: true,
+    coinbase_spot_ticker_current_source: 'exchange_product_ticker_last_trade',
+    coinbase_spot_ticker_current_cache_ms: COINBASE_TICKER_TTL_MS,
+    coinbase_spot_ticker_stats_cache_ms: COINBASE_STATS_TTL_MS,
+    coinbase_spot_usdt_exact_product_passthrough: true,
+    coinbase_all_directory_quote_realtime_and_history_supported: true,
+    all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
+    coinbase_usdt_directory_not_cross_aliased_to_usd: true,
+    shared_spot_quote_suffixes: SUPPORTED_EXACT_QUOTE_ASSETS,
+    coinbase_trade_history: getCoinbaseTradeHistoryHealth(),
+    coinbase_trade_history_page_limit: COINBASE_TRADE_PAGE_LIMIT,
+    coinbase_trade_history_cursor_checkpoint_reuse: true,
+    coinbase_trade_history_no_three_minute_wall: true,
+    asset_market_tab_count_uses_visible_rows: true,
     one_second_history_end_time_pagination: {
       binance_spot: 'native_1s_kline_end_time',
       binance_contract: 'protected_archive_edge_live_chain',
@@ -3233,7 +3480,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3245,7 +3492,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3255,7 +3502,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3264,7 +3511,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3274,7 +3521,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         self_test: selfTest,
       });
       return true;
@@ -3290,7 +3537,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         checks: tests.length,
         tests,
       });
@@ -3305,7 +3552,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3324,7 +3571,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3452,7 +3699,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.58',
+        version: '650.8.15.60',
         provider,
         market_type: market,
         symbol,
@@ -3527,4 +3774,7 @@ export const _test = {
   recentPublicTrades,
   fetchSecondMarketKlines,
   fetchBybitSecondHistoryFromChild,
+  coinbaseTradeStartCursor,
+  getCoinbaseTradeHistoryHealth,
+  SUPPORTED_EXACT_QUOTE_ASSETS,
 };

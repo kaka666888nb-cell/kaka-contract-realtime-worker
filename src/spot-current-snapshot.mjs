@@ -48,7 +48,7 @@ function finiteNumber(value) {
 function quoteAssetFor(row, symbol) {
   const explicit = compact(row?.quote_asset ?? row?.quoteAsset ?? row?.settle_asset);
   if (explicit) return explicit;
-  for (const quote of ['USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'USD', 'BTC', 'ETH', 'EUR', 'GBP', 'JPY', 'KRW']) {
+  for (const quote of ['FDUSD', 'PYUSD', 'USDT', 'USDC', 'USD1', 'TUSD', 'BUSD', 'EURC', 'DAI', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'KRW', 'TRY', 'BRL', 'AUD', 'CAD', 'SGD', 'HKD', 'CHF', 'MXN', 'PLN']) {
     if (symbol.endsWith(quote) && symbol.length > quote.length) return quote;
   }
   return '';

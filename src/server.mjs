@@ -31,9 +31,20 @@ function symbolKey(raw) {
     .replace(/_UMCBL$/i, '')
     .replace(/[^A-Z0-9]/g, '');
 }
+// Step781.2.9: every public spot directory path, realtime channel and
+// 1-second history path must recognize the same exact quote suffix set.
+// Longest suffixes are listed first so EURC is never parsed as EUR and
+// PYUSD/FDUSD/TUSD/BUSD are never parsed as plain USD.
+const SPOT_QUOTE_SUFFIXES = Object.freeze([
+  'FDUSD', 'PYUSD', 'USDT', 'USDC', 'USD1', 'TUSD', 'BUSD', 'EURC',
+  'DAI', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'KRW',
+  'TRY', 'BRL', 'AUD', 'CAD', 'SGD', 'HKD', 'CHF', 'MXN', 'PLN',
+]);
 function splitSymbol(symbol) {
-  for (const quote of ['FDUSD', 'USDT', 'USDC', 'USD1', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'TRY', 'BRL', 'AUD', 'CAD']) {
-    if (symbol.endsWith(quote)) return [symbol.slice(0, -quote.length), quote];
+  for (const quote of SPOT_QUOTE_SUFFIXES) {
+    if (symbol.endsWith(quote) && symbol.length > quote.length) {
+      return [symbol.slice(0, -quote.length), quote];
+    }
   }
   return [symbol, 'USDT'];
 }
@@ -42,7 +53,7 @@ function coinbaseProductId(symbol) {
   return `${base}-${quote}`;
 }
 
-// Step781.2.7: Coinbase public market channels normalize USDC books to the
+// Step781.2.8: Coinbase public market channels normalize USDC books to the
 // corresponding USD product. Keep the App identity unchanged, but subscribe to
 // the official public product actually emitted by the feed.
 function coinbasePublicTradeProductId(symbol) {
@@ -1195,18 +1206,31 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.58', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.60', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', coinbase_all_directory_quotes_realtime_supported: true,
+      all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
+      coinbase_usdt_directory_not_cross_aliased_to_usd: true, shared_spot_quote_suffixes: SPOT_QUOTE_SUFFIXES, binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.58',
+      version: '650.8.15.60',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat',
       coinbase_one_second_empty_seconds_owned_by_app: true,
+      coinbase_spot_usdt_realtime_supported: true,
+      coinbase_all_directory_quotes_realtime_supported: true,
+      all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
+      coinbase_usdt_directory_not_cross_aliased_to_usd: true,
+      coinbase_eur_realtime_supported: true,
+      coinbase_trade_history_page_limit: 1000,
+      coinbase_trade_history_max_pages_per_request: 12,
+      coinbase_trade_history_cursor_checkpoint_reuse: true,
+      coinbase_trade_history_no_three_minute_wall: true,
+      coinbase_asset_ticker_shared_live_source: 'exchange_product_ticker_last_trade_plus_stats',
+      asset_market_tab_count_uses_visible_rows: true,
       providers: [...PROVIDERS],
       spot_providers: SPOT_PROVIDERS,
       contract_providers: CONTRACT_PROVIDERS,
@@ -1478,7 +1502,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Kaka market realtime worker 650.8.15.58 listening on ${PORT}`);
+  console.log(`Kaka market realtime worker 650.8.15.60 listening on ${PORT}`);
   setTimeout(() => {
     startBybitSecondHistoryHotSeeds().catch(() => {});
   }, 1200).unref?.();
