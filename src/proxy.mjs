@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.56';
+const STEP_VERSION = '650.8.15.57';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -307,6 +307,9 @@ const server = http.createServer(async (req, res) => {
         realtimeWsHealth?.bybit_second_history || null,
       bybit_recent_trade_time_range_parameters_used: false,
       one_second_history_app_direct_left_backfill_required: true,
+      coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat',
+      coinbase_one_second_empty_seconds_owned_by_app: true,
+      one_second_history_drag_window_target_seconds: 90,
       spot_flow_shared_history: '/api/spot-flow/history',
       spot_flow_shared_history_health: '/api/spot-flow/history-health',
       spot_flow_shared_history_state: getSpotFlowHistoryHealth(),
@@ -379,6 +382,11 @@ const server = http.createServer(async (req, res) => {
         bitget_429_rate_limit_detection: true,
         gate_rate_limit_reset_header_detection: true,
         coinbase_public_rest_guard_below_official_10rps: true,
+        coinbase_one_second_realtime_transport: 'official_exchange_ticker_per_match_plus_heartbeat',
+        coinbase_public_usdc_alias_to_usd_for_market_channels: true,
+        one_second_wall_clock_transport_reconnect_independent: true,
+        one_second_history_drag_window_target_seconds: 90,
+        one_second_history_drag_max_pages: 4,
         binance_contract_market_transport: 'official_websocket_ticker_bookticker_contract_info_mark_price',
         binance_contract_market_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
         binance_contract_market_rest_role: 'automatic_rest_disabled_websocket_snapshot_only',

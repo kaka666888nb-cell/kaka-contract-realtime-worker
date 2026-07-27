@@ -41,6 +41,15 @@ function coinbaseProductId(symbol) {
   const [base, quote] = splitSymbol(symbol);
   return `${base}-${quote}`;
 }
+
+// Step781.2.6: Coinbase public market channels normalize USDC books to the
+// corresponding USD product. Keep the App identity unchanged, but subscribe to
+// the official public product actually emitted by the feed.
+function coinbasePublicTradeProductId(symbol) {
+  const [base, rawQuote] = splitSymbol(symbol);
+  const quote = rawQuote === 'USDC' ? 'USD' : rawQuote;
+  return `${base}-${quote}`;
+}
 function okxInstId(symbol, market) {
   const [base, quote] = splitSymbol(symbol);
   return `${base}-${quote}${market === 'contract' ? '-SWAP' : ''}`;
@@ -200,9 +209,27 @@ function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quot
     };
   }
   if (provider === 'coinbase') {
-    const productId = coinbaseProductId(symbol);
-    return {
+    const productId = coinbasePublicTradeProductId(symbol);
+    const exchangeCandidate = {
       tradeMode: true,
+      sourceName: 'coinbase_exchange_ticker_per_match',
+      url: 'wss://ws-feed.exchange.coinbase.com',
+      subscribe: {
+        type: 'subscribe',
+        product_ids: [productId],
+        channels: ['ticker', 'heartbeat'],
+      },
+      parseTrades(raw) {
+        const message = JSON.parse(raw.toString());
+        if (message?.type !== 'ticker') return [];
+        if (String(message?.product_id || '').toUpperCase() !== productId) return [];
+        const item = tradeItem(Date.parse(String(message?.time || '')), message?.price, message?.last_size);
+        return item ? [item] : [];
+      },
+    };
+    const advancedCandidate = {
+      tradeMode: true,
+      sourceName: 'coinbase_advanced_market_trades',
       url: 'wss://advanced-trade-ws.coinbase.com',
       subscribe: [
         { type: 'subscribe', product_ids: [productId], channel: 'market_trades' },
@@ -221,6 +248,14 @@ function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quot
         }
         return items;
       },
+    };
+    return {
+      tradeMode: true,
+      sourceName: exchangeCandidate.sourceName,
+      url: exchangeCandidate.url,
+      subscribe: exchangeCandidate.subscribe,
+      parseTrades: exchangeCandidate.parseTrades,
+      candidates: [exchangeCandidate, advancedCandidate],
     };
   }
   if (provider === 'okx') {
@@ -1160,16 +1195,18 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.56', binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.57', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.56',
+      version: '650.8.15.57',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
+      coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat',
+      coinbase_one_second_empty_seconds_owned_by_app: true,
       providers: [...PROVIDERS],
       spot_providers: SPOT_PROVIDERS,
       contract_providers: CONTRACT_PROVIDERS,
@@ -1334,14 +1371,15 @@ wss.on('connection', async (client, req, parsedUrl) => {
     client.on('error', cleanupPoll);
     return;
   }
-  try {
-    upstream = new WebSocket(cfg.url, { handshakeTimeout: 15_000 });
-  } catch (error) {
-    client.close(1011, String(error).slice(0, 120));
-    return;
-  }
+  const upstreamCandidates = Array.isArray(cfg.candidates) && cfg.candidates.length
+    ? cfg.candidates
+    : [cfg];
+  let candidateIndex = 0;
+  let activeCfg = upstreamCandidates[0];
+  let closing = false;
 
   const cleanup = () => {
+    closing = true;
     clearInterval(heartbeat);
     clearInterval(secondTickTimer);
     try {
@@ -1351,65 +1389,96 @@ wss.on('connection', async (client, req, parsedUrl) => {
   client.on('close', cleanup);
   client.on('error', cleanup);
 
-  upstream.on('open', () => {
-    const subscriptions = Array.isArray(cfg.subscribe) ? cfg.subscribe : (cfg.subscribe ? [cfg.subscribe] : []);
-    for (const subscription of subscriptions) upstream.send(JSON.stringify(subscription));
-    if (cfg.tradeMode === true) {
-      secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
-      secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
-      // Step650.8.15.33: WebSocket carries official real trades only.
-      // Historical 1-second seeds are fetched by the App through /api/klines. Empty
-      // natural seconds are extended locally on the visible device with zero volume,
-      // so Render does not replay history or emit one synthetic message per second.
-    }
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({
-        type:'ready', provider, market, symbol, interval,
-        protocol:'kaka.market.realtime.v1',
-        mode: cfg.tradeMode === true ? 'official_public_trade_1s' : 'official_public_kline',
-      }));
-    }
-    heartbeat = setInterval(() => {
-      if (upstream.readyState === WebSocket.OPEN) {
-        if (cfg.heartbeatMessage) upstream.send(JSON.stringify(cfg.heartbeatMessage));
-        else if (provider === 'okx' || provider === 'bitget') upstream.send('ping');
-        else upstream.ping();
-      }
-      if (client.readyState === WebSocket.OPEN) client.ping();
-    }, 20_000);
-  });
-
-  upstream.on('message', (raw) => {
-    const text = raw.toString();
-    if (text === 'pong') return;
+  const connectCandidate = () => {
+    if (closing || client.readyState !== WebSocket.OPEN) return;
+    activeCfg = upstreamCandidates[candidateIndex] || cfg;
+    let socket;
     try {
-      if (cfg.tradeMode === true) {
-        const trades = cfg.parseTrades(raw);
-        secondAggregator?.ingest(trades);
+      socket = new WebSocket(activeCfg.url, { handshakeTimeout: 15_000 });
+      upstream = socket;
+    } catch (error) {
+      if (candidateIndex + 1 < upstreamCandidates.length) {
+        candidateIndex += 1;
+        connectCandidate();
+      } else {
+        client.close(1011, String(error).slice(0, 120));
+      }
+      return;
+    }
+
+    socket.on('open', () => {
+      if (closing || socket !== upstream) return;
+      const subscriptions = Array.isArray(activeCfg.subscribe)
+        ? activeCfg.subscribe
+        : (activeCfg.subscribe ? [activeCfg.subscribe] : []);
+      for (const subscription of subscriptions) socket.send(JSON.stringify(subscription));
+      if (cfg.tradeMode === true && !secondAggregator) {
+        secondAggregator = createSecondTradeAggregator({ provider, market, symbol, interval, client });
+        secondTickTimer = setInterval(() => secondAggregator?.tick(), 250);
+      }
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+          type:'ready', provider, market, symbol, interval,
+          protocol:'kaka.market.realtime.v1',
+          mode: cfg.tradeMode === true ? 'official_public_trade_1s' : 'official_public_kline',
+          upstream_source: activeCfg.sourceName || provider,
+        }));
+      }
+      clearInterval(heartbeat);
+      heartbeat = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          if (activeCfg.heartbeatMessage) socket.send(JSON.stringify(activeCfg.heartbeatMessage));
+          else if (provider === 'okx' || provider === 'bitget') socket.send('ping');
+          else socket.ping();
+        }
+        if (client.readyState === WebSocket.OPEN) client.ping();
+      }, 20_000);
+    });
+
+    socket.on('message', (raw) => {
+      if (closing || socket !== upstream) return;
+      const text = raw.toString();
+      if (text === 'pong') return;
+      try {
+        if (cfg.tradeMode === true) {
+          const trades = activeCfg.parseTrades(raw);
+          secondAggregator?.ingest(trades);
+          return;
+        }
+        const normalized = activeCfg.parse(raw);
+        if (!normalized || client.readyState !== WebSocket.OPEN) return;
+        const messages = Array.isArray(normalized) ? normalized : [normalized];
+        for (const message of messages) {
+          if (message && client.readyState === WebSocket.OPEN) client.send(message);
+        }
+      } catch (_) {}
+    });
+
+    socket.on('close', (code, reason) => {
+      if (socket !== upstream) return;
+      clearInterval(heartbeat);
+      heartbeat = null;
+      upstream = null;
+      if (!closing && client.readyState === WebSocket.OPEN && candidateIndex + 1 < upstreamCandidates.length) {
+        candidateIndex += 1;
+        connectCandidate();
         return;
       }
-      const normalized = cfg.parse(raw);
-      if (!normalized || client.readyState !== WebSocket.OPEN) return;
-      const messages = Array.isArray(normalized) ? normalized : [normalized];
-      for (const message of messages) {
-        if (message && client.readyState === WebSocket.OPEN) client.send(message);
+      if (!closing && client.readyState === WebSocket.OPEN) {
+        client.close(code === 1000 ? 1000 : 1012, `upstream closed ${reason || ''}`.slice(0, 120));
       }
-    } catch (_) {}
-  });
+    });
+    socket.on('error', () => {
+      try { socket.terminate(); } catch (_) {}
+    });
+  };
 
-  upstream.on('close', (code, reason) => {
-    clearInterval(heartbeat);
-    if (client.readyState === WebSocket.OPEN) {
-      client.close(code === 1000 ? 1000 : 1012, `upstream closed ${reason || ''}`.slice(0, 120));
-    }
-  });
-  upstream.on('error', () => {
-    if (client.readyState === WebSocket.OPEN) client.close(1011, 'upstream connection failed');
-  });
+  connectCandidate();
+
 });
 
 server.listen(PORT, () => {
-  console.log(`Kaka market realtime worker 650.8.15.56 listening on ${PORT}`);
+  console.log(`Kaka market realtime worker 650.8.15.57 listening on ${PORT}`);
   setTimeout(() => {
     startBybitSecondHistoryHotSeeds().catch(() => {});
   }, 1200).unref?.();
@@ -1417,5 +1486,7 @@ server.listen(PORT, () => {
 
 export const _test = {
   createSecondTradeAggregator,
+  secondTradeConfig,
+  coinbasePublicTradeProductId,
   binanceSharedWsHealth,
 };

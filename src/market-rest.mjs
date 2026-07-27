@@ -3230,7 +3230,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3242,7 +3242,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3252,7 +3252,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3261,7 +3261,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3271,7 +3271,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         self_test: selfTest,
       });
       return true;
@@ -3287,7 +3287,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         checks: tests.length,
         tests,
       });
@@ -3302,7 +3302,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3321,7 +3321,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3449,7 +3449,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.56',
+        version: '650.8.15.57',
         provider,
         market_type: market,
         symbol,
