@@ -1,3 +1,7 @@
+# Step781.2.2 / Render 650.8.15.53
+
+Fixes the three remaining verified one-second older-page failures. OKX history-trades now uses the documented timestamp pagination mode (`type=2`, `after=<timestamp>`). Bybit no longer sends ignored `startTime/endTime` parameters to the recent-trade endpoint; the child maintains a bounded exact-symbol publicTrade WebSocket history for spot and contract, with BTCUSDT/ETHUSDT hot targets and ten-minute on-demand leases. No empty seconds are fabricated by the backend.
+
 # Step781.2.1 / Render 650.8.15.52
 
 Production audit: latest one-second history passed 11/11, while true older-page pagination passed 5/11. This version adds bounded historical pagination for OKX, Bybit and Bitget and keeps verified Binance, Gate and Coinbase paths unchanged.
