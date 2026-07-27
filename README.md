@@ -1,6 +1,6 @@
 # Kaka Contract Realtime Worker
 
-Version **650.8.15.48 / Step777**.
+Version **650.8.15.49 / Step778**.
 
 Step777 adds a shared exact-key spot taker-flow history endpoint:
 
@@ -17,3 +17,8 @@ Unchanged boundaries:
 - Binance contract direct REST remains hard disabled.
 - No new SQL, Edge, Cron, environment variables, or persistent raw trade history.
 - Current spot snapshot, contract flow, funding, liquidation, depth, trades, Klines and WebSocket routes remain intact.
+
+
+## Step778
+
+Adds `/api/spot-flow/snapshot` and `/api/spot-flow/snapshot-health`. The endpoint activates and reads the existing spot trade-flow periods, size-periods, and five-day daily RPCs once per exact provider+symbol key, then shares a 40-second cache with inflight merge and a five-minute verified stale fallback. App clients no longer call those four Supabase RPCs directly.
