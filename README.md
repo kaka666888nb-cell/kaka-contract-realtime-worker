@@ -1,3 +1,7 @@
+# Step781.2 / Render 650.8.15.51
+
+Binance contract 1-second history now uses the existing shared official continuous-kline WebSocket ring. Render-direct Binance Futures REST remains disabled. BTCUSDT and ETHUSDT are bounded hot seeds; other exact symbols stay active for ten minutes after a history read.
+
 # Step780 / Render 650.8.15.50
 
 Adds a backend-shared exact spot ticker endpoint for coin-detail first paint. The App no longer calls the dedicated spot ticker Edge function or device-direct ticker fallbacks for that first paint.

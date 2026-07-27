@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.50",
+  "version": "650.8.15.51",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,5 +10,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.50 / Step780 shared exact spot ticker first paint"
+  "description": "Kaka contract realtime worker 650.8.15.51 / Step781.2 shared Binance contract 1-second history"
 }
