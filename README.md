@@ -1,8 +1,10 @@
-# Step781.2.9 / Render 650.8.15.60
+# Step781.2.10 / Render 650.8.15.61
 
-- Coinbase all real spot quote identities share the same directory/ticker/WebSocket/1-second-history parser.
-- Coinbase trade history uses official `CB-AFTER` cursor checkpoints, 1000 trades per page, at most 12 pages per request, and no longer restarts from latest on every left drag.
-- Coinbase USD/USDT/USDC/EUR/GBP/BTC/ETH and any other actual directory quote are handled by exact native product identity.
-- Six spot and five contract providers retain strict provider/market/symbol/quote isolation.
-- Render direct Binance contract REST remains hard disabled.
-- Asset quote discovery now uses the same expanded exact quote set as directory/ticker/realtime/history, and Coinbase USDT is never cross-aliased to USD.
+Root-cause follow-up after the Step781.2.9 production gate:
+
+- preserves all verified Coinbase USD/USDT/EUR realtime and deep-history fixes;
+- acknowledges the official Bybit Spot recent-trade limit of 60 and absence of a public older cursor;
+- starts all officially listed BTC/ETH Spot quote pairs at process boot;
+- paginates only verified Bybit recent-trade/WebSocket rows by reserving a bounded oldest slice for the first older request;
+- never synthesizes empty seconds, aliases quote assets, or crosses providers;
+- keeps Binance contract Render-direct REST permanently disabled.
