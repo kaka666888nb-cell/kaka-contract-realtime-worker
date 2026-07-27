@@ -1,6 +1,6 @@
-# Step781.2 / Render 650.8.15.51
+# Step781.2.1 / Render 650.8.15.52
 
-Binance contract 1-second history now uses the existing shared official continuous-kline WebSocket ring. Render-direct Binance Futures REST remains disabled. BTCUSDT and ETHUSDT are bounded hot seeds; other exact symbols stay active for ten minutes after a history read.
+Production audit: latest one-second history passed 11/11, while true older-page pagination passed 5/11. This version adds bounded historical pagination for OKX, Bybit and Bitget and keeps verified Binance, Gate and Coinbase paths unchanged.
 
 # Step780 / Render 650.8.15.50
 
