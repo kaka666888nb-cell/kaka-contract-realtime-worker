@@ -2158,15 +2158,12 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       : 1;
 
     if (historical) {
-      // OKX history-trades defaults to type=1, where `after`
-      // is interpreted as a tradeId. Step781.2.1 passed a
-      // millisecond timestamp without type=2, which happened
-      // to work for some spot rows but repeated the newest
-      // contract page. Use the documented timestamp cursor.
-      let cursor = String(
-        Math.max(1, Math.floor(Number(end))),
-      );
-      let previousCursor = '';
+      // Step781.2.4: type=2 uses a millisecond timestamp cursor. Keep the
+      // cursor strictly decreasing even when OKX returns an inclusive or
+      // slightly newer boundary page, and never accept a trade newer than
+      // the caller's exact end_time.
+      let cursor = Math.max(1, Math.floor(Number(end)));
+      let previousCursor = null;
       for (
         let pageIndex = 0;
         pageIndex < 8 && trades.length < wanted;
@@ -2176,7 +2173,7 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
           `https://www.okx.com/api/v5/market/history-trades` +
           `?instId=${encodeURIComponent(instrument)}` +
           `&type=2` +
-          `&after=${encodeURIComponent(cursor)}` +
+          `&after=${encodeURIComponent(String(cursor))}` +
           `&limit=100`,
           20_000,
         );
@@ -2186,6 +2183,7 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
         if (!page.length) break;
 
         let oldestTimestamp = null;
+        let oldestAcceptedTimestamp = null;
         for (const item of page) {
           const rawSize = num(item.sz);
           const baseSize =
@@ -2198,31 +2196,38 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
             baseSize,
             item.tradeId,
           );
-          if (trade && trade.time <= end + 5_000) {
+          const timestamp = normalizeTradeTimestamp(item.ts);
+          if (timestamp !== null) {
+            oldestTimestamp = oldestTimestamp == null
+              ? timestamp
+              : Math.min(oldestTimestamp, timestamp);
+          }
+          if (trade && trade.time <= end) {
             trade.raw_contract_count =
               market === 'contract'
                 ? Math.abs(rawSize || 0)
                 : null;
             trade.quantity_unit = 'base_asset';
             trades.push(trade);
-          }
-          const timestamp = Number(item.ts);
-          if (Number.isFinite(timestamp)) {
-            oldestTimestamp =
-              oldestTimestamp == null
-                ? timestamp
-                : Math.min(oldestTimestamp, timestamp);
+            oldestAcceptedTimestamp =
+              oldestAcceptedTimestamp == null
+                ? trade.time
+                : Math.min(oldestAcceptedTimestamp, trade.time);
           }
         }
 
-        const nextCursor = String(
-          oldestTimestamp == null
-            ? ''
-            : Math.max(1, Math.floor(oldestTimestamp - 1)),
+        const observedOlder = oldestAcceptedTimestamp ?? oldestTimestamp;
+        const nextCursor = Math.max(
+          1,
+          Math.min(
+            cursor - 1000,
+            observedOlder == null
+              ? cursor - 5000
+              : Math.floor(observedOlder - 1),
+          ),
         );
         if (
-          !nextCursor ||
-          nextCursor === cursor ||
+          nextCursor >= cursor ||
           nextCursor === previousCursor
         ) {
           break;
@@ -2333,6 +2338,20 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
 
     if (historical && market === 'contract') {
+      // Step781.2.4: start from the official history endpoint at the
+      // requested time window. Starting from `/fills` always reintroduced
+      // the current page and could satisfy the loose boundary with the same
+      // two seconds. Further pages use the response tail tradeId as the
+      // documented idLessThan/endId cursor.
+      const startTime = secondHistoryWindowStart(
+        end,
+        wanted,
+        {
+          minMs: 10 * 60_000,
+          maxMs: 6 * 60 * 60_000,
+          perWantedMs: 5_000,
+        },
+      );
       let idLessThan = '';
       let previousCursor = '';
       for (
@@ -2340,22 +2359,23 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
         pageIndex < 8 && trades.length < wanted;
         pageIndex += 1
       ) {
-        const url = pageIndex === 0
-          ? `https://api.bitget.com/api/v2/mix/market/fills` +
-            `?symbol=${encodeURIComponent(nativeSymbol)}` +
-            `&productType=${encodeURIComponent(productType)}` +
-            `&limit=100`
-          : `https://api.bitget.com/api/v2/mix/market/fills-history` +
-            `?symbol=${encodeURIComponent(nativeSymbol)}` +
-            `&productType=${encodeURIComponent(productType)}` +
-            `&limit=100` +
-            `&idLessThan=${encodeURIComponent(idLessThan)}`;
-        const payload = await jsonFetch(url, 20_000);
+        const params = new URLSearchParams({
+          symbol: nativeSymbol,
+          productType,
+          limit: '1000',
+          startTime: String(Math.floor(startTime)),
+          endTime: String(Math.max(1, Math.floor(Number(end)))),
+        });
+        if (idLessThan) {
+          params.set('idLessThan', idLessThan);
+        }
+        const payload = await jsonFetch(
+          `https://api.bitget.com/api/v2/mix/market/fills-history?${params.toString()}`,
+          20_000,
+        );
         const items = payloadRows(payload);
         if (!items.length) break;
 
-        let oldestItem = null;
-        let oldestTimestamp = null;
         for (const item of items) {
           const trade = publicTrade(
             item.ts,
@@ -2363,22 +2383,23 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
             item.size,
             item.tradeId ?? item.execId,
           );
-          if (trade && trade.time <= end + 5_000) {
+          if (trade && trade.time <= end) {
             trades.push(trade);
-          }
-          const timestamp = normalizeTradeTimestamp(item.ts);
-          if (
-            timestamp !== null &&
-            (oldestTimestamp === null || timestamp < oldestTimestamp)
-          ) {
-            oldestTimestamp = timestamp;
-            oldestItem = item;
           }
         }
 
+        const tailCursorItem = [...items]
+          .reverse()
+          .find((item) =>
+            String(
+              item?.tradeId ?? item?.execId ?? '',
+            ).trim(),
+          );
         const nextCursor = String(
-          oldestItem?.tradeId ?? oldestItem?.execId ?? '',
-        );
+          tailCursorItem?.tradeId ??
+          tailCursorItem?.execId ??
+          '',
+        ).trim();
         if (
           !nextCursor ||
           nextCursor === idLessThan ||
@@ -2549,7 +2570,7 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
 const KAKA_REALTIME_CHILD_PORT =
   Number(process.env.KAKA_CHILD_PORT || 10001);
 
-function fetchBybitSecondHistoryFromChild({
+async function fetchBybitSecondHistoryFromChild({
   market,
   symbol,
   nativeSymbol,
@@ -2557,16 +2578,17 @@ function fetchBybitSecondHistoryFromChild({
   end,
   limit,
 }) {
-  return new Promise((resolve, reject) => {
-    const params = new URLSearchParams({
-      market,
-      symbol,
-      native_symbol: nativeSymbol,
-      category,
-      end_time: String(end),
-      limit: String(limit),
-      wait_ms: '5000',
-    });
+  const params = new URLSearchParams({
+    market,
+    symbol,
+    native_symbol: nativeSymbol,
+    category,
+    end_time: String(end),
+    limit: String(limit),
+    wait_ms: '2500',
+  });
+
+  const readOnce = () => new Promise((resolve, reject) => {
     const request = http.get({
       hostname: '127.0.0.1',
       port: KAKA_REALTIME_CHILD_PORT,
@@ -2601,13 +2623,28 @@ function fetchBybitSecondHistoryFromChild({
         }
       });
     });
-    request.setTimeout(9000, () => {
+    request.setTimeout(12_000, () => {
       request.destroy(new Error(
         'bybit_second_child_timeout',
       ));
     });
     request.on('error', reject);
   });
+
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await readOnce();
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 120),
+        );
+      }
+    }
+  }
+  throw lastError || new Error('bybit_second_child_failed');
 }
 
 async function fetchSecondMarketKlines(provider, market, symbol, end, limit) {
@@ -3049,6 +3086,10 @@ export function getBinanceMarketRestHealth() {
     shared_cache_max: BINANCE_SHARED_CACHE_MAX,
     contract_second_history_max_rest_pages: 8,
     bybit_second_history_rows_normalized: true,
+    okx_bitget_contract_strict_end_time_boundary: true,
+    okx_contract_timestamp_cursor_monotonic_decrease: true,
+    bitget_contract_history_starts_at_requested_window: true,
+    bybit_second_history_child_fast_read: true,
     one_second_history_end_time_pagination: {
       binance_spot: 'native_1s_kline_end_time',
       binance_contract: 'protected_archive_edge_live_chain',
@@ -3056,11 +3097,11 @@ export function getBinanceMarketRestHealth() {
       gate_spot: 'public_trade_history',
       gate_contract: 'public_trade_history_to_time',
       okx_spot: 'history_trades_after_timestamp',
-      okx_contract: 'history_trades_after_timestamp',
+      okx_contract: 'history_trades_type_2_strict_monotonic_timestamp',
       bybit_spot: 'shared_public_trade_websocket_ring',
       bybit_contract: 'shared_public_trade_websocket_ring',
       bitget_spot: 'fills_history_start_end_time',
-      bitget_contract: 'fills_history_id_less_than_cursor',
+      bitget_contract: 'fills_history_start_end_time_plus_id_less_than_cursor',
     },
     one_second_history_app_direct_left_backfill_required: true,
     synthetic_one_second_candles: false,
@@ -3149,7 +3190,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3161,7 +3202,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3171,7 +3212,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3180,7 +3221,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3190,7 +3231,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         self_test: selfTest,
       });
       return true;
@@ -3206,7 +3247,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         checks: tests.length,
         tests,
       });
@@ -3221,7 +3262,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3240,7 +3281,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3361,7 +3402,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.54',
+        version: '650.8.15.55',
         provider,
         market_type: market,
         symbol,
@@ -3430,4 +3471,9 @@ export const _test = {
   marketRow,
   payloadRows,
   tickerRow,
+  secondHistoryIsOlderRequest,
+  secondHistoryWindowStart,
+  recentPublicTrades,
+  fetchSecondMarketKlines,
+  fetchBybitSecondHistoryFromChild,
 };

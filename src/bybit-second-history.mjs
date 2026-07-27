@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.54';
+const VERSION = '650.8.15.55';
 const PROVIDER = 'bybit';
 const MAX_ROWS = 3600;
 const MAX_ENTRIES = 32;
@@ -8,6 +8,7 @@ const ON_DEMAND_LEASE_MS = 10 * 60_000;
 const RECONNECT_MAX_MS = 30_000;
 const FIRST_PERSIST_MS = 60_000;
 const PERSIST_INTERVAL_MS = 15 * 60_000;
+const SEED_REFRESH_MS = 60_000;
 const SUPABASE_URL =
   String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY =
@@ -220,8 +221,16 @@ function ingestTrade(entry, rawTime, rawPrice, rawSize) {
   notify(entry);
 }
 
-async function seedRecent(entry) {
+async function seedRecent(entry, { force = false } = {}) {
   if (entry.seedPromise) return entry.seedPromise;
+  if (
+    !force &&
+    entry.rows.length > 0 &&
+    Number(entry.lastSeedAt || 0) > 0 &&
+    Date.now() - Number(entry.lastSeedAt || 0) < SEED_REFRESH_MS
+  ) {
+    return;
+  }
   entry.seedPromise = (async () => {
     stats.seed_requests += 1;
     const limit = entry.market === 'spot' ? 60 : 1000;
@@ -273,6 +282,7 @@ async function seedRecent(entry) {
       stats.last_error = String(error?.message || error);
     }
   })().finally(() => {
+    entry.lastSeedAt = Date.now();
     entry.seedPromise = null;
   });
   return entry.seedPromise;
@@ -407,6 +417,7 @@ function createEntry({
     heartbeat: null,
     waiters: new Set(),
     seedPromise: null,
+    lastSeedAt: 0,
     restorePromise: null,
     restored: false,
     persistPromise: null,
@@ -635,9 +646,39 @@ async function ensureEntry({
     }
   }
 
+  // Step781.2.4: reads of an already-warmed exact market+symbol must never
+  // wait behind a fresh REST seed or a WebSocket handshake. The child can
+  // already hold thousands of verified seconds; serve those rows first and
+  // repair the seed/connection in the background. This prevents the parent
+  // from timing out while valid cached rows are available.
+  if (entry.rows.length > 0) {
+    if (!entry.restored && !entry.restorePromise) {
+      restore(entry).catch(() => {});
+    }
+    seedRecent(entry).catch(() => {});
+    if (
+      entry.ws?.readyState !== WebSocket.OPEN &&
+      !entry.connectPromise
+    ) {
+      connect(entry).catch(() => {});
+    }
+    return entry;
+  }
+
   await restore(entry);
-  await seedRecent(entry);
-  await connect(entry);
+  if (entry.rows.length === 0) {
+    await seedRecent(entry, { force: true });
+  } else {
+    seedRecent(entry).catch(() => {});
+  }
+  if (entry.rows.length === 0) {
+    await connect(entry);
+  } else if (
+    entry.ws?.readyState !== WebSocket.OPEN &&
+    !entry.connectPromise
+  ) {
+    connect(entry).catch(() => {});
+  }
   return entry;
 }
 
@@ -746,6 +787,9 @@ export function getBybitSecondHistoryHealth() {
     render_direct_private_or_user_trade_api_used: false,
     recent_trade_time_range_parameters_used: false,
     empty_seconds_generated_by_backend: false,
+    cached_rows_served_before_seed_or_ws_repair: true,
+    blocking_seed_on_warmed_read: false,
+    seed_refresh_seconds: Math.round(SEED_REFRESH_MS / 1000),
     hot_targets: HOT_TARGETS.map((item) => ({
       market: item.market,
       symbol: item.symbol,
@@ -886,3 +930,40 @@ export async function startBybitSecondHistoryHotSeeds() {
 setInterval(() => {
   evictIfNeeded();
 }, 60_000).unref?.();
+
+
+export const _test = {
+  mergeRows,
+  readBybitSecondHistory,
+  primeEntry({
+    market,
+    symbol,
+    nativeSymbol = symbol,
+    category = market === 'contract' ? 'linear' : 'spot',
+    rows = [],
+    connected = true,
+  }) {
+    const safeMarket = marketKey(market);
+    const safeSymbol = compact(symbol);
+    let entry = entries.get(entryKey(safeMarket, safeSymbol));
+    if (!entry) {
+      entry = createEntry({
+        market: safeMarket,
+        symbol: safeSymbol,
+        nativeSymbol: compact(nativeSymbol),
+        category: categoryKey(category, safeMarket, safeSymbol),
+        hotPinned: true,
+      });
+    }
+    entry.rows = mergeRows(
+      [],
+      rows,
+      safeMarket,
+      safeSymbol,
+    );
+    entry.restored = true;
+    entry.lastSeedAt = Date.now();
+    if (connected) entry.ws = { readyState: WebSocket.OPEN };
+    return entry;
+  },
+};
