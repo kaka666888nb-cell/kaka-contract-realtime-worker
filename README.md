@@ -1,3 +1,7 @@
+# Step780 / Render 650.8.15.50
+
+Adds a backend-shared exact spot ticker endpoint for coin-detail first paint. The App no longer calls the dedicated spot ticker Edge function or device-direct ticker fallbacks for that first paint.
+
 # Kaka Contract Realtime Worker
 
 Version **650.8.15.49 / Step778**.
