@@ -1,3 +1,4 @@
+import http from 'node:http';
 import {
   getBinanceContractMarketHealth,
   getBinanceContractTickers,
@@ -2012,16 +2013,24 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       : 1;
 
     if (historical) {
-      let cursor = String(Math.max(1, Math.floor(Number(end))));
+      // OKX history-trades defaults to type=1, where `after`
+      // is interpreted as a tradeId. Step781.2.1 passed a
+      // millisecond timestamp without type=2, which happened
+      // to work for some spot rows but repeated the newest
+      // contract page. Use the documented timestamp cursor.
+      let cursor = String(
+        Math.max(1, Math.floor(Number(end))),
+      );
       let previousCursor = '';
       for (
         let pageIndex = 0;
-        pageIndex < 5 && trades.length < wanted;
+        pageIndex < 8 && trades.length < wanted;
         pageIndex += 1
       ) {
         const payload = await jsonFetch(
           `https://www.okx.com/api/v5/market/history-trades` +
           `?instId=${encodeURIComponent(instrument)}` +
+          `&type=2` +
           `&after=${encodeURIComponent(cursor)}` +
           `&limit=100`,
           20_000,
@@ -2031,6 +2040,7 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
           : [];
         if (!page.length) break;
 
+        let oldestTimestamp = null;
         for (const item of page) {
           const rawSize = num(item.sz);
           const baseSize =
@@ -2051,12 +2061,20 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
             trade.quantity_unit = 'base_asset';
             trades.push(trade);
           }
+          const timestamp = Number(item.ts);
+          if (Number.isFinite(timestamp)) {
+            oldestTimestamp =
+              oldestTimestamp == null
+                ? timestamp
+                : Math.min(oldestTimestamp, timestamp);
+          }
         }
 
-        const oldest = page[page.length - 1] || null;
         const nextCursor = String(
-          oldest?.tradeId ?? oldest?.ts ?? '',
-        ).trim();
+          oldestTimestamp == null
+            ? ''
+            : Math.max(1, Math.floor(oldestTimestamp - 1)),
+        );
         if (
           !nextCursor ||
           nextCursor === cursor ||
@@ -2117,16 +2135,6 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       symbol: nativeSymbol,
       limit: String(maxLimit),
     });
-    if (historical) {
-      params.set(
-        'startTime',
-        String(secondHistoryWindowStart(end, wanted)),
-      );
-      params.set(
-        'endTime',
-        String(Math.max(1, Math.floor(Number(end)))),
-      );
-    }
 
     const payload = await bybitPublicJson(
       `/v5/market/recent-trade?${params.toString()}`,
@@ -2340,11 +2348,122 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
     .slice(-limit);
 }
 
+
+const KAKA_REALTIME_CHILD_PORT =
+  Number(process.env.KAKA_CHILD_PORT || 10001);
+
+function fetchBybitSecondHistoryFromChild({
+  market,
+  symbol,
+  nativeSymbol,
+  category,
+  end,
+  limit,
+}) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      market,
+      symbol,
+      native_symbol: nativeSymbol,
+      category,
+      end_time: String(end),
+      limit: String(limit),
+      wait_ms: '5000',
+    });
+    const request = http.get({
+      hostname: '127.0.0.1',
+      port: KAKA_REALTIME_CHILD_PORT,
+      path:
+        '/internal/bybit-second-history?' +
+        params.toString(),
+      headers: { accept: 'application/json' },
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks)
+          .toString('utf8');
+        if ((response.statusCode || 500) >= 400) {
+          reject(new Error(
+            `bybit_second_child_${response.statusCode}:` +
+            text.slice(0, 180),
+          ));
+          return;
+        }
+        try {
+          const payload = JSON.parse(text);
+          resolve(
+            Array.isArray(payload?.rows)
+              ? payload.rows
+              : [],
+          );
+        } catch (_) {
+          reject(new Error(
+            'bybit_second_child_invalid_json',
+          ));
+        }
+      });
+    });
+    request.setTimeout(9000, () => {
+      request.destroy(new Error(
+        'bybit_second_child_timeout',
+      ));
+    });
+    request.on('error', reject);
+  });
+}
+
 async function fetchSecondMarketKlines(provider, market, symbol, end, limit) {
   // Binance Spot公开K线原生支持1s，直接读取最多1000根真实历史，避免以成交分页近似。
   if (provider === 'binance' && market === 'spot') {
     return fetchNativeMarketKlines(provider, market, symbol, '1s', end, Math.min(1000, limit));
   }
+
+  // Bybit's current public recent-trade reference exposes only
+  // the recent page. Production verification showed that the
+  // former startTime/endTime parameters were ignored and the
+  // newest rows were repeated. Read the bounded exact-symbol
+  // shared publicTrade WebSocket history from the child process.
+  if (provider === 'bybit') {
+    const identity = market === 'contract'
+      ? await resolveNativeMarketIdentity(
+          provider,
+          market,
+          symbol,
+        )
+      : {
+          native_symbol: symbol,
+          quote_asset: split(compact(symbol))[1],
+        };
+    const nativeSymbol = compact(
+      identity.native_symbol || symbol,
+    );
+    const quote = normalizedQuote(
+      identity.quote_asset ||
+      split(compact(symbol))[1],
+      'USDT',
+    );
+    const category = market === 'contract'
+      ? bybitContractCategory(quote)
+      : 'spot';
+    const rows =
+      await fetchBybitSecondHistoryFromChild({
+        market,
+        symbol,
+        nativeSymbol,
+        category,
+        end,
+        limit: Math.min(3600, Math.max(2, limit)),
+      });
+    return normalizeMarketKlineRows(
+      rows,
+      provider,
+      market,
+      symbol,
+      '1s',
+    ).slice(-limit);
+  }
+
   const tradeLimit = Math.min(5000, Math.max(1000, limit * 8));
   const trades = await recentPublicTrades(provider, market, symbol, end, tradeLimit);
   return aggregateTradesToSecondRows(trades, provider, market, symbol, end, limit);
@@ -2740,8 +2859,8 @@ export function getBinanceMarketRestHealth() {
       gate_contract: 'public_trade_history_to_time',
       okx_spot: 'history_trades_after_timestamp',
       okx_contract: 'history_trades_after_timestamp',
-      bybit_spot: 'recent_trade_start_end_time',
-      bybit_contract: 'recent_trade_start_end_time',
+      bybit_spot: 'shared_public_trade_websocket_ring',
+      bybit_contract: 'shared_public_trade_websocket_ring',
       bitget_spot: 'fills_history_start_end_time',
       bitget_contract: 'fills_history_start_end_time',
     },
@@ -2832,7 +2951,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -2844,7 +2963,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -2854,7 +2973,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -2863,7 +2982,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -2873,7 +2992,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         self_test: selfTest,
       });
       return true;
@@ -2889,7 +3008,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         checks: tests.length,
         tests,
       });
@@ -2904,7 +3023,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -2923,7 +3042,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3044,7 +3163,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.52',
+        version: '650.8.15.53',
         provider,
         market_type: market,
         symbol,

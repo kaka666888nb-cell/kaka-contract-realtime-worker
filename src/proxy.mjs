@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.52';
+const STEP_VERSION = '650.8.15.53';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -300,6 +300,12 @@ const server = http.createServer(async (req, res) => {
       all_market_second_history_end_time_pagination: true,
       all_market_second_history_latest_audit_cases: 11,
       all_market_second_history_older_target_cases: 11,
+      all_market_second_history_verified_older_cases_target: 11,
+      okx_second_history_cursor_mode: 'type_2_timestamp_after',
+      bybit_second_history: '/api/bybit-second-history-health',
+      bybit_second_history_state:
+        realtimeWsHealth?.bybit_second_history || null,
+      bybit_recent_trade_time_range_parameters_used: false,
       one_second_history_app_direct_left_backfill_required: true,
       spot_flow_shared_history: '/api/spot-flow/history',
       spot_flow_shared_history_health: '/api/spot-flow/history-health',
@@ -617,6 +623,31 @@ const server = http.createServer(async (req, res) => {
       self_test: runProviderGovernorSelfTest(),
       time: new Date().toISOString(),
     }));
+    return;
+  }
+
+  if (url.pathname === '/api/bybit-second-history-health') {
+    try {
+      const payload = await fetchChildJson(
+        '/internal/bybit-second-history-health',
+        8_000,
+      );
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(JSON.stringify(payload));
+    } catch (error) {
+      res.writeHead(503, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(JSON.stringify({
+        ok: false,
+        version: STEP_VERSION,
+        error: String(error?.message || error),
+      }));
+    }
     return;
   }
 
