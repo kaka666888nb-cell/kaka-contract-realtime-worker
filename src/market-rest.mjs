@@ -1895,6 +1895,130 @@ function dedupePublicTrades(items) {
   return rows;
 }
 
+function normalizeMarketKlineRows(
+  items,
+  provider,
+  market,
+  symbol,
+  interval,
+) {
+  const step = intervalMs(interval);
+  const byOpenTime = new Map();
+  for (const raw of Array.isArray(items) ? items : []) {
+    if (!raw || typeof raw !== 'object') continue;
+    let openTime = Number(
+      raw.open_time_ms ??
+      raw.openTime ??
+      raw.open_time ??
+      raw.t,
+    );
+    if (
+      !Number.isFinite(openTime) &&
+      typeof raw.open_time === 'string'
+    ) {
+      openTime = Date.parse(raw.open_time);
+    }
+    if (!Number.isFinite(openTime) || openTime <= 0) continue;
+    if (openTime < 10_000_000_000) openTime *= 1000;
+    if (openTime > 10_000_000_000_000) openTime /= 1000;
+    openTime = Math.floor(openTime / step) * step;
+
+    const open = num(raw.open ?? raw.open_price ?? raw.o);
+    const high = num(raw.high ?? raw.high_price ?? raw.h);
+    const low = num(raw.low ?? raw.low_price ?? raw.l);
+    const close = num(raw.close ?? raw.close_price ?? raw.c);
+    if (
+      [open, high, low, close].some(
+        (value) => value === null || value <= 0,
+      )
+    ) {
+      continue;
+    }
+
+    byOpenTime.set(openTime, {
+      ...raw,
+      provider,
+      market_type: market,
+      symbol,
+      interval,
+      kline_interval: interval,
+      open_time: new Date(openTime).toISOString(),
+      open_time_ms: openTime,
+      close_time: new Date(openTime + step - 1).toISOString(),
+      close_time_ms: openTime + step - 1,
+      open,
+      high,
+      low,
+      close,
+      volume: Math.max(0, num(raw.volume ?? raw.v) || 0),
+      quote_volume: Math.max(
+        0,
+        num(raw.quote_volume ?? raw.quoteVolume ?? raw.q) || 0,
+      ),
+      trade_count: Math.max(
+        0,
+        Math.round(num(raw.trade_count ?? raw.n) || 0),
+      ),
+      source:
+        raw.source ||
+        `${provider}_official_public_kline_render`,
+    });
+  }
+  return [...byOpenTime.values()].sort(
+    (a, b) => a.open_time_ms - b.open_time_ms,
+  );
+}
+
+async function fetchCoinbasePublicTradePage(
+  productId,
+  afterCursor = '',
+  limit = 100,
+) {
+  const params = new URLSearchParams({
+    limit: String(Math.max(1, Math.min(100, Number(limit) || 100))),
+  });
+  if (afterCursor) params.set('after', String(afterCursor));
+  const url =
+    `${COINBASE_BASE_URL}/products/` +
+    `${encodeURIComponent(productId)}/trades?${params.toString()}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'KakaWeb3-Market-Worker/515.1.2',
+      },
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      throw new Error(
+        `${response.status} ${response.statusText} ` +
+        `api.exchange.coinbase.com/products/trades ` +
+        `${bodyText.slice(0, 240)}`.trim(),
+      );
+    }
+    let payload = [];
+    if (bodyText) {
+      try {
+        payload = JSON.parse(bodyText);
+      } catch (_) {
+        throw new Error(
+          `invalid JSON from Coinbase trades: ` +
+          bodyText.slice(0, 240),
+        );
+      }
+    }
+    return {
+      rows: Array.isArray(payload) ? payload : [],
+      after: String(response.headers.get('cb-after') || ''),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function secondHistoryIsOlderRequest(end) {
   const safeEnd = Number(end);
   return Number.isFinite(safeEnd) && safeEnd < Date.now() - 8_000;
@@ -1990,21 +2114,42 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
     }
   } else if (provider === 'coinbase') {
     const productId = coinbaseProductId(symbol);
-    const payload = await jsonFetch(
-      `${COINBASE_BASE_URL}/products/` +
-      `${encodeURIComponent(productId)}/trades`,
-      20_000,
-    );
-    for (const item of Array.isArray(payload) ? payload : []) {
-      const trade = publicTrade(
-        item.time,
-        item.price,
-        item.size,
-        item.trade_id,
+    let afterCursor = '';
+    let previousCursor = '';
+    const maxPages = historical ? 8 : 1;
+    for (
+      let pageIndex = 0;
+      pageIndex < maxPages && trades.length < wanted;
+      pageIndex += 1
+    ) {
+      const page = await fetchCoinbasePublicTradePage(
+        productId,
+        afterCursor,
+        100,
       );
-      if (trade && trade.time <= end + 5_000) {
-        trades.push(trade);
+      if (!page.rows.length) break;
+      for (const item of page.rows) {
+        const trade = publicTrade(
+          item.time,
+          item.price,
+          item.size,
+          item.trade_id,
+        );
+        if (trade && trade.time <= end + 5_000) {
+          trades.push(trade);
+        }
       }
+      const nextCursor = String(page.after || '');
+      if (
+        !historical ||
+        !nextCursor ||
+        nextCursor === afterCursor ||
+        nextCursor === previousCursor
+      ) {
+        break;
+      }
+      previousCursor = afterCursor;
+      afterCursor = nextCursor;
     }
   } else if (provider === 'okx') {
     const instrument = okxId(symbol, market);
@@ -2187,66 +2332,118 @@ async function recentPublicTrades(provider, market, symbol, end, limit) {
       productType = bitgetContractCategory(quote);
     }
 
-    let url;
-    if (historical) {
-      const startTime = secondHistoryWindowStart(
-        end,
-        wanted,
-        {
-          minMs: 10 * 60_000,
-          maxMs: 6 * 60 * 60_000,
-          perWantedMs: 5_000,
-        },
-      );
-      url = market === 'contract'
-        ? `https://api.bitget.com/api/v2/mix/market/fills-history` +
-          `?symbol=${encodeURIComponent(nativeSymbol)}` +
-          `&productType=${encodeURIComponent(productType)}` +
-          `&limit=1000` +
-          `&startTime=${Math.floor(startTime)}` +
-          `&endTime=${Math.max(1, Math.floor(Number(end)))}`
-        : `https://api.bitget.com/api/v2/spot/market/fills-history` +
+    if (historical && market === 'contract') {
+      let idLessThan = '';
+      let previousCursor = '';
+      for (
+        let pageIndex = 0;
+        pageIndex < 8 && trades.length < wanted;
+        pageIndex += 1
+      ) {
+        const url = pageIndex === 0
+          ? `https://api.bitget.com/api/v2/mix/market/fills` +
+            `?symbol=${encodeURIComponent(nativeSymbol)}` +
+            `&productType=${encodeURIComponent(productType)}` +
+            `&limit=100`
+          : `https://api.bitget.com/api/v2/mix/market/fills-history` +
+            `?symbol=${encodeURIComponent(nativeSymbol)}` +
+            `&productType=${encodeURIComponent(productType)}` +
+            `&limit=100` +
+            `&idLessThan=${encodeURIComponent(idLessThan)}`;
+        const payload = await jsonFetch(url, 20_000);
+        const items = payloadRows(payload);
+        if (!items.length) break;
+
+        let oldestItem = null;
+        let oldestTimestamp = null;
+        for (const item of items) {
+          const trade = publicTrade(
+            item.ts,
+            item.price,
+            item.size,
+            item.tradeId ?? item.execId,
+          );
+          if (trade && trade.time <= end + 5_000) {
+            trades.push(trade);
+          }
+          const timestamp = normalizeTradeTimestamp(item.ts);
+          if (
+            timestamp !== null &&
+            (oldestTimestamp === null || timestamp < oldestTimestamp)
+          ) {
+            oldestTimestamp = timestamp;
+            oldestItem = item;
+          }
+        }
+
+        const nextCursor = String(
+          oldestItem?.tradeId ?? oldestItem?.execId ?? '',
+        );
+        if (
+          !nextCursor ||
+          nextCursor === idLessThan ||
+          nextCursor === previousCursor
+        ) {
+          break;
+        }
+        previousCursor = idLessThan;
+        idLessThan = nextCursor;
+      }
+    } else {
+      let url;
+      if (historical) {
+        const startTime = secondHistoryWindowStart(
+          end,
+          wanted,
+          {
+            minMs: 10 * 60_000,
+            maxMs: 6 * 60 * 60_000,
+            perWantedMs: 5_000,
+          },
+        );
+        url = `https://api.bitget.com/api/v2/spot/market/fills-history` +
           `?symbol=${encodeURIComponent(nativeSymbol)}` +
           `&limit=1000` +
           `&startTime=${Math.floor(startTime)}` +
           `&endTime=${Math.max(1, Math.floor(Number(end)))}`;
-    } else {
-      url = market === 'contract'
-        ? `https://api.bitget.com/api/v2/mix/market/fills` +
-          `?symbol=${encodeURIComponent(nativeSymbol)}` +
-          `&productType=${encodeURIComponent(productType)}` +
-          `&limit=100`
-        : `https://api.bitget.com/api/v2/spot/market/fills` +
-          `?symbol=${encodeURIComponent(nativeSymbol)}` +
-          `&limit=500`;
-    }
+      } else {
+        url = market === 'contract'
+          ? `https://api.bitget.com/api/v2/mix/market/fills` +
+            `?symbol=${encodeURIComponent(nativeSymbol)}` +
+            `&productType=${encodeURIComponent(productType)}` +
+            `&limit=100`
+          : `https://api.bitget.com/api/v2/spot/market/fills` +
+            `?symbol=${encodeURIComponent(nativeSymbol)}` +
+            `&limit=500`;
+      }
 
-    let payload = await jsonFetch(url, 20_000);
-    let items = payloadRows(payload);
-    if (
-      !historical &&
-      market === 'contract' &&
-      items.length === 0
-    ) {
-      payload = await jsonFetch(
-        `https://api.bitget.com/api/v3/market/fills` +
-        `?category=${encodeURIComponent(productType)}` +
-        `&symbol=${encodeURIComponent(nativeSymbol)}` +
-        `&limit=100`,
-        20_000,
-      );
-      items = payloadRows(payload);
-    }
+      let payload = await jsonFetch(url, 20_000);
+      let items = payloadRows(payload);
+      if (
+        !historical &&
+        market === 'contract' &&
+        items.length === 0
+      ) {
+        payload = await jsonFetch(
+          `https://api.bitget.com/api/v3/market/fills` +
+          `?category=${encodeURIComponent(productType)}` +
+          `&symbol=${encodeURIComponent(nativeSymbol)}` +
+          `&limit=100`,
+          20_000,
+        );
+        items = payloadRows(payload);
+      }
 
-    for (const item of items) {
-      const trade = publicTrade(
-        item.ts,
-        item.price,
-        item.size,
-        item.tradeId ?? item.execId,
-      );
-      if (trade && trade.time <= end + 5_000) {
-        trades.push(trade);
+      for (const item of items) {
+        const trade = publicTrade(
+          item.ts,
+          item.price,
+          item.size,
+          item.tradeId ?? item.execId,
+        );
+        if (trade && trade.time <= end + 5_000) {
+          trades.push(trade);
+        }
       }
     }
   } else if (provider === 'gate') {
@@ -2850,11 +3047,12 @@ export function getBinanceMarketRestHealth() {
     shared_cache_entries: binanceSharedCache.size,
     shared_inflight_entries: binanceSharedInflight.size,
     shared_cache_max: BINANCE_SHARED_CACHE_MAX,
-    contract_second_history_max_rest_pages: 1,
+    contract_second_history_max_rest_pages: 8,
+    bybit_second_history_rows_normalized: true,
     one_second_history_end_time_pagination: {
       binance_spot: 'native_1s_kline_end_time',
       binance_contract: 'protected_archive_edge_live_chain',
-      coinbase_spot: 'public_trade_history',
+      coinbase_spot: 'cb_after_public_trade_cursor',
       gate_spot: 'public_trade_history',
       gate_contract: 'public_trade_history_to_time',
       okx_spot: 'history_trades_after_timestamp',
@@ -2862,7 +3060,7 @@ export function getBinanceMarketRestHealth() {
       bybit_spot: 'shared_public_trade_websocket_ring',
       bybit_contract: 'shared_public_trade_websocket_ring',
       bitget_spot: 'fills_history_start_end_time',
-      bitget_contract: 'fills_history_start_end_time',
+      bitget_contract: 'fills_history_id_less_than_cursor',
     },
     one_second_history_app_direct_left_backfill_required: true,
     synthetic_one_second_candles: false,
@@ -2951,7 +3149,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -2963,7 +3161,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -2973,7 +3171,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -2982,7 +3180,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -2992,7 +3190,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         self_test: selfTest,
       });
       return true;
@@ -3008,7 +3206,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         checks: tests.length,
         tests,
       });
@@ -3023,7 +3221,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3042,7 +3240,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3163,7 +3361,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.53',
+        version: '650.8.15.54',
         provider,
         market_type: market,
         symbol,
