@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.57';
+const VERSION = '650.8.15.58';
 const PROVIDER = 'bybit';
 const MAX_ROWS = 3600;
 const MAX_ENTRIES = 32;
@@ -154,6 +154,46 @@ function mergeRows(existing, incoming, market, symbol) {
     .slice(-MAX_ROWS);
 }
 
+function rebuildRowIndex(entry) {
+  entry.rowByTime = new Map();
+  for (const row of entry.rows || []) {
+    const time = Number(row?.open_time_ms || 0);
+    if (Number.isFinite(time) && time > 0) {
+      entry.rowByTime.set(time, row);
+    }
+  }
+}
+
+function trimEntryRows(entry) {
+  const overflow = Math.max(0, entry.rows.length - MAX_ROWS);
+  if (overflow <= 0) return;
+  const removed = entry.rows.splice(0, overflow);
+  for (const row of removed) {
+    entry.rowByTime.delete(Number(row?.open_time_ms || 0));
+  }
+}
+
+function insertEntryRow(entry, row) {
+  const time = Number(row?.open_time_ms || 0);
+  if (!Number.isFinite(time) || time <= 0) return;
+  const lastTime = Number(entry.rows.at(-1)?.open_time_ms || 0);
+  if (!entry.rows.length || time > lastTime) {
+    entry.rows.push(row);
+  } else {
+    let low = 0;
+    let high = entry.rows.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      const middleTime = Number(entry.rows[middle]?.open_time_ms || 0);
+      if (middleTime < time) low = middle + 1;
+      else high = middle;
+    }
+    entry.rows.splice(low, 0, row);
+  }
+  entry.rowByTime.set(time, row);
+  trimEntryRows(entry);
+}
+
 function notify(entry) {
   for (const waiter of [...entry.waiters]) {
     try { waiter(); } catch (_) {}
@@ -177,23 +217,23 @@ function ingestTrade(entry, rawTime, rawPrice, rawSize) {
   }
   const quote = size * price;
 
-  const previous = entry.rows.find(
-    (row) => Number(row.open_time_ms) === bucket,
-  );
-  let next;
+  const previous = entry.rowByTime.get(bucket);
   if (previous) {
-    next = {
-      ...previous,
-      high: Math.max(Number(previous.high), price),
-      low: Math.min(Number(previous.low), price),
-      close: price,
-      volume: Number(previous.volume || 0) + size,
-      quote_volume: Number(previous.quote_volume || 0) + quote,
-      trade_count: Number(previous.trade_count || 0) + 1,
-      cached_at: new Date().toISOString(),
-    };
+    // Step781.2.7: mutate the current one-second bucket in place. The old
+    // implementation scanned, filtered, normalized and sorted all 3600 rows
+    // for every single public trade. BTC/ETH can deliver thousands of trades
+    // per second, starving the child HTTP server and preventing contract hot
+    // targets from ever starting. Exact-key O(1) updates keep the event loop
+    // responsive while preserving the same real-trade-only candle semantics.
+    previous.high = Math.max(Number(previous.high), price);
+    previous.low = Math.min(Number(previous.low), price);
+    previous.close = price;
+    previous.volume = Number(previous.volume || 0) + size;
+    previous.quote_volume = Number(previous.quote_volume || 0) + quote;
+    previous.trade_count = Number(previous.trade_count || 0) + 1;
+    previous.cached_at = new Date().toISOString();
   } else {
-    next = normalizeRow({
+    const next = normalizeRow({
       open_time_ms: bucket,
       open: price,
       high: price,
@@ -204,17 +244,9 @@ function ingestTrade(entry, rawTime, rawPrice, rawSize) {
       trade_count: 1,
       source: 'bybit_official_public_trade_1s_shared_ws',
     }, entry.market, entry.symbol);
+    if (!next) return;
+    insertEntryRow(entry, next);
   }
-  if (!next) return;
-
-  entry.rows = mergeRows(
-    entry.rows.filter(
-      (row) => Number(row.open_time_ms) !== bucket,
-    ),
-    [next],
-    entry.market,
-    entry.symbol,
-  );
   entry.dirty = true;
   stats.rows_written += 1;
   schedulePersist(entry);
@@ -410,6 +442,7 @@ function createEntry({
       ? Number.MAX_SAFE_INTEGER
       : Date.now() + ON_DEMAND_LEASE_MS,
     rows: [],
+    rowByTime: new Map(),
     ws: null,
     connectPromise: null,
     reconnectTimer: null,
@@ -514,6 +547,7 @@ async function restore(entry) {
           entry.market,
           entry.symbol,
         );
+        rebuildRowIndex(entry);
         stats.restore_hits += 1;
         notify(entry);
       }
@@ -789,6 +823,9 @@ export function getBybitSecondHistoryHealth() {
     empty_seconds_generated_by_backend: false,
     cached_rows_served_before_seed_or_ws_repair: true,
     blocking_seed_on_warmed_read: false,
+    indexed_second_bucket_updates: true,
+    full_history_resort_per_trade: false,
+    hot_target_start_mode: 'parallel_all_targets_created_before_wait',
     seed_refresh_seconds: Math.round(SEED_REFRESH_MS / 1000),
     hot_targets: HOT_TARGETS.map((item) => ({
       market: item.market,
@@ -914,17 +951,19 @@ export async function handleBybitSecondHistoryInternal(
 }
 
 export async function startBybitSecondHistoryHotSeeds() {
-  for (const target of HOT_TARGETS) {
+  // Step781.2.7: create all four exact hot identities immediately, then warm
+  // them concurrently. A slow restore/seed/handshake for one market must not
+  // prevent the following contract target from even existing in health state.
+  await Promise.allSettled(HOT_TARGETS.map(async (target) => {
     try {
       await ensureEntry({
         ...target,
         hotPinned: true,
       });
     } catch (error) {
-      stats.last_error =
-        String(error?.message || error);
+      stats.last_error = String(error?.message || error);
     }
-  }
+  }));
 }
 
 setInterval(() => {
@@ -934,6 +973,8 @@ setInterval(() => {
 
 export const _test = {
   mergeRows,
+  ingestTrade,
+  rebuildRowIndex,
   readBybitSecondHistory,
   primeEntry({
     market,
@@ -961,6 +1002,7 @@ export const _test = {
       safeMarket,
       safeSymbol,
     );
+    rebuildRowIndex(entry);
     entry.restored = true;
     entry.lastSeedAt = Date.now();
     if (connected) entry.ws = { readyState: WebSocket.OPEN };
