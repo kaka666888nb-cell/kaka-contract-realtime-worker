@@ -815,6 +815,245 @@ const binanceSharedStats = {
   last_error: '',
 };
 
+const BINANCE_CONTRACT_SECOND_HISTORY_MAX_ROWS = 1200;
+const BINANCE_CONTRACT_SECOND_HISTORY_LEASE_MS = 10 * 60_000;
+const BINANCE_CONTRACT_SECOND_HISTORY_WAIT_MAX_MS = 6_000;
+const BINANCE_CONTRACT_SECOND_HISTORY_HOT_SYMBOLS = ['BTCUSDT', 'ETHUSDT'];
+const binanceContractSecondHistoryStats = {
+  reads: 0,
+  waits: 0,
+  empty: 0,
+  rows_remembered: 0,
+  hot_started: 0,
+};
+
+function secondHistoryNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function secondHistoryRowFromPayload(entry, payload) {
+  if (entry.market !== 'contract' || entry.interval !== '1s') return null;
+  try {
+    const decoded = typeof payload === 'string' ? JSON.parse(payload) : payload;
+    const kline = decoded?.data?.k;
+    if (!kline) return null;
+    let openTimeMs = Number(kline.t);
+    if (!Number.isFinite(openTimeMs) || openTimeMs <= 0) return null;
+    if (openTimeMs < 10_000_000_000) openTimeMs *= 1000;
+    openTimeMs = Math.round(openTimeMs / 1000) * 1000;
+    const open = secondHistoryNumber(kline.o);
+    const high = secondHistoryNumber(kline.h);
+    const low = secondHistoryNumber(kline.l);
+    const close = secondHistoryNumber(kline.c);
+    if ([open, high, low, close].some((value) => value === null || value <= 0)) return null;
+    return {
+      provider: 'binance',
+      market_type: 'contract',
+      symbol: entry.symbol,
+      interval: '1s',
+      open_time: new Date(openTimeMs).toISOString(),
+      open_time_ms: openTimeMs,
+      close_time: new Date(openTimeMs + 999).toISOString(),
+      close_time_ms: openTimeMs + 999,
+      open,
+      high,
+      low,
+      close,
+      volume: Math.max(0, secondHistoryNumber(kline.v) || 0),
+      quote_volume: Math.max(0, secondHistoryNumber(kline.q) || 0),
+      trade_count: Math.max(0, Math.round(secondHistoryNumber(kline.n) || 0)),
+      source: 'binance_official_public_continuous_kline_1s_shared_ws',
+      cached_at: new Date().toISOString(),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function rememberBinanceContractSecondHistory(entry, payload) {
+  const row = secondHistoryRowFromPayload(entry, payload);
+  if (!row) return;
+  const byTime = new Map(entry.historyRows.map((item) => [item.open_time_ms, item]));
+  const isNew = !byTime.has(row.open_time_ms);
+  byTime.set(row.open_time_ms, row);
+  entry.historyRows = [...byTime.values()]
+    .sort((a, b) => a.open_time_ms - b.open_time_ms)
+    .slice(-BINANCE_CONTRACT_SECOND_HISTORY_MAX_ROWS);
+  if (isNew) binanceContractSecondHistoryStats.rows_remembered += 1;
+  for (const waiter of [...entry.historyWaiters]) {
+    try { waiter(); } catch (_) {}
+  }
+}
+
+function binanceSharedEntryHasDemand(entry) {
+  return entry.clients.size > 0 ||
+    entry.hotPinned === true ||
+    Number(entry.internalLeaseUntil || 0) > Date.now();
+}
+
+function scheduleBinanceSharedIdleClose(entry) {
+  clearTimeout(entry.idleTimer);
+  entry.idleTimer = null;
+  if (entry.closed || entry.hotPinned || entry.clients.size > 0) return;
+  const leaseRemaining = Math.max(0, Number(entry.internalLeaseUntil || 0) - Date.now());
+  const delay = Math.max(BINANCE_SHARED_IDLE_MS, leaseRemaining);
+  entry.idleTimer = setTimeout(() => {
+    entry.idleTimer = null;
+    if (binanceSharedEntryHasDemand(entry)) {
+      scheduleBinanceSharedIdleClose(entry);
+      return;
+    }
+    closeBinanceSharedEntry(entry, 'idle');
+  }, delay);
+  entry.idleTimer.unref?.();
+}
+
+function createBinanceSharedEntry({ market, symbol, interval, cfg, hotPinned = false }) {
+  const key = binanceSharedStreamKey(market, symbol, interval);
+  const entry = {
+    key,
+    market,
+    symbol,
+    interval,
+    cfg,
+    clients: new Set(),
+    upstream: null,
+    connecting: null,
+    reconnectTimer: null,
+    reconnectAttempt: 0,
+    heartbeat: null,
+    idleTimer: null,
+    closed: false,
+    createdAt: Date.now(),
+    secondAggregator: null,
+    secondTickTimer: null,
+    lastPayload: null,
+    hotPinned,
+    internalLeaseUntil: hotPinned ? Number.MAX_SAFE_INTEGER : 0,
+    historyRows: [],
+    historyWaiters: new Set(),
+  };
+  binanceSharedStreams.set(key, entry);
+  binanceSharedStats.created += 1;
+  return entry;
+}
+
+function getOrCreateBinanceSharedEntry({ market, symbol, interval, cfg, hotPinned = false }) {
+  const key = binanceSharedStreamKey(market, symbol, interval);
+  let entry = binanceSharedStreams.get(key);
+  if (entry) {
+    if (hotPinned) {
+      entry.hotPinned = true;
+      entry.internalLeaseUntil = Number.MAX_SAFE_INTEGER;
+    }
+    return entry;
+  }
+  if (binanceSharedStreams.size >= BINANCE_SHARED_STREAM_MAX) evictIdleBinanceSharedStreams();
+  if (binanceSharedStreams.size >= BINANCE_SHARED_STREAM_MAX) return null;
+  return createBinanceSharedEntry({ market, symbol, interval, cfg, hotPinned });
+}
+
+function filteredSecondHistory(entry, endTime, limit) {
+  const end = Number.isFinite(Number(endTime)) ? Number(endTime) : Date.now();
+  return entry.historyRows.filter((row) => Number(row.open_time_ms || 0) < end).slice(-limit);
+}
+
+async function waitForSecondHistory(entry, endTime, limit, waitMs) {
+  let rows = filteredSecondHistory(entry, endTime, limit);
+  if (rows.length >= 2 || waitMs <= 0) return rows;
+  binanceContractSecondHistoryStats.waits += 1;
+  await new Promise((resolve) => {
+    const deadline = Date.now() + waitMs;
+    let timer;
+    const check = () => {
+      rows = filteredSecondHistory(entry, endTime, limit);
+      if (rows.length >= 2 || Date.now() >= deadline) {
+        clearTimeout(timer);
+        entry.historyWaiters.delete(check);
+        resolve();
+        return;
+      }
+      timer = setTimeout(check, 250);
+      timer.unref?.();
+    };
+    entry.historyWaiters.add(check);
+    check();
+  });
+  return filteredSecondHistory(entry, endTime, limit);
+}
+
+async function ensureBinanceContractSecondHistory({
+  symbol,
+  endTime,
+  limit,
+  waitMs,
+  hotPinned = false,
+}) {
+  const cfg = await upstreamConfig('binance', 'contract', symbol, '1s');
+  const entry = getOrCreateBinanceSharedEntry({
+    market: 'contract',
+    symbol,
+    interval: '1s',
+    cfg,
+    hotPinned,
+  });
+  if (!entry) throw new Error('binance_second_history_capacity');
+  if (!hotPinned) {
+    entry.internalLeaseUntil = Math.max(
+      Number(entry.internalLeaseUntil || 0),
+      Date.now() + BINANCE_CONTRACT_SECOND_HISTORY_LEASE_MS,
+    );
+  }
+  clearTimeout(entry.idleTimer);
+  entry.idleTimer = null;
+  await connectBinanceSharedEntry(entry);
+  const rows = await waitForSecondHistory(entry, endTime, limit, waitMs);
+  scheduleBinanceSharedIdleClose(entry);
+  return { entry, rows };
+}
+
+function binanceContractSecondHistoryHealth() {
+  return {
+    ok: true,
+    version: '650.8.15.51',
+    mode: 'shared_official_continuous_kline_1s_memory_ring',
+    source: 'binance_official_public_continuous_kline_1s_shared_ws',
+    render_direct_binance_contract_rest_used: false,
+    max_rows_per_symbol: BINANCE_CONTRACT_SECOND_HISTORY_MAX_ROWS,
+    lease_seconds: Math.round(BINANCE_CONTRACT_SECOND_HISTORY_LEASE_MS / 1000),
+    hot_symbols: [...BINANCE_CONTRACT_SECOND_HISTORY_HOT_SYMBOLS],
+    entries: [...binanceSharedStreams.values()]
+      .filter((entry) => entry.market === 'contract' && entry.interval === '1s')
+      .map((entry) => ({
+        symbol: entry.symbol,
+        hot_pinned: entry.hotPinned === true,
+        clients: entry.clients.size,
+        connected: entry.upstream?.readyState === WebSocket.OPEN,
+        row_count: entry.historyRows.length,
+        oldest_open_time: entry.historyRows[0]?.open_time || null,
+        latest_open_time: entry.historyRows.at(-1)?.open_time || null,
+      })),
+    ...binanceContractSecondHistoryStats,
+    time: new Date().toISOString(),
+  };
+}
+
+async function startHotBinanceContractSecondHistory() {
+  for (const symbol of BINANCE_CONTRACT_SECOND_HISTORY_HOT_SYMBOLS) {
+    try {
+      await ensureBinanceContractSecondHistory({
+        symbol,
+        endTime: Date.now() + 1_000,
+        limit: 20,
+        waitMs: 0,
+        hotPinned: true,
+      });
+      binanceContractSecondHistoryStats.hot_started += 1;
+    } catch (_) {}
+  }
+}
+
 function binanceSharedStreamKey(market, symbol, interval) {
   return `${market}|${symbol}|${interval}`;
 }
@@ -835,7 +1074,10 @@ function sendWsSafe(client, payload) {
 }
 
 function broadcastBinanceShared(entry, payload, { remember = true } = {}) {
-  if (remember) entry.lastPayload = payload;
+  if (remember) {
+    entry.lastPayload = payload;
+    rememberBinanceContractSecondHistory(entry, payload);
+  }
   for (const client of [...entry.clients]) {
     const sent = sendWsSafe(client, payload);
     if (!sent) {
@@ -890,6 +1132,7 @@ async function acquireBinanceConnectSlot() {
 }
 
 function closeBinanceSharedEntry(entry, reason = 'closed') {
+  if (entry.hotPinned && reason !== 'shutdown') return;
   entry.closed = true;
   clearTimeout(entry.reconnectTimer);
   clearTimeout(entry.idleTimer);
@@ -911,13 +1154,15 @@ function closeBinanceSharedEntry(entry, reason = 'closed') {
 
 function evictIdleBinanceSharedStreams() {
   for (const entry of [...binanceSharedStreams.values()]) {
-    if (entry.clients.size === 0) closeBinanceSharedEntry(entry, 'capacity_evict_idle');
+    if (!binanceSharedEntryHasDemand(entry) && !entry.hotPinned) {
+      closeBinanceSharedEntry(entry, 'capacity_evict_idle');
+    }
     if (binanceSharedStreams.size < BINANCE_SHARED_STREAM_MAX) break;
   }
 }
 
 function scheduleBinanceSharedReconnect(entry) {
-  if (entry.closed || entry.reconnectTimer || entry.clients.size === 0) return;
+  if (entry.closed || entry.reconnectTimer || !binanceSharedEntryHasDemand(entry)) return;
   const delay = Math.min(
     BINANCE_SHARED_RECONNECT_MAX_MS,
     1_000 * (2 ** Math.min(entry.reconnectAttempt, 5)),
@@ -932,11 +1177,11 @@ function scheduleBinanceSharedReconnect(entry) {
 }
 
 async function connectBinanceSharedEntry(entry) {
-  if (entry.closed || entry.clients.size === 0) return;
+  if (entry.closed || !binanceSharedEntryHasDemand(entry)) return;
   if (entry.upstream?.readyState === WebSocket.OPEN || entry.connecting) return entry.connecting;
   entry.connecting = (async () => {
     await acquireBinanceConnectSlot();
-    if (entry.closed || entry.clients.size === 0) return;
+    if (entry.closed || !binanceSharedEntryHasDemand(entry)) return;
     const upstream = new WebSocket(entry.cfg.url, { handshakeTimeout: 15_000 });
     entry.upstream = upstream;
     await new Promise((resolve, reject) => {
@@ -1052,33 +1297,12 @@ async function attachBinanceSharedClient(client, market, symbol, interval, cfg) 
     return;
   }
   if (!entry) {
-    if (binanceSharedStreams.size >= BINANCE_SHARED_STREAM_MAX) evictIdleBinanceSharedStreams();
-    if (binanceSharedStreams.size >= BINANCE_SHARED_STREAM_MAX) {
+    entry = getOrCreateBinanceSharedEntry({ market, symbol, interval, cfg });
+    if (!entry) {
       binanceSharedStats.rejected_capacity += 1;
       client.close(1013, 'binance shared stream capacity reached');
       return;
     }
-    entry = {
-      key,
-      market,
-      symbol,
-      interval,
-      cfg,
-      clients: new Set(),
-      upstream: null,
-      connecting: null,
-      reconnectTimer: null,
-      reconnectAttempt: 0,
-      heartbeat: null,
-      idleTimer: null,
-      closed: false,
-      createdAt: Date.now(),
-      secondAggregator: null,
-      secondTickTimer: null,
-      lastPayload: null,
-    };
-    binanceSharedStreams.set(key, entry);
-    binanceSharedStats.created += 1;
   } else {
     binanceSharedStats.reused += 1;
   }
@@ -1089,9 +1313,7 @@ async function attachBinanceSharedClient(client, market, symbol, interval, cfg) 
   const cleanup = () => {
     entry.clients.delete(client);
     if (entry.clients.size === 0 && !entry.closed) {
-      clearTimeout(entry.idleTimer);
-      entry.idleTimer = setTimeout(() => closeBinanceSharedEntry(entry, 'idle'), BINANCE_SHARED_IDLE_MS);
-      entry.idleTimer.unref?.();
+      scheduleBinanceSharedIdleClose(entry);
     }
   };
   client.on('close', cleanup);
@@ -1148,24 +1370,109 @@ function binanceSharedWsHealth() {
       clients: entry.clients.size,
       connected: entry.upstream?.readyState === WebSocket.OPEN,
       reconnect_attempt: entry.reconnectAttempt,
+      hot_pinned: entry.hotPinned === true,
+      history_rows:
+        entry.market === 'contract' && entry.interval === '1s'
+          ? entry.historyRows.length
+          : null,
     })),
+    binance_contract_second_history: binanceContractSecondHistoryHealth(),
     ...binanceSharedStats,
   };
 }
 
 const server = http.createServer(async (req, res) => {
   const parsedHttpUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+  if (parsedHttpUrl.pathname === '/internal/binance-contract-second-history-health') {
+    if (req.headers['x-kaka-internal-child'] !== '1') {
+      res.writeHead(403, {'content-type':'application/json'});
+      res.end(JSON.stringify({ok:false,error:'internal only'}));
+      return;
+    }
+    res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
+    res.end(JSON.stringify(binanceContractSecondHistoryHealth()));
+    return;
+  }
+
+  if (parsedHttpUrl.pathname === '/internal/binance-contract-second-history') {
+    if (req.headers['x-kaka-internal-child'] !== '1') {
+      res.writeHead(403, {'content-type':'application/json'});
+      res.end(JSON.stringify({ok:false,error:'internal only'}));
+      return;
+    }
+    const symbol = symbolKey(parsedHttpUrl.searchParams.get('symbol'));
+    const limit = Math.max(
+      20,
+      Math.min(
+        BINANCE_CONTRACT_SECOND_HISTORY_MAX_ROWS,
+        Number.parseInt(parsedHttpUrl.searchParams.get('limit') || '1000', 10) || 1000,
+      ),
+    );
+    const endTime = Number(parsedHttpUrl.searchParams.get('end_time') || Date.now());
+    const waitMs = Math.max(
+      0,
+      Math.min(
+        BINANCE_CONTRACT_SECOND_HISTORY_WAIT_MAX_MS,
+        Number.parseInt(parsedHttpUrl.searchParams.get('wait_ms') || '4500', 10) || 0,
+      ),
+    );
+    if (!symbol) {
+      res.writeHead(400, {'content-type':'application/json'});
+      res.end(JSON.stringify({ok:false,error:'symbol required'}));
+      return;
+    }
+    binanceContractSecondHistoryStats.reads += 1;
+    try {
+      const { entry, rows } = await ensureBinanceContractSecondHistory({
+        symbol,
+        endTime,
+        limit,
+        waitMs,
+      });
+      if (!rows.length) binanceContractSecondHistoryStats.empty += 1;
+      res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
+      res.end(JSON.stringify({
+        ok:true,
+        version:'650.8.15.51',
+        provider:'binance',
+        market_type:'contract',
+        symbol,
+        interval:'1s',
+        source:'binance_official_public_continuous_kline_1s_shared_ws',
+        shared_upstream:true,
+        render_direct_binance_contract_rest_used:false,
+        row_count:rows.length,
+        cached_row_count:entry.historyRows.length,
+        rows,
+        generated_at:new Date().toISOString(),
+      }));
+    } catch (error) {
+      res.writeHead(503, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        ok:false,
+        version:'650.8.15.51',
+        provider:'binance',
+        market_type:'contract',
+        symbol,
+        interval:'1s',
+        error:String(error?.message || error),
+      }));
+    }
+    return;
+  }
+
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.33', binance_shared_ws: binanceSharedWsHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.51', binance_shared_ws: binanceSharedWsHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.33',
+      version: '650.8.15.51',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       providers: [...PROVIDERS],
@@ -1406,7 +1713,13 @@ wss.on('connection', async (client, req, parsedUrl) => {
   });
 });
 
-server.listen(PORT, () => console.log(`Kaka market realtime worker 650.8.15.33 listening on ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Kaka market realtime worker 650.8.15.51 listening on ${PORT}`);
+  const warmTimer = setTimeout(() => {
+    startHotBinanceContractSecondHistory().catch(() => {});
+  }, 1_500);
+  warmTimer.unref?.();
+});
 
 export const _test = {
   createSecondTradeAggregator,

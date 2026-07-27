@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.50';
+const STEP_VERSION = '650.8.15.51';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -250,7 +250,10 @@ function fetchChildJson(pathname, timeoutMs = 4_000) {
       hostname: '127.0.0.1',
       port: CHILD_PORT,
       path: pathname,
-      headers: { accept: 'application/json' },
+      headers: {
+        accept: 'application/json',
+        'x-kaka-internal-child': '1',
+      },
     }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
@@ -321,6 +324,11 @@ const server = http.createServer(async (req, res) => {
       contract_funding_health: '/api/contract-funding/health',
       binance_contract_market_health: '/api/binance-contract-market-health',
       binance_contract_kline_seed_health: '/api/binance-contract-kline-seed-health',
+      binance_contract_second_history_health: '/api/binance-contract-second-history-health',
+      binance_contract_second_history_state:
+        realtimeWsHealth?.binance_contract_second_history ||
+        realtimeWsHealth?.binance_shared_ws?.binance_contract_second_history ||
+        null,
       binance_contract_rest_probe: 'retired_step650_8_11',
       binance_contract_validation_reset: 'retired_step650_8_11',
       binance_contract_kline_relay_health: '/api/binance-contract-kline-relay-health',
@@ -496,6 +504,9 @@ const server = http.createServer(async (req, res) => {
         binance_app_ws_max_connect_attempts_per_ip_1m: Number(realtimeWsHealth?.binance_shared_ws?.max_connect_attempts_per_ip_1m || 60),
         binance_app_ws_client_ip_source: 'render_x_forwarded_for_first_entry',
         binance_app_ws_trade_1s_shared_aggregator: true,
+        binance_contract_1s_history_source: 'shared_continuous_kline_websocket_ring',
+        binance_contract_1s_history_render_direct_rest_used: false,
+        binance_contract_1s_history_hot_symbols: ['BTCUSDT','ETHUSDT'],
         binance_depth_ws_max_symbols: getContractDepthHealth().binance_ws_max_symbols,
         binance_depth_ws_connect_gap_ms: getContractDepthHealth().binance_ws_connect_gap_ms,
         binance_depth_ws_max_connect_attempts_5m: getContractDepthHealth().binance_ws_max_connect_attempts_5m,
@@ -616,6 +627,30 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/api/binance-contract-second-history-health') {
+    try {
+      const payload = await fetchChildJson(
+        '/internal/binance-contract-second-history-health',
+      );
+      res.writeHead(200, {
+        'content-type':'application/json; charset=utf-8',
+        'cache-control':'no-store',
+      });
+      res.end(JSON.stringify(payload));
+    } catch (error) {
+      res.writeHead(503, {
+        'content-type':'application/json; charset=utf-8',
+        'cache-control':'no-store',
+      });
+      res.end(JSON.stringify({
+        ok:false,
+        version:STEP_VERSION,
+        error:String(error?.message || error),
+      }));
+    }
+    return;
+  }
+
   if (url.pathname === '/api/realtime-ws-health') {
     try {
       const payload = await fetchChildJson('/ws-health');
@@ -711,5 +746,5 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + single-venue liquidation statistics + shared five-platform liquidation current snapshot + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + shared Binance contract 1s history + persistent Binance contract market + contract flow + contract depth + single-venue liquidation statistics + shared five-platform liquidation current snapshot + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

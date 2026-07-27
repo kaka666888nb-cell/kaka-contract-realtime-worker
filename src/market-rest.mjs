@@ -1,3 +1,4 @@
+import http from 'node:http';
 import {
   getBinanceContractMarketHealth,
   getBinanceContractTickers,
@@ -2094,7 +2095,72 @@ function aggregateTradesToSecondRows(trades, provider, market, symbol, end, limi
     .slice(-limit);
 }
 
+
+const KAKA_REALTIME_CHILD_PORT =
+  Number(process.env.KAKA_CHILD_PORT || 10001);
+
+function fetchBinanceContractSecondHistoryFromChild({
+  symbol,
+  end,
+  limit,
+  waitMs = 4_500,
+}) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      symbol,
+      end_time: String(end),
+      limit: String(limit),
+      wait_ms: String(waitMs),
+    });
+    const request = http.get({
+      hostname: '127.0.0.1',
+      port: KAKA_REALTIME_CHILD_PORT,
+      path:
+        '/internal/binance-contract-second-history?' +
+        params.toString(),
+      headers: {
+        accept: 'application/json',
+        'x-kaka-internal-child': '1',
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        if ((response.statusCode || 500) >= 400) {
+          reject(new Error(
+            `second_history_child_${response.statusCode}:` +
+            body.slice(0, 240),
+          ));
+          return;
+        }
+        try {
+          const decoded = JSON.parse(body);
+          resolve(Array.isArray(decoded?.rows) ? decoded.rows : []);
+        } catch (_) {
+          reject(new Error('second_history_child_invalid_json'));
+        }
+      });
+    });
+    request.setTimeout(8_000, () => {
+      request.destroy(new Error('second_history_child_timeout'));
+    });
+    request.on('error', reject);
+  });
+}
+
 async function fetchSecondMarketKlines(provider, market, symbol, end, limit) {
+  // Binance合约1秒历史禁止Render直连Futures REST。
+  // 统一读取实时子进程按精确symbol维护的共享官方1秒K线环形历史。
+  if (provider === 'binance' && market === 'contract') {
+    return fetchBinanceContractSecondHistoryFromChild({
+      symbol,
+      end,
+      limit: Math.min(1200, Math.max(20, limit)),
+      waitMs: 4_500,
+    });
+  }
+
   // Binance Spot公开K线原生支持1s，直接读取最多1000根真实历史，避免以成交分页近似。
   if (provider === 'binance' && market === 'spot') {
     return fetchNativeMarketKlines(provider, market, symbol, '1s', end, Math.min(1000, limit));
@@ -2572,7 +2638,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -2584,7 +2650,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -2594,7 +2660,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -2603,7 +2669,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -2613,7 +2679,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         self_test: selfTest,
       });
       return true;
@@ -2629,7 +2695,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         checks: tests.length,
         tests,
       });
@@ -2644,7 +2710,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -2663,7 +2729,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -2784,7 +2850,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.33',
+        version: '650.8.15.51',
         provider,
         market_type: market,
         symbol,
