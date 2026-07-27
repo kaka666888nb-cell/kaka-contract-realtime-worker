@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.58",
+  "version": "650.8.15.60",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,10 +8,12 @@
     "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs",
     "test:step781.2.5": "node tests/step781_2_5_selftest.mjs",
     "test:step781.2.6": "node tests/step781_2_6_selftest.mjs",
-    "test:step781.2.7": "node tests/step781_2_7_selftest.mjs"
+    "test:step781.2.7": "node tests/step781_2_7_selftest.mjs",
+    "test:step781.2.8": "node tests/step781_2_8_selftest.mjs",
+    "test:step781.2.9": "node tests/step781_2_9_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.58 / Step781.2.7 Bybit indexed one-second hot history and bounded time-window gate correction"
+  "description": "Kaka contract realtime worker 650.8.15.60 / Step781.2.9 all Coinbase quote realtime and resumable deep 1-second history audit fix"
 }

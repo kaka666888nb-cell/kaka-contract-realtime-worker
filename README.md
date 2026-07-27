@@ -1,11 +1,8 @@
-# Step781.2.7 / Render 650.8.15.58
+# Step781.2.9 / Render 650.8.15.60
 
-Production root-cause repair after the Step781.2.6 gate exposed a blocked Bybit realtime child and one false Binance window failure.
-
-- Bybit public-trade one-second history no longer scans, filters, normalizes, and sorts the full 3600-row ring for every incoming trade. Each exact market+symbol now keeps a millisecond bucket index; an existing second is updated in O(1), and only a genuinely new out-of-order second uses binary insertion.
-- All four pinned Bybit hot targets (spot/contract BTCUSDT and ETHUSDT) are created immediately and warmed in parallel. A slow restore, seed, or handshake for one target cannot prevent the following contract target from existing.
-- The child remains responsive while high-activity spot and contract trades are ingested, so health/history reads no longer wait behind full-history rebuild work.
-- The one-second history gate now validates the actual goal: bounded requests must cover at least 45 seconds of older time with real distinct seconds. It no longer incorrectly requires two pages when a single Binance page already covers the App's approximately 90-second target.
-- Step781.2.6 Coinbase official per-match realtime, App-owned empty-second wall clock, and portrait/fullscreen bounded 90-second backfill remain unchanged.
-
-Existing protections remain unchanged: exact provider/market/symbol identity, strict older-time progress, bounded requests, empty results never overwrite verified data, Render never fabricates empty seconds, and Binance contract direct Render REST remains permanently disabled.
+- Coinbase all real spot quote identities share the same directory/ticker/WebSocket/1-second-history parser.
+- Coinbase trade history uses official `CB-AFTER` cursor checkpoints, 1000 trades per page, at most 12 pages per request, and no longer restarts from latest on every left drag.
+- Coinbase USD/USDT/USDC/EUR/GBP/BTC/ETH and any other actual directory quote are handled by exact native product identity.
+- Six spot and five contract providers retain strict provider/market/symbol/quote isolation.
+- Render direct Binance contract REST remains hard disabled.
+- Asset quote discovery now uses the same expanded exact quote set as directory/ticker/realtime/history, and Coinbase USDT is never cross-aliased to USD.
