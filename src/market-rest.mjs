@@ -44,6 +44,28 @@ const MARKET_TICKER_CACHE_TTL_MS = 10_000;
 const marketUniverseCache = new Map();
 const marketTickerCache = new Map();
 const marketCacheInflight = new Map();
+
+// Step788.1:
+// Verify exact provider + market + symbol against the official directory
+// before any Kline or trade-history upstream request.
+const KLINE_IDENTITY_POSITIVE_TTL_MS = 5 * 60_000;
+const KLINE_IDENTITY_NEGATIVE_TTL_MS = 60_000;
+const KLINE_IDENTITY_CACHE_MAX = 512;
+const klineIdentityCache = new Map();
+const klineIdentityInflight = new Map();
+const klineIdentityStats = {
+  requests: 0,
+  cache_hits: 0,
+  positive_hits: 0,
+  negative_hits: 0,
+  inflight_hits: 0,
+  builds_started: 0,
+  builds_succeeded: 0,
+  builds_positive: 0,
+  builds_negative: 0,
+  builds_failed: 0,
+  evictions: 0,
+};
 const coinbaseTickerCache = new Map();
 const coinbaseStatsCache = new Map();
 // Step781.2.8: current price follows the official last-trade ticker snapshot;
@@ -138,6 +160,131 @@ async function sharedMarketResult(key, ttlMs, loader) {
   } finally {
     if (marketCacheInflight.get(key) === task) marketCacheInflight.delete(key);
   }
+}
+
+
+function pruneKlineIdentityCache() {
+  const now = Date.now();
+  for (const [key, entry] of klineIdentityCache.entries()) {
+    if (Number(entry?.expiresAt || 0) <= now) {
+      klineIdentityCache.delete(key);
+    }
+  }
+  while (klineIdentityCache.size > KLINE_IDENTITY_CACHE_MAX) {
+    const oldest = klineIdentityCache.keys().next().value;
+    if (oldest == null) break;
+    klineIdentityCache.delete(oldest);
+    klineIdentityStats.evictions += 1;
+  }
+}
+
+async function exactKlineIdentityExists(provider, market, rawSymbol) {
+  const symbol = compact(rawSymbol);
+  if (!symbol) return false;
+
+  klineIdentityStats.requests += 1;
+  pruneKlineIdentityCache();
+
+  const key = `${provider}:${market}:${symbol}`;
+  const cached = klineIdentityCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    klineIdentityStats.cache_hits += 1;
+    if (cached.exists === true) {
+      klineIdentityStats.positive_hits += 1;
+    } else {
+      klineIdentityStats.negative_hits += 1;
+    }
+    return cached.exists === true;
+  }
+
+  const running = klineIdentityInflight.get(key);
+  if (running) {
+    klineIdentityStats.inflight_hits += 1;
+    return await running;
+  }
+
+  const task = (async () => {
+    klineIdentityStats.builds_started += 1;
+    try {
+      const [, quote] = split(symbol);
+      let exists = false;
+
+      if (
+        quote &&
+        !(
+          market === 'contract' &&
+          !contractQuoteSupported(provider, quote)
+        )
+      ) {
+        const rows = await universe(provider, market, quote);
+        exists = rows.some((row) =>
+          row?.provider === provider &&
+          row?.market_type === market &&
+          compact(row?.symbol) === symbol
+        );
+      }
+
+      klineIdentityStats.builds_succeeded += 1;
+      if (exists) {
+        klineIdentityStats.builds_positive += 1;
+      } else {
+        klineIdentityStats.builds_negative += 1;
+      }
+
+      klineIdentityCache.set(key, {
+        exists,
+        expiresAt:
+          Date.now() +
+          (exists
+            ? KLINE_IDENTITY_POSITIVE_TTL_MS
+            : KLINE_IDENTITY_NEGATIVE_TTL_MS),
+      });
+      pruneKlineIdentityCache();
+      return exists;
+    } catch (error) {
+      klineIdentityStats.builds_failed += 1;
+      throw error;
+    }
+  })();
+
+  klineIdentityInflight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (klineIdentityInflight.get(key) === task) {
+      klineIdentityInflight.delete(key);
+    }
+  }
+}
+
+function getKlineIdentityPreflightHealth() {
+  pruneKlineIdentityCache();
+  let positiveEntries = 0;
+  let negativeEntries = 0;
+  for (const entry of klineIdentityCache.values()) {
+    if (entry?.exists === true) {
+      positiveEntries += 1;
+    } else {
+      negativeEntries += 1;
+    }
+  }
+  return {
+    enabled: true,
+    exact_key: 'provider_market_symbol',
+    positive_ttl_seconds:
+      Math.round(KLINE_IDENTITY_POSITIVE_TTL_MS / 1000),
+    negative_ttl_seconds:
+      Math.round(KLINE_IDENTITY_NEGATIVE_TTL_MS / 1000),
+    cache_max: KLINE_IDENTITY_CACHE_MAX,
+    cache_entries: klineIdentityCache.size,
+    positive_entries: positiveEntries,
+    negative_entries: negativeEntries,
+    inflight_entries: klineIdentityInflight.size,
+    nonexistent_pair_upstream_short_circuit: true,
+    nonexistent_pair_returns_exact_honest_empty: true,
+    directory_failure_never_written_as_negative: true,
+    ...klineIdentityStats,
+  };
 }
 
 function providerKey(raw) {
@@ -3121,6 +3268,16 @@ async function fetchSecondMarketKlines(provider, market, symbol, end, limit, opt
 
 export async function fetchMarketKlines(provider, market, symbol, interval, end, limit, options = {}) {
   assertProviderMarket(provider, market);
+
+  const exactIdentityExists = await exactKlineIdentityExists(
+    provider,
+    market,
+    symbol,
+  );
+  if (!exactIdentityExists) {
+    return [];
+  }
+
   if (interval === '1s') {
     return fetchSecondMarketKlines(
       provider, market, symbol, end, limit, options,
@@ -3498,6 +3655,14 @@ export function getBinanceMarketRestHealth() {
     shared_cache_entries: binanceSharedCache.size,
     shared_inflight_entries: binanceSharedInflight.size,
     shared_cache_max: BINANCE_SHARED_CACHE_MAX,
+    kline_identity_preflight: getKlineIdentityPreflightHealth(),
+    kline_identity_preflight_enabled: true,
+    nonexistent_pair_kline_upstream_short_circuit: true,
+    nonexistent_pair_kline_returns_exact_honest_empty: true,
+    nonexistent_pair_kline_negative_ttl_seconds:
+      Math.round(KLINE_IDENTITY_NEGATIVE_TTL_MS / 1000),
+    nonexistent_pair_kline_positive_ttl_seconds:
+      Math.round(KLINE_IDENTITY_POSITIVE_TTL_MS / 1000),
     contract_second_history_max_rest_pages: 8,
     bybit_second_history_rows_normalized: true,
     okx_bitget_contract_strict_end_time_boundary: true,
@@ -3643,7 +3808,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3655,7 +3820,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3665,7 +3830,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3674,7 +3839,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3684,7 +3849,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         self_test: selfTest,
       });
       return true;
@@ -3700,7 +3865,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         checks: tests.length,
         tests,
       });
@@ -3715,7 +3880,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3734,7 +3899,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3862,7 +4027,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.67',
+        version: '650.8.15.68',
         provider,
         market_type: market,
         symbol,
@@ -3941,4 +4106,6 @@ export const _test = {
   getCoinbaseTradeHistoryHealth,
   SUPPORTED_EXACT_QUOTE_ASSETS,
   contractQuoteSupported,
+  exactKlineIdentityExists,
+  getKlineIdentityPreflightHealth,
 };

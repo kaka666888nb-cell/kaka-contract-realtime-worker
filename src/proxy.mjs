@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.67';
+const STEP_VERSION = '650.8.15.68';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -301,6 +301,11 @@ const server = http.createServer(async (req, res) => {
       all_market_second_history_latest_audit_cases: 11,
       all_market_second_history_older_target_cases: 11,
       all_market_second_history_verified_older_cases_target: 11,
+      nonexistent_pair_kline_identity_preflight: true,
+      nonexistent_pair_kline_upstream_short_circuit: true,
+      nonexistent_pair_kline_returns_exact_honest_empty: true,
+      nonexistent_pair_kline_negative_ttl_seconds: 60,
+      nonexistent_pair_kline_positive_ttl_seconds: 300,
       okx_second_history_cursor_mode: 'type_2_timestamp_after',
       bybit_second_history: '/api/bybit-second-history-health',
       bybit_second_history_state:
@@ -402,6 +407,13 @@ const server = http.createServer(async (req, res) => {
         non_binance_exact_get_inflight_merge: true,
         non_binance_retry_after_honored: true,
         non_binance_unsupported_market_negative_cache_minutes: 15,
+        nonexistent_pair_kline_identity_preflight: true,
+        nonexistent_pair_kline_exact_key: 'provider_market_symbol',
+        nonexistent_pair_kline_upstream_short_circuit: true,
+        nonexistent_pair_kline_returns_exact_honest_empty: true,
+        nonexistent_pair_kline_negative_ttl_seconds: 60,
+        nonexistent_pair_kline_positive_ttl_seconds: 300,
+        nonexistent_pair_directory_failure_never_written_as_negative: true,
         bybit_403_minimum_hard_cooldown_minutes: 10,
         okx_50011_rate_limit_detection: true,
         bitget_429_rate_limit_detection: true,
