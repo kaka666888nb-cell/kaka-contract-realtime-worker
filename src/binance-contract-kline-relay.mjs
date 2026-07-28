@@ -4,7 +4,7 @@ import {
   isBinanceValidationAdminConfigured,
 } from './binance-rest-guard.mjs';
 
-const VERSION = '650.8.15.62';
+const VERSION = '650.8.15.63';
 const EDGE_PROTOCOL_VERSION = '650.8.11';
 const SCHEMA_VERSION = '650.8.11';
 const PROVIDER = 'binance';

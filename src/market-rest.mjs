@@ -2730,14 +2730,6 @@ async function recentPublicTrades(
     const raw = gateId(symbol);
     const quote = split(compact(symbol))[1];
     const settle = gateContractSettle(quote);
-    const url = market === 'contract'
-      ? `https://api.gateio.ws/api/v4/futures/${settle}/trades` +
-        `?contract=${encodeURIComponent(raw)}` +
-        `&limit=1000&to=${Math.floor(end / 1000)}`
-      : `https://api.gateio.ws/api/v4/spot/trades` +
-        `?currency_pair=${encodeURIComponent(raw)}` +
-        `&limit=1000`;
-    const payload = await jsonFetch(url, 20_000);
     const multiplier =
       market === 'contract' && quote !== 'USD'
         ? await marketContractBaseMultiplier(
@@ -2745,27 +2737,33 @@ async function recentPublicTrades(
             symbol,
           )
         : 1;
-    for (const item of Array.isArray(payload) ? payload : []) {
-      const timestamp =
-        item.create_time_ms ??
-        item.time_ms ??
-        item.create_time ??
-        item.time;
-      const rawSize = num(item.amount ?? item.size);
-      const price = num(item.price);
-      const baseSize =
-        rawSize === null || price === null || price <= 0
-          ? null
-          : market === 'contract' && quote === 'USD'
-              ? Math.abs(rawSize) / price
-              : Math.abs(rawSize) * multiplier;
-      const trade = publicTrade(
-        timestamp,
-        price,
-        baseSize,
-        item.id,
-      );
-      if (trade && trade.time <= end + 5_000) {
+
+    const appendGateTrades = (payload) => {
+      const page = Array.isArray(payload) ? payload : [];
+      for (const item of page) {
+        const timestamp =
+          item.create_time_ms ??
+          item.time_ms ??
+          item.create_time ??
+          item.time;
+        const rawSize = num(item.amount ?? item.size);
+        const price = num(item.price);
+        const baseSize =
+          rawSize === null || price === null || price <= 0
+            ? null
+            : market === 'contract' && quote === 'USD'
+                ? Math.abs(rawSize) / price
+                : Math.abs(rawSize) * multiplier;
+        const trade = publicTrade(
+          timestamp,
+          price,
+          baseSize,
+          item.id,
+        );
+        const withinBoundary = historical
+          ? trade && trade.time < end
+          : trade && trade.time <= end + 5_000;
+        if (!withinBoundary) continue;
         trade.raw_contract_count =
           market === 'contract'
             ? Math.abs(rawSize || 0)
@@ -2776,6 +2774,54 @@ async function recentPublicTrades(
         }
         trades.push(trade);
       }
+      return page.length;
+    };
+
+    if (market === 'spot' && historical) {
+      // Gate's official public spot trades endpoint supports `from`, `to`,
+      // `page`, and `limit`. The former latest-only request ignored the
+      // caller's historical boundary and then accepted a +5s slack, which
+      // could repeat the first latest-page second on a quiet market.
+      //
+      // Use the official time-range query and make the boundary strictly
+      // earlier than the caller's exact millisecond end_time. A bounded
+      // 30-day window matches Gate's documented default history scope,
+      // while at most 8 x 1000 public rows keeps the request bounded.
+      const toSeconds = Math.max(
+        1,
+        Math.floor((Number(end) - 1) / 1_000),
+      );
+      const fromSeconds = Math.max(
+        0,
+        toSeconds - 30 * 24 * 60 * 60,
+      );
+      for (
+        let page = 1;
+        page <= 8 && trades.length < wanted;
+        page += 1
+      ) {
+        const payload = await jsonFetch(
+          `https://api.gateio.ws/api/v4/spot/trades` +
+          `?currency_pair=${encodeURIComponent(raw)}` +
+          `&limit=1000` +
+          `&from=${fromSeconds}` +
+          `&to=${toSeconds}` +
+          `&page=${page}`,
+          20_000,
+        );
+        const pageLength = appendGateTrades(payload);
+        if (pageLength < 1_000) break;
+      }
+    } else {
+      const url = market === 'contract'
+        ? `https://api.gateio.ws/api/v4/futures/${settle}/trades` +
+          `?contract=${encodeURIComponent(raw)}` +
+          `&limit=1000&to=${Math.floor(end / 1000)}`
+        : `https://api.gateio.ws/api/v4/spot/trades` +
+          `?currency_pair=${encodeURIComponent(raw)}` +
+          `&limit=1000`;
+      const payload = await jsonFetch(url, 20_000);
+      appendGateTrades(payload);
     }
   }
 
@@ -3361,6 +3407,10 @@ export function getBinanceMarketRestHealth() {
     contract_second_history_max_rest_pages: 8,
     bybit_second_history_rows_normalized: true,
     okx_bitget_contract_strict_end_time_boundary: true,
+    gate_spot_history_uses_official_from_to: true,
+    gate_spot_history_strict_end_time_boundary: true,
+    gate_spot_history_max_pages: 8,
+    gate_spot_history_window_days: 30,
     okx_contract_timestamp_cursor_monotonic_decrease: true,
     explicit_end_time_forces_second_history_mode: true,
     bitget_contract_history_starts_at_requested_window: true,
@@ -3391,7 +3441,7 @@ export function getBinanceMarketRestHealth() {
       binance_spot: 'native_1s_kline_end_time',
       binance_contract: 'protected_archive_edge_live_chain',
       coinbase_spot: 'cb_after_public_trade_cursor',
-      gate_spot: 'public_trade_history',
+      gate_spot: 'official_time_range_from_to_strict_boundary',
       gate_contract: 'public_trade_history_to_time',
       okx_spot: 'history_trades_after_timestamp',
       okx_contract: 'history_trades_type_2_strict_monotonic_timestamp',
@@ -3487,7 +3537,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3499,7 +3549,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3509,7 +3559,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3518,7 +3568,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3528,7 +3578,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         self_test: selfTest,
       });
       return true;
@@ -3544,7 +3594,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         checks: tests.length,
         tests,
       });
@@ -3559,7 +3609,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3578,7 +3628,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3706,7 +3756,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.62',
+        version: '650.8.15.63',
         provider,
         market_type: market,
         symbol,
