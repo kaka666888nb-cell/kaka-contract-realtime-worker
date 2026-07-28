@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.66';
+const VERSION = '650.8.15.67';
 const PROVIDER = 'bybit';
 const MAX_ROWS = 3600;
 const MAX_ENTRIES = 64;
