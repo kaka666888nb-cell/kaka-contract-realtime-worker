@@ -2778,39 +2778,121 @@ async function recentPublicTrades(
     };
 
     if (market === 'spot' && historical) {
-      // Gate's official public spot trades endpoint supports `from`, `to`,
-      // `page`, and `limit`. The former latest-only request ignored the
-      // caller's historical boundary and then accepted a +5s slack, which
-      // could repeat the first latest-page second on a quiet market.
+      // Step786.2:
+      // Gate officially supports tracing older market trades with
+      // `last_id` plus `reverse=true`. Step786.1's 30-day from/to
+      // range scan returned upstream 502 for multiple quiet spot pairs
+      // in production, so the range scan is retired.
       //
-      // Use the official time-range query and make the boundary strictly
-      // earlier than the caller's exact millisecond end_time. A bounded
-      // 30-day window matches Gate's documented default history scope,
-      // while at most 8 x 1000 public rows keeps the request bounded.
-      const toSeconds = Math.max(
-        1,
-        Math.floor((Number(end) - 1) / 1_000),
-      );
-      const fromSeconds = Math.max(
-        0,
-        toSeconds - 30 * 24 * 60 * 60,
-      );
+      // Start from the official latest page, keep only trades strictly
+      // earlier than the exact caller boundary, then walk older IDs.
+      // IDs are compared as BigInt strings to avoid cursor precision loss.
+      const oldestGateTradeId = (payload) => {
+        let bestText = '';
+        let bestValue = null;
+        for (const item of Array.isArray(payload) ? payload : []) {
+          const text = String(item?.id ?? '').trim();
+          if (!/^\d+$/.test(text)) continue;
+          let value;
+          try {
+            value = BigInt(text);
+          } catch (_) {
+            continue;
+          }
+          if (bestValue === null || value < bestValue) {
+            bestValue = value;
+            bestText = text;
+          }
+        }
+        return bestText;
+      };
+
+      let cursor = '';
+      let previousCursor = '';
+      let cursorFailed = false;
       for (
-        let page = 1;
-        page <= 8 && trades.length < wanted;
-        page += 1
+        let pageIndex = 0;
+        pageIndex < 8 && trades.length < wanted;
+        pageIndex += 1
       ) {
-        const payload = await jsonFetch(
-          `https://api.gateio.ws/api/v4/spot/trades` +
-          `?currency_pair=${encodeURIComponent(raw)}` +
-          `&limit=1000` +
-          `&from=${fromSeconds}` +
-          `&to=${toSeconds}` +
-          `&page=${page}`,
-          20_000,
+        const params = new URLSearchParams({
+          currency_pair: raw,
+          limit: '1000',
+        });
+        if (cursor) {
+          params.set('last_id', cursor);
+          params.set('reverse', 'true');
+        }
+
+        let payload;
+        try {
+          payload = await jsonFetch(
+            `https://api.gateio.ws/api/v4/spot/trades?` +
+            params.toString(),
+            20_000,
+          );
+        } catch (_) {
+          cursorFailed = true;
+          break;
+        }
+
+        const page = Array.isArray(payload) ? payload : [];
+        if (!page.length) break;
+        appendGateTrades(page);
+
+        const nextCursor = oldestGateTradeId(page);
+        if (
+          !nextCursor ||
+          nextCursor === cursor ||
+          nextCursor === previousCursor
+        ) {
+          break;
+        }
+        previousCursor = cursor;
+        cursor = nextCursor;
+      }
+
+      // If the official trade cursor itself fails before yielding any
+      // strict older trade, use Gate's official native 1s candlestick
+      // endpoint as a bounded real-data fallback. These rows are produced
+      // by Gate, not synthesized by this backend.
+      if (trades.length === 0 && cursorFailed) {
+        const fallbackRows = await fetchNativeMarketKlines(
+          'gate',
+          'spot',
+          symbol,
+          '1s',
+          Math.max(1, Number(end) - 1),
+          Math.min(
+            1_000,
+            Math.max(20, Number(secondBucketTarget) || 120),
+          ),
         );
-        const pageLength = appendGateTrades(payload);
-        if (pageLength < 1_000) break;
+        for (const row of fallbackRows) {
+          const openTime = Number(row?.open_time_ms);
+          const close = num(row?.close);
+          const volume = Math.max(0, num(row?.volume) || 0);
+          if (
+            !Number.isFinite(openTime) ||
+            openTime >= Number(end) ||
+            close === null ||
+            close <= 0
+          ) {
+            continue;
+          }
+          const trade = publicTrade(
+            openTime,
+            close,
+            volume,
+            `gate-candle-${openTime}`,
+          );
+          if (trade) {
+            trade.quote_amount =
+              Math.max(0, num(row?.quote_volume) || 0);
+            trade.quantity_unit = 'base_asset';
+            trades.push(trade);
+          }
+        }
       }
     } else {
       const url = market === 'contract'
@@ -3407,10 +3489,11 @@ export function getBinanceMarketRestHealth() {
     contract_second_history_max_rest_pages: 8,
     bybit_second_history_rows_normalized: true,
     okx_bitget_contract_strict_end_time_boundary: true,
-    gate_spot_history_uses_official_from_to: true,
+    gate_spot_history_uses_official_last_id_reverse: true,
     gate_spot_history_strict_end_time_boundary: true,
-    gate_spot_history_max_pages: 8,
-    gate_spot_history_window_days: 30,
+    gate_spot_history_max_cursor_pages: 8,
+    gate_spot_history_from_to_range_retired_after_upstream_502: true,
+    gate_spot_history_native_1s_candle_fallback: true,
     okx_contract_timestamp_cursor_monotonic_decrease: true,
     explicit_end_time_forces_second_history_mode: true,
     bitget_contract_history_starts_at_requested_window: true,
@@ -3441,7 +3524,7 @@ export function getBinanceMarketRestHealth() {
       binance_spot: 'native_1s_kline_end_time',
       binance_contract: 'protected_archive_edge_live_chain',
       coinbase_spot: 'cb_after_public_trade_cursor',
-      gate_spot: 'official_time_range_from_to_strict_boundary',
+      gate_spot: 'official_last_id_reverse_strict_boundary_plus_native_1s_fallback',
       gate_contract: 'public_trade_history_to_time',
       okx_spot: 'history_trades_after_timestamp',
       okx_contract: 'history_trades_type_2_strict_monotonic_timestamp',
@@ -3537,7 +3620,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3549,7 +3632,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3559,7 +3642,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3568,7 +3651,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3578,7 +3661,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         self_test: selfTest,
       });
       return true;
@@ -3594,7 +3677,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         checks: tests.length,
         tests,
       });
@@ -3609,7 +3692,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3628,7 +3711,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3756,7 +3839,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.63',
+        version: '650.8.15.64',
         provider,
         market_type: market,
         symbol,
