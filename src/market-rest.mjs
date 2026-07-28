@@ -2778,121 +2778,93 @@ async function recentPublicTrades(
     };
 
     if (market === 'spot' && historical) {
-      // Step786.2:
-      // Gate officially supports tracing older market trades with
-      // `last_id` plus `reverse=true`. Step786.1's 30-day from/to
-      // range scan returned upstream 502 for multiple quiet spot pairs
-      // in production, so the range scan is retired.
+      // Step786.3: production audit proved the legacy last_id cursor did not
+      // reach older records even when bounded from/to queries did. Retire the
+      // cursor and use small official time windows.
       //
-      // Start from the official latest page, keep only trades strictly
-      // earlier than the exact caller boundary, then walk older IDs.
-      // IDs are compared as BigInt strings to avoid cursor precision loss.
-      const oldestGateTradeId = (payload) => {
-        let bestText = '';
-        let bestValue = null;
-        for (const item of Array.isArray(payload) ? payload : []) {
-          const text = String(item?.id ?? '').trim();
-          if (!/^\d+$/.test(text)) continue;
-          let value;
+      // 1) Search 6h then 18h backward windows.
+      // 2) For extremely quiet markets, use official 1m candles only as
+      //    activity anchors, then query official trades for those minutes.
+      // 3) Continue at most six additional 24h windows (174h total).
+      // 4) Keep only official trades strictly earlier than exact end_time.
+      // A 1m candle is never promoted into or returned as a 1s candle.
+      const gateTradeWindow = async (fromSeconds, toSeconds) => {
+        let lastError = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
           try {
-            value = BigInt(text);
-          } catch (_) {
-            continue;
-          }
-          if (bestValue === null || value < bestValue) {
-            bestValue = value;
-            bestText = text;
+            const payload = await jsonFetch(
+              `https://api.gateio.ws/api/v4/spot/trades` +
+              `?currency_pair=${encodeURIComponent(raw)}` +
+              `&limit=1000` +
+              `&from=${Math.max(0, Math.floor(fromSeconds))}` +
+              `&to=${Math.max(1, Math.floor(toSeconds))}` +
+              `&page=1`,
+              20_000,
+            );
+            appendGateTrades(payload);
+            return { ok: true, rows: Array.isArray(payload) ? payload.length : 0 };
+          } catch (error) {
+            lastError = error;
           }
         }
-        return bestText;
+        return { ok: false, rows: 0, error: lastError };
       };
 
-      let cursor = '';
-      let previousCursor = '';
-      let cursorFailed = false;
-      for (
-        let pageIndex = 0;
-        pageIndex < 8 && trades.length < wanted;
-        pageIndex += 1
-      ) {
-        const params = new URLSearchParams({
-          currency_pair: raw,
-          limit: '1000',
-        });
-        if (cursor) {
-          params.set('last_id', cursor);
-          params.set('reverse', 'true');
-        }
+      const exactEndSeconds = Math.max(1, Math.floor((Number(end) - 1) / 1_000));
+      let successfulOfficialQueries = 0;
+      let lastOfficialError = null;
+      let backwardTo = exactEndSeconds;
 
-        let payload;
-        try {
-          payload = await jsonFetch(
-            `https://api.gateio.ws/api/v4/spot/trades?` +
-            params.toString(),
-            20_000,
-          );
-        } catch (_) {
-          cursorFailed = true;
-          break;
-        }
-
-        const page = Array.isArray(payload) ? payload : [];
-        if (!page.length) break;
-        appendGateTrades(page);
-
-        const nextCursor = oldestGateTradeId(page);
-        if (
-          !nextCursor ||
-          nextCursor === cursor ||
-          nextCursor === previousCursor
-        ) {
-          break;
-        }
-        previousCursor = cursor;
-        cursor = nextCursor;
+      for (const widthSeconds of [6 * 60 * 60, 18 * 60 * 60]) {
+        if (trades.length >= wanted) break;
+        const fromSeconds = Math.max(0, backwardTo - widthSeconds);
+        const result = await gateTradeWindow(fromSeconds, backwardTo);
+        if (result.ok) successfulOfficialQueries += 1;
+        else lastOfficialError = result.error || lastOfficialError;
+        backwardTo = Math.max(0, fromSeconds - 1);
       }
 
-      // If the official trade cursor itself fails before yielding any
-      // strict older trade, use Gate's official native 1s candlestick
-      // endpoint as a bounded real-data fallback. These rows are produced
-      // by Gate, not synthesized by this backend.
-      if (trades.length === 0 && cursorFailed) {
-        const fallbackRows = await fetchNativeMarketKlines(
-          'gate',
-          'spot',
-          symbol,
-          '1s',
-          Math.max(1, Number(end) - 1),
-          Math.min(
-            1_000,
-            Math.max(20, Number(secondBucketTarget) || 120),
-          ),
-        );
-        for (const row of fallbackRows) {
-          const openTime = Number(row?.open_time_ms);
-          const close = num(row?.close);
-          const volume = Math.max(0, num(row?.volume) || 0);
-          if (
-            !Number.isFinite(openTime) ||
-            openTime >= Number(end) ||
-            close === null ||
-            close <= 0
-          ) {
-            continue;
-          }
-          const trade = publicTrade(
-            openTime,
-            close,
-            volume,
-            `gate-candle-${openTime}`,
+      if (trades.length < wanted) {
+        try {
+          const candlePayload = await jsonFetch(
+            `https://api.gateio.ws/api/v4/spot/candlesticks` +
+            `?currency_pair=${encodeURIComponent(raw)}` +
+            `&interval=1m&limit=100&to=${exactEndSeconds}`,
+            20_000,
           );
-          if (trade) {
-            trade.quote_amount =
-              Math.max(0, num(row?.quote_volume) || 0);
-            trade.quantity_unit = 'base_asset';
-            trades.push(trade);
+          const anchors = [...new Set(
+            (Array.isArray(candlePayload) ? candlePayload : [])
+              .map((item) => {
+                const seconds = Array.isArray(item)
+                  ? Number(item[0])
+                  : Number(item?.t ?? item?.time);
+                return Number.isFinite(seconds) ? Math.floor(seconds) : null;
+              })
+              .filter((seconds) =>
+                Number.isFinite(seconds) && seconds * 1_000 < Number(end)),
+          )].sort((a, b) => b - a);
+
+          for (const anchorSeconds of anchors.slice(0, 8)) {
+            if (trades.length >= wanted) break;
+            const result = await gateTradeWindow(anchorSeconds, anchorSeconds + 59);
+            if (result.ok) successfulOfficialQueries += 1;
+            else lastOfficialError = result.error || lastOfficialError;
           }
+        } catch (error) {
+          lastOfficialError = error || lastOfficialError;
         }
+      }
+
+      for (let index = 0; index < 6 && trades.length < wanted; index += 1) {
+        const fromSeconds = Math.max(0, backwardTo - 24 * 60 * 60);
+        const result = await gateTradeWindow(fromSeconds, backwardTo);
+        if (result.ok) successfulOfficialQueries += 1;
+        else lastOfficialError = result.error || lastOfficialError;
+        backwardTo = Math.max(0, fromSeconds - 1);
+      }
+
+      if (trades.length === 0 && successfulOfficialQueries === 0 && lastOfficialError) {
+        throw lastOfficialError;
       }
     } else {
       const url = market === 'contract'
@@ -3489,11 +3461,16 @@ export function getBinanceMarketRestHealth() {
     contract_second_history_max_rest_pages: 8,
     bybit_second_history_rows_normalized: true,
     okx_bitget_contract_strict_end_time_boundary: true,
-    gate_spot_history_uses_official_last_id_reverse: true,
+    gate_spot_history_uses_bounded_backward_time_windows: true,
     gate_spot_history_strict_end_time_boundary: true,
-    gate_spot_history_max_cursor_pages: 8,
-    gate_spot_history_from_to_range_retired_after_upstream_502: true,
-    gate_spot_history_native_1s_candle_fallback: true,
+    gate_spot_history_initial_window_hours: [6, 18],
+    gate_spot_history_additional_daily_windows: 6,
+    gate_spot_history_total_bounded_lookback_hours: 174,
+    gate_spot_history_uses_one_minute_activity_anchors: true,
+    gate_spot_history_activity_anchor_max: 8,
+    gate_spot_history_one_minute_candles_never_promoted_to_one_second: true,
+    gate_spot_history_last_id_cursor_retired_after_production_audit: true,
+    gate_spot_history_large_from_to_range_retired_after_upstream_502: true,
     okx_contract_timestamp_cursor_monotonic_decrease: true,
     explicit_end_time_forces_second_history_mode: true,
     bitget_contract_history_starts_at_requested_window: true,
@@ -3524,7 +3501,7 @@ export function getBinanceMarketRestHealth() {
       binance_spot: 'native_1s_kline_end_time',
       binance_contract: 'protected_archive_edge_live_chain',
       coinbase_spot: 'cb_after_public_trade_cursor',
-      gate_spot: 'official_last_id_reverse_strict_boundary_plus_native_1s_fallback',
+      gate_spot: 'official_bounded_time_windows_plus_1m_activity_anchor_exact_trades_strict_boundary',
       gate_contract: 'public_trade_history_to_time',
       okx_spot: 'history_trades_after_timestamp',
       okx_contract: 'history_trades_type_2_strict_monotonic_timestamp',
@@ -3620,7 +3597,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3632,7 +3609,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3642,7 +3619,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3651,7 +3628,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3661,7 +3638,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         self_test: selfTest,
       });
       return true;
@@ -3677,7 +3654,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         checks: tests.length,
         tests,
       });
@@ -3692,7 +3669,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3711,7 +3688,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -3839,7 +3816,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.64',
+        version: '650.8.15.65',
         provider,
         market_type: market,
         symbol,

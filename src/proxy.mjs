@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.64';
+const STEP_VERSION = '650.8.15.65';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -401,15 +401,16 @@ const server = http.createServer(async (req, res) => {
         okx_50011_rate_limit_detection: true,
         bitget_429_rate_limit_detection: true,
         gate_rate_limit_reset_header_detection: true,
-        gate_spot_second_history_uses_official_last_id_reverse: true,
-
+        gate_spot_second_history_uses_bounded_backward_time_windows: true,
         gate_spot_second_history_strict_end_time_boundary: true,
-
-        gate_spot_second_history_max_cursor_pages: 8,
-
-        gate_spot_second_history_from_to_range_retired_after_upstream_502: true,
-
-        gate_spot_second_history_native_1s_candle_fallback: true,
+        gate_spot_second_history_initial_window_hours: [6, 18],
+        gate_spot_second_history_additional_daily_windows: 6,
+        gate_spot_second_history_total_bounded_lookback_hours: 174,
+        gate_spot_second_history_uses_one_minute_activity_anchors: true,
+        gate_spot_second_history_activity_anchor_max: 8,
+        gate_spot_second_history_one_minute_candles_never_promoted_to_one_second: true,
+        gate_spot_second_history_last_id_cursor_retired_after_production_audit: true,
+        gate_spot_second_history_large_from_to_range_retired_after_upstream_502: true,
         coinbase_public_rest_guard_below_official_10rps: true,
         coinbase_one_second_realtime_transport: 'official_exchange_ticker_per_match_plus_heartbeat',
         coinbase_spot_usdt_realtime_supported: true,
