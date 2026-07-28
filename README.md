@@ -1,13 +1,20 @@
-# Step788.1.2 / Render 650.8.15.69
+# Step788.1.2.1 / Render 650.8.15.70
 
-Coinbase不存在产品Ticker真实空态修正：
+本次只补齐`risk_controls`中的4个Coinbase声明：
 
-- Coinbase ticker请求先查询当前官方产品目录；
-- 精确symbol不存在时直接返回空，不访问`/ticker`或`/stats`；
-- `/api/spot-market/exact-ticker`将其写入60秒负缓存并返回HTTP 404真实空；
-- 不再把Coinbase官方404转换成Render 503；
-- 混合批量ticker中，不存在的quote组返回空，不影响真实邻居symbol；
-- 已有K线身份预检、正负缓存、跨quote和跨market隔离保持不变；
-- 官方目录读取失败仍抛错，不写负缓存，不伪装为空；
-- App继续Step781.2.10，不覆盖main.dart；
+- coinbase_exact_ticker_official_directory_preflight = true
+- coinbase_nonexistent_product_returns_honest_empty = true
+- coinbase_nonexistent_product_writes_negative_cache = true
+- coinbase_mixed_batch_absent_symbol_does_not_fail_valid_neighbors = true
+
+Step788.1.2已经通过的业务逻辑全部保持不变：
+
+- Coinbase不存在产品不访问ticker/stats；
+- exact ticker返回HTTP 404精确空；
+- 60秒负缓存正常；
+- 混合BTC/USD + BTC/BTC只保留真实BTC/USD；
+- 11个不存在交易对K线全部HTTP 200精确空；
+- K线身份预检、跨quote、跨market、资产数量0保持；
 - Binance Render直连REST继续永久禁用。
+
+App继续Step781.2.10，不覆盖main.dart。

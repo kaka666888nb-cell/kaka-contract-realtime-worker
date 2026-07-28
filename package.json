@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.69",
+  "version": "650.8.15.70",
   "private": true,
   "type": "module",
   "scripts": {
@@ -19,10 +19,11 @@
     "test:step787.1": "node tests/step787_1_selftest.mjs",
     "test:step787.1.1": "node tests/step787_1_1_selftest.mjs",
     "test:step788.1": "node tests/step788_1_selftest.mjs",
-    "test:step788.1.2": "node tests/step788_1_2_selftest.mjs"
+    "test:step788.1.2": "node tests/step788_1_2_selftest.mjs",
+    "test:step788.1.2.1": "node tests/step788_1_2_1_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.69 / Step788.1.2 Coinbase nonexistent product honest-empty ticker and negative cache"
+  "description": "Kaka contract realtime worker 650.8.15.70 / Step788.1.2.1 Coinbase honest-empty risk-control declaration completion"
 }
