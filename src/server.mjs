@@ -1206,7 +1206,7 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.65', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', coinbase_all_directory_quotes_realtime_supported: true,
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.66', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', coinbase_all_directory_quotes_realtime_supported: true,
       all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
       coinbase_usdt_directory_not_cross_aliased_to_usd: true, bybit_shallow_latest_page_reserves_verified_older_rows: true, bybit_btc_eth_quote_pairs_prestarted_from_official_directory: true, shared_spot_quote_suffixes: SPOT_QUOTE_SUFFIXES, binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
@@ -1215,7 +1215,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.65',
+      version: '650.8.15.66',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat',
@@ -1506,7 +1506,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Kaka market realtime worker 650.8.15.65 listening on ${PORT}`);
+  console.log(`Kaka market realtime worker 650.8.15.66 listening on ${PORT}`);
   setTimeout(() => {
     startBybitSecondHistoryHotSeeds().catch(() => {});
   }, 1200).unref?.();

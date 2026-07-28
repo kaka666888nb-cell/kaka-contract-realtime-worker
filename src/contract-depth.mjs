@@ -467,7 +467,7 @@ function contractQuoteSupported(provider, quote) {
       .includes(provider);
   }
   if (quote === 'USDC') {
-    return ['binance', 'okx', 'bybit', 'bitget']
+    return ['binance', 'bybit', 'bitget']
       .includes(provider);
   }
   if (quote === 'USD') {

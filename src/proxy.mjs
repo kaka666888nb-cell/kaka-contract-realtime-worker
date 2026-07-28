@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.65';
+const STEP_VERSION = '650.8.15.66';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -312,6 +312,11 @@ const server = http.createServer(async (req, res) => {
       coinbase_spot_usdt_realtime_supported: true,
       coinbase_all_directory_quotes_realtime_supported: true,
       all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
+    mixed_quote_ticker_requests_grouped_by_exact_quote: true,
+    mixed_quote_ticker_max_quote_groups: 8,
+    mixed_quote_ticker_merge_identity: 'provider_market_symbol',
+    okx_usdc_contract_identity_retired_after_official_delisting: true,
+    okx_current_contract_quotes: ['USDT', 'USD'],
       coinbase_usdt_directory_not_cross_aliased_to_usd: true,
       coinbase_eur_realtime_supported: true,
       coinbase_trade_history_page_limit: 1000,

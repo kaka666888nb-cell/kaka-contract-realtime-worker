@@ -563,7 +563,6 @@ function supportsNativeContract(provider, symbol) {
   if (quote === 'USDT') return SUPPORTED.has(provider);
   if (quote === 'USDC') {
     return provider === 'binance' ||
-      provider === 'okx' ||
       provider === 'bybit' ||
       provider === 'bitget';
   }
@@ -1057,9 +1056,11 @@ export async function handleContractFunding(req, res, url) {
       bitget_next_funding_time_endpoint: '/api/v2/mix/market/funding-time',
       native_contract_quotes: {
         USDT: ['binance','okx','bybit','bitget','gate'],
-        USDC: ['binance','okx','bybit','bitget'],
+        USDC: ['binance','bybit','bitget'],
         USD: ['okx','bybit','bitget','gate'],
       },
+      okx_usdc_contract_retired: true,
+      okx_current_contract_quotes: ['USDT', 'USD'],
       binance_coin_m_usd_enabled: false,
       history_background_delay_ms: BINANCE_HISTORY_BACKGROUND_DELAY_MS,
       time: new Date().toISOString(),

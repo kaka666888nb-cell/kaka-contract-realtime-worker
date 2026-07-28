@@ -710,7 +710,6 @@ function supportsNativeContract(provider, rawSymbol) {
   if (quote === 'USDT') return SUPPORTED_PROVIDERS.has(provider);
   if (quote === 'USDC') {
     return provider === 'binance' ||
-      provider === 'okx' ||
       provider === 'bybit' ||
       provider === 'bitget';
   }
@@ -1905,11 +1904,13 @@ export async function handleContractLiquidation(req, res, url) {
       version: STEP_VERSION,
       contract_quote_support: {
         binance: ['USDT', 'USDC'],
-        okx: ['USDT', 'USDC', 'USD'],
+        okx: ['USDT', 'USD'],
         bybit: ['USDT', 'USDC', 'USD'],
         bitget: ['USDT', 'USDC', 'USD'],
         gate: ['USDT', 'USD'],
       },
+      okx_usdc_contract_retired: true,
+      okx_current_contract_quotes: ['USDT', 'USD'],
       provider,
       market_type: 'contract',
       symbol,
