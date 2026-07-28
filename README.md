@@ -1,10 +1,10 @@
-# Step781.2.10 / Render 650.8.15.61
+# Step784 / Render 650.8.15.62
 
-Root-cause follow-up after the Step781.2.9 production gate:
+Binance Edge relay queue scheduling fix based on the Step783.1 production audit:
 
-- preserves all verified Coinbase USD/USDT/EUR realtime and deep-history fixes;
-- acknowledges the official Bybit Spot recent-trade limit of 60 and absence of a public older cursor;
-- starts all officially listed BTC/ETH Spot quote pairs at process boot;
-- paginates only verified Bybit recent-trade/WebSocket rows by reserving a bounded oldest slice for the first older request;
-- never synthesizes empty seconds, aliases quote assets, or crosses providers;
-- keeps Binance contract Render-direct REST permanently disabled.
+- fixes the delayed-dispatch race where a waiter was removed before its timer fired and could be stranded when another higher-priority request acquired the slot first;
+- re-evaluates the full priority queue at dispatch time and keeps FIFO order within the same priority;
+- reserves two of six pending positions for visible Kline and critical first-paint metrics;
+- defers background funding/history and full position-metric rotation while the relay is busy instead of letting them age into queue timeouts;
+- records queue waits/timeouts by lane and bounded source labels for production verification;
+- keeps Render-direct Binance REST permanently disabled and does not increase queue size or upstream request rate.
