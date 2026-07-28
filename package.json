@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.62",
+  "version": "650.8.15.63",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,10 +12,11 @@
     "test:step781.2.8": "node tests/step781_2_8_selftest.mjs",
     "test:step781.2.9": "node tests/step781_2_9_selftest.mjs",
     "test:step781.2.10": "node tests/step781_2_10_selftest.mjs",
-    "test:step784": "node tests/step784_selftest.mjs"
+    "test:step784": "node tests/step784_selftest.mjs",
+    "test:step786.1": "node tests/step786_1_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.62 / Step784 Binance Edge relay priority-safe scheduler and background deferral"
+  "description": "Kaka contract realtime worker 650.8.15.63 / Step786.1 Gate spot official from-to strict older 1-second history"
 }
