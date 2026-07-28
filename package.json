@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.65",
+  "version": "650.8.15.66",
   "private": true,
   "type": "module",
   "scripts": {
@@ -15,10 +15,11 @@
     "test:step784": "node tests/step784_selftest.mjs",
     "test:step786.1": "node tests/step786_1_selftest.mjs",
     "test:step786.2": "node tests/step786_2_selftest.mjs",
-    "test:step786.3": "node tests/step786_3_selftest.mjs"
+    "test:step786.3": "node tests/step786_3_selftest.mjs",
+    "test:step787.1": "node tests/step787_1_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.65 / Step786.3 Gate bounded time windows and 1m activity-anchor exact trade reconstruction"
+  "description": "Kaka contract realtime worker 650.8.15.66 / Step787.1 mixed exact-quote ticker grouping and retired OKX USDC contract identity"
 }
