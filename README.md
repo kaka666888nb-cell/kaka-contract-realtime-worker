@@ -1,10 +1,10 @@
-# Step786.1 / Render 650.8.15.63
+# Step786.2 / Render 650.8.15.64
 
-Binance Edge relay queue scheduling fix based on the Step783.1 production audit:
-
-- fixes the delayed-dispatch race where a waiter was removed before its timer fired and could be stranded when another higher-priority request acquired the slot first;
-- re-evaluates the full priority queue at dispatch time and keeps FIFO order within the same priority;
-- reserves two of six pending positions for visible Kline and critical first-paint metrics;
-- defers background funding/history and full position-metric rotation while the relay is busy instead of letting them age into queue timeouts;
-- records queue waits/timeouts by lane and bounded source labels for production verification;
-- keeps Render-direct Binance REST permanently disabled and does not increase queue size or upstream request rate.
+- Gate现货更旧成交使用官方`last_id + reverse=true`游标。
+- 严格接受`trade.time < exact end_time`。
+- 最多8页，每页1000条。
+- Step786.1会触发502的30天`from/to`范围扫描已退役。
+- 游标异常且没有取得任何更旧成交时，仅回退Gate官方1秒K线。
+- 不生成假秒线，不跨平台、市场或报价币补数据。
+- App继续Step781.2.10，不修改main.dart。
+- Binance Render直连REST继续永久禁用。
