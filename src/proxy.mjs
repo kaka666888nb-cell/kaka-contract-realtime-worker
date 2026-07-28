@@ -16,7 +16,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.61';
+const STEP_VERSION = '650.8.15.62';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -446,6 +446,14 @@ const server = http.createServer(async (req, res) => {
         binance_contract_long_short_first_paint_limit: 3,
         binance_contract_long_short_fast_retry_without_app_restart: true,
         binance_contract_kline_edge_relay_priority: true,
+        binance_edge_relay_dispatch_rechecks_priority_before_grant: true,
+        binance_edge_relay_reserved_high_priority_pending: 2,
+        binance_edge_relay_max_auxiliary_pending: 4,
+        binance_edge_relay_background_work_deferred_while_busy: true,
+        binance_edge_relay_high_priority_preempts_lower_priority_when_full: true,
+        binance_edge_relay_background_metrics_priority: -20,
+        binance_edge_relay_background_funding_priority: -10,
+        binance_edge_relay_timeout_counters_by_lane_and_source: true,
         contract_api_route_ownership_fixed: true,
         generic_market_handler_intercepts_contract_routes: false,
         binance_contract_kline_first_paint_max_rows: 240,

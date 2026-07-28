@@ -4,7 +4,7 @@ import {
   isBinanceValidationAdminConfigured,
 } from './binance-rest-guard.mjs';
 
-const VERSION = '650.8.15.3';
+const VERSION = '650.8.15.62';
 const EDGE_PROTOCOL_VERSION = '650.8.11';
 const SCHEMA_VERSION = '650.8.11';
 const PROVIDER = 'binance';
@@ -25,6 +25,10 @@ const GLOBAL_MIN_REQUEST_GAP_MS = 1_000;
 const MAX_QUEUE_WAIT_MS = 25_000;
 const KLINE_MAX_QUEUE_WAIT_MS = 35_000;
 const MAX_PENDING = 6;
+const RESERVED_HIGH_PRIORITY_PENDING = 2;
+const MAX_AUXILIARY_PENDING = MAX_PENDING - RESERVED_HIGH_PRIORITY_PENDING;
+const MAX_BACKGROUND_PENDING = 1;
+const MAX_QUEUE_TIMEOUT_SOURCE_ENTRIES = 32;
 const RESTRICTED_FALLBACK_MS = 30 * 60_000;
 const BAN_SAFETY_MS = 90_000;
 const VALIDATION_TTL_MS = 30 * 60_000;
@@ -37,9 +41,13 @@ const RESTRICTED_STATUSES = new Set([403, 418, 429, 451]);
 let initialized = false;
 let initializingPromise = null;
 let activeRequest = false;
+let activeRequestLane = '';
+let activeRequestSource = '';
 let lastRequestStartedAt = 0;
 const lastRequestStartedAtByLane = { kline: 0, critical: 0, auxiliary: 0 };
 const waiters = [];
+let dispatchTimer = null;
+let dispatchDueAt = 0;
 let state = defaultState();
 
 const stats = {
@@ -56,6 +64,18 @@ const stats = {
   queue_waits: 0,
   queue_timeouts: 0,
   queue_rejections: 0,
+  auxiliary_capacity_deferrals: 0,
+  lower_priority_preemptions: 0,
+  lower_priority_preemptions_by_lane: { kline: 0, critical: 0, auxiliary: 0 },
+  background_deferrals: 0,
+  dispatch_reschedules: 0,
+  stale_dispatch_grants_prevented: 0,
+  requests_started_by_lane: { kline: 0, critical: 0, auxiliary: 0 },
+  queue_waits_by_lane: { kline: 0, critical: 0, auxiliary: 0 },
+  queue_timeouts_by_lane: { kline: 0, critical: 0, auxiliary: 0 },
+  queue_timeout_sources: {},
+  last_queue_timeout_lane: '',
+  last_queue_timeout_source: '',
   ordinary_success_persistence_skipped: 0,
   client_abort_blocks: 0,
   validation_starts: 0,
@@ -338,57 +358,162 @@ function queueWaitMsForLane(lane) {
     : MAX_QUEUE_WAIT_MS;
 }
 
-function nextWaiterIndex() {
+function bestWaiterIndex(queue) {
   let bestIndex = -1;
   let bestPriority = -Infinity;
-  for (let index = 0; index < waiters.length; index += 1) {
-    const waiter = waiters[index];
+  let bestQueuedAt = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < queue.length; index += 1) {
+    const waiter = queue[index];
     if (waiter.done) continue;
     const priority = Number(waiter.priority || 0);
-    if (bestIndex < 0 || priority > bestPriority) {
+    const queuedAt = Number(waiter.queuedAt || 0);
+    if (
+      bestIndex < 0 ||
+      priority > bestPriority ||
+      (priority === bestPriority && queuedAt < bestQueuedAt)
+    ) {
       bestIndex = index;
       bestPriority = priority;
+      bestQueuedAt = queuedAt;
     }
   }
   return bestIndex;
 }
 
-function releaseNext() {
-  if (activeRequest) return;
-  while (waiters.length) {
-    const index = nextWaiterIndex();
-    if (index < 0) {
-      waiters.splice(0, waiters.length);
-      return;
-    }
-    const [waiter] = waiters.splice(index, 1);
-    if (waiter.done) continue;
-    const now = Date.now();
-    const lane = waiter.lane === 'kline' ? 'kline' : waiter.lane === 'critical' ? 'critical' : 'auxiliary';
-    const laneDelay = laneGapMs(lane) - (now - Number(lastRequestStartedAtByLane[lane] || 0));
-    const globalDelay = GLOBAL_MIN_REQUEST_GAP_MS - (now - lastRequestStartedAt);
-    const delay = Math.max(0, laneDelay, globalDelay);
-    const grant = () => {
-      if (waiter.done || activeRequest) return;
-      waiter.done = true;
-      clearTimeout(waiter.timeout);
-      waiter.signal?.removeEventListener('abort', waiter.abort);
-      activeRequest = true;
-      lastRequestStartedAt = Date.now();
-      lastRequestStartedAtByLane[lane] = lastRequestStartedAt;
-      stats.requests_started += 1;
-      waiter.resolve(() => {
-        if (!activeRequest) return;
-        activeRequest = false;
-        releaseNext();
-      });
-    };
-    if (delay > 0) setTimeout(grant, delay).unref?.(); else grant();
-    return;
-  }
+function nextWaiterIndex() {
+  return bestWaiterIndex(waiters);
 }
 
-async function acquireSlot(signal = null, { lane = 'auxiliary', priority = 0 } = {}) {
+function recordQueueTimeoutSource(source) {
+  const key = String(source || 'unknown').slice(0, 180);
+  if (Object.hasOwn(stats.queue_timeout_sources, key)) {
+    stats.queue_timeout_sources[key] += 1;
+    return;
+  }
+  if (Object.keys(stats.queue_timeout_sources).length < MAX_QUEUE_TIMEOUT_SOURCE_ENTRIES) {
+    stats.queue_timeout_sources[key] = 1;
+    return;
+  }
+  stats.queue_timeout_sources.__other__ = Number(stats.queue_timeout_sources.__other__ || 0) + 1;
+}
+
+function clearDispatchTimer() {
+  if (dispatchTimer) clearTimeout(dispatchTimer);
+  dispatchTimer = null;
+  dispatchDueAt = 0;
+}
+
+function activeWaitersByLane(lane) {
+  return waiters.filter((waiter) => !waiter.done && waiter.lane === lane).length;
+}
+
+function incrementLaneCounter(counter, lane) {
+  counter[lane] = Number(counter[lane] || 0) + 1;
+}
+
+function preemptLowerPriorityWaiter(incomingLane, incomingPriority) {
+  let selectedIndex = -1;
+  let selectedPriority = Number.POSITIVE_INFINITY;
+  let selectedQueuedAt = -Infinity;
+  for (let index = 0; index < waiters.length; index += 1) {
+    const waiter = waiters[index];
+    if (!waiter || waiter.done) continue;
+    const priority = Number(waiter.priority || 0);
+    const queuedAt = Number(waiter.queuedAt || 0);
+    if (priority >= Number(incomingPriority || 0)) continue;
+    if (
+      selectedIndex < 0 ||
+      priority < selectedPriority ||
+      (priority === selectedPriority && queuedAt > selectedQueuedAt)
+    ) {
+      selectedIndex = index;
+      selectedPriority = priority;
+      selectedQueuedAt = queuedAt;
+    }
+  }
+  if (selectedIndex < 0) return false;
+  const [waiter] = waiters.splice(selectedIndex, 1);
+  if (!waiter || waiter.done) return false;
+  waiter.done = true;
+  clearTimeout(waiter.timeout);
+  waiter.signal?.removeEventListener('abort', waiter.abort);
+  stats.lower_priority_preemptions += 1;
+  incrementLaneCounter(stats.lower_priority_preemptions_by_lane, incomingLane);
+  const error = new Error('binance_kline_relay_preempted_by_higher_priority');
+  error.auxiliaryDeferred = waiter.lane === 'auxiliary';
+  error.preemptedByLane = incomingLane;
+  waiter.reject(error);
+  clearDispatchTimer();
+  return true;
+}
+
+function scheduleDispatch(delay) {
+  const safeDelay = Math.max(0, Math.trunc(Number(delay) || 0));
+  const dueAt = Date.now() + safeDelay;
+  if (dispatchTimer && dispatchDueAt <= dueAt) return;
+  if (dispatchTimer) {
+    clearTimeout(dispatchTimer);
+    stats.dispatch_reschedules += 1;
+  }
+  dispatchDueAt = dueAt;
+  dispatchTimer = setTimeout(() => {
+    dispatchTimer = null;
+    dispatchDueAt = 0;
+    releaseNext();
+  }, safeDelay);
+  dispatchTimer.unref?.();
+}
+
+function releaseNext() {
+  if (activeRequest) return;
+  for (let index = waiters.length - 1; index >= 0; index -= 1) {
+    if (waiters[index]?.done) waiters.splice(index, 1);
+  }
+  const index = nextWaiterIndex();
+  if (index < 0) {
+    clearDispatchTimer();
+    return;
+  }
+  const waiter = waiters[index];
+  const now = Date.now();
+  const lane = waiter.lane === 'kline' ? 'kline' : waiter.lane === 'critical' ? 'critical' : 'auxiliary';
+  const laneDelay = laneGapMs(lane) - (now - Number(lastRequestStartedAtByLane[lane] || 0));
+  const globalDelay = GLOBAL_MIN_REQUEST_GAP_MS - (now - lastRequestStartedAt);
+  const delay = Math.max(0, laneDelay, globalDelay);
+  if (delay > 0) {
+    scheduleDispatch(delay);
+    return;
+  }
+
+  clearDispatchTimer();
+  const [selected] = waiters.splice(index, 1);
+  if (!selected || selected.done || activeRequest) {
+    stats.stale_dispatch_grants_prevented += 1;
+    releaseNext();
+    return;
+  }
+  selected.done = true;
+  clearTimeout(selected.timeout);
+  selected.signal?.removeEventListener('abort', selected.abort);
+  activeRequest = true;
+  activeRequestLane = lane;
+  activeRequestSource = String(selected.sourceLabel || 'public_rest');
+  lastRequestStartedAt = Date.now();
+  lastRequestStartedAtByLane[lane] = lastRequestStartedAt;
+  stats.requests_started += 1;
+  incrementLaneCounter(stats.requests_started_by_lane, lane);
+  selected.resolve(() => {
+    if (!activeRequest) return;
+    activeRequest = false;
+    activeRequestLane = '';
+    activeRequestSource = '';
+    releaseNext();
+  });
+}
+
+async function acquireSlot(signal = null, {
+  lane = 'auxiliary', priority = 0, sourceLabel = 'public_rest', deferWhenBusy = false,
+} = {}) {
   await ensureBinanceContractKlineRelayInitialized();
   if (activeState()) {
     const error = new Error('binance_kline_edge_relay_cooling_down');
@@ -401,43 +526,100 @@ async function acquireSlot(signal = null, { lane = 'auxiliary', priority = 0 } =
     throw new Error('binance_kline_relay_client_aborted_before_queue');
   }
   const safeLane = lane === 'kline' ? 'kline' : lane === 'critical' ? 'critical' : 'auxiliary';
+  const safeSource = String(sourceLabel || 'public_rest').slice(0, 180);
+  const pendingAuxiliary = activeWaitersByLane('auxiliary');
+  const pendingBackground = waiters.filter((waiter) => !waiter.done && waiter.deferWhenBusy === true).length;
+
+  // Step784: background rotations are useful only while the relay is genuinely
+  // idle. They must never occupy the bounded queue ahead of visible Kline or
+  // first-paint critical metrics. A deferred background refresh keeps verified
+  // stale cache and is retried by its existing scheduler.
+  if (
+    deferWhenBusy === true &&
+    (activeRequest || waiters.some((waiter) => !waiter.done) || pendingBackground >= MAX_BACKGROUND_PENDING)
+  ) {
+    stats.background_deferrals += 1;
+    const error = new Error('binance_kline_relay_background_deferred');
+    error.backgroundDeferred = true;
+    throw error;
+  }
+
+  // Reserve two of the six pending positions for visible Kline/critical work.
+  // Auxiliary callers fail fast to their existing stale/cache fallback instead
+  // of waiting 25 seconds and inflating queue-timeout counters.
+  if (safeLane === 'auxiliary' && pendingAuxiliary >= MAX_AUXILIARY_PENDING) {
+    stats.auxiliary_capacity_deferrals += 1;
+    const error = new Error('binance_kline_relay_auxiliary_capacity_reserved');
+    error.auxiliaryDeferred = true;
+    throw error;
+  }
+
   const now = Date.now();
   const laneReady = now - Number(lastRequestStartedAtByLane[safeLane] || 0) >= laneGapMs(safeLane);
   const globalReady = now - lastRequestStartedAt >= GLOBAL_MIN_REQUEST_GAP_MS;
   if (!activeRequest && waiters.length === 0 && laneReady && globalReady) {
+    clearDispatchTimer();
     activeRequest = true;
+    activeRequestLane = safeLane;
+    activeRequestSource = safeSource;
     lastRequestStartedAt = Date.now();
     lastRequestStartedAtByLane[safeLane] = lastRequestStartedAt;
     stats.requests_started += 1;
+    incrementLaneCounter(stats.requests_started_by_lane, safeLane);
     let released = false;
     return () => {
       if (released) return;
       released = true;
       activeRequest = false;
+      activeRequestLane = '';
+      activeRequestSource = '';
       releaseNext();
     };
   }
-  if (waiters.length >= MAX_PENDING) {
-    stats.queue_rejections += 1;
-    throw new Error('binance_kline_relay_queue_full');
+  if (waiters.filter((waiter) => !waiter.done).length >= MAX_PENDING) {
+    const preempted = safeLane !== 'auxiliary' &&
+      preemptLowerPriorityWaiter(safeLane, Number(priority || 0));
+    if (!preempted) {
+      stats.queue_rejections += 1;
+      throw new Error('binance_kline_relay_queue_full');
+    }
   }
   stats.queue_waits += 1;
+  incrementLaneCounter(stats.queue_waits_by_lane, safeLane);
   return await new Promise((resolve, reject) => {
-    const waiter = { resolve, reject, done: false, signal, timeout: null, abort: null, lane: safeLane, priority: Number(priority || 0) };
+    const waiter = {
+      resolve,
+      reject,
+      done: false,
+      signal,
+      timeout: null,
+      abort: null,
+      lane: safeLane,
+      priority: Number(priority || 0),
+      sourceLabel: safeSource,
+      deferWhenBusy: deferWhenBusy === true,
+      queuedAt: Date.now(),
+    };
     waiter.abort = () => {
       if (waiter.done) return;
       waiter.done = true;
       stats.client_abort_blocks += 1;
       clearTimeout(waiter.timeout);
       reject(new Error('binance_kline_relay_client_aborted_in_queue'));
+      releaseNext();
     };
     const queueWaitMs = queueWaitMsForLane(safeLane);
     waiter.timeout = setTimeout(() => {
       if (waiter.done) return;
       waiter.done = true;
       stats.queue_timeouts += 1;
+      incrementLaneCounter(stats.queue_timeouts_by_lane, safeLane);
+      stats.last_queue_timeout_lane = safeLane;
+      stats.last_queue_timeout_source = safeSource;
+      recordQueueTimeoutSource(safeSource);
       signal?.removeEventListener('abort', waiter.abort);
       reject(new Error('binance_kline_relay_queue_timeout'));
+      releaseNext();
     }, queueWaitMs);
     waiter.timeout.unref?.();
     signal?.addEventListener('abort', waiter.abort, { once: true });
@@ -480,8 +662,10 @@ function normalizeRelayRows(rawRows, symbol, interval) {
   return [...new Map(rows.map((row) => [row.open_time_ms, row])).values()].sort((a, b) => a.open_time_ms - b.open_time_ms);
 }
 
-async function invokeAuthenticatedEdgeRelay(body, { signal = null, sourceLabel = 'public_rest', lane = 'auxiliary', priority = 0 } = {}) {
-  const release = await acquireSlot(signal, { lane, priority });
+async function invokeAuthenticatedEdgeRelay(body, {
+  signal = null, sourceLabel = 'public_rest', lane = 'auxiliary', priority = 0, deferWhenBusy = false,
+} = {}) {
+  const release = await acquireSlot(signal, { lane, priority, sourceLabel, deferWhenBusy });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RELAY_TIMEOUT_MS);
   try {
@@ -590,7 +774,7 @@ export async function fetchBinanceContractKlineRelayRows({
 }
 
 export async function fetchBinancePublicRestRelayJson(url, {
-  source = 'public_rest', signal = null, allowBeforeValidation = false, lane = 'auxiliary', priority = 0,
+  source = 'public_rest', signal = null, allowBeforeValidation = false, lane = 'auxiliary', priority = 0, deferWhenBusy = false,
 } = {}) {
   await ensureBinanceContractKlineRelayInitialized();
   if (state.validation_completed !== true && allowBeforeValidation !== true) {
@@ -603,7 +787,7 @@ export async function fetchBinancePublicRestRelayJson(url, {
   const payload = await invokeAuthenticatedEdgeRelay({
     kind: 'public_rest',
     upstream_url: parsed.toString(),
-  }, { signal, sourceLabel: String(source || 'public_rest'), lane, priority });
+  }, { signal, sourceLabel: String(source || 'public_rest'), lane, priority, deferWhenBusy });
   return payload?.data;
 }
 
@@ -795,7 +979,14 @@ export function getBinanceContractKlineRelayHealth() {
     restore_healthy: initialized && stats.restore_errors === 0,
     persistence_healthy: stats.persistence_errors === 0,
     queue_depth: waiters.filter((waiter) => !waiter.done).length,
+    queue_depth_by_lane: {
+      kline: activeWaitersByLane('kline'),
+      critical: activeWaitersByLane('critical'),
+      auxiliary: activeWaitersByLane('auxiliary'),
+    },
     active_request: activeRequest,
+    active_request_lane: activeRequestLane || null,
+    active_request_source: activeRequestSource || null,
     min_request_gap_ms: MIN_REQUEST_GAP_MS,
     kline_min_request_gap_ms: KLINE_MIN_REQUEST_GAP_MS,
     critical_aux_min_request_gap_ms: CRITICAL_AUX_MIN_REQUEST_GAP_MS,
@@ -806,6 +997,13 @@ export function getBinanceContractKlineRelayHealth() {
     ordinary_success_persistence_blocks_queue: false,
     restriction_persistence_strict: true,
     max_pending: MAX_PENDING,
+    reserved_high_priority_pending: RESERVED_HIGH_PRIORITY_PENDING,
+    max_auxiliary_pending: MAX_AUXILIARY_PENDING,
+    max_background_pending: MAX_BACKGROUND_PENDING,
+    max_queue_timeout_source_entries: MAX_QUEUE_TIMEOUT_SOURCE_ENTRIES,
+    dispatch_rechecks_priority_before_grant: true,
+    background_work_deferred_while_busy: true,
+    high_priority_preempts_lower_priority_when_full: true,
     prior_validated_symbols: PRIOR_VALIDATED_SYMBOLS,
     validation_sequence: VALIDATION_SEQUENCE,
     validation_interval: VALIDATION_INTERVAL,
@@ -828,4 +1026,12 @@ export const _test = {
   queueWaitMsForLane,
   ordinarySuccessPersistenceBlocksQueue: false,
   restrictionPersistenceStrict: true,
+  dispatchRechecksPriorityBeforeGrant: true,
+  reservedHighPriorityPending: RESERVED_HIGH_PRIORITY_PENDING,
+  maxAuxiliaryPending: MAX_AUXILIARY_PENDING,
+  maxBackgroundPending: MAX_BACKGROUND_PENDING,
+  backgroundWorkDeferredWhileBusy: true,
+  bestWaiterIndex,
+  highPriorityPreemptsLowerPriorityWhenFull: true,
+  maxQueueTimeoutSourceEntries: MAX_QUEUE_TIMEOUT_SOURCE_ENTRIES,
 };

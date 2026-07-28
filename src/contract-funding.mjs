@@ -697,6 +697,7 @@ async function fetchBinanceJson(url, timeoutMs = 8000, source = 'contract_fundin
     source,
     lane: options.lane || 'auxiliary',
     priority: Number(options.priority || 0),
+    deferWhenBusy: options.deferWhenBusy === true,
   });
 }
 
@@ -769,7 +770,7 @@ async function fetchBinanceFundingHistory(symbol, limit) {
     `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
     8000,
     'funding:history_background',
-    { lane: 'auxiliary', priority: -10 },
+    { lane: 'auxiliary', priority: -10, deferWhenBusy: true },
   );
   return Array.isArray(historyRaw) ? historyRaw.map((item) => historyRow({
     provider: 'binance', symbol,

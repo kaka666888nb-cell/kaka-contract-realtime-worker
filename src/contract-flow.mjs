@@ -1455,7 +1455,7 @@ async function fetchJson(url, { headers = {}, timeoutMs = 8000 } = {}) {
 }
 
 async function fetchBinanceJson(url, {
-  headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0,
+  headers = {}, timeoutMs = 8000, source = 'contract_flow', lane = 'auxiliary', priority = 0, deferWhenBusy = false,
 } = {}) {
   // Step650.8.15.14: all Binance public HTTP used by contract flow/meta is relayed
   // through the authenticated Supabase Edge allowlist. Render never contacts
@@ -1463,7 +1463,7 @@ async function fetchBinanceJson(url, {
   // lane; slower ratio history remains background auxiliary work.
   void headers;
   void timeoutMs;
-  return await fetchBinancePublicRestRelayJson(url, { source, lane, priority });
+  return await fetchBinancePublicRestRelayJson(url, { source, lane, priority, deferWhenBusy });
 }
 
 
@@ -1903,7 +1903,7 @@ async function refreshBinanceLongShortCritical(state) {
         else errors.push(`${family.prefix}_ratio_empty`);
       } catch (error) {
         errors.push(`${family.prefix}:${String(error?.message || error)}`);
-        if (error?.internalBinanceRestGuard || [403, 418, 429, 451].includes(Number(error?.status || 0))) break;
+        if (error?.backgroundDeferred || error?.auxiliaryDeferred || error?.internalBinanceRestGuard || [403, 418, 429, 451].includes(Number(error?.status || 0))) break;
       }
     }
 
@@ -2162,10 +2162,10 @@ async function fetchBinanceMetricRows(state) {
   const settled = [];
   for (const [url, source] of metricRequests) {
     try {
-      settled.push({ status: 'fulfilled', value: await fetchBinanceJson(url, { headers, timeoutMs: 6500, source, lane: 'auxiliary', priority: 10 }) });
+      settled.push({ status: 'fulfilled', value: await fetchBinanceJson(url, { headers, timeoutMs: 6500, source, lane: 'auxiliary', priority: -20, deferWhenBusy: true }) });
     } catch (error) {
       settled.push({ status: 'rejected', reason: error });
-      if (error?.internalBinanceRestGuard || [403, 418, 429, 451].includes(Number(error?.status || 0))) break;
+      if (error?.backgroundDeferred || error?.auxiliaryDeferred || error?.internalBinanceRestGuard || [403, 418, 429, 451].includes(Number(error?.status || 0))) break;
     }
   }
   while (settled.length < metricRequests.length) {
