@@ -1455,15 +1455,45 @@ async function tickers(provider, market, wantedSymbols = []) {
 
   if (provider === 'coinbase') {
     if (!wanted.length) return [];
+
+    // Step788.1.2:
+    // Coinbase returns an upstream 404 for an unknown product. Preflight the
+    // exact symbol set against the current official product directory so an
+    // absent product becomes an honest empty result instead of a failed
+    // exact-ticker build. In mixed-quote batches, absent groups return []
+    // without discarding valid rows from neighboring quote groups.
+    const identities = await universe(
+      provider,
+      market,
+      requestedQuote,
+    );
+    const exactSymbols = new Set(
+      identities
+        .filter((row) =>
+          row?.provider === provider &&
+          row?.market_type === market &&
+          row?.quote_asset === requestedQuote
+        )
+        .map((row) => compact(row?.symbol)),
+    );
+    const existingWanted = wanted.filter(
+      (symbol) => exactSymbols.has(symbol),
+    );
+    if (!existingWanted.length) return [];
+
     let lastError = null;
-    const rows = await mapLimit(wanted.slice(0, 48), 5, async (symbol) => {
-      try {
-        return await coinbaseTicker(symbol);
-      } catch (error) {
-        lastError = error;
-        return null;
-      }
-    });
+    const rows = await mapLimit(
+      existingWanted.slice(0, 48),
+      5,
+      async (symbol) => {
+        try {
+          return await coinbaseTicker(symbol);
+        } catch (error) {
+          lastError = error;
+          return null;
+        }
+      },
+    );
     const validRows = rows.filter(Boolean);
     if (!validRows.length && lastError) throw lastError;
     return validRows;
@@ -3697,6 +3727,10 @@ export function getBinanceMarketRestHealth() {
     one_second_history_window_passes_by_time_span_not_page_count: true,
     coinbase_spot_ticker_current_source: 'exchange_product_ticker_last_trade',
     coinbase_spot_ticker_current_cache_ms: COINBASE_TICKER_TTL_MS,
+    coinbase_exact_ticker_official_directory_preflight: true,
+    coinbase_nonexistent_product_returns_honest_empty: true,
+    coinbase_nonexistent_product_never_calls_ticker_or_stats: true,
+    coinbase_mixed_batch_absent_symbol_does_not_fail_valid_neighbors: true,
     coinbase_spot_ticker_stats_cache_ms: COINBASE_STATS_TTL_MS,
     coinbase_spot_usdt_exact_product_passthrough: true,
     coinbase_all_directory_quote_realtime_and_history_supported: true,
@@ -3808,7 +3842,7 @@ export async function handleMarketApi(req, res, url) {
       const result = await startBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         relay_validation: result,
         health: getBinanceContractKlineRelayHealth(),
         cached_at: new Date().toISOString(),
@@ -3820,7 +3854,7 @@ export async function handleMarketApi(req, res, url) {
       const health = await resetBinanceContractKlineRelayValidation(adminKey);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         reset: true,
         health,
         cached_at: new Date().toISOString(),
@@ -3830,7 +3864,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-validation-reset') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         error: 'legacy direct-REST validation reset retired; use the Kline relay validation reset endpoint',
         direct_binance_rest_enabled: false,
       });
@@ -3839,7 +3873,7 @@ export async function handleMarketApi(req, res, url) {
     if (url.pathname === '/api/binance-contract-rest-probe') {
       send(res, 410, {
         ok: false,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         error: 'direct Binance REST probe retired; use the Supabase Edge Kline relay validation endpoint',
         direct_binance_rest_probe_enabled: false,
       });
@@ -3849,7 +3883,7 @@ export async function handleMarketApi(req, res, url) {
       const selfTest = marketUnitSelfTest();
       send(res, selfTest.ok ? 200 : 500, {
         ok: selfTest.ok,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         self_test: selfTest,
       });
       return true;
@@ -3865,7 +3899,7 @@ export async function handleMarketApi(req, res, url) {
       ].map(([name, ok]) => ({ name, ok: Boolean(ok) }));
       send(res, tests.every((item) => item.ok) ? 200 : 500, {
         ok: tests.every((item) => item.ok),
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         checks: tests.length,
         tests,
       });
@@ -3880,7 +3914,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await assetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         base_asset: base,
         rows,
         total_quote_assets: rows.length,
@@ -3899,7 +3933,7 @@ export async function handleMarketApi(req, res, url) {
       const rows = await binanceAssetQuoteSummary(base);
       send(res, 200, {
         ok: true,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         provider: 'binance',
         base_asset: base,
         rows,
@@ -4027,7 +4061,7 @@ export async function handleMarketApi(req, res, url) {
       }
       send(res, 200, {
         ok: true,
-        version: '650.8.15.68',
+        version: '650.8.15.69',
         provider,
         market_type: market,
         symbol,

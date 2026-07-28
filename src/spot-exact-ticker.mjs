@@ -1,6 +1,6 @@
 import { tickers } from './market-rest.mjs';
 
-const VERSION = '650.8.15.50';
+const VERSION = '650.8.15.51';
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 
 const CACHE_TTL_MS = 20_000;
@@ -280,6 +280,10 @@ export function getSpotExactTickerHealth() {
     app_no_longer_calls_spot_detail_ticker_edge: true,
     app_no_longer_uses_device_direct_spot_ticker_fallback_for_detail_first_paint: true,
     detail_first_paint_ticker_builds_scale_by_exact_key_not_user_count: true,
+    coinbase_exact_symbol_official_directory_preflight: true,
+    coinbase_nonexistent_product_writes_negative_cache: true,
+    coinbase_nonexistent_product_returns_http_404_honest_empty: true,
+    coinbase_upstream_404_is_not_a_build_failure: true,
     ...stats,
     time: new Date().toISOString(),
   };
