@@ -1,7 +1,8 @@
 // Step650.8.15.72 / Step930: one scheduled CME official fetch, persistent shared expiry universe, zero user upstream reads.
 import { inflateRawSync } from 'node:zlib';
+import { createConnection } from 'node:net';
 
-const STEP_VERSION = '650.8.15.72';
+const STEP_VERSION = '650.8.15.72.1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const LEGACY_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const SECRET_KEYS = (() => {
@@ -15,13 +16,21 @@ const ADMIN_API_KEY = SECRET_KEYS.default || Object.values(SECRET_KEYS)[0] || LE
 const SNAPSHOT_TABLE = 'kaka_calendar_snapshot_cache';
 const SHARED_KEY = 'expiries|shared_universe|cme_fprf_v3';
 const SHARED_COVERAGE_VERSION = 'step930_cme_fprf_shared_universe_v4';
-const OFFICIAL_ZIP_URL = 'https://www.cmegroup.com/ftp/fprf/csv/cmeg.fut.prf.csv.zip';
-const OFFICIAL_PLAIN_URL = 'https://www.cmegroup.com/ftp/fprf/csv/cmeg.fut.prf.csv';
+// CME's public web gateway currently lists the file but returns HTTP 400 for direct binary downloads.
+// Use CME's documented public anonymous FTP production path instead. This is still one official backend fetch;
+// normal users and Edge reads continue to use only the persisted Supabase snapshot.
+const OFFICIAL_FTP_HOST = String(process.env.CME_FPRF_FTP_HOST || 'ftp.cmegroup.com').trim();
+const OFFICIAL_FTP_PORT = Number(process.env.CME_FPRF_FTP_PORT || 21);
+const OFFICIAL_FTP_PATH = String(process.env.CME_FPRF_FTP_PATH || '/pub/fprf/csv/cmeg.fut.prf.csv.zip').trim();
+const OFFICIAL_SOURCE_URL = `ftp://${OFFICIAL_FTP_HOST}${OFFICIAL_FTP_PATH}`;
+const OFFICIAL_WEB_DIRECTORY_URL = 'https://www.cmegroup.com/ftp/fprf/csv/';
 const SOURCE_HELP_URL = 'https://www.cmegroup.com/clearing/files/cme-group-product-reference-file-futures.pdf';
 const REFRESH_MS = 6 * 60 * 60 * 1000;
 const BLOCK_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const MAX_COMPRESSED_BYTES = 64 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES = 180 * 1024 * 1024;
+const FTP_CONNECT_TIMEOUT_MS = 30_000;
+const FTP_TRANSFER_TIMEOUT_MS = 90_000;
 
 const PRODUCT_IDENTITIES={
   ES:{zh:"E-mini标普500指数期货",en:"E-mini S&P 500 Futures",sectorKey:"equity_index",sectorZh:"股票指数",sectorEn:"Equity indexes",countryCode:"US",countryZh:"美国",countryEn:"United States"},
@@ -83,6 +92,9 @@ const state = {
   last_reason: '',
   blocked_until: '',
   collector_transport: 'render_shared_single_official_fetch',
+  official_transport: 'cme_public_anonymous_passive_ftp',
+  official_ftp_host: OFFICIAL_FTP_HOST,
+  official_ftp_path: OFFICIAL_FTP_PATH,
   user_read_upstream_requests: 0,
 };
 let refreshPromise = null;
@@ -164,6 +176,236 @@ function unzipFirstCsv(input) {
   }
   throw new Error('zip_csv_entry_missing');
 }
+
+function ftpReplyReader(socket) {
+  let buffer = '';
+  let multilineCode = '';
+  let multilineLines = [];
+  const queued = [];
+  const waiters = [];
+  let terminalError = null;
+
+  const deliver = (reply) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter.resolve(reply);
+    else queued.push(reply);
+  };
+  const fail = (error) => {
+    if (terminalError) return;
+    terminalError = error instanceof Error ? error : new Error(String(error));
+    while (waiters.length) waiters.shift().reject(terminalError);
+  };
+  const consumeLine = (line) => {
+    if (multilineCode) {
+      multilineLines.push(line);
+      if (line.startsWith(`${multilineCode} `)) {
+        const code = Number(multilineCode);
+        const message = multilineLines.join('\n');
+        multilineCode = '';
+        multilineLines = [];
+        deliver({ code, message });
+      }
+      return;
+    }
+    const match = /^(\d{3})([- ])(.*)$/.exec(line);
+    if (!match) return;
+    if (match[2] === '-') {
+      multilineCode = match[1];
+      multilineLines = [line];
+      return;
+    }
+    deliver({ code: Number(match[1]), message: line });
+  };
+
+  socket.setEncoding('utf8');
+  socket.on('data', (chunk) => {
+    buffer += chunk;
+    while (true) {
+      const index = buffer.indexOf('\n');
+      if (index < 0) break;
+      const line = buffer.slice(0, index).replace(/\r$/, '');
+      buffer = buffer.slice(index + 1);
+      consumeLine(line);
+    }
+  });
+  socket.on('error', fail);
+  socket.on('close', () => fail(new Error('cme_ftp_control_closed')));
+
+  return {
+    next(timeoutMs = FTP_TRANSFER_TIMEOUT_MS) {
+      if (queued.length) return Promise.resolve(queued.shift());
+      if (terminalError) return Promise.reject(terminalError);
+      return new Promise((resolve, reject) => {
+        const waiter = { resolve, reject };
+        waiters.push(waiter);
+        const timer = setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          reject(new Error('cme_ftp_reply_timeout'));
+        }, timeoutMs);
+        const originalResolve = waiter.resolve;
+        const originalReject = waiter.reject;
+        waiter.resolve = (value) => { clearTimeout(timer); originalResolve(value); };
+        waiter.reject = (error) => { clearTimeout(timer); originalReject(error); };
+      });
+    },
+  };
+}
+
+function expectFtp(reply, allowed, label) {
+  if (!reply || !allowed.includes(reply.code)) {
+    throw new Error(`cme_ftp_${label}_${reply?.code || 'missing'}:${text(reply?.message).slice(0, 220)}`);
+  }
+  return reply;
+}
+
+function connectSocket({ host, port, timeoutMs, label }) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host, port });
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      socket.removeListener('connect', onConnect);
+      socket.removeListener('error', onError);
+      socket.removeListener('timeout', onTimeout);
+      if (error) {
+        socket.destroy();
+        reject(error);
+      } else {
+        socket.setTimeout(0);
+        resolve(socket);
+      }
+    };
+    const onConnect = () => finish();
+    const onError = (error) => finish(new Error(`cme_ftp_${label}_connect:${error?.message || error}`));
+    const onTimeout = () => finish(new Error(`cme_ftp_${label}_connect_timeout`));
+    socket.once('connect', onConnect);
+    socket.once('error', onError);
+    socket.once('timeout', onTimeout);
+    socket.setTimeout(timeoutMs);
+  });
+}
+
+function parseEpsvPort(message) {
+  const match = /\(\|\|\|(\d+)\|\)/.exec(message);
+  const port = Number(match?.[1] || 0);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0;
+}
+
+function parsePasvEndpoint(message, fallbackHost) {
+  const match = /\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/.exec(message);
+  if (!match) return null;
+  const values = match.slice(1).map(Number);
+  const candidateHost = values.slice(0, 4).join('.');
+  const port = values[4] * 256 + values[5];
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  const privateOrInvalid = /^(?:0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(candidateHost);
+  return { host: privateOrInvalid ? fallbackHost : candidateHost, port };
+}
+
+function readDataSocket(socket, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      socket.removeAllListeners();
+      if (error) {
+        socket.destroy();
+        reject(error);
+      } else {
+        resolve(Buffer.concat(chunks, total));
+      }
+    };
+    socket.setTimeout(FTP_TRANSFER_TIMEOUT_MS);
+    socket.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        finish(new Error(`cme_ftp_body_too_large:${total}`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    socket.once('end', () => finish());
+    socket.once('error', (error) => finish(new Error(`cme_ftp_data_error:${error?.message || error}`)));
+    socket.once('timeout', () => finish(new Error('cme_ftp_data_timeout')));
+  });
+}
+
+function ftpTimestampToIso(reply) {
+  const match = /213\s+(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(text(reply?.message));
+  if (!match) return '';
+  const iso = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`;
+  return Number.isFinite(Date.parse(iso)) ? iso : '';
+}
+
+async function downloadOfficialFtpFile() {
+  let control = null;
+  let dataSocket = null;
+  try {
+    control = await connectSocket({ host: OFFICIAL_FTP_HOST, port: OFFICIAL_FTP_PORT, timeoutMs: FTP_CONNECT_TIMEOUT_MS, label: 'control' });
+    control.setKeepAlive(true, 15_000);
+    const replies = ftpReplyReader(control);
+    expectFtp(await replies.next(FTP_CONNECT_TIMEOUT_MS), [220], 'greeting');
+
+    const command = async (line, allowed, label, timeoutMs = FTP_CONNECT_TIMEOUT_MS) => {
+      control.write(`${line}\r\n`);
+      return expectFtp(await replies.next(timeoutMs), allowed, label);
+    };
+
+    let login = await command('USER anonymous', [230, 331], 'user');
+    if (login.code === 331) login = await command('PASS kakaweb3@kakaweb3.com', [230, 202], 'password');
+    await command('TYPE I', [200], 'binary_type');
+
+    let expectedSize = 0;
+    try {
+      const sizeReply = await command(`SIZE ${OFFICIAL_FTP_PATH}`, [213], 'size');
+      expectedSize = Number(/213\s+(\d+)/.exec(sizeReply.message)?.[1] || 0);
+      if (expectedSize > MAX_COMPRESSED_BYTES) throw new Error(`cme_ftp_file_too_large:${expectedSize}`);
+    } catch (error) {
+      if (/file_too_large/.test(String(error?.message || error))) throw error;
+      expectedSize = 0;
+    }
+
+    let lastModified = '';
+    try {
+      const mdtmReply = await command(`MDTM ${OFFICIAL_FTP_PATH}`, [213], 'mdtm');
+      lastModified = ftpTimestampToIso(mdtmReply);
+    } catch (_) {}
+
+    let passiveHost = OFFICIAL_FTP_HOST;
+    let passivePort = 0;
+    control.write('EPSV\r\n');
+    const epsv = await replies.next(FTP_CONNECT_TIMEOUT_MS);
+    if (epsv.code === 229) passivePort = parseEpsvPort(epsv.message);
+    if (!passivePort) {
+      const pasv = await command('PASV', [227], 'pasv');
+      const endpoint = parsePasvEndpoint(pasv.message, OFFICIAL_FTP_HOST);
+      if (!endpoint) throw new Error(`cme_ftp_pasv_parse:${text(pasv.message).slice(0, 220)}`);
+      passiveHost = endpoint.host;
+      passivePort = endpoint.port;
+    }
+
+    dataSocket = await connectSocket({ host: passiveHost, port: passivePort, timeoutMs: FTP_CONNECT_TIMEOUT_MS, label: 'data' });
+    const dataPromise = readDataSocket(dataSocket, MAX_COMPRESSED_BYTES);
+    control.write(`RETR ${OFFICIAL_FTP_PATH}\r\n`);
+    expectFtp(await replies.next(FTP_CONNECT_TIMEOUT_MS), [125, 150], 'retr_start');
+    const bytes = await dataPromise;
+    dataSocket = null;
+    expectFtp(await replies.next(FTP_TRANSFER_TIMEOUT_MS), [226, 250], 'retr_complete');
+    if (expectedSize && bytes.length !== expectedSize) throw new Error(`cme_ftp_size_mismatch:${bytes.length}/${expectedSize}`);
+    if (bytes.length < 4) throw new Error(`cme_ftp_body_too_small:${bytes.length}`);
+    try { control.write('QUIT\r\n'); } catch (_) {}
+    return { bytes, lastModified };
+  } finally {
+    if (dataSocket) dataSocket.destroy();
+    if (control) control.destroy();
+  }
+}
+
 function rootCode(row) {
   const candidates=[row.Sym,row.GBXAlias,row.ClrAlias,row.TCCAlias,row.ITCAlias]
     .map((value)=>text(value).toUpperCase().replace(/\s+/g,''));
@@ -202,33 +444,32 @@ async function writeSnapshot(payload) {
       source_fetched_at:payload.fetched_at,cached_at:now.toISOString(),
       expires_at:new Date(now.getTime()+30*24*60*60*1000).toISOString(),
       last_error:'',consecutive_errors:0,updated_at:now.toISOString(),
-      metadata:{coverage_version:SHARED_COVERAGE_VERSION,collector_version:STEP_VERSION,collector_transport:'render_shared_single_official_fetch',user_read_upstream_requests:0},
+      metadata:{coverage_version:SHARED_COVERAGE_VERSION,collector_version:STEP_VERSION,collector_transport:'render_shared_single_official_fetch',official_transport:text(payload?.item?.official_transport)||'cme_public_anonymous_passive_ftp',user_read_upstream_requests:0},
     }),
   });
   if(!response.ok) throw new Error(`shared_snapshot_write_${response.status}:${(await response.text()).slice(0,220)}`);
 }
 async function fetchOfficialCsv() {
-  const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),75000);
   state.official_requests_started++;
-  try{
-    let response=await fetch(OFFICIAL_ZIP_URL,{
-      headers:{Accept:'application/zip,application/octet-stream,*/*','Accept-Language':'en-US,en;q=0.9',Referer:'https://www.cmegroup.com/ftp/fprf/csv/','User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36 KakaWeb3-Shared-Collector/1.0'},
-      signal:controller.signal,
-    });
-    if(response.status===404){
-      response=await fetch(OFFICIAL_PLAIN_URL,{headers:{Accept:'text/csv,text/plain,*/*','User-Agent':'KakaWeb3-Shared-Collector/1.0'},signal:controller.signal});
-    }
-    const bytes=Buffer.from(await response.arrayBuffer());
-    if(!response.ok) throw new Error(`cme_official_http_${response.status}:${bytes.toString('utf8',0,220).replace(/\s+/g,' ')}`);
-    if(bytes.length>MAX_COMPRESSED_BYTES) throw new Error(`cme_official_body_too_large:${bytes.length}`);
-    const contentType=text(response.headers.get('content-type')).toLowerCase();
-    const csv=contentType.includes('zip')||bytes.readUInt32LE(0)===0x04034b50?unzipFirstCsv(bytes):bytes.toString('utf8');
+  try {
+    const official = await downloadOfficialFtpFile();
+    const bytes = official.bytes;
+    if (bytes.length > MAX_COMPRESSED_BYTES) throw new Error(`cme_official_body_too_large:${bytes.length}`);
+    const csv = bytes.readUInt32LE(0) === 0x04034b50 ? unzipFirstCsv(bytes) : bytes.toString('utf8');
+    if (!csv.trim()) throw new Error('cme_official_csv_empty');
     state.official_requests_succeeded++;
-    return {csv,etag:text(response.headers.get('etag')),lastModified:text(response.headers.get('last-modified')),sourceUrl:response.url||OFFICIAL_ZIP_URL};
-  }catch(error){
+    state.last_transport = 'cme_public_anonymous_passive_ftp';
+    return {
+      csv,
+      etag: '',
+      lastModified: official.lastModified,
+      sourceUrl: OFFICIAL_SOURCE_URL,
+      transport: 'cme_public_anonymous_passive_ftp',
+    };
+  } catch (error) {
     state.official_requests_failed++;
     throw error;
-  }finally{clearTimeout(timer);}
+  }
 }
 function buildUniverse(csv, meta) {
   const rows=parseCsv(csv); const events=[];
@@ -248,7 +489,7 @@ function buildUniverse(csv, meta) {
   const unique=new Map(); for(const event of events) unique.set(event.event_id,event);
   const finalEvents=[...unique.values()].sort((a,b)=>a.last_trade_date.localeCompare(b.last_trade_date)||a.product_code.localeCompare(b.product_code)||a.contract_month.localeCompare(b.contract_month));
   const fetchedAt=new Date().toISOString();
-  return {ok:true,source:'cme_group_official_fprf_shared_render',cache_status:'official_shared_render_snapshot',fetched_at:fetchedAt,item:{source_verified:true,time_identity_verified:true,coverage_version:SHARED_COVERAGE_VERSION,collector_version:STEP_VERSION,collector_transport:'render_shared_single_official_fetch',official_request_count:1,user_read_upstream_requests:0,source_file_count:1,source_row_count:rows.length,matched_benchmark_row_count:finalEvents.length,official_etag:meta.etag,official_last_modified:meta.lastModified,source_url:meta.sourceUrl,source_help_url:SOURCE_HELP_URL,country_filter_options:COUNTRY_OPTIONS,country_filter_option_count:COUNTRY_OPTIONS.length,country_filter_options_date_independent:true,sector_filter_options:SECTOR_OPTIONS,sector_filter_option_count:SECTOR_OPTIONS.length,events:finalEvents}};
+  return {ok:true,source:'cme_group_official_fprf_shared_render',cache_status:'official_shared_render_snapshot',fetched_at:fetchedAt,item:{source_verified:true,time_identity_verified:true,coverage_version:SHARED_COVERAGE_VERSION,collector_version:STEP_VERSION,collector_transport:'render_shared_single_official_fetch',official_transport:meta.transport||'cme_public_anonymous_passive_ftp',official_request_count:1,user_read_upstream_requests:0,source_file_count:1,source_row_count:rows.length,matched_benchmark_row_count:finalEvents.length,official_etag:meta.etag,official_last_modified:meta.lastModified,source_url:meta.sourceUrl,source_help_url:SOURCE_HELP_URL,country_filter_options:COUNTRY_OPTIONS,country_filter_option_count:COUNTRY_OPTIONS.length,country_filter_options_date_independent:true,sector_filter_options:SECTOR_OPTIONS,sector_filter_option_count:SECTOR_OPTIONS.length,events:finalEvents}};
 }
 function updateStateFromPayload(payload, reason='restore') {
   const item=payload?.item||{};
@@ -274,7 +515,7 @@ async function refreshSharedUniverse({force=false,reason='cron'}={}) {
       const payload=buildUniverse(official.csv,official);
       await writeSnapshot(payload);
       state.last_error=''; state.blocked_until=''; updateStateFromPayload(payload,reason);
-      return {ok:true,skipped:false,coverage_version:SHARED_COVERAGE_VERSION,fetched_at:payload.fetched_at,event_count:payload.item.events.length,source_row_count:payload.item.source_row_count,official_requests_started_this_refresh:1,collector_transport:'render_shared_single_official_fetch',user_read_upstream_requests:0};
+      return {ok:true,skipped:false,coverage_version:SHARED_COVERAGE_VERSION,fetched_at:payload.fetched_at,event_count:payload.item.events.length,source_row_count:payload.item.source_row_count,official_requests_started_this_refresh:1,collector_transport:'render_shared_single_official_fetch',official_transport:'cme_public_anonymous_passive_ftp',user_read_upstream_requests:0};
     }catch(error){
       const message=String(error?.message||error); state.last_error=message;
       if(/http_403|blocked|scraping/i.test(message)) state.blocked_until=new Date(Date.now()+BLOCK_COOLDOWN_MS).toISOString();
@@ -301,7 +542,7 @@ async function readJson(req) {
   for await (const chunk of req){ total+=chunk.length;if(total>64*1024)throw new Error('request_body_too_large');chunks.push(chunk); }
   if(chunks.length===0)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch(_){return{};}
 }
-export function getCmeExpirySharedHealth() { return {...state,step_version:STEP_VERSION,shared_key:SHARED_KEY,shared_coverage_version:SHARED_COVERAGE_VERSION,refresh_interval_seconds:REFRESH_MS/1000,official_source_url:OFFICIAL_ZIP_URL,health_path:'/api/calendar/cme-expiry/health',refresh_path:'/api/calendar/cme-expiry/refresh'}; }
+export function getCmeExpirySharedHealth() { return {...state,step_version:STEP_VERSION,shared_key:SHARED_KEY,shared_coverage_version:SHARED_COVERAGE_VERSION,refresh_interval_seconds:REFRESH_MS/1000,official_source_url:OFFICIAL_SOURCE_URL,official_web_directory_url:OFFICIAL_WEB_DIRECTORY_URL,health_path:'/api/calendar/cme-expiry/health',refresh_path:'/api/calendar/cme-expiry/refresh'}; }
 export function startCmeExpirySharedCollector() {
   if(state.started)return; state.started=true;
   setTimeout(async()=>{
