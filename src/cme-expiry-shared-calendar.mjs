@@ -5,9 +5,10 @@ import { promisify } from 'node:util';
 
 const inflateRawAsync = promisify(inflateRaw);
 
-const STEP_VERSION = '650.8.15.72.2';
+const STEP_VERSION = '650.8.15.72.3';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const LEGACY_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const KAKA_CALENDAR_REFRESH_KEY = String(process.env.KAKA_CALENDAR_REFRESH_KEY || '').trim();
 const SECRET_KEYS = (() => {
   try {
     const raw = JSON.parse(process.env.SUPABASE_SECRET_KEYS || '{}');
@@ -649,7 +650,7 @@ function requestKey(req) {
 }
 function authorized(req) {
   const candidate=requestKey(req); if(!candidate) return false;
-  return candidate===ADMIN_API_KEY||candidate===LEGACY_SERVICE_ROLE_KEY||Object.values(SECRET_KEYS).includes(candidate);
+  return candidate===KAKA_CALENDAR_REFRESH_KEY||candidate===ADMIN_API_KEY||candidate===LEGACY_SERVICE_ROLE_KEY||Object.values(SECRET_KEYS).includes(candidate);
 }
 function sendJson(res,status,payload) {
   const body=Buffer.from(JSON.stringify(payload));
@@ -660,7 +661,7 @@ async function readJson(req) {
   for await (const chunk of req){ total+=chunk.length;if(total>64*1024)throw new Error('request_body_too_large');chunks.push(chunk); }
   if(chunks.length===0)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch(_){return{};}
 }
-export function getCmeExpirySharedHealth() { return {...state,step_version:STEP_VERSION,shared_key:SHARED_KEY,shared_coverage_version:SHARED_COVERAGE_VERSION,refresh_interval_seconds:REFRESH_MS/1000,official_source_url:OFFICIAL_SOURCE_URL,official_web_directory_url:OFFICIAL_WEB_DIRECTORY_URL,health_path:'/api/calendar/cme-expiry/health',refresh_path:'/api/calendar/cme-expiry/refresh'}; }
+export function getCmeExpirySharedHealth() { return {...state,step_version:STEP_VERSION,refresh_key_configured:Boolean(KAKA_CALENDAR_REFRESH_KEY),refresh_auth_mode:'dedicated_calendar_key_with_server_secret_fallback',shared_key:SHARED_KEY,shared_coverage_version:SHARED_COVERAGE_VERSION,refresh_interval_seconds:REFRESH_MS/1000,official_source_url:OFFICIAL_SOURCE_URL,official_web_directory_url:OFFICIAL_WEB_DIRECTORY_URL,health_path:'/api/calendar/cme-expiry/health',refresh_path:'/api/calendar/cme-expiry/refresh'}; }
 
 export function startCmeExpirySharedCollector() {
   if(state.started)return;
