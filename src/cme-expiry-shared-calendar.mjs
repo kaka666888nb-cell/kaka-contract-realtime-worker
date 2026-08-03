@@ -1,8 +1,11 @@
 // Step650.8.15.72 / Step930: one scheduled CME official fetch, persistent shared expiry universe, zero user upstream reads.
-import { inflateRawSync } from 'node:zlib';
+import { inflateRaw } from 'node:zlib';
 import { createConnection } from 'node:net';
+import { promisify } from 'node:util';
 
-const STEP_VERSION = '650.8.15.72.1';
+const inflateRawAsync = promisify(inflateRaw);
+
+const STEP_VERSION = '650.8.15.72.2';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const LEGACY_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const SECRET_KEYS = (() => {
@@ -29,8 +32,12 @@ const REFRESH_MS = 6 * 60 * 60 * 1000;
 const BLOCK_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const MAX_COMPRESSED_BYTES = 64 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES = 180 * 1024 * 1024;
-const FTP_CONNECT_TIMEOUT_MS = 30_000;
-const FTP_TRANSFER_TIMEOUT_MS = 90_000;
+const FTP_CONNECT_TIMEOUT_MS = 8_000;
+const FTP_TRANSFER_TIMEOUT_MS = 45_000;
+const FTP_OVERALL_TIMEOUT_MS = 60_000;
+const MAX_SOURCE_LINES = 500_000;
+const EVENT_PAST_DAYS = 45;
+const EVENT_FUTURE_DAYS = 3 * 366;
 
 const PRODUCT_IDENTITIES={
   ES:{zh:"E-mini标普500指数期货",en:"E-mini S&P 500 Futures",sectorKey:"equity_index",sectorZh:"股票指数",sectorEn:"Equity indexes",countryCode:"US",countryZh:"美国",countryEn:"United States"},
@@ -96,8 +103,15 @@ const state = {
   official_ftp_host: OFFICIAL_FTP_HOST,
   official_ftp_path: OFFICIAL_FTP_PATH,
   user_read_upstream_requests: 0,
+  stage: 'idle',
+  last_duration_ms: 0,
+  scheduler_active: false,
+  next_scheduled_refresh_at: '',
+  startup_auto_fetch: false,
+  main_process_safety: 'bounded_async_parse_no_startup_upstream_fetch',
 };
 let refreshPromise = null;
+let scheduleTimer = null;
 
 function text(value) { return String(value ?? '').trim(); }
 function cleanValue(value) {
@@ -142,7 +156,8 @@ function parseCsv(raw) {
   }
   return rows;
 }
-function unzipFirstCsv(input) {
+
+async function unzipFirstCsv(input) {
   const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input);
   const min = Math.max(0, buffer.length - 65557);
   let eocd=-1;
@@ -168,8 +183,11 @@ function unzipFirstCsv(input) {
       const localExtraLen=buffer.readUInt16LE(localOffset+28);
       const dataStart=localOffset+30+localNameLen+localExtraLen;
       const compressed=buffer.subarray(dataStart,dataStart+compressedSize);
-      const output=method===0?compressed:method===8?inflateRawSync(compressed):null;
-      if(!output) throw new Error(`zip_compression_unsupported:${method}`);
+      let output;
+      if(method===0) output=Buffer.from(compressed);
+      else if(method===8) output=await inflateRawAsync(compressed, { maxOutputLength: MAX_UNCOMPRESSED_BYTES });
+      else throw new Error(`zip_compression_unsupported:${method}`);
+      if(output.length>MAX_UNCOMPRESSED_BYTES) throw new Error(`zip_csv_too_large:${output.length}`);
       return output.toString('utf8');
     }
     offset += 46 + nameLen + extraLen + commentLen;
@@ -342,67 +360,88 @@ function ftpTimestampToIso(reply) {
   return Number.isFinite(Date.parse(iso)) ? iso : '';
 }
 
+
 async function downloadOfficialFtpFile() {
   let control = null;
   let dataSocket = null;
+  let deadlineTimer = null;
+  const task = (async () => {
+    try {
+      control = await connectSocket({ host: OFFICIAL_FTP_HOST, port: OFFICIAL_FTP_PORT, timeoutMs: FTP_CONNECT_TIMEOUT_MS, label: 'control' });
+      control.setKeepAlive(true, 15_000);
+      const replies = ftpReplyReader(control);
+      expectFtp(await replies.next(FTP_CONNECT_TIMEOUT_MS), [220], 'greeting');
+
+      const command = async (line, allowed, label, timeoutMs = FTP_CONNECT_TIMEOUT_MS) => {
+        control.write(`${line}\r\n`);
+        return expectFtp(await replies.next(timeoutMs), allowed, label);
+      };
+
+      let login = await command('USER anonymous', [230, 331], 'user');
+      if (login.code === 331) login = await command('PASS kakaweb3@kakaweb3.com', [230, 202], 'password');
+      await command('TYPE I', [200], 'binary_type');
+
+      let expectedSize = 0;
+      try {
+        const sizeReply = await command(`SIZE ${OFFICIAL_FTP_PATH}`, [213], 'size');
+        expectedSize = Number(/213\s+(\d+)/.exec(sizeReply.message)?.[1] || 0);
+        if (expectedSize > MAX_COMPRESSED_BYTES) throw new Error(`cme_ftp_file_too_large:${expectedSize}`);
+      } catch (error) {
+        if (/file_too_large/.test(String(error?.message || error))) throw error;
+        expectedSize = 0;
+      }
+
+      let lastModified = '';
+      try {
+        const mdtmReply = await command(`MDTM ${OFFICIAL_FTP_PATH}`, [213], 'mdtm');
+        lastModified = ftpTimestampToIso(mdtmReply);
+      } catch (_) {}
+
+      let passiveHost = OFFICIAL_FTP_HOST;
+      let passivePort = 0;
+      control.write('EPSV\r\n');
+      const epsv = await replies.next(FTP_CONNECT_TIMEOUT_MS);
+      if (epsv.code === 229) passivePort = parseEpsvPort(epsv.message);
+      if (!passivePort) {
+        const pasv = await command('PASV', [227], 'pasv');
+        const endpoint = parsePasvEndpoint(pasv.message, OFFICIAL_FTP_HOST);
+        if (!endpoint) throw new Error(`cme_ftp_pasv_parse:${text(pasv.message).slice(0, 220)}`);
+        passiveHost = endpoint.host;
+        passivePort = endpoint.port;
+      }
+
+      dataSocket = await connectSocket({ host: passiveHost, port: passivePort, timeoutMs: FTP_CONNECT_TIMEOUT_MS, label: 'data' });
+      const dataPromise = readDataSocket(dataSocket, MAX_COMPRESSED_BYTES);
+      control.write(`RETR ${OFFICIAL_FTP_PATH}\r\n`);
+      expectFtp(await replies.next(FTP_CONNECT_TIMEOUT_MS), [125, 150], 'retr_start');
+      const bytes = await dataPromise;
+      dataSocket = null;
+      expectFtp(await replies.next(FTP_TRANSFER_TIMEOUT_MS), [226, 250], 'retr_complete');
+      if (expectedSize && bytes.length !== expectedSize) throw new Error(`cme_ftp_size_mismatch:${bytes.length}/${expectedSize}`);
+      if (bytes.length < 4) throw new Error(`cme_ftp_body_too_small:${bytes.length}`);
+      try { control.write('QUIT\r\n'); } catch (_) {}
+      return { bytes, lastModified };
+    } finally {
+      if (dataSocket) dataSocket.destroy();
+      if (control) control.destroy();
+    }
+  })();
+
+  const deadline = new Promise((_, reject) => {
+    deadlineTimer = setTimeout(() => {
+      const error = new Error('cme_ftp_overall_timeout');
+      try { if (dataSocket) dataSocket.destroy(error); } catch (_) {}
+      try { if (control) control.destroy(error); } catch (_) {}
+      reject(error);
+    }, FTP_OVERALL_TIMEOUT_MS);
+  });
+
   try {
-    control = await connectSocket({ host: OFFICIAL_FTP_HOST, port: OFFICIAL_FTP_PORT, timeoutMs: FTP_CONNECT_TIMEOUT_MS, label: 'control' });
-    control.setKeepAlive(true, 15_000);
-    const replies = ftpReplyReader(control);
-    expectFtp(await replies.next(FTP_CONNECT_TIMEOUT_MS), [220], 'greeting');
-
-    const command = async (line, allowed, label, timeoutMs = FTP_CONNECT_TIMEOUT_MS) => {
-      control.write(`${line}\r\n`);
-      return expectFtp(await replies.next(timeoutMs), allowed, label);
-    };
-
-    let login = await command('USER anonymous', [230, 331], 'user');
-    if (login.code === 331) login = await command('PASS kakaweb3@kakaweb3.com', [230, 202], 'password');
-    await command('TYPE I', [200], 'binary_type');
-
-    let expectedSize = 0;
-    try {
-      const sizeReply = await command(`SIZE ${OFFICIAL_FTP_PATH}`, [213], 'size');
-      expectedSize = Number(/213\s+(\d+)/.exec(sizeReply.message)?.[1] || 0);
-      if (expectedSize > MAX_COMPRESSED_BYTES) throw new Error(`cme_ftp_file_too_large:${expectedSize}`);
-    } catch (error) {
-      if (/file_too_large/.test(String(error?.message || error))) throw error;
-      expectedSize = 0;
-    }
-
-    let lastModified = '';
-    try {
-      const mdtmReply = await command(`MDTM ${OFFICIAL_FTP_PATH}`, [213], 'mdtm');
-      lastModified = ftpTimestampToIso(mdtmReply);
-    } catch (_) {}
-
-    let passiveHost = OFFICIAL_FTP_HOST;
-    let passivePort = 0;
-    control.write('EPSV\r\n');
-    const epsv = await replies.next(FTP_CONNECT_TIMEOUT_MS);
-    if (epsv.code === 229) passivePort = parseEpsvPort(epsv.message);
-    if (!passivePort) {
-      const pasv = await command('PASV', [227], 'pasv');
-      const endpoint = parsePasvEndpoint(pasv.message, OFFICIAL_FTP_HOST);
-      if (!endpoint) throw new Error(`cme_ftp_pasv_parse:${text(pasv.message).slice(0, 220)}`);
-      passiveHost = endpoint.host;
-      passivePort = endpoint.port;
-    }
-
-    dataSocket = await connectSocket({ host: passiveHost, port: passivePort, timeoutMs: FTP_CONNECT_TIMEOUT_MS, label: 'data' });
-    const dataPromise = readDataSocket(dataSocket, MAX_COMPRESSED_BYTES);
-    control.write(`RETR ${OFFICIAL_FTP_PATH}\r\n`);
-    expectFtp(await replies.next(FTP_CONNECT_TIMEOUT_MS), [125, 150], 'retr_start');
-    const bytes = await dataPromise;
-    dataSocket = null;
-    expectFtp(await replies.next(FTP_TRANSFER_TIMEOUT_MS), [226, 250], 'retr_complete');
-    if (expectedSize && bytes.length !== expectedSize) throw new Error(`cme_ftp_size_mismatch:${bytes.length}/${expectedSize}`);
-    if (bytes.length < 4) throw new Error(`cme_ftp_body_too_small:${bytes.length}`);
-    try { control.write('QUIT\r\n'); } catch (_) {}
-    return { bytes, lastModified };
+    return await Promise.race([task, deadline]);
   } finally {
-    if (dataSocket) dataSocket.destroy();
-    if (control) control.destroy();
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    try { if (dataSocket) dataSocket.destroy(); } catch (_) {}
+    try { if (control) control.destroy(); } catch (_) {}
   }
 }
 
@@ -455,7 +494,7 @@ async function fetchOfficialCsv() {
     const official = await downloadOfficialFtpFile();
     const bytes = official.bytes;
     if (bytes.length > MAX_COMPRESSED_BYTES) throw new Error(`cme_official_body_too_large:${bytes.length}`);
-    const csv = bytes.readUInt32LE(0) === 0x04034b50 ? unzipFirstCsv(bytes) : bytes.toString('utf8');
+    const csv = bytes.readUInt32LE(0) === 0x04034b50 ? await unzipFirstCsv(bytes) : bytes.toString('utf8');
     if (!csv.trim()) throw new Error('cme_official_csv_empty');
     state.official_requests_succeeded++;
     state.last_transport = 'cme_public_anonymous_passive_ftp';
@@ -471,26 +510,100 @@ async function fetchOfficialCsv() {
     throw error;
   }
 }
-function buildUniverse(csv, meta) {
-  const rows=parseCsv(csv); const events=[];
-  for(const row of rows){
-    const code=rootCode(row); if(!code) continue;
-    const identity=PRODUCT_IDENTITIES[code];
-    const lastTrade=fprfDate(row.LastTrdDt); if(!dateParts(lastTrade)) continue;
-    const firstTrade=fprfDate(row.FirstTrdDt); const maturity=fprfDate(row.MatDt);
-    const status=text(row.Status).toUpperCase(); const tradable=text(row.Tradable).toUpperCase();
+
+async function buildUniverse(csv, meta) {
+  const raw = String(csv || '').replace(/^\uFEFF/, '');
+  const firstBreak = raw.indexOf('\n');
+  if (firstBreak < 0) throw new Error('cme_official_csv_header_missing');
+  const headerLine = raw.slice(0, firstBreak).replace(/\r$/, '');
+  const headers = parseCsvLine(headerLine).map((value) => value.trim());
+  const index = Object.fromEntries(headers.map((name, i) => [name, i]));
+  const required = ['Sym','GBXAlias','ClrAlias','TCCAlias','ITCAlias','LastTrdDt','FirstTrdDt','MatDt','Status','Tradable','MMY','Desc','Exch','SettlMeth'];
+  for (const name of required) if (!(name in index)) throw new Error(`cme_official_csv_column_missing:${name}`);
+
+  const get = (values, name) => cleanValue(values[index[name]]);
+  const now = Date.now();
+  const minDate = now - EVENT_PAST_DAYS * 86400000;
+  const maxDate = now + EVENT_FUTURE_DAYS * 86400000;
+  const unique = new Map();
+  let lineStart = firstBreak + 1;
+  let sourceRowCount = 0;
+  let processedSinceYield = 0;
+
+  while (lineStart < raw.length) {
+    let lineEnd = raw.indexOf('\n', lineStart);
+    if (lineEnd < 0) lineEnd = raw.length;
+    const line = raw.slice(lineStart, lineEnd).replace(/\r$/, '');
+    lineStart = lineEnd + 1;
+    if (!line.trim()) continue;
+    sourceRowCount++;
+    if (sourceRowCount > MAX_SOURCE_LINES) throw new Error(`cme_official_csv_too_many_rows:${sourceRowCount}`);
+
+    const values = parseCsvLine(line);
+    const candidates = [get(values,'Sym'),get(values,'GBXAlias'),get(values,'ClrAlias'),get(values,'TCCAlias'),get(values,'ITCAlias')]
+      .map((value)=>text(value).toUpperCase().replace(/\s+/g,''));
+    let code = '';
+    for (const value of candidates) {
+      if (PRODUCT_IDENTITIES[value]) { code = value; break; }
+    }
+    if (!code) {
+      for (const value of candidates) {
+        const match=/^([A-Z0-9]+?)[FGHJKMNQUVXZ]\d{1,4}$/.exec(value);
+        if(match&&PRODUCT_IDENTITIES[match[1]]) { code=match[1]; break; }
+      }
+    }
+    if (!code) {
+      if (++processedSinceYield >= 2500) { processedSinceYield = 0; await new Promise(setImmediate); }
+      continue;
+    }
+
+    const lastTrade = fprfDate(get(values,'LastTrdDt'));
+    if (!dateParts(lastTrade)) continue;
+    const lastTradeMs = Date.parse(`${lastTrade}T12:00:00Z`);
+    if (!Number.isFinite(lastTradeMs) || lastTradeMs < minDate || lastTradeMs > maxDate) continue;
+
+    const status=get(values,'Status').toUpperCase();
+    const tradable=get(values,'Tradable').toUpperCase();
     if(status&&!['A','ACTIVE','1'].includes(status)) continue;
     if(['N','NO','FALSE','0'].includes(tradable)) continue;
-    const contractMonth=cleanValue(row.MMY); const contractCode=cleanValue(row.GBXAlias||row.ClrAlias||row.Sym);
-    const description=cleanValue(row.Desc)||identity.en;
-    const eventId=`cme_fprf_${lastTrade.replaceAll('-','')}_${cleanValue(row.Exch)||'CME'}_${code}_${(contractMonth||contractCode).replace(/[^A-Za-z0-9._-]/g,'_')}`;
-    events.push({event_id:eventId,product_code:code,product_name:description,product_name_zh:identity.zh,product_name_en:identity.en||description,product_translation_verified:true,contract_code:contractCode,contract_month:contractMonth,first_trade_date:firstTrade,last_trade_date:lastTrade,maturity_date:maturity,expiry_date:maturity||lastTrade,final_settlement_date:'',exchange_code:cleanValue(row.Exch)||'CME',exchange_name_zh:'CME集团',exchange_name_en:'CME Group',country_code:identity.countryCode,country_name_zh:identity.countryZh,country_name_en:identity.countryEn,sector_key:identity.sectorKey,sector_name_zh:identity.sectorZh,sector_name_en:identity.sectorEn,settlement_method:cleanValue(row.SettlMeth),source_verified:true,source_name:'CME Group Futures Product Reference File',source_name_zh:'CME集团期货产品参考文件',source_name_en:'CME Group Futures Product Reference File',source_url:meta.sourceUrl,official_timezone:'America/Chicago'});
+
+    const identity=PRODUCT_IDENTITIES[code];
+    const firstTrade=fprfDate(get(values,'FirstTrdDt'));
+    const maturity=fprfDate(get(values,'MatDt'));
+    const contractMonth=get(values,'MMY');
+    const contractCode=get(values,'GBXAlias')||get(values,'ClrAlias')||get(values,'Sym');
+    const description=get(values,'Desc')||identity.en;
+    const exchangeCode=get(values,'Exch')||'CME';
+    const eventId=`cme_fprf_${lastTrade.replaceAll('-','')}_${exchangeCode}_${code}_${(contractMonth||contractCode).replace(/[^A-Za-z0-9._-]/g,'_')}`;
+    unique.set(eventId,{
+      event_id:eventId,product_code:code,product_name:description,product_name_zh:identity.zh,product_name_en:identity.en||description,
+      product_translation_verified:true,contract_code:contractCode,contract_month:contractMonth,first_trade_date:firstTrade,
+      last_trade_date:lastTrade,maturity_date:maturity,expiry_date:maturity||lastTrade,final_settlement_date:'',
+      exchange_code:exchangeCode,exchange_name_zh:'CME集团',exchange_name_en:'CME Group',
+      country_code:identity.countryCode,country_name_zh:identity.countryZh,country_name_en:identity.countryEn,
+      sector_key:identity.sectorKey,sector_name_zh:identity.sectorZh,sector_name_en:identity.sectorEn,
+      settlement_method:get(values,'SettlMeth'),source_verified:true,
+      source_name:'CME Group Futures Product Reference File',source_name_zh:'CME集团期货产品参考文件',
+      source_name_en:'CME Group Futures Product Reference File',source_url:meta.sourceUrl,official_timezone:'America/Chicago'
+    });
+
+    if (++processedSinceYield >= 2500) { processedSinceYield = 0; await new Promise(setImmediate); }
   }
-  const unique=new Map(); for(const event of events) unique.set(event.event_id,event);
+
   const finalEvents=[...unique.values()].sort((a,b)=>a.last_trade_date.localeCompare(b.last_trade_date)||a.product_code.localeCompare(b.product_code)||a.contract_month.localeCompare(b.contract_month));
+  if (!finalEvents.length) throw new Error('cme_official_csv_no_matched_benchmark_events');
   const fetchedAt=new Date().toISOString();
-  return {ok:true,source:'cme_group_official_fprf_shared_render',cache_status:'official_shared_render_snapshot',fetched_at:fetchedAt,item:{source_verified:true,time_identity_verified:true,coverage_version:SHARED_COVERAGE_VERSION,collector_version:STEP_VERSION,collector_transport:'render_shared_single_official_fetch',official_transport:meta.transport||'cme_public_anonymous_passive_ftp',official_request_count:1,user_read_upstream_requests:0,source_file_count:1,source_row_count:rows.length,matched_benchmark_row_count:finalEvents.length,official_etag:meta.etag,official_last_modified:meta.lastModified,source_url:meta.sourceUrl,source_help_url:SOURCE_HELP_URL,country_filter_options:COUNTRY_OPTIONS,country_filter_option_count:COUNTRY_OPTIONS.length,country_filter_options_date_independent:true,sector_filter_options:SECTOR_OPTIONS,sector_filter_option_count:SECTOR_OPTIONS.length,events:finalEvents}};
+  return {ok:true,source:'cme_group_official_fprf_shared_render',cache_status:'official_shared_render_snapshot',fetched_at:fetchedAt,item:{
+    source_verified:true,time_identity_verified:true,coverage_version:SHARED_COVERAGE_VERSION,collector_version:STEP_VERSION,
+    collector_transport:'render_shared_single_official_fetch',official_transport:meta.transport||'cme_public_anonymous_passive_ftp',
+    official_request_count:1,user_read_upstream_requests:0,source_file_count:1,source_row_count:sourceRowCount,
+    matched_benchmark_row_count:finalEvents.length,official_etag:meta.etag,official_last_modified:meta.lastModified,
+    source_url:meta.sourceUrl,source_help_url:SOURCE_HELP_URL,country_filter_options:COUNTRY_OPTIONS,
+    country_filter_option_count:COUNTRY_OPTIONS.length,country_filter_options_date_independent:true,
+    sector_filter_options:SECTOR_OPTIONS,sector_filter_option_count:SECTOR_OPTIONS.length,events:finalEvents
+  }};
 }
+
 function updateStateFromPayload(payload, reason='restore') {
   const item=payload?.item||{};
   state.snapshot_ready=item.source_verified===true&&item.coverage_version===SHARED_COVERAGE_VERSION&&Array.isArray(item.events);
@@ -503,25 +616,30 @@ function updateStateFromPayload(payload, reason='restore') {
 async function refreshSharedUniverse({force=false,reason='cron'}={}) {
   if(refreshPromise) return refreshPromise;
   refreshPromise=(async()=>{
+    const startedAt=Date.now();
+    state.stage='read_snapshot';
     const existing=await readSnapshot().catch(()=>null);
     const existingFetched=Date.parse(existing?.payload?.fetched_at||existing?.source_fetched_at||'');
     if(existing?.payload) updateStateFromPayload(existing.payload,'restore_before_refresh');
     if(!force&&Number.isFinite(existingFetched)&&Date.now()-existingFetched<REFRESH_MS) return {ok:true,skipped:true,reason:'shared_snapshot_fresh',...getCmeExpirySharedHealth()};
     const blocked=Date.parse(state.blocked_until||'');
     if(!force&&Number.isFinite(blocked)&&blocked>Date.now()) return {ok:true,skipped:true,reason:'collector_upstream_cooldown',...getCmeExpirySharedHealth()};
-    state.refresh_inflight=true; state.last_reason=reason;
+    state.refresh_inflight=true; state.last_reason=reason; state.stage='download';
     try{
       const official=await fetchOfficialCsv();
-      const payload=buildUniverse(official.csv,official);
+      state.stage='parse';
+      const payload=await buildUniverse(official.csv,official);
+      state.stage='write_snapshot';
       await writeSnapshot(payload);
-      state.last_error=''; state.blocked_until=''; updateStateFromPayload(payload,reason);
+      state.last_error=''; state.blocked_until=''; updateStateFromPayload(payload,reason); state.stage='ready';
       return {ok:true,skipped:false,coverage_version:SHARED_COVERAGE_VERSION,fetched_at:payload.fetched_at,event_count:payload.item.events.length,source_row_count:payload.item.source_row_count,official_requests_started_this_refresh:1,collector_transport:'render_shared_single_official_fetch',official_transport:'cme_public_anonymous_passive_ftp',user_read_upstream_requests:0};
     }catch(error){
-      const message=String(error?.message||error); state.last_error=message;
+      const message=String(error?.message||error); state.last_error=message; state.stage='failed';
       if(/http_403|blocked|scraping/i.test(message)) state.blocked_until=new Date(Date.now()+BLOCK_COOLDOWN_MS).toISOString();
+      else if(/ftp|timeout|connect|closed/i.test(message)) state.blocked_until=new Date(Date.now()+15*60*1000).toISOString();
       if(existing?.payload) return {ok:true,skipped:true,reason:'official_refresh_failed_kept_shared_snapshot',warning:message,...getCmeExpirySharedHealth()};
       throw error;
-    }finally{state.refresh_inflight=false;}
+    }finally{state.refresh_inflight=false;state.last_duration_ms=Date.now()-startedAt;if(state.stage!=='ready'&&state.stage!=='failed')state.stage='idle';}
   })().finally(()=>{refreshPromise=null;});
   return refreshPromise;
 }
@@ -543,13 +661,34 @@ async function readJson(req) {
   if(chunks.length===0)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch(_){return{};}
 }
 export function getCmeExpirySharedHealth() { return {...state,step_version:STEP_VERSION,shared_key:SHARED_KEY,shared_coverage_version:SHARED_COVERAGE_VERSION,refresh_interval_seconds:REFRESH_MS/1000,official_source_url:OFFICIAL_SOURCE_URL,official_web_directory_url:OFFICIAL_WEB_DIRECTORY_URL,health_path:'/api/calendar/cme-expiry/health',refresh_path:'/api/calendar/cme-expiry/refresh'}; }
+
 export function startCmeExpirySharedCollector() {
-  if(state.started)return; state.started=true;
+  if(state.started)return;
+  state.started=true;
+  state.scheduler_active=true;
+  state.startup_auto_fetch=false;
+  state.next_scheduled_refresh_at=new Date(Date.now()+REFRESH_MS).toISOString();
+
   setTimeout(async()=>{
-    try{const existing=await readSnapshot();if(existing?.payload)updateStateFromPayload(existing.payload,'startup_restore');const fetched=Date.parse(existing?.payload?.fetched_at||existing?.source_fetched_at||'');if(!Number.isFinite(fetched)||Date.now()-fetched>=REFRESH_MS)await refreshSharedUniverse({force:false,reason:'startup'});}
-    catch(error){state.last_error=String(error?.message||error);}
+    try{
+      state.stage='startup_restore';
+      const existing=await readSnapshot();
+      if(existing?.payload)updateStateFromPayload(existing.payload,'startup_restore');
+      state.stage=state.snapshot_ready?'ready':'idle';
+    }catch(error){
+      state.last_error=String(error?.message||error);
+      state.stage='idle';
+    }
   },15000).unref();
+
+  scheduleTimer=setInterval(async()=>{
+    state.next_scheduled_refresh_at=new Date(Date.now()+REFRESH_MS).toISOString();
+    try{await refreshSharedUniverse({force:false,reason:'render_6h_schedule'});}
+    catch(error){state.last_error=String(error?.message||error);}
+  },REFRESH_MS);
+  scheduleTimer.unref();
 }
+
 export async function handleCmeExpirySharedCalendar(req,res,url) {
   if(url.pathname==='/api/calendar/cme-expiry/health'&&req.method==='GET'){sendJson(res,200,{ok:true,...getCmeExpirySharedHealth()});return true;}
   if(url.pathname==='/api/calendar/cme-expiry/refresh'&&req.method==='POST'){
