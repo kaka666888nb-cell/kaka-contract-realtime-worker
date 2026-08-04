@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 
 const inflateRawAsync = promisify(inflateRaw);
 
-const STEP_VERSION = '650.8.15.72.3';
+const STEP_VERSION = '650.8.15.72.4';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const LEGACY_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const KAKA_CALENDAR_REFRESH_KEY = String(process.env.KAKA_CALENDAR_REFRESH_KEY || '').trim();
@@ -36,6 +36,8 @@ const MAX_UNCOMPRESSED_BYTES = 180 * 1024 * 1024;
 const FTP_CONNECT_TIMEOUT_MS = 8_000;
 const FTP_TRANSFER_TIMEOUT_MS = 45_000;
 const FTP_OVERALL_TIMEOUT_MS = 60_000;
+const FTP_MAX_ATTEMPTS = 3;
+const FTP_RETRY_DELAYS_MS = [1500, 4000];
 const MAX_SOURCE_LINES = 500_000;
 const EVENT_PAST_DAYS = 45;
 const EVENT_FUTURE_DAYS = 3 * 366;
@@ -96,6 +98,9 @@ const state = {
   official_requests_started: 0,
   official_requests_succeeded: 0,
   official_requests_failed: 0,
+  last_ftp_attempt_count: 0,
+  last_ftp_attempt_errors: [],
+  ftp_retry_limit: FTP_MAX_ATTEMPTS,
   last_error: '',
   last_reason: '',
   blocked_until: '',
@@ -362,7 +367,7 @@ function ftpTimestampToIso(reply) {
 }
 
 
-async function downloadOfficialFtpFile() {
+async function downloadOfficialFtpFileOnce({ preferPasv = false } = {}) {
   let control = null;
   let dataSocket = null;
   let deadlineTimer = null;
@@ -400,9 +405,11 @@ async function downloadOfficialFtpFile() {
 
       let passiveHost = OFFICIAL_FTP_HOST;
       let passivePort = 0;
-      control.write('EPSV\r\n');
-      const epsv = await replies.next(FTP_CONNECT_TIMEOUT_MS);
-      if (epsv.code === 229) passivePort = parseEpsvPort(epsv.message);
+      if (!preferPasv) {
+        control.write('EPSV\r\n');
+        const epsv = await replies.next(FTP_CONNECT_TIMEOUT_MS);
+        if (epsv.code === 229) passivePort = parseEpsvPort(epsv.message);
+      }
       if (!passivePort) {
         const pasv = await command('PASV', [227], 'pasv');
         const endpoint = parsePasvEndpoint(pasv.message, OFFICIAL_FTP_HOST);
@@ -412,16 +419,24 @@ async function downloadOfficialFtpFile() {
       }
 
       dataSocket = await connectSocket({ host: passiveHost, port: passivePort, timeoutMs: FTP_CONNECT_TIMEOUT_MS, label: 'data' });
-      const dataPromise = readDataSocket(dataSocket, MAX_COMPRESSED_BYTES);
+      // Convert the data-socket rejection to an outcome immediately. This prevents Node's
+      // unhandled-rejection policy from terminating the Render process if CME resets the
+      // data channel before the control channel has returned the 150 reply.
+      const dataOutcomePromise = readDataSocket(dataSocket, MAX_COMPRESSED_BYTES).then(
+        (bytes) => ({ bytes, error: null }),
+        (error) => ({ bytes: null, error }),
+      );
       control.write(`RETR ${OFFICIAL_FTP_PATH}\r\n`);
       expectFtp(await replies.next(FTP_CONNECT_TIMEOUT_MS), [125, 150], 'retr_start');
-      const bytes = await dataPromise;
+      const outcome = await dataOutcomePromise;
+      if (outcome.error) throw outcome.error;
+      const bytes = outcome.bytes;
       dataSocket = null;
       expectFtp(await replies.next(FTP_TRANSFER_TIMEOUT_MS), [226, 250], 'retr_complete');
       if (expectedSize && bytes.length !== expectedSize) throw new Error(`cme_ftp_size_mismatch:${bytes.length}/${expectedSize}`);
       if (bytes.length < 4) throw new Error(`cme_ftp_body_too_small:${bytes.length}`);
       try { control.write('QUIT\r\n'); } catch (_) {}
-      return { bytes, lastModified };
+      return { bytes, lastModified, passiveMode: preferPasv ? 'PASV' : 'EPSV_or_PASV' };
     } finally {
       if (dataSocket) dataSocket.destroy();
       if (control) control.destroy();
@@ -444,6 +459,32 @@ async function downloadOfficialFtpFile() {
     try { if (dataSocket) dataSocket.destroy(); } catch (_) {}
     try { if (control) control.destroy(); } catch (_) {}
   }
+}
+
+function retryableFtpError(message) {
+  return /ECONNRESET|ETIMEDOUT|EPIPE|ftp_(?:data|control|reply|overall|retr|pasv|epsv|size_mismatch)|connect|closed|timeout/i.test(message);
+}
+
+async function downloadOfficialFtpFile() {
+  const errors = [];
+  for (let attempt = 1; attempt <= FTP_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const result = await downloadOfficialFtpFileOnce({ preferPasv: attempt === 2 });
+      state.last_ftp_attempt_count = attempt;
+      state.last_ftp_attempt_errors = errors;
+      return { ...result, attemptCount: attempt, attemptErrors: errors };
+    } catch (error) {
+      const message = String(error?.message || error);
+      errors.push(`attempt_${attempt}:${message}`);
+      state.last_ftp_attempt_count = attempt;
+      state.last_ftp_attempt_errors = [...errors];
+      if (attempt >= FTP_MAX_ATTEMPTS || !retryableFtpError(message)) {
+        throw new Error(`cme_ftp_refresh_failed_after_${attempt}_attempts:${errors.join('|')}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, FTP_RETRY_DELAYS_MS[attempt - 1] || 4000));
+    }
+  }
+  throw new Error(`cme_ftp_refresh_failed:${errors.join('|')}`);
 }
 
 function rootCode(row) {
@@ -505,6 +546,9 @@ async function fetchOfficialCsv() {
       lastModified: official.lastModified,
       sourceUrl: OFFICIAL_SOURCE_URL,
       transport: 'cme_public_anonymous_passive_ftp',
+      ftp_attempt_count: official.attemptCount,
+      ftp_attempt_errors: official.attemptErrors,
+      ftp_passive_mode: official.passiveMode,
     };
   } catch (error) {
     state.official_requests_failed++;
@@ -598,6 +642,7 @@ async function buildUniverse(csv, meta) {
     source_verified:true,time_identity_verified:true,coverage_version:SHARED_COVERAGE_VERSION,collector_version:STEP_VERSION,
     collector_transport:'render_shared_single_official_fetch',official_transport:meta.transport||'cme_public_anonymous_passive_ftp',
     official_request_count:1,user_read_upstream_requests:0,source_file_count:1,source_row_count:sourceRowCount,
+    ftp_attempt_count:Number(meta.ftp_attempt_count||1),ftp_attempt_errors:Array.isArray(meta.ftp_attempt_errors)?meta.ftp_attempt_errors:[],ftp_passive_mode:text(meta.ftp_passive_mode),
     matched_benchmark_row_count:finalEvents.length,official_etag:meta.etag,official_last_modified:meta.lastModified,
     source_url:meta.sourceUrl,source_help_url:SOURCE_HELP_URL,country_filter_options:COUNTRY_OPTIONS,
     country_filter_option_count:COUNTRY_OPTIONS.length,country_filter_options_date_independent:true,
