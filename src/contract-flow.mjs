@@ -3,7 +3,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const VERSION = '650.8.15.46';
+const VERSION = '650.8.15.47';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -1295,7 +1295,7 @@ function nextFlowScanBatch(provider, symbols) {
 function sharedMetricRotationPayload() {
   return {
     enabled: SHARED_METRIC_ROTATION_ENABLED,
-    mode: 'backend_bounded_current_oi_ratio_rotation_v2_recent_persist',
+    mode: 'backend_bounded_current_oi_ratio_rotation_v3_binance_critical_relay',
     every_scan_cycles: SHARED_METRIC_ROTATION_EVERY_SCAN_CYCLES,
     estimated_interval_minutes: Math.round(
       SHARED_METRIC_ROTATION_EVERY_SCAN_CYCLES * FLOW_SCAN_ROTATION_MS / 60_000,
@@ -1443,14 +1443,41 @@ async function runSharedMetricRotationCycle() {
         sharedMetricRotationState.attempts[provider] += 1;
         try {
           const state = states.get(`${provider}:${symbol}`) || getState(provider, symbol, { source: 'scanner' });
-          const payload = await fetchVenueMetrics(state, {
-            persistRecentLimit: SHARED_METRIC_PERSIST_RECENT_BUCKETS,
-          });
+          let payload = null;
+          if (provider === 'binance') {
+            // Step965.4: the exact Binance flow endpoint already uses the authenticated
+            // critical relay for OI and long/short families. Shared rotation must use the
+            // same low-volume path; the generic auxiliary history path can be deferred
+            // by the Binance REST governor and previously left the shared snapshot at 4/5.
+            await Promise.allSettled([
+              refreshBinanceOpenInterestCritical(state),
+              refreshBinanceLongShortCritical(state),
+            ]);
+            await flushMetricPersistQueue();
+            payload = metricPayloadFromState(state);
+          } else {
+            payload = await fetchVenueMetrics(state, {
+              persistRecentLimit: SHARED_METRIC_PERSIST_RECENT_BUCKETS,
+            });
+          }
           const metricStatus = payload?.metric_status || recentMetricFamilyStatus(state);
-          if (metricStatus?.oi || metricStatus?.global_account || metricStatus?.top_account || metricStatus?.top_position) {
+          const hasMetric = Boolean(
+            metricStatus?.oi ||
+            metricStatus?.global_account ||
+            metricStatus?.top_account ||
+            metricStatus?.top_position
+          );
+          const hasRatio = Boolean(
+            metricStatus?.global_account ||
+            metricStatus?.top_account ||
+            metricStatus?.top_position
+          );
+          if (hasMetric && (provider !== 'binance' || hasRatio)) {
             sharedMetricRotationState.successes[provider] += 1;
           } else {
-            sharedMetricRotationState.errors[provider] = 'metric_fields_empty';
+            sharedMetricRotationState.errors[provider] = provider === 'binance'
+              ? (state.ratioCriticalError || 'binance_ratio_critical_empty')
+              : 'metric_fields_empty';
           }
         } catch (error) {
           sharedMetricRotationState.errors[provider] = String(error?.message || error).slice(0, 240);
