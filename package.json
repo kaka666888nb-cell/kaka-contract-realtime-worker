@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.72",
+  "version": "650.8.15.73",
   "private": true,
   "type": "module",
   "scripts": {
@@ -25,5 +25,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.72 / Step930 shared data-hub and CME expiry collector"
+  "description": "Kaka contract realtime worker 650.8.15.73 / Step965.3.1 persistence backlog recovery"
 }

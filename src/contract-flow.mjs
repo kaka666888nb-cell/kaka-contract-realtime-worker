@@ -3,7 +3,7 @@ import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const VERSION = '650.8.15.45';
+const VERSION = '650.8.15.46';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -409,12 +409,12 @@ const FLOW_SCAN_BATCH_BY_PROVIDER = Object.freeze({
 const SHARED_METRIC_ROTATION_ENABLED = process.env.KAKA_SHARED_METRIC_ROTATION_ENABLED !== '0';
 const SHARED_METRIC_ROTATION_EVERY_SCAN_CYCLES = Math.max(
   1,
-  Math.min(12, Number(process.env.KAKA_SHARED_METRIC_ROTATION_EVERY_SCAN_CYCLES || 4)),
+  Math.min(12, Number(process.env.KAKA_SHARED_METRIC_ROTATION_EVERY_SCAN_CYCLES || 2)),
 );
 const SHARED_METRIC_ROTATION_PINNED = Object.freeze(['BTCUSDT', 'ETHUSDT']);
 const SHARED_METRIC_ROTATING_PER_PROVIDER = Math.max(
   1,
-  Math.min(12, Number(process.env.KAKA_SHARED_METRIC_ROTATING_PER_PROVIDER || 6)),
+  Math.min(12, Number(process.env.KAKA_SHARED_METRIC_ROTATING_PER_PROVIDER || 2)),
 );
 const SHARED_METRIC_ROTATION_GLOBAL_CONCURRENCY = Math.max(
   1,
@@ -455,6 +455,23 @@ const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY |
 const PERSISTENCE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 const persistQueue = new Map();
 let persistFlushPromise = null;
+// Step965.3.1：旧版500行整批失败会整体回队，旧积压会长期挡住当前数据。
+// 小批量 + 最新优先，保证当前共享快照先恢复。
+const FLOW_PERSIST_BATCH_SIZE = Math.max(
+  10,
+  Math.min(100, Number(process.env.KAKA_FLOW_PERSIST_BATCH_SIZE || 40)),
+);
+const flowPersistHealth = {
+  last_success_at: null,
+  last_error_at: null,
+  last_error: '',
+  success_batches: 0,
+  failed_batches: 0,
+  persisted_rows: 0,
+  quarantined_rows: 0,
+  last_quarantine_error: '',
+  last_batch_size: 0,
+};
 const METRIC_HISTORY_MS = 24 * 60 * 60 * 1000;
 const METRIC_REFRESH_MS = 5 * 60 * 1000;
 const METRIC_TABLE = 'app_contract_position_5m_cache';
@@ -464,6 +481,42 @@ const METRIC_TABLE = 'app_contract_position_5m_cache';
 const SHARED_CURRENT_META_TABLE = 'app_funding_rate_current_cache';
 const metricPersistQueue = new Map();
 let metricPersistFlushPromise = null;
+const METRIC_PERSIST_BATCH_SIZE = Math.max(
+  10,
+  Math.min(100, Number(process.env.KAKA_METRIC_PERSIST_BATCH_SIZE || 40)),
+);
+// 后台共享轮换只需要最近桶保持30分钟当前视图。
+// 精确按需请求仍保留原完整历史返回与默认持久化范围。
+const SHARED_METRIC_PERSIST_RECENT_BUCKETS = Math.max(
+  3,
+  Math.min(
+    24,
+    Number(process.env.KAKA_SHARED_METRIC_PERSIST_RECENT_BUCKETS || 6),
+  ),
+);
+const metricPersistHealth = {
+  last_success_at: null,
+  last_error_at: null,
+  last_error: '',
+  success_batches: 0,
+  failed_batches: 0,
+  persisted_rows: 0,
+  quarantined_rows: 0,
+  last_quarantine_error: '',
+  last_batch_size: 0,
+};
+
+function kakaPersistError(prefix, response, text) {
+  const error = new Error(
+    `${prefix}_${response.status}:${String(text || '').slice(0, 180)}`,
+  );
+  error.status = Number(response.status || 0);
+  return error;
+}
+
+function kakaPersistenceRowError(error) {
+  return [400, 409, 422].includes(Number(error?.status || 0));
+}
 const BINANCE_API_KEY = String(process.env.BINANCE_API_KEY || '').trim();
 const CONTRACT_META_TTL_MS = 30 * 1000;
 const CONTRACT_META_STALE_MS = 30 * 60 * 1000;
@@ -603,37 +656,129 @@ function queuePersist(row) {
   persistQueue.set(key, row);
 }
 
-async function flushPersistQueue() {
-  if (!PERSISTENCE_ENABLED || persistFlushPromise || persistQueue.size === 0) return;
-  const rows = [...persistQueue.values()].slice(0, 500);
-  for (const row of rows) persistQueue.delete(`${row.provider}:${row.symbol}:${row.bucket_time}`);
-  persistFlushPromise = (async () => {
-    try {
-      const endpoint = `${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?on_conflict=provider,symbol,bucket_time`;
-      const headers = {
-        apikey: SUPABASE_SERVICE_ROLE_KEY,
-        authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-        'content-type': 'application/json',
-        prefer: 'resolution=merge-duplicates,return=minimal',
-      };
-      let response = await fetch(endpoint, {
-        method: 'POST', headers, body: JSON.stringify(rows), signal: AbortSignal.timeout(15000),
-      });
-      if (!response.ok) {
-        const text = await response.text();
-        const baseColumnsMissing = response.status === 400 && /buy_base|sell_base|column/i.test(text);
-        if (!baseColumnsMissing) throw new Error(`persist_http_${response.status}:${text.slice(0, 180)}`);
-        const compatibleRows = rows.map(({ buy_base, sell_base, ...row }) => row);
-        response = await fetch(endpoint, {
-          method: 'POST', headers, body: JSON.stringify(compatibleRows), signal: AbortSignal.timeout(15000),
-        });
-        if (!response.ok) throw new Error(`persist_compat_http_${response.status}:${(await response.text()).slice(0, 180)}`);
-      }
-    } catch (error) {
-      for (const row of rows) persistQueue.set(`${row.provider}:${row.symbol}:${row.bucket_time}`, row);
-      console.error(`[Step615.5] flow bucket persist failed: ${error?.message || error}`);
+async function postFlowPersistBatch(rows) {
+  const endpoint =
+    `${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?on_conflict=provider,symbol,bucket_time`;
+  const headers = {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    'content-type': 'application/json',
+    prefer: 'resolution=merge-duplicates,return=minimal',
+  };
+
+  let response = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(rows),
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    const baseColumnsMissing =
+      response.status === 400 && /buy_base|sell_base|column/i.test(text);
+
+    if (!baseColumnsMissing) {
+      throw kakaPersistError('persist_http', response, text);
     }
-  })().finally(() => { persistFlushPromise = null; });
+
+    const compatibleRows = rows.map(
+      ({ buy_base, sell_base, ...row }) => row,
+    );
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(compatibleRows),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      throw kakaPersistError(
+        'persist_compat_http',
+        response,
+        await response.text(),
+      );
+    }
+  }
+
+  return rows.length;
+}
+
+async function persistFlowRowsAdaptive(rows) {
+  try {
+    return await postFlowPersistBatch(rows);
+  } catch (error) {
+    if (kakaPersistenceRowError(error) && rows.length > 1) {
+      const middle = Math.ceil(rows.length / 2);
+      const left = await persistFlowRowsAdaptive(rows.slice(0, middle));
+      const right = await persistFlowRowsAdaptive(rows.slice(middle));
+      return left + right;
+    }
+
+    if (kakaPersistenceRowError(error) && rows.length === 1) {
+      flowPersistHealth.quarantined_rows += 1;
+      flowPersistHealth.last_quarantine_error =
+        `${rows[0]?.provider || ''}:${rows[0]?.symbol || ''}:` +
+        String(error?.message || error).slice(0, 180);
+      console.error(
+        `[Step965.3.1] quarantined invalid flow row: ` +
+        flowPersistHealth.last_quarantine_error,
+      );
+      return 0;
+    }
+
+    throw error;
+  }
+}
+
+async function flushPersistQueue() {
+  if (
+    !PERSISTENCE_ENABLED ||
+    persistFlushPromise ||
+    persistQueue.size === 0
+  ) return;
+
+  const rows = [...persistQueue.values()]
+    .sort(
+      (a, b) =>
+        (normalizeTime(b?.bucket_time) || 0) -
+        (normalizeTime(a?.bucket_time) || 0),
+    )
+    .slice(0, FLOW_PERSIST_BATCH_SIZE);
+
+  for (const row of rows) {
+    persistQueue.delete(
+      `${row.provider}:${row.symbol}:${row.bucket_time}`,
+    );
+  }
+
+  persistFlushPromise = (async () => {
+    flowPersistHealth.last_batch_size = rows.length;
+    try {
+      const persisted = await persistFlowRowsAdaptive(rows);
+      flowPersistHealth.success_batches += 1;
+      flowPersistHealth.persisted_rows += persisted;
+      flowPersistHealth.last_success_at = new Date().toISOString();
+      flowPersistHealth.last_error = '';
+    } catch (error) {
+      for (const row of rows) {
+        persistQueue.set(
+          `${row.provider}:${row.symbol}:${row.bucket_time}`,
+          row,
+        );
+      }
+      flowPersistHealth.failed_batches += 1;
+      flowPersistHealth.last_error_at = new Date().toISOString();
+      flowPersistHealth.last_error =
+        String(error?.message || error).slice(0, 240);
+      console.error(
+        `[Step965.3.1] flow persist failed: ${flowPersistHealth.last_error}`,
+      );
+    }
+  })().finally(() => {
+    persistFlushPromise = null;
+  });
+
   await persistFlushPromise;
 }
 
@@ -1150,13 +1295,14 @@ function nextFlowScanBatch(provider, symbols) {
 function sharedMetricRotationPayload() {
   return {
     enabled: SHARED_METRIC_ROTATION_ENABLED,
-    mode: 'backend_bounded_current_oi_ratio_rotation',
+    mode: 'backend_bounded_current_oi_ratio_rotation_v2_recent_persist',
     every_scan_cycles: SHARED_METRIC_ROTATION_EVERY_SCAN_CYCLES,
     estimated_interval_minutes: Math.round(
       SHARED_METRIC_ROTATION_EVERY_SCAN_CYCLES * FLOW_SCAN_ROTATION_MS / 60_000,
     ),
     pinned_symbols: SHARED_METRIC_ROTATION_PINNED,
     rotating_per_provider: SHARED_METRIC_ROTATING_PER_PROVIDER,
+    persist_recent_buckets: SHARED_METRIC_PERSIST_RECENT_BUCKETS,
     global_concurrency: SHARED_METRIC_ROTATION_GLOBAL_CONCURRENCY,
     cycle: sharedMetricRotationState.cycle,
     running: Boolean(sharedMetricRotationState.running),
@@ -1297,7 +1443,9 @@ async function runSharedMetricRotationCycle() {
         sharedMetricRotationState.attempts[provider] += 1;
         try {
           const state = states.get(`${provider}:${symbol}`) || getState(provider, symbol, { source: 'scanner' });
-          const payload = await fetchVenueMetrics(state);
+          const payload = await fetchVenueMetrics(state, {
+            persistRecentLimit: SHARED_METRIC_PERSIST_RECENT_BUCKETS,
+          });
           const metricStatus = payload?.metric_status || recentMetricFamilyStatus(state);
           if (metricStatus?.oi || metricStatus?.global_account || metricStatus?.top_account || metricStatus?.top_position) {
             sharedMetricRotationState.successes[provider] += 1;
@@ -2009,29 +2157,99 @@ function queueMetricPersist(row) {
   metricPersistQueue.set(metricKey(row), row);
 }
 
-async function flushMetricPersistQueue() {
-  if (!PERSISTENCE_ENABLED || metricPersistFlushPromise || metricPersistQueue.size === 0) return;
-  const rows = [...metricPersistQueue.values()].slice(0, 500);
-  for (const row of rows) metricPersistQueue.delete(metricKey(row));
-  metricPersistFlushPromise = (async () => {
-    try {
-      const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/app_upsert_contract_position_metrics`, {
-        method: 'POST',
-        headers: {
-          apikey: SUPABASE_SERVICE_ROLE_KEY,
-          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-          'content-type': 'application/json',
-          prefer: 'return=minimal',
-        },
-        body: JSON.stringify({ p_rows: rows }),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!response.ok) throw new Error(`metric_persist_http_${response.status}:${(await response.text()).slice(0, 180)}`);
-    } catch (error) {
-      for (const row of rows) metricPersistQueue.set(metricKey(row), row);
-      console.error(`[Step615.5] contract metrics persist failed: ${error?.message || error}`);
+async function postMetricPersistBatch(rows) {
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/rpc/app_upsert_contract_position_metrics`,
+    {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'content-type': 'application/json',
+        prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ p_rows: rows }),
+      signal: AbortSignal.timeout(15000),
+    },
+  );
+
+  if (!response.ok) {
+    throw kakaPersistError(
+      'metric_persist_http',
+      response,
+      await response.text(),
+    );
+  }
+
+  return rows.length;
+}
+
+async function persistMetricRowsAdaptive(rows) {
+  try {
+    return await postMetricPersistBatch(rows);
+  } catch (error) {
+    if (kakaPersistenceRowError(error) && rows.length > 1) {
+      const middle = Math.ceil(rows.length / 2);
+      const left = await persistMetricRowsAdaptive(rows.slice(0, middle));
+      const right = await persistMetricRowsAdaptive(rows.slice(middle));
+      return left + right;
     }
-  })().finally(() => { metricPersistFlushPromise = null; });
+
+    if (kakaPersistenceRowError(error) && rows.length === 1) {
+      metricPersistHealth.quarantined_rows += 1;
+      metricPersistHealth.last_quarantine_error =
+        `${rows[0]?.provider || ''}:${rows[0]?.symbol || ''}:` +
+        String(error?.message || error).slice(0, 180);
+      console.error(
+        `[Step965.3.1] quarantined invalid metric row: ` +
+        metricPersistHealth.last_quarantine_error,
+      );
+      return 0;
+    }
+
+    throw error;
+  }
+}
+
+async function flushMetricPersistQueue() {
+  if (
+    !PERSISTENCE_ENABLED ||
+    metricPersistFlushPromise ||
+    metricPersistQueue.size === 0
+  ) return;
+
+  const rows = [...metricPersistQueue.values()]
+    .sort((a, b) => metricRowStart(b) - metricRowStart(a))
+    .slice(0, METRIC_PERSIST_BATCH_SIZE);
+
+  for (const row of rows) {
+    metricPersistQueue.delete(metricKey(row));
+  }
+
+  metricPersistFlushPromise = (async () => {
+    metricPersistHealth.last_batch_size = rows.length;
+    try {
+      const persisted = await persistMetricRowsAdaptive(rows);
+      metricPersistHealth.success_batches += 1;
+      metricPersistHealth.persisted_rows += persisted;
+      metricPersistHealth.last_success_at = new Date().toISOString();
+      metricPersistHealth.last_error = '';
+    } catch (error) {
+      for (const row of rows) {
+        metricPersistQueue.set(metricKey(row), row);
+      }
+      metricPersistHealth.failed_batches += 1;
+      metricPersistHealth.last_error_at = new Date().toISOString();
+      metricPersistHealth.last_error =
+        String(error?.message || error).slice(0, 240);
+      console.error(
+        `[Step965.3.1] metric persist failed: ${metricPersistHealth.last_error}`,
+      );
+    }
+  })().finally(() => {
+    metricPersistFlushPromise = null;
+  });
+
   await metricPersistFlushPromise;
 }
 
@@ -2753,7 +2971,7 @@ function metricPayloadFromState(state) {
   };
 }
 
-async function fetchVenueMetrics(state) {
+async function fetchVenueMetrics(state, { persistRecentLimit = 288 } = {}) {
   await loadPersistedMetrics(state);
   const now = Date.now();
   const latest = [...state.metricRows.values()]
@@ -2768,9 +2986,24 @@ async function fetchVenueMetrics(state) {
       try {
         const rows = await fetchProviderMetricRows(state);
         if (!rows.length) throw new Error(`${state.provider}_metrics_empty`);
+        const persistenceCandidates = new Map();
         for (const raw of rows) {
           const merged = mergeMetricRow(state.metricRows, raw);
-          if (merged) queueMetricPersist(merged);
+          if (merged) {
+            persistenceCandidates.set(metricKey(merged), merged);
+          }
+        }
+
+        const safePersistRecentLimit = Math.max(
+          1,
+          Math.min(288, Number(persistRecentLimit) || 288),
+        );
+        const persistRows = [...persistenceCandidates.values()]
+          .sort((a, b) => metricRowStart(b) - metricRowStart(a))
+          .slice(0, safePersistRecentLimit);
+
+        for (const merged of persistRows) {
+          queueMetricPersist(merged);
         }
         state.metricFetchedAt = Date.now();
         state.metricError = '';
@@ -3468,7 +3701,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,metric_persist_queue:metricPersistQueue.size,metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,market_snapshot_rotates_scan:false,shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,market_snapshot_rotates_scan:false,shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
