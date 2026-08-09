@@ -1290,6 +1290,35 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
     item,
     last,
   );
+  // Step968.13: preserve the official top-of-book fields already present in
+  // provider ticker payloads. This adds no upstream request; shared/current
+  // snapshots and App Top20 batches can reuse the same ticker response.
+  const bestBid = num(
+    item.best_bid ??
+    item.bid_price ??
+    item.bidPrice ??
+    item.bidPx ??
+    item.bid1Price ??
+    item.bidPr ??
+    item.highest_bid ??
+    item.bid
+  );
+  const bestAsk = num(
+    item.best_ask ??
+    item.ask_price ??
+    item.askPrice ??
+    item.askPx ??
+    item.ask1Price ??
+    item.askPr ??
+    item.lowest_ask ??
+    item.ask
+  );
+  const spreadPercent =
+    bestBid !== null && bestAsk !== null && bestAsk > 0 && bestAsk >= bestBid
+      ? ((bestAsk - bestBid) / bestAsk) * 100
+      : null;
+  const markPrice = num(item.mark_price ?? item.markPrice ?? item.markPx);
+  const indexPrice = num(item.index_price ?? item.indexPrice ?? item.indexPx ?? item.idxPx);
   return {
     provider,
     market_type: market,
@@ -1312,6 +1341,13 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
     quantity_semantics: volumes.quantity_semantics,
     high_24h: num(item.high_24h ?? item.highPrice ?? item.high24h ?? item.highPrice24h),
     low_24h: num(item.low_24h ?? item.lowPrice ?? item.low24h ?? item.lowPrice24h),
+    best_bid: bestBid,
+    best_ask: bestAsk,
+    bid_price: bestBid,
+    ask_price: bestAsk,
+    spread_percent: spreadPercent,
+    mark_price: markPrice,
+    index_price: indexPrice,
     funding_rate: num(item.fundingRate),
     open_interest: openInterest.open_interest,
     open_interest_value: openInterest.open_interest_value,
