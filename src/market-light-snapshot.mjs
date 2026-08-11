@@ -994,6 +994,39 @@ function snapshotPayload({ market = '', provider = '', includeRows = true, offse
   return { ...payload, cache_hit: false, cache_age_ms: 0 };
 }
 
+
+export function getMarketLightInternalSnapshot({ market = '', provider = '' } = {}) {
+  const normalizedMarket = String(market || '').trim().toLowerCase();
+  const normalizedProvider = String(provider || '').trim().toLowerCase();
+  if (!['spot', 'contract'].includes(normalizedMarket)) {
+    return { ok: false, version: STEP_VERSION, error: 'unsupported_market_type', market_type: normalizedMarket, provider: normalizedProvider, rows: [] };
+  }
+  const allowed = normalizedMarket === 'spot' ? SPOT_PROVIDERS : CONTRACT_PROVIDERS;
+  if (!allowed.includes(normalizedProvider)) {
+    return { ok: false, version: STEP_VERSION, error: 'unsupported_provider', market_type: normalizedMarket, provider: normalizedProvider, rows: [] };
+  }
+  const key = keyFor(normalizedMarket, normalizedProvider);
+  const meta = providerMeta(normalizedProvider, normalizedMarket);
+  const rows = rowsByKey.get(key) || [];
+  return {
+    ok: true,
+    version: STEP_VERSION,
+    market_type: normalizedMarket,
+    provider: normalizedProvider,
+    primary_quote: PRIMARY_QUOTE[normalizedMarket]?.[normalizedProvider] || null,
+    row_count: rows.length,
+    directory_count: Number(directoryCountByKey.get(key) || 0),
+    stale: Boolean(meta.stale),
+    updated_at: meta.updated_at || null,
+    last_error: meta.last_error || '',
+    shared_round: round,
+    exchange_requests_started: 0,
+    exchange_connections_started: 0,
+    reads_scale_with_users: false,
+    rows: rows.map((row) => ({ ...row })),
+  };
+}
+
 export function getMarketLightSnapshotHealth() {
   const providerCoverage = {};
   for (const provider of SPOT_PROVIDERS) providerCoverage[keyFor('spot', provider)] = providerMeta(provider, 'spot');

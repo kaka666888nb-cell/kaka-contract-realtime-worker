@@ -13,17 +13,19 @@ import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ti
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
 import { getMarketLightSnapshotHealth, handleMarketLightSnapshot, startMarketLightSnapshotScanner } from './market-light-snapshot.mjs';
+import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.84';
+const STEP_VERSION = '650.8.15.85';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
 startSpotCurrentSnapshotScanner();
 startMarketLightSnapshotScanner();
+startContractBasisScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -303,6 +305,9 @@ const server = http.createServer(async (req, res) => {
       market_light_current_snapshot: '/api/market-light/current-snapshot',
       market_light_health: '/api/market-light/health',
       market_light_state: getMarketLightSnapshotHealth(),
+      contract_basis_current_snapshot: '/api/contract-basis/current-snapshot',
+      contract_basis_health: '/api/contract-basis/health',
+      contract_basis_state: getContractBasisHealth(),
       spot_exact_ticker: '/api/spot-market/exact-ticker',
       spot_exact_ticker_health: '/api/spot-market/exact-ticker-health',
       spot_exact_ticker_state: getSpotExactTickerHealth(),
@@ -629,6 +634,11 @@ const server = http.createServer(async (req, res) => {
         market_light_full_directory_snapshot_endpoint: '/api/market-light/current-snapshot',
         market_light_snapshot_reads_scale_with_users: false,
         market_light_failed_refresh_retains_last_verified_rows: true,
+        contract_basis_shared_current_endpoint: '/api/contract-basis/current-snapshot',
+        contract_basis_reuses_market_light_only: true,
+        contract_basis_additional_exchange_requests_per_build: 0,
+        contract_basis_additional_exchange_connections_per_build: 0,
+        contract_basis_reads_scale_with_users: false,
         data_page_spot_current_snapshot_targets_per_provider: 20,
         data_page_spot_current_snapshot_reads_open_exchange_request: false,
         data_page_spot_current_snapshot_scales_with_users: false,
@@ -788,6 +798,7 @@ const server = http.createServer(async (req, res) => {
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
       if (await handleMarketLightSnapshot(req, res, url)) return true;
+      if (await handleContractBasis(req, res, url)) return true;
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
@@ -860,5 +871,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + single-venue liquidation statistics + shared five-platform liquidation current snapshot + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + shared five-platform liquidation + shared five-platform derived basis + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
