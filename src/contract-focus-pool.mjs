@@ -1,6 +1,6 @@
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const SNAPSHOT_ROUTE = '/api/contract-focus-pool/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-focus-pool/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -20,6 +20,7 @@ const HOT_TARGET = 5;
 const POOL_TARGET = CORE_TARGET + HOT_TARGET;
 const HOT_RANK_METRIC = 'quote_volume_24h';
 const SCAN_INTERVAL_MS = 60_000;
+const STARTUP_RETRY_MS = 15_000;
 const HOT_REFRESH_MS = 5 * 60_000;
 const RESPONSE_CACHE_TTL_MS = 20_000;
 const STALE_MS = 3 * 60_000;
@@ -214,7 +215,7 @@ function buildProvider(provider, now) {
 
 async function buildAll(reason = 'interval') {
   if (running) return await running;
-  running = (async () => {
+  const task = (async () => {
     const now = Date.now();
     lastStartedAt = new Date(now).toISOString();
     try {
@@ -230,17 +231,40 @@ async function buildAll(reason = 'interval') {
       totalBuildFailures += 1;
       lastError = String(error?.message || error).slice(0, 300);
       throw error;
-    } finally {
-      running = null;
     }
   })();
-  return await running;
+  running = task;
+  try {
+    return await task;
+  } finally {
+    if (running === task) running = null;
+  }
+}
+
+function allProvidersReady() {
+  return PROVIDERS.every((provider) => providerState.get(provider)?.ready === true);
+}
+
+function scheduleStartupRecovery() {
+  if (!started || allProvidersReady()) return;
+  timer = setTimeout(async () => {
+    try {
+      await buildAll('startup_recovery');
+    } catch {}
+    scheduleStartupRecovery();
+  }, STARTUP_RETRY_MS);
+  timer.unref?.();
 }
 
 export function startContractFocusPoolScanner() {
   if (started || process.env.KAKA_DISABLE_CONTRACT_FOCUS_POOL === '1') return;
   started = true;
-  timer = setTimeout(() => buildAll('startup').catch(() => {}), 8_000);
+  timer = setTimeout(async () => {
+    try {
+      await buildAll('startup');
+    } catch {}
+    scheduleStartupRecovery();
+  }, 8_000);
   timer.unref?.();
   interval = setInterval(() => buildAll('interval').catch(() => {}), SCAN_INTERVAL_MS);
   interval.unref?.();
@@ -292,6 +316,7 @@ function snapshotPayload() {
     hot_rank_metric: HOT_RANK_METRIC,
     hot_refresh_minutes: HOT_REFRESH_MS / 60_000,
     scanner_interval_seconds: SCAN_INTERVAL_MS / 1000,
+    startup_retry_seconds: STARTUP_RETRY_MS / 1000,
     derived_from_existing_shared_market_light_only: true,
     exchange_requests_started: 0,
     exchange_connections_started: 0,
@@ -326,6 +351,7 @@ export function getContractFocusPoolHealth() {
     hot_rank_metric: HOT_RANK_METRIC,
     hot_refresh_minutes: HOT_REFRESH_MS / 60_000,
     scanner_interval_seconds: SCAN_INTERVAL_MS / 1000,
+    startup_retry_seconds: STARTUP_RETRY_MS / 1000,
     running: Boolean(running),
     round,
     last_started_at: lastStartedAt,
@@ -339,6 +365,8 @@ export function getContractFocusPoolHealth() {
     response_cache_misses: responseCacheMisses,
     market_light_internal_reads_only: true,
     market_light_http_rereads_per_user: 0,
+    build_lock_releases_after_completion: true,
+    startup_recovery_until_all_providers_ready: true,
     exchange_requests_started_by_user_read: 0,
     exchange_connections_started_by_user_read: 0,
     reads_scale_with_users: false,
