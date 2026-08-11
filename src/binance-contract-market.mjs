@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.41';
+const VERSION = '650.8.15.42';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -13,6 +13,10 @@ const SNAPSHOT_MIN_TICKER_ROWS = 50;
 // Fifteen minutes is still fresh enough for last-known-good cold-start recovery because
 // the official WebSocket immediately refreshes live rows after startup.
 const SNAPSHOT_PERSIST_INTERVAL_MS = 15 * 60_000;
+// Step980.6.3.5.1: identity mutations are rare and restart-critical. Persist the
+// already-shared clean snapshot shortly after a real listing/delisting/prune instead
+// of waiting for the ordinary 15-minute market-data persistence cadence.
+const IDENTITY_MUTATION_PERSIST_DELAY_MS = 5_000;
 const AUTOMATIC_REST_ENABLED = false;
 const REST_REFRESH_INTERVAL_MS = 6 * 60 * 60_000;
 const REST_RESTRICTED_COOLDOWN_MS = 30 * 60_000;
@@ -68,6 +72,12 @@ let lastPersistAt = 0;
 let dirtyUniverse = false;
 let dirtyTickers = false;
 let persistTimer = null;
+let persistTimerDueAt = 0;
+let identityMutationGeneration = 0;
+let persistedIdentityGeneration = 0;
+let lastIdentityMutationAt = 0;
+let lastIdentityPersistAt = 0;
+let lastIdentityReconcileAt = 0;
 let restRefreshPromise = null;
 let restNextAllowedAt = 0;
 let restLastSuccessAt = 0;
@@ -313,6 +323,12 @@ function symbolAllowedByConfirmedIdentity(symbol) {
   return confirmedCurrentIdentitySymbols.has(compact(symbol));
 }
 
+function markIdentityMutation(observedAt = Date.now()) {
+  identityMutationGeneration += 1;
+  lastIdentityMutationAt = observedAt;
+  schedulePersist(IDENTITY_MUTATION_PERSIST_DELAY_MS);
+}
+
 function reconcileCurrentIdentitySnapshot(symbols, observedAt = Date.now()) {
   if (!(symbols instanceof Set) || !symbols.size) return { accepted: false, reason: 'empty' };
   const minimumRows = currentIdentityMinimumRows();
@@ -360,6 +376,7 @@ function reconcileCurrentIdentitySnapshot(symbols, observedAt = Date.now()) {
 
   confirmedCurrentIdentitySymbols = new Set(symbols);
   currentIdentityConfirmedAt = observedAt;
+  lastIdentityReconcileAt = observedAt;
   const allKnownSymbols = new Set([
     ...universeBySymbol.keys(),
     ...tickerBySymbol.keys(),
@@ -370,13 +387,13 @@ function reconcileCurrentIdentitySnapshot(symbols, observedAt = Date.now()) {
     if (symbols.has(symbol)) continue;
     if (removeSymbol(symbol)) pruned += 1;
   }
-  currentIdentityLastPrunedRows = pruned;
-  currentIdentityTotalPrunedRows += pruned;
-  currentIdentityLastPrunedAt = observedAt;
   currentIdentityCandidateConfirmations = CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED;
   if (pruned) {
+    currentIdentityLastPrunedRows = pruned;
+    currentIdentityTotalPrunedRows += pruned;
+    currentIdentityLastPrunedAt = observedAt;
+    markIdentityMutation(observedAt);
     notifyWaiters();
-    schedulePersist();
   }
   return {
     accepted: true,
@@ -509,6 +526,7 @@ function handleContractInfoMessage(raw) {
   const rows = Array.isArray(payload) ? payload : [payload];
   const now = Date.now();
   let accepted = 0;
+  let identityMutated = false;
   for (const item of rows) {
     if (!item || typeof item !== 'object' || !isUsdmPayload(item)) continue;
     const symbol = compact(item.s ?? item.symbol);
@@ -518,19 +536,22 @@ function handleContractInfoMessage(raw) {
     if (contractType && !['PERPETUAL', 'TRADIFI_PERPETUAL'].includes(contractType)) continue;
     if (contractStatus && !['TRADING', 'PRE_DELIVERING', 'PRE_SETTLE'].includes(contractStatus)) {
       confirmedCurrentIdentitySymbols.delete(symbol);
-      removeSymbol(symbol);
+      if (removeSymbol(symbol)) identityMutated = true;
       accepted += 1;
       continue;
     }
     const identity = normalizedPerpetual(item);
     if (!identity) continue;
+    const existedBefore = universeBySymbol.has(identity.symbol);
     if (currentIdentityConfirmed()) confirmedCurrentIdentitySymbols.add(identity.symbol);
     upsertUniverse(identity, 'binance_official_public_contract_info_websocket', now);
+    if (!existedBefore) identityMutated = true;
     accepted += 1;
   }
   if (accepted) {
     lastContractInfoEventAt = now;
-    schedulePersist();
+    if (identityMutated) markIdentityMutation(now);
+    else schedulePersist();
   }
 }
 
@@ -640,7 +661,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.41' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.42' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -710,7 +731,7 @@ async function capturePeriodicSnapshot(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.41' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.42' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -849,7 +870,7 @@ async function captureCurrentPriceBaseline() {
         socket = new WebSocket(WS_API_URL, {
           handshakeTimeout: 15_000,
           perMessageDeflate: false,
-          headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.41' },
+          headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.42' },
         });
       } catch (error) {
         finish(false, error?.message || error);
@@ -1048,6 +1069,8 @@ function sortedTickerRows(symbols = []) {
 
 async function persistDirtySnapshots() {
   persistTimer = null;
+  persistTimerDueAt = 0;
+  const identityGenerationAtStart = identityMutationGeneration;
   const tasks = [];
   const universeRows = sortedUniverseRows(DEFAULT_QUOTE);
   const tickerRows = sortedTickerRows().filter((row) => compact(row.symbol).endsWith(DEFAULT_QUOTE));
@@ -1063,17 +1086,31 @@ async function persistDirtySnapshots() {
   try {
     await Promise.all(tasks);
     lastPersistAt = Date.now();
+    if (identityGenerationAtStart > persistedIdentityGeneration) {
+      persistedIdentityGeneration = identityGenerationAtStart;
+      lastIdentityPersistAt = lastPersistAt;
+    }
   } catch (error) {
     restLastError = `snapshot_persist:${String(error?.message || error)}`;
     schedulePersist();
   }
 }
 
-function schedulePersist() {
-  if (!supabaseEnabled() || persistTimer) return;
+function schedulePersist(delayMs = SNAPSHOT_PERSIST_INTERVAL_MS) {
+  if (!supabaseEnabled()) return;
+  const safeDelay = Math.max(1_000, Number(delayMs) || SNAPSHOT_PERSIST_INTERVAL_MS);
+  const dueAt = Date.now() + safeDelay;
+  if (persistTimer) {
+    // Keep an already-earlier persistence deadline; only replace a later timer
+    // when a real identity mutation needs a prompt restart-safe checkpoint.
+    if (persistTimerDueAt > 0 && persistTimerDueAt <= dueAt) return;
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  persistTimerDueAt = dueAt;
   persistTimer = setTimeout(() => {
     persistDirtySnapshots().catch(() => {});
-  }, SNAPSHOT_PERSIST_INTERVAL_MS);
+  }, safeDelay);
   persistTimer.unref?.();
 }
 
@@ -1260,6 +1297,7 @@ export function getBinanceContractMarketHealth() {
       last_pruned_rows: currentIdentityLastPrunedRows,
       total_pruned_rows: currentIdentityTotalPrunedRows,
       last_pruned_at: currentIdentityLastPrunedAt ? iso(currentIdentityLastPrunedAt) : null,
+      last_reconcile_at: lastIdentityReconcileAt ? iso(lastIdentityReconcileAt) : null,
       changed_only_ticker_stream_not_used_as_full_identity: true,
       mark_price_stream_not_used_as_full_identity: true,
       confirmed_identity_rows: confirmedCurrentIdentitySymbols.size,
@@ -1289,6 +1327,17 @@ export function getBinanceContractMarketHealth() {
     rest_last_error: restLastError || null,
     persistence_enabled: supabaseEnabled(),
     snapshot_persist_interval_seconds: Math.round(SNAPSHOT_PERSIST_INTERVAL_MS / 1000),
+    identity_mutation_persist_delay_seconds: Math.round(IDENTITY_MUTATION_PERSIST_DELAY_MS / 1000),
+    identity_persistence: {
+      mutation_generation: identityMutationGeneration,
+      persisted_generation: persistedIdentityGeneration,
+      pending_generation: Math.max(0, identityMutationGeneration - persistedIdentityGeneration),
+      last_mutation_at: lastIdentityMutationAt ? iso(lastIdentityMutationAt) : null,
+      last_identity_persist_at: lastIdentityPersistAt ? iso(lastIdentityPersistAt) : null,
+      restart_snapshot_ready: persistedIdentityGeneration >= identityMutationGeneration,
+      persist_timer_scheduled: Boolean(persistTimer),
+      persist_due_at: persistTimerDueAt ? iso(persistTimerDueAt) : null,
+    },
     snapshot_persist_stats: {
       ...snapshotPersistStats,
       last_attempt_at: snapshotPersistStats.last_attempt_at ? iso(snapshotPersistStats.last_attempt_at) : null,

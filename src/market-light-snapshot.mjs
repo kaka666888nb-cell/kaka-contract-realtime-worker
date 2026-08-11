@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.79';
+const STEP_VERSION = '650.8.15.80';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -28,7 +28,7 @@ const SCAN_INTERVAL_MS = Math.max(15_000, Number(process.env.KAKA_MARKET_LIGHT_S
 const START_DELAY_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_START_DELAY_MS || 7_000));
 const STALE_MS = Math.max(60_000, Number(process.env.KAKA_MARKET_LIGHT_STALE_MS || 3 * 60_000));
 const DIRECTORY_INTERVAL_MS = Math.max(2 * 60_000, Number(process.env.KAKA_MARKET_LIGHT_DIRECTORY_INTERVAL_MS || 10 * 60_000));
-const SNAPSHOT_CACHE_TTL_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_RESPONSE_CACHE_TTL_MS || 3_000));
+const SNAPSHOT_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_MARKET_LIGHT_RESPONSE_CACHE_TTL_MS || 20_000));
 const BUILD_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.KAKA_MARKET_LIGHT_BUILD_CONCURRENCY || 2)));
 const PARTIAL_RETAIN_RATIO = Math.max(0.4, Math.min(0.95, Number(process.env.KAKA_MARKET_LIGHT_PARTIAL_RETAIN_RATIO || 0.65)));
 const DIRECTORY_MIN_RATIO_AFTER_WARM = Math.max(0.2, Math.min(0.9, Number(process.env.KAKA_MARKET_LIGHT_DIRECTORY_MIN_RATIO_AFTER_WARM || 0.35)));
@@ -64,6 +64,8 @@ let directoryInterval = null;
 let totalSnapshotReads = 0;
 let totalBuilds = 0;
 let totalBuildFailures = 0;
+let responseCacheHits = 0;
+let responseCacheMisses = 0;
 
 let wsCtorPromise = null;
 const coinbase = {
@@ -280,7 +282,7 @@ async function fetchJson(url, { timeoutMs = 15_000 } = {}) {
     const response = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.79 market-light',
+        'user-agent': 'KakaWeb3/650.8.15.80 market-light',
       },
       signal: controller.signal,
     });
@@ -929,8 +931,10 @@ function snapshotPayload({ market = '', provider = '', includeRows = true, offse
   const cacheKey = `${marketFilter || 'all'}|${providerFilter || 'all'}|${includeRows ? 1 : 0}|${safeOffset}|${safeLimit ?? 'all'}`;
   const cached = responseCache.get(cacheKey);
   if (cached && Date.now() - cached.at <= SNAPSHOT_CACHE_TTL_MS) {
+    responseCacheHits += 1;
     return { ...cached.payload, cache_hit: true, cache_age_ms: Date.now() - cached.at };
   }
+  responseCacheMisses += 1;
 
   const markets = marketFilter === 'spot'
     ? ['spot']
@@ -1016,6 +1020,10 @@ export function getMarketLightSnapshotHealth() {
     total_builds: totalBuilds,
     total_build_failures: totalBuildFailures,
     total_snapshot_reads: totalSnapshotReads,
+    response_cache_ttl_seconds: Math.round(SNAPSHOT_CACHE_TTL_MS / 1000),
+    response_cache_entries: responseCache.size,
+    response_cache_hits: responseCacheHits,
+    response_cache_misses: responseCacheMisses,
     snapshot_reads_start_exchange_requests: false,
     snapshot_reads_start_exchange_connections: false,
     snapshot_reads_scale_with_users: false,
