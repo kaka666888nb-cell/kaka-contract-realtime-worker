@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.90",
+  "version": "650.8.15.91",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.90 / Step983 focus-pool shared depth20 + focus-flow binding"
+  "description": "Kaka contract realtime worker 650.8.15.91 / Step985 focus-pool P95 large-trade fields on shared deep layer"
 }
