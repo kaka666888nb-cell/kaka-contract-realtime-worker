@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.82';
+const STEP_VERSION = '650.8.15.86';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -66,6 +66,22 @@ let totalBuilds = 0;
 let totalBuildFailures = 0;
 let responseCacheHits = 0;
 let responseCacheMisses = 0;
+
+const okxContractBatchEnrichment = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  last_started_at: null,
+  last_completed_at: null,
+  last_error: '',
+  mark_rows: 0,
+  index_rows: 0,
+  open_interest_rows: 0,
+  patch_rows: 0,
+  mark_host: '',
+  index_host: '',
+  open_interest_host: '',
+};
 
 let wsCtorPromise = null;
 const coinbase = {
@@ -282,7 +298,7 @@ async function fetchJson(url, { timeoutMs = 15_000 } = {}) {
     const response = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.82 market-light',
+        'user-agent': 'KakaWeb3/650.8.15.86 market-light',
       },
       signal: controller.signal,
     });
@@ -291,6 +307,24 @@ async function fetchJson(url, { timeoutMs = 15_000 } = {}) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchFirstNonEmptyJson(urls, { timeoutMs = 15_000 } = {}) {
+  let lastFailure = null;
+  for (const url of urls) {
+    try {
+      const payload = await fetchJson(url, { timeoutMs });
+      if (payload?.code != null && String(payload.code) !== '0') {
+        throw new Error(`okx_code_${payload.code}:${String(payload.msg || '')}`);
+      }
+      const data = Array.isArray(payload?.data) ? payload.data : [];
+      if (!data.length) throw new Error(`okx_empty_batch:${new URL(url).hostname}`);
+      return { payload, url, host: new URL(url).hostname };
+    } catch (error) {
+      lastFailure = error;
+    }
+  }
+  throw lastFailure || new Error('okx_batch_all_hosts_failed');
 }
 
 function bitgetV3Row(item, market, observedAt) {
@@ -385,38 +419,85 @@ function mergeRowsByNative(baseRows, patchRows, provider, market, observedAt, pr
 }
 
 async function loadOkxContractBatchEnrichment(observedAt) {
-  const [markResult, oiResult] = await Promise.allSettled([
-    fetchJson('https://www.okx.com/api/v5/public/mark-price?instType=SWAP'),
-    fetchJson('https://www.okx.com/api/v5/public/open-interest?instType=SWAP'),
+  okxContractBatchEnrichment.attempts += 1;
+  okxContractBatchEnrichment.last_started_at = new Date().toISOString();
+  const [markResult, indexResult, oiResult] = await Promise.allSettled([
+    fetchFirstNonEmptyJson([
+      'https://www.okx.com/api/v5/public/mark-price?instType=SWAP',
+      'https://aws.okx.com/api/v5/public/mark-price?instType=SWAP',
+    ]),
+    fetchFirstNonEmptyJson([
+      'https://www.okx.com/api/v5/market/index-tickers?quoteCcy=USDT',
+      'https://aws.okx.com/api/v5/market/index-tickers?quoteCcy=USDT',
+    ]),
+    fetchFirstNonEmptyJson([
+      'https://www.okx.com/api/v5/public/open-interest?instType=SWAP',
+      'https://aws.okx.com/api/v5/public/open-interest?instType=SWAP',
+    ]),
   ]);
+
   const patches = new Map();
-  function ensure(instId) {
-    const key = compact(instId);
-    if (!key) return null;
+  function ensureSwap(instId) {
+    const raw = String(instId || '').trim().toUpperCase();
+    const key = compact(raw);
+    if (!raw || !key) return null;
     if (!patches.has(key)) {
       patches.set(key, {
         provider: 'okx',
         market_type: 'contract',
-        raw_symbol: instId,
-        native_symbol: instId,
+        raw_symbol: raw,
+        native_symbol: raw,
         source_time: observedAt,
         cached_at: observedAt,
       });
     }
     return patches.get(key);
   }
+  function swapIdForIndex(indexId) {
+    const raw = String(indexId || '').trim().toUpperCase();
+    if (!raw) return '';
+    return raw.endsWith('-SWAP') ? raw : `${raw}-SWAP`;
+  }
+
+  let markRows = 0;
+  let indexRows = 0;
+  let oiRows = 0;
+  const errors = [];
+
   if (markResult.status === 'fulfilled') {
-    for (const item of Array.isArray(markResult.value?.data) ? markResult.value.data : []) {
-      const row = ensure(item?.instId);
-      if (!row) continue;
-      row.mark_price = finite(item?.markPx);
+    okxContractBatchEnrichment.mark_host = markResult.value.host;
+    for (const item of markResult.value.payload.data) {
+      const row = ensureSwap(item?.instId);
+      const value = finite(item?.markPx);
+      if (!row || value == null || value <= 0) continue;
+      row.mark_price = value;
       row.source_time = isoMs(item?.ts) || row.source_time;
       row.mark_price_source = 'okx_public_mark_price_batch';
+      markRows += 1;
     }
+  } else {
+    errors.push(`mark:${String(markResult.reason?.message || markResult.reason || 'failed')}`);
   }
+
+  if (indexResult.status === 'fulfilled') {
+    okxContractBatchEnrichment.index_host = indexResult.value.host;
+    for (const item of indexResult.value.payload.data) {
+      const row = ensureSwap(swapIdForIndex(item?.instId));
+      const value = finite(item?.idxPx);
+      if (!row || value == null || value <= 0) continue;
+      row.index_price = value;
+      row.source_time = isoMs(item?.ts) || row.source_time;
+      row.index_price_source = 'okx_public_index_tickers_usdt_batch';
+      indexRows += 1;
+    }
+  } else {
+    errors.push(`index:${String(indexResult.reason?.message || indexResult.reason || 'failed')}`);
+  }
+
   if (oiResult.status === 'fulfilled') {
-    for (const item of Array.isArray(oiResult.value?.data) ? oiResult.value.data : []) {
-      const row = ensure(item?.instId);
+    okxContractBatchEnrichment.open_interest_host = oiResult.value.host;
+    for (const item of oiResult.value.payload.data) {
+      const row = ensureSwap(item?.instId);
       if (!row) continue;
       row.open_interest = finite(item?.oiCcy ?? item?.oi);
       row.open_interest_value = finite(item?.oiUsd);
@@ -424,8 +505,21 @@ async function loadOkxContractBatchEnrichment(observedAt) {
       row.open_interest_value_unit = row.open_interest_value != null ? 'usd' : null;
       row.source_time = isoMs(item?.ts) || row.source_time;
       row.open_interest_source = 'okx_public_open_interest_batch';
+      oiRows += 1;
     }
+  } else {
+    errors.push(`oi:${String(oiResult.reason?.message || oiResult.reason || 'failed')}`);
   }
+
+  okxContractBatchEnrichment.mark_rows = markRows;
+  okxContractBatchEnrichment.index_rows = indexRows;
+  okxContractBatchEnrichment.open_interest_rows = oiRows;
+  okxContractBatchEnrichment.patch_rows = patches.size;
+  okxContractBatchEnrichment.last_completed_at = new Date().toISOString();
+  okxContractBatchEnrichment.last_error = errors.join('|');
+  if (markRows > 0 && indexRows > 0) okxContractBatchEnrichment.successes += 1;
+  else okxContractBatchEnrichment.failures += 1;
+
   return [...patches.values()];
 }
 
@@ -1078,7 +1172,7 @@ export function getMarketLightSnapshotHealth() {
       binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
-      okx_contract: 'official_SWAP_tickers_batch + public mark-price batch + public open-interest batch; funding remains missing unless officially supplied by a batch source',
+      okx_contract: 'official_SWAP_tickers_batch + dual-host public mark-price batch + USDT index-tickers batch + public open-interest batch; funding remains missing unless officially supplied by a batch source',
       bybit_spot: 'official_spot_tickers_batch',
       bybit_contract: 'official_linear_tickers_batch including mark/index/OI/funding/BBO',
       bitget_spot: 'official_v3_SPOT_tickers_product_batch with v2 fallback',
@@ -1087,6 +1181,17 @@ export function getMarketLightSnapshotHealth() {
       gate_contract: 'official_USDT_futures_tickers_batch including mark/index/funding/BBO; total_size preserved separately and not relabeled as OI',
     },
     provider_coverage: providerCoverage,
+    okx_contract_batch_enrichment: {
+      ...okxContractBatchEnrichment,
+      mark_ready: okxContractBatchEnrichment.mark_rows > 0,
+      index_ready: okxContractBatchEnrichment.index_rows > 0,
+      open_interest_ready: okxContractBatchEnrichment.open_interest_rows > 0,
+      dual_host_fallback_enabled: true,
+      index_batch_mode: 'quoteCcy=USDT',
+      mark_batch_mode: 'instType=SWAP',
+      additional_user_scaled_requests: 0,
+      additional_user_scaled_connections: 0,
+    },
     coinbase_ticker_batch: {
       source: 'coinbase_advanced_trade_public_ticker_batch_websocket',
       url: COINBASE_WS_URL,
