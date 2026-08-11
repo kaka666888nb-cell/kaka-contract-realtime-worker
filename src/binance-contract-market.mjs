@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.43';
+const VERSION = '650.8.15.44';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -336,7 +336,11 @@ function currentIdentityConfirmed() {
 }
 
 function symbolAllowedByConfirmedIdentity(symbol) {
-  if (!currentIdentityConfirmed()) return true;
+  // Step980.6.3.5.4: enrichment is never allowed to establish identity.
+  // Until the official all-symbol price baseline is confirmed 2/2, ticker/mark
+  // enrichment must not write into the active maps at all. After confirmation
+  // it may enrich only symbols already admitted by the authoritative baseline.
+  if (!currentIdentityConfirmed()) return false;
   return confirmedCurrentIdentitySymbols.has(compact(symbol));
 }
 
@@ -544,6 +548,8 @@ function handleContractInfoMessage(raw) {
   const now = Date.now();
   let accepted = 0;
   let identityMutated = false;
+  let requiresIdentityRefresh = false;
+
   for (const item of rows) {
     if (!item || typeof item !== 'object' || !isUsdmPayload(item)) continue;
     const symbol = compact(item.s ?? item.symbol);
@@ -551,24 +557,49 @@ function handleContractInfoMessage(raw) {
     const contractType = String(item.ct ?? item.contractType ?? '').toUpperCase();
     const contractStatus = String(item.cs ?? item.contractStatus ?? item.status ?? '').toUpperCase();
     if (contractType && !['PERPETUAL', 'TRADIFI_PERPETUAL'].includes(contractType)) continue;
-    if (contractStatus && !['TRADING', 'PRE_DELIVERING', 'PRE_SETTLE'].includes(contractStatus)) {
+
+    const isRemovalState = Boolean(contractStatus) &&
+      !['TRADING', 'PRE_DELIVERING', 'PRE_SETTLE'].includes(contractStatus);
+
+    // Step980.6.3.5.4: before the authoritative all-symbol baseline reaches
+    // 2/2 confirmation, contractInfo is advisory only. Never let it populate
+    // active identity during cold start. Its event simply accelerates a fresh
+    // all-symbol identity baseline.
+    if (!currentIdentityConfirmed()) {
+      requiresIdentityRefresh = true;
+      accepted += 1;
+      continue;
+    }
+
+    if (isRemovalState) {
       confirmedCurrentIdentitySymbols.delete(symbol);
       if (removeSymbol(symbol)) identityMutated = true;
       accepted += 1;
       continue;
     }
+
     const identity = normalizedPerpetual(item);
     if (!identity) continue;
-    const existedBefore = universeBySymbol.has(identity.symbol);
-    if (currentIdentityConfirmed()) confirmedCurrentIdentitySymbols.add(identity.symbol);
+
+    // A positive/listing contractInfo event cannot establish a new active
+    // identity by itself. Existing confirmed symbols may update identity fields;
+    // a genuinely new symbol triggers an immediate authoritative price baseline
+    // and becomes active only if that baseline contains it.
+    if (!confirmedCurrentIdentitySymbols.has(identity.symbol)) {
+      requiresIdentityRefresh = true;
+      accepted += 1;
+      continue;
+    }
+
     upsertUniverse(identity, 'binance_official_public_contract_info_websocket', now);
-    if (!existedBefore) identityMutated = true;
     accepted += 1;
   }
+
   if (accepted) {
     lastContractInfoEventAt = now;
     if (identityMutated) markIdentityMutation(now);
     else schedulePersist();
+    if (requiresIdentityRefresh) scheduleCurrentPriceBaselineUrgent(250);
   }
 }
 
@@ -852,6 +883,15 @@ function scheduleCurrentPriceBaseline(delayMs) {
   currentPriceBaselineTimer.unref?.();
 }
 
+function scheduleCurrentPriceBaselineUrgent(delayMs = 250) {
+  if (currentPriceBaselineRunning) return;
+  if (currentPriceBaselineTimer) {
+    clearTimeout(currentPriceBaselineTimer);
+    currentPriceBaselineTimer = null;
+  }
+  scheduleCurrentPriceBaseline(delayMs);
+}
+
 function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
   const rows = Array.isArray(resultRows) ? resultRows : [];
   currentPriceBaselineStats.last_rows = rows.length;
@@ -894,8 +934,14 @@ function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
 
   const reconciliation = reconcileCurrentIdentitySnapshot(currentSymbols, observedAt);
   currentPriceBaselineStats.last_error = reconciliation.accepted ? '' : String(reconciliation.reason || 'reconciliation_rejected');
-  if (reconciliation.accepted) startPeriodicEnrichmentStreams();
-  if (reconciliation.confirmed) releaseRestoredSnapshotQuarantine(currentSymbols, observedAt);
+  // Step980.6.3.5.4: do not start changed-only ticker / mark-price enrichment
+  // after the first 1/2 candidate. Those streams are not identity authorities
+  // and may contain rows outside the final priced-symbol set. Start them only
+  // after two stable all-symbol baselines have confirmed current identity.
+  if (reconciliation.confirmed) {
+    startPeriodicEnrichmentStreams();
+    releaseRestoredSnapshotQuarantine(currentSymbols, observedAt);
+  }
   notifyWaiters();
   schedulePersist();
   return { ...reconciliation, seeded_rows: seeded };
@@ -1376,7 +1422,7 @@ export function getBinanceContractMarketHealth() {
       released_at: restoredSnapshotQuarantineStats.released_at ? iso(restoredSnapshotQuarantineStats.released_at) : null,
     },
     current_identity_reconciliation: {
-      mode: 'two_stable_ws_api_all_symbol_latest_price_snapshots_then_prune_mark_and_changed_streams_enrichment_only',
+      mode: 'two_stable_ws_api_all_symbol_latest_price_snapshots_then_admit_enrichment_only',
       confirmations_required: CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED,
       candidate_confirmations: currentIdentityCandidateConfirmations,
       last_candidate_rows: currentIdentityLastCandidateRows,
@@ -1391,6 +1437,8 @@ export function getBinanceContractMarketHealth() {
       last_reconcile_at: lastIdentityReconcileAt ? iso(lastIdentityReconcileAt) : null,
       changed_only_ticker_stream_not_used_as_full_identity: true,
       mark_price_stream_not_used_as_full_identity: true,
+      enrichment_blocked_until_identity_confirmed: true,
+      contract_info_additions_require_authoritative_baseline: true,
       confirmed_identity_rows: confirmedCurrentIdentitySymbols.size,
       confirmed_identity_at: currentIdentityConfirmedAt ? iso(currentIdentityConfirmedAt) : null,
       mark_price_perpetual_identity_rows: latestMarkPricePerpetualSymbols.size,
