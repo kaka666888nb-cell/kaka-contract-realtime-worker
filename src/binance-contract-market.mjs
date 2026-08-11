@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.38';
+const VERSION = '650.8.15.39';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -28,6 +28,16 @@ const MARKET_MARK_PRICE_SNAPSHOT_INTERVAL_MS = 60_000;
 const MARKET_SNAPSHOT_RETRY_MS = 15_000;
 const MARKET_SNAPSHOT_TIMEOUT_MS = 20_000;
 const START_WAIT_MS = 6_500;
+// Step980.6.3.4: restored persistent snapshots are cold-start fallback, not a
+// permanent claim that every old symbol is still currently tradable. A large
+// official all-market ticker array is treated as an authoritative current
+// identity candidate only when it retains a safe share of the existing set.
+// Two stable full snapshots are required before pruning, preventing one partial
+// WebSocket payload from deleting valid markets.
+const CURRENT_IDENTITY_MIN_ABSOLUTE_ROWS = 250;
+const CURRENT_IDENTITY_MIN_RETAIN_RATIO = 0.70;
+const CURRENT_IDENTITY_STABLE_OVERLAP_RATIO = 0.97;
+const CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED = 2;
 const WS_CONNECT_GAP_MS = 3_000;
 const WS_CONNECT_WINDOW_MS = 5 * 60_000;
 const WS_MAX_CONNECT_ATTEMPTS_5M = 15;
@@ -56,6 +66,15 @@ let restRefreshPromise = null;
 let restNextAllowedAt = 0;
 let restLastSuccessAt = 0;
 let restLastError = '';
+const restoredPendingSymbols = new Set();
+let currentIdentityCandidate = null;
+let currentIdentityCandidateConfirmations = 0;
+let currentIdentityLastCandidateRows = 0;
+let currentIdentityLastCandidateAt = 0;
+let currentIdentityLastPrunedRows = 0;
+let currentIdentityTotalPrunedRows = 0;
+let currentIdentityLastPrunedAt = 0;
+let currentIdentityRejectedPartialSnapshots = 0;
 const snapshotPersistStats = {
   attempts: 0,
   succeeded: 0,
@@ -100,7 +119,18 @@ function splitQuote(symbol) {
       return [normalized.slice(0, -quote.length), quote];
     }
   }
-  return [normalized, DEFAULT_QUOTE];
+  return [normalized, ''];
+}
+
+function symbolMatchesQuote(symbol, quote) {
+  const normalizedSymbol = compact(symbol);
+  const normalizedQuote = compact(quote);
+  return Boolean(
+    normalizedSymbol &&
+    normalizedQuote &&
+    normalizedSymbol.endsWith(normalizedQuote) &&
+    normalizedSymbol.length > normalizedQuote.length
+  );
 }
 
 function finite(value) {
@@ -180,6 +210,7 @@ function notifyWaiters() {
 }
 
 function upsertUniverse(identity, source, updatedAt = Date.now()) {
+  restoredPendingSymbols.delete(identity.symbol);
   const previous = universeBySymbol.get(identity.symbol);
   const next = universeRow(identity, source, updatedAt);
   // Step651.2D.2: ticker/book/mark-price events arrive continuously, but they do
@@ -215,9 +246,112 @@ function upsertTicker(item, identity, source, updatedAt = Date.now()) {
 
 function removeSymbol(symbol) {
   const normalized = compact(symbol);
-  if (!normalized) return;
-  if (universeBySymbol.delete(normalized)) dirtyUniverse = true;
-  if (tickerBySymbol.delete(normalized)) dirtyTickers = true;
+  if (!normalized) return false;
+  let removed = false;
+  if (universeBySymbol.delete(normalized)) {
+    dirtyUniverse = true;
+    removed = true;
+  }
+  if (tickerBySymbol.delete(normalized)) {
+    dirtyTickers = true;
+    removed = true;
+  }
+  if (realtimeMetaBySymbol.delete(normalized)) {
+    dirtyTickers = true;
+    removed = true;
+  }
+  restoredPendingSymbols.delete(normalized);
+  return removed;
+}
+
+function identitySetOverlapRatio(left, right) {
+  if (!(left instanceof Set) || !(right instanceof Set) || !left.size || !right.size) return 0;
+  let intersection = 0;
+  const smaller = left.size <= right.size ? left : right;
+  const larger = smaller === left ? right : left;
+  for (const symbol of smaller) if (larger.has(symbol)) intersection += 1;
+  return intersection / Math.max(left.size, right.size);
+}
+
+function currentIdentityMinimumRows() {
+  const liveOrRestoredRows = Math.max(universeBySymbol.size, tickerBySymbol.size, realtimeMetaBySymbol.size);
+  return Math.max(
+    CURRENT_IDENTITY_MIN_ABSOLUTE_ROWS,
+    Math.floor(liveOrRestoredRows * CURRENT_IDENTITY_MIN_RETAIN_RATIO),
+  );
+}
+
+function reconcileCurrentIdentitySnapshot(symbols, observedAt = Date.now()) {
+  if (!(symbols instanceof Set) || !symbols.size) return { accepted: false, reason: 'empty' };
+  const minimumRows = currentIdentityMinimumRows();
+  currentIdentityLastCandidateRows = symbols.size;
+  currentIdentityLastCandidateAt = observedAt;
+
+  if (symbols.size < minimumRows) {
+    currentIdentityRejectedPartialSnapshots += 1;
+    currentIdentityCandidate = null;
+    currentIdentityCandidateConfirmations = 0;
+    return { accepted: false, reason: 'partial', rows: symbols.size, minimum_rows: minimumRows };
+  }
+
+  if (!currentIdentityCandidate) {
+    currentIdentityCandidate = new Set(symbols);
+    currentIdentityCandidateConfirmations = 1;
+    return { accepted: true, confirmed: false, confirmations: 1, rows: symbols.size };
+  }
+
+  const overlapRatio = identitySetOverlapRatio(currentIdentityCandidate, symbols);
+  if (overlapRatio < CURRENT_IDENTITY_STABLE_OVERLAP_RATIO) {
+    currentIdentityCandidate = new Set(symbols);
+    currentIdentityCandidateConfirmations = 1;
+    return {
+      accepted: true,
+      confirmed: false,
+      confirmations: 1,
+      rows: symbols.size,
+      overlap_ratio: overlapRatio,
+      reason: 'candidate_changed',
+    };
+  }
+
+  currentIdentityCandidate = new Set(symbols);
+  currentIdentityCandidateConfirmations += 1;
+  if (currentIdentityCandidateConfirmations < CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED) {
+    return {
+      accepted: true,
+      confirmed: false,
+      confirmations: currentIdentityCandidateConfirmations,
+      rows: symbols.size,
+      overlap_ratio: overlapRatio,
+    };
+  }
+
+  const allKnownSymbols = new Set([
+    ...universeBySymbol.keys(),
+    ...tickerBySymbol.keys(),
+    ...realtimeMetaBySymbol.keys(),
+  ]);
+  let pruned = 0;
+  for (const symbol of allKnownSymbols) {
+    if (symbols.has(symbol)) continue;
+    if (removeSymbol(symbol)) pruned += 1;
+  }
+  currentIdentityLastPrunedRows = pruned;
+  currentIdentityTotalPrunedRows += pruned;
+  currentIdentityLastPrunedAt = observedAt;
+  currentIdentityCandidateConfirmations = CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED;
+  if (pruned) {
+    notifyWaiters();
+    schedulePersist();
+  }
+  return {
+    accepted: true,
+    confirmed: true,
+    confirmations: currentIdentityCandidateConfirmations,
+    rows: symbols.size,
+    overlap_ratio: overlapRatio,
+    pruned_rows: pruned,
+  };
 }
 
 function parsePayload(raw) {
@@ -235,14 +369,17 @@ function handleTickerMessage(raw) {
   if (!rows.length) return;
   const now = Date.now();
   let accepted = 0;
+  const currentSymbols = new Set();
   for (const item of rows) {
     const identity = normalizedPerpetual(item);
     if (!identity) continue;
+    currentSymbols.add(identity.symbol);
     upsertTicker(item, identity, 'binance_official_public_ticker_websocket', now);
     accepted += 1;
   }
   if (accepted) {
     lastTickerEventAt = now;
+    reconcileCurrentIdentitySnapshot(currentSymbols, now);
     schedulePersist();
   }
 }
@@ -461,7 +598,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.38' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.39' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -531,7 +668,7 @@ async function capturePeriodicSnapshot(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.38' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.39' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -648,7 +785,7 @@ async function restoreSnapshots() {
       const [fallbackBase, fallbackQuote] = splitQuote(symbol);
       const base = String(raw?.base_asset || fallbackBase).toUpperCase();
       const quote = String(raw?.quote_asset || fallbackQuote).toUpperCase();
-      if (!symbol || !base || !quote) continue;
+      if (!symbol || !base || !quote || !symbolMatchesQuote(symbol, quote)) continue;
       universeBySymbol.set(symbol, {
         ...raw,
         provider: PROVIDER,
@@ -656,14 +793,17 @@ async function restoreSnapshots() {
         symbol,
         base_asset: base,
         quote_asset: quote,
-        status: 'TRADING',
-        active: true,
+        status: String(raw?.status || 'TRADING').toUpperCase(),
+        active: raw?.active !== false,
         source: raw?.source || 'binance_contract_persistent_snapshot',
       });
+      restoredPendingSymbols.add(symbol);
     }
     for (const raw of tickerRows) {
       const symbol = compact(raw?.symbol);
       if (!symbol) continue;
+      const restoredUniverse = universeBySymbol.get(symbol);
+      if (!restoredUniverse) continue;
       tickerBySymbol.set(symbol, {
         ...raw,
         provider: PROVIDER,
@@ -927,6 +1067,21 @@ export function getBinanceContractMarketHealth() {
     ticker_rows: tickerBySymbol.size,
     realtime_meta_rows: realtimeMetaBySymbol.size,
     usdt_universe_rows: sortedUniverseRows(DEFAULT_QUOTE).length,
+    restored_pending_identity_rows: restoredPendingSymbols.size,
+    current_identity_reconciliation: {
+      mode: 'two_stable_full_ticker_snapshots_then_prune',
+      confirmations_required: CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED,
+      candidate_confirmations: currentIdentityCandidateConfirmations,
+      last_candidate_rows: currentIdentityLastCandidateRows,
+      last_candidate_at: currentIdentityLastCandidateAt ? iso(currentIdentityLastCandidateAt) : null,
+      minimum_rows_now: currentIdentityMinimumRows(),
+      stable_overlap_ratio: CURRENT_IDENTITY_STABLE_OVERLAP_RATIO,
+      retain_ratio_guard: CURRENT_IDENTITY_MIN_RETAIN_RATIO,
+      rejected_partial_snapshots: currentIdentityRejectedPartialSnapshots,
+      last_pruned_rows: currentIdentityLastPrunedRows,
+      total_pruned_rows: currentIdentityTotalPrunedRows,
+      last_pruned_at: currentIdentityLastPrunedAt ? iso(currentIdentityLastPrunedAt) : null,
+    },
     restored_at: restoredAt ? iso(restoredAt) : null,
     last_universe_event_at: lastUniverseEventAt ? iso(lastUniverseEventAt) : null,
     last_ticker_event_at: lastTickerEventAt ? iso(lastTickerEventAt) : null,
@@ -973,7 +1128,7 @@ export function getBinanceContractMarketHealth() {
       markPrice: Math.round(MARKET_MARK_PRICE_SNAPSHOT_INTERVAL_MS / 1000),
     },
     funding_current_source: 'binance_official_public_mark_price_websocket_periodic_snapshot',
-    source: 'binance_official_periodic_market_snapshots_with_persistent_last_correct_snapshot_no_automatic_rest',
+    source: 'binance_official_periodic_market_snapshots_with_persistent_cold_start_and_confirmed_identity_reconciliation_no_automatic_rest',
     time: new Date().toISOString(),
   };
 }

@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.76';
+const STEP_VERSION = '650.8.15.77';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -280,7 +280,7 @@ async function fetchJson(url, { timeoutMs = 15_000 } = {}) {
     const response = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.76 market-light',
+        'user-agent': 'KakaWeb3/650.8.15.77 market-light',
       },
       signal: controller.signal,
     });
@@ -467,7 +467,13 @@ function assertNoSeverePartialOverwrite(key, rows) {
 async function ensureDirectory(provider, market) {
   const key = keyFor(market, provider);
   const rows = directoryRowsByKey.get(key);
-  if (Array.isArray(rows) && rows.length) return rows;
+  // Step980.6.3.4: Binance contract universe is already an in-process shared
+  // WebSocket snapshot, so re-reading it here starts zero exchange requests.
+  // Refresh this one cached directory every market-light cycle so a confirmed
+  // stale-identity prune becomes visible within ~30s instead of waiting for the
+  // generic 10-minute external-directory cadence used by other providers.
+  const localBinanceContractDirectory = provider === 'binance' && market === 'contract';
+  if (!localBinanceContractDirectory && Array.isArray(rows) && rows.length) return rows;
   const quote = PRIMARY_QUOTE[market]?.[provider];
   if (!quote) return [];
   try {

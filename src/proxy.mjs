@@ -18,7 +18,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.76';
+const STEP_VERSION = '650.8.15.77';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -372,7 +372,7 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_persistence_health: getContractLiquidationPersistenceHealth(),
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
       contract_liquidation_scope: 'single_provider_single_symbol_plus_backend_shared_five_by_three',
-      market_light_rollout: 'step980_6_3_side_by_side_primary_quote_full_directory_no_app_cutover',
+      market_light_rollout: 'step980_6_3_4_binance_contract_current_identity_reconciliation_no_app_cutover',
       contract_funding: '/api/contract-funding',
       contract_funding_history: '/api/contract-funding/history',
       contract_funding_health: '/api/contract-funding/health',
