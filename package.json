@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.86",
+  "version": "650.8.15.87",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.86 / Step980.6.5.1 OKX shared mark-index batch enrichment fix for five-provider basis"
+  "description": "Kaka contract realtime worker 650.8.15.87 / Step980.6.5.2 OKX canonical SWAP identity merge correction for shared basis"
 }
