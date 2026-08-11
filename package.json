@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.76",
+  "version": "650.8.15.77",
   "private": true,
   "type": "module",
   "scripts": {
@@ -21,10 +21,11 @@
     "test:step788.1": "node tests/step788_1_selftest.mjs",
     "test:step788.1.2": "node tests/step788_1_2_selftest.mjs",
     "test:step788.1.2.1": "node tests/step788_1_2_1_selftest.mjs",
-    "test:step980.6.3": "node tests/step980_6_3_selftest.mjs"
+    "test:step980.6.3": "node tests/step980_6_3_selftest.mjs",
+    "test:step980.6.3.4": "node tests/step980_6_3_4_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.76 / Step980.6.3 shared primary-quote full-directory market-light snapshot"
+  "description": "Kaka contract realtime worker 650.8.15.77 / Step980.6.3.4 Binance contract current identity reconciliation"
 }

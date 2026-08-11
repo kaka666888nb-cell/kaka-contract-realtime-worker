@@ -33,3 +33,15 @@ Scope: primary quote full-directory light data. Spot uses Binance/OKX/Bybit/Bitg
 
 Safety: snapshot reads start zero exchange requests/connections, user count does not scale upstream, failed refreshes keep the last verified rows, and missing fields stay missing rather than becoming zero. Old bounded Data Hub endpoints remain active until a later App cutover.
 
+
+
+## Step980.6.3.4 / Render 650.8.15.77
+
+Render-only Binance contract current-identity reconciliation. App, Supabase schema/Edge, liquidation 5x3, other providers and Kline behavior are unchanged.
+
+- Persistent Binance contract snapshots remain cold-start fallback, but restored rows are tracked as unconfirmed until seen again in live official WebSocket data.
+- Unknown quote suffixes no longer default to USDT; malformed restored identities whose symbol does not end with their stored quote are rejected.
+- The official all-market `!ticker@arr` snapshot becomes the current-identity authority only after two large, stable snapshots. A 70% retain guard and 97% overlap guard prevent one partial payload from deleting valid symbols.
+- Confirmed absent symbols are removed from universe, ticker and realtime-meta together; the cleaned universe/ticker snapshot is persisted on the existing low-frequency schedule.
+- Binance contract market-light directory cache is refreshed from the in-process shared universe each scanner cycle, starting zero exchange requests, so coverage converges shortly after identity pruning instead of waiting up to 10 minutes.
+- Binance automatic REST remains disabled. Snapshot reads remain backend-shared and do not scale upstream requests with App users.
