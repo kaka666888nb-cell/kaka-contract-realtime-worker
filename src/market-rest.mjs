@@ -1070,6 +1070,18 @@ async function universe(provider, market, requestedQuote = 'USDT') {
       !contractQuoteSupported(provider, quote)) {
     return [];
   }
+
+  // Step980.6.4.1: Binance contract identity is already owned by the
+  // in-process shared WebSocket market. Do not put a startup-time empty result
+  // into the generic 5-minute external-directory cache: the liquidation
+  // collector can start before the 2/2 authoritative identity baseline is
+  // ready, and caching that temporary empty catalog also makes market-light
+  // report directory_count=0. Re-reading this in-process universe starts zero
+  // Binance REST requests and zero user-scaled exchange work.
+  if (provider === 'binance' && market === 'contract') {
+    return await getBinanceContractUniverse({ quote });
+  }
+
   const catalog = await universeCatalog(provider, market);
   return catalog.filter((row) => row.quote_asset === quote);
 }

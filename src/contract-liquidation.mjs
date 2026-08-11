@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.47';
+const STEP_VERSION = '650.8.15.48';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -59,6 +59,7 @@ const LIQUIDATION_HEALTH_ROUTE = '/api/contract-liquidation/health';
 const LIQUIDATION_CURRENT_ROUTE = '/api/contract-liquidation/current-snapshot';
 const LIQUIDATION_MARKET_ROUTE = '/api/contract-liquidation/market-snapshot';
 const LIQUIDATION_MARKET_UNIVERSE_REFRESH_MS = 10 * 60_000;
+const LIQUIDATION_MARKET_STARTUP_RETRY_MS = 15_000;
 const LIQUIDATION_MARKET_CACHE_TTL_MS = 5_000;
 const LIQUIDATION_MARKET_MAX_EVENT_ROWS = 2000;
 const BYBIT_SHARD_ARG_CHAR_BUDGET = 9000;
@@ -68,6 +69,7 @@ const liquidationMarketUniverseMeta = new Map();
 const bybitMarketShardKeys = new Set();
 let liquidationMarketCurrentCache = { cachedAt: 0, payload: null };
 let liquidationMarketUniverseRefreshInflight = null;
+let liquidationMarketUniverseRetryTimer = null;
 const liquidationMarketHealth = {
   universe_refresh_attempts: 0,
   universe_refresh_successes: 0,
@@ -721,9 +723,14 @@ function buildMarketLiquidationSnapshot(now = Date.now()) {
     .filter((row) => Number(row.directory_symbols || 0) > 0).length;
   const connectedProviderCount = Object.values(providerCoverage)
     .filter((row) => Number(row.connected_symbols || 0) > 0).length;
-  const fullDirectoryConnected = directorySymbolCount > 0 &&
-    connectedSymbolCount === directorySymbolCount;
-  const fullWindowComplete = directorySymbolCount > 0 &&
+  const universeErrorFree = LIQUIDATION_MARKET_PROVIDER_ORDER.every((provider) =>
+    !String(providerCoverage[provider]?.universe_error || '').trim());
+  const fullDirectoryConnected = providerCount === LIQUIDATION_MARKET_PROVIDER_ORDER.length &&
+    connectedProviderCount === LIQUIDATION_MARKET_PROVIDER_ORDER.length &&
+    directorySymbolCount > 0 &&
+    connectedSymbolCount === directorySymbolCount &&
+    universeErrorFree;
+  const fullWindowComplete = fullDirectoryConnected &&
     completeSymbolCount === directorySymbolCount;
 
   return {
@@ -2294,8 +2301,29 @@ function markCoreFeed(feed) {
   return feed;
 }
 
+function scheduleLiquidationMarketUniverseRetry(reason = 'startup_retry') {
+  if (liquidationMarketUniverseRetryTimer) return;
+  liquidationMarketUniverseRetryTimer = setTimeout(async () => {
+    liquidationMarketUniverseRetryTimer = null;
+    try {
+      const result = await refreshLiquidationMarketUniverse({ reason });
+      if (result?.ok !== true) {
+        scheduleLiquidationMarketUniverseRetry('startup_retry');
+      }
+    } catch (error) {
+      liquidationMarketHealth.last_universe_refresh_error =
+        `retry:${String(error?.message || error)}`.slice(0, 1000);
+      scheduleLiquidationMarketUniverseRetry('startup_retry');
+    }
+  }, LIQUIDATION_MARKET_STARTUP_RETRY_MS);
+  liquidationMarketUniverseRetryTimer.unref?.();
+}
+
 async function bootstrapCollection() {
-  await refreshLiquidationMarketUniverse({ reason: 'startup' });
+  const startupUniverse = await refreshLiquidationMarketUniverse({ reason: 'startup' });
+  if (startupUniverse?.ok !== true) {
+    scheduleLiquidationMarketUniverseRetry('startup_retry');
+  }
 
   // Keep the original 5 x 3 focused snapshot as a compatibility/fallback layer,
   // but reuse the already-running market collectors. No focused read creates
@@ -2323,10 +2351,15 @@ const bootstrapTimer = setTimeout(() => {
 bootstrapTimer.unref?.();
 
 const marketUniverseRefreshTimer = setInterval(() => {
-  refreshLiquidationMarketUniverse({ reason: 'scheduled' }).catch((error) => {
-    liquidationMarketHealth.last_universe_refresh_error =
-      `scheduled:${String(error?.message || error)}`.slice(0, 1000);
-  });
+  refreshLiquidationMarketUniverse({ reason: 'scheduled' })
+    .then((result) => {
+      if (result?.ok !== true) scheduleLiquidationMarketUniverseRetry('scheduled_retry');
+    })
+    .catch((error) => {
+      liquidationMarketHealth.last_universe_refresh_error =
+        `scheduled:${String(error?.message || error)}`.slice(0, 1000);
+      scheduleLiquidationMarketUniverseRetry('scheduled_retry');
+    });
 }, LIQUIDATION_MARKET_UNIVERSE_REFRESH_MS);
 marketUniverseRefreshTimer.unref?.();
 
