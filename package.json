@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.77",
+  "version": "650.8.15.78",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.77 / Step980.6.3.4 Binance contract current identity reconciliation"
+  "description": "Kaka contract realtime worker 650.8.15.78 / Step980.6.3.4.1 Binance changed-only ticker correction and all-symbol WebSocket price baseline"
 }
