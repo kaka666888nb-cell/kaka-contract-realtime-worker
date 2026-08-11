@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.88",
+  "version": "650.8.15.89",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.88 / Step982 shared five-provider 10-core + 5-hot contract focus pool registry"
+  "description": "Kaka contract realtime worker 650.8.15.89 / Step982.1 focus-pool build-lock and startup recovery correction"
 }
