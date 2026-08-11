@@ -1,6 +1,6 @@
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.3';
 const SNAPSHOT_ROUTE = '/api/contract-focus-pool/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-focus-pool/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -328,6 +328,11 @@ function snapshotPayload() {
   };
   responseCache.set('all', { at: Date.now(), payload });
   return { ...clone(payload), cache_hit: false, cache_age_ms: 0 };
+}
+
+
+export function getContractFocusPoolInternalSnapshot() {
+  return snapshotPayload();
 }
 
 export function getContractFocusPoolHealth() {

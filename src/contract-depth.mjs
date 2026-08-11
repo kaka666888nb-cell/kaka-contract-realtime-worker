@@ -1,10 +1,17 @@
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.33';
+const STEP_VERSION = '650.8.15.90';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
 const CIRCUIT = new Map();
 const CONTRACT_META_CACHE = new Map();
+const SHARED_BACKGROUND_STATS = {
+  reads: 0,
+  successes: 0,
+  failures: 0,
+  last_success_at: null,
+  last_error: '',
+};
 
 const ORDERBOOK_FRESH_MS = 1_200;
 const TRADES_FRESH_MS = 1_200;
@@ -1868,11 +1875,40 @@ async function resolveCached(provider, marketType, view, symbol, limit) {
 }
 
 
+export async function getContractDepthSharedOrderbook(providerRaw, symbolRaw, limitRaw = 20) {
+  const provider = normalizeProvider(providerRaw);
+  const symbol = compactSymbol(symbolRaw);
+  const limit = clampLimit('orderbook', limitRaw);
+  if (!SUPPORTED_PROVIDERS.has(provider) || provider === 'coinbase') {
+    throw new Error('unsupported_contract_provider');
+  }
+  if (!symbol) throw new Error('invalid_symbol');
+  SHARED_BACKGROUND_STATS.reads += 1;
+  try {
+    const payload = await resolveCached(provider, 'contract', 'orderbook', symbol, limit);
+    SHARED_BACKGROUND_STATS.successes += 1;
+    SHARED_BACKGROUND_STATS.last_success_at = new Date().toISOString();
+    SHARED_BACKGROUND_STATS.last_error = '';
+    return payload;
+  } catch (error) {
+    SHARED_BACKGROUND_STATS.failures += 1;
+    SHARED_BACKGROUND_STATS.last_error = String(error?.message || error).slice(0, 220);
+    throw error;
+  }
+}
+
 export function getContractDepthHealth() {
   pruneBinanceDepthConnectAttempts();
   return {
     ok: true,
     version: STEP_VERSION,
+    shared_background_orderbook_reads: SHARED_BACKGROUND_STATS.reads,
+    shared_background_orderbook_successes: SHARED_BACKGROUND_STATS.successes,
+    shared_background_orderbook_failures: SHARED_BACKGROUND_STATS.failures,
+    shared_background_orderbook_last_success_at: SHARED_BACKGROUND_STATS.last_success_at,
+    shared_background_orderbook_last_error: SHARED_BACKGROUND_STATS.last_error,
+    shared_background_orderbook_uses_same_cache_inflight_governor: true,
+    shared_background_user_reads_open_upstream: false,
     binance_contract_rest_disabled: true,
     binance_spot_depth_transport: 'official_data_api_rest_with_endpoint_cache_inflight_and_circuit',
     fdusd_spot_identity_enabled: true,

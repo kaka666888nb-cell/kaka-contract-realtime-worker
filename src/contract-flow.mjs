@@ -2,8 +2,9 @@ import { WebSocket } from 'ws';
 import { fetchBinancePublicRestRelayJson } from './binance-contract-kline-relay.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
+import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.47';
+const VERSION = '650.8.15.90';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -361,7 +362,7 @@ const FLOW_HISTOGRAM_MAX_LOG10 = 10;
 const FLOW_HISTOGRAM_STEP = 0.10;
 const FLOW_HISTOGRAM_BINS = Math.ceil((FLOW_HISTOGRAM_MAX_LOG10 - FLOW_HISTOGRAM_MIN_LOG10) / FLOW_HISTOGRAM_STEP);
 const MAX_RECENT_IDS = 3000;
-const MAX_ACTIVE_STATES = 80;
+const MAX_ACTIVE_STATES = 112;
 const BINANCE_FLOW_MAX_STATES = 24;
 const BINANCE_FLOW_CONNECT_GAP_MS = 2_500;
 const BINANCE_FLOW_CONNECT_WINDOW_MS = 5 * 60_000;
@@ -395,11 +396,13 @@ const FLOW_SCAN_CATALOG_TTL_MS = Math.max(
   Number(process.env.KAKA_FLOW_SCAN_CATALOG_TTL_MS || 30 * 60_000),
 );
 const FLOW_SCAN_BATCH_BY_PROVIDER = Object.freeze({
-  binance: Math.max(1, Math.min(BINANCE_FLOW_MAX_STATES - 2, Number(process.env.KAKA_FLOW_SCAN_BINANCE_BATCH || 18))),
-  okx: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_OKX_BATCH || 8)),
-  bybit: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_BYBIT_BATCH || 8)),
-  bitget: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_BITGET_BATCH || 8)),
-  gate: Math.max(1, Number(process.env.KAKA_FLOW_SCAN_GATE_BATCH || 8)),
+  // Step983: keep all 15 focus symbols active per provider, with a small
+  // rotating tail so the legacy full-universe flow discovery is preserved.
+  binance: Math.max(15, Math.min(BINANCE_FLOW_MAX_STATES - 2, Number(process.env.KAKA_FLOW_SCAN_BINANCE_BATCH || 18))),
+  okx: Math.max(15, Number(process.env.KAKA_FLOW_SCAN_OKX_BATCH || 17)),
+  bybit: Math.max(15, Number(process.env.KAKA_FLOW_SCAN_BYBIT_BATCH || 17)),
+  bitget: Math.max(15, Number(process.env.KAKA_FLOW_SCAN_BITGET_BATCH || 17)),
+  gate: Math.max(15, Number(process.env.KAKA_FLOW_SCAN_GATE_BATCH || 17)),
 });
 // Step769.2: the trade-stream universe scanner previously rotated WebSocket streams only.
 // It did not call fetchVenueMetrics(), so after a Render restart the 30-minute
@@ -1228,6 +1231,58 @@ function getState(provider, symbol, { source = 'client' } = {}) {
   return state;
 }
 
+function focusPoolSymbolsByProvider() {
+  const snapshot = getContractFocusPoolInternalSnapshot();
+  const result = Object.fromEntries([...PROVIDERS].map((provider) => [provider, []]));
+  if (snapshot?.ready !== true) return { ready: false, round: Number(snapshot?.round || 0), byProvider: result };
+  for (const provider of PROVIDERS) {
+    const rows = Array.isArray(snapshot?.providers?.[provider]?.rows) ? snapshot.providers[provider].rows : [];
+    result[provider] = [...new Set(rows.map((row) => symbolKey(row?.symbol)).filter((symbol) => symbol && symbol.endsWith('USDT')))].slice(0, 15);
+  }
+  return { ready: [...PROVIDERS].every((provider) => result[provider].length === 15), round: Number(snapshot?.round || 0), byProvider: result };
+}
+
+function focusFlowBindingPayload() {
+  const focus = focusPoolSymbolsByProvider();
+  const targetByProvider = {};
+  const activeByProvider = {};
+  const connectedByProvider = {};
+  let targetRows = 0;
+  let activeRows = 0;
+  let connectedRows = 0;
+  for (const provider of PROVIDERS) {
+    const symbols = focus.byProvider[provider] || [];
+    targetByProvider[provider] = symbols.length;
+    let active = 0;
+    let connected = 0;
+    for (const symbol of symbols) {
+      const state = states.get(`${provider}:${symbol}`);
+      if (state) active += 1;
+      if (state?.ws?.readyState === WebSocket.OPEN) connected += 1;
+    }
+    activeByProvider[provider] = active;
+    connectedByProvider[provider] = connected;
+    targetRows += symbols.length;
+    activeRows += active;
+    connectedRows += connected;
+  }
+  return {
+    enabled: true,
+    focus_pool_ready: focus.ready,
+    focus_pool_round: focus.round,
+    target_by_provider: targetByProvider,
+    active_by_provider: activeByProvider,
+    connected_by_provider: connectedByProvider,
+    target_rows: targetRows,
+    active_rows: activeRows,
+    connected_rows: connectedRows,
+    all_focus_active: focus.ready && targetRows === 75 && activeRows === 75,
+    all_focus_connected: focus.ready && targetRows === 75 && connectedRows === 75,
+    extra_rotation_preserved: true,
+    user_reads_open_focus_streams: false,
+  };
+}
+
 function flowScanStatusPayload() {
   const directoryTotals = {};
   const activeCounts = {};
@@ -1237,7 +1292,7 @@ function flowScanStatusPayload() {
   }
   return {
     enabled: FLOW_SCAN_ENABLED,
-    mode: 'full_universe_rotating_bounded_websocket',
+    mode: 'focus_pool_15_each_plus_full_universe_rotating_tail_websocket',
     fixed_symbol_whitelist: false,
     pinned_symbols: PINNED_SYMBOLS,
     rotation_ms: FLOW_SCAN_ROTATION_MS,
@@ -1250,6 +1305,7 @@ function flowScanStatusPayload() {
     active_by_provider: activeCounts,
     active_symbols_by_provider: flowScanState.active_symbols,
     provider_errors: flowScanState.errors,
+    focus_pool_binding: focusFlowBindingPayload(),
   };
 }
 
@@ -1274,22 +1330,28 @@ async function loadFlowScanCatalog(provider) {
 function nextFlowScanBatch(provider, symbols) {
   if (!symbols.length) return [];
   const size = Math.max(1, Math.min(symbols.length, FLOW_SCAN_BATCH_BY_PROVIDER[provider] || 1));
-  const pinned = SHARED_METRIC_ROTATION_PINNED
+  const focus = focusPoolSymbolsByProvider();
+  const focusSymbols = (focus.byProvider[provider] || [])
     .filter((symbol) => symbols.includes(symbol))
-    .slice(0, size);
-  const pinnedSet = new Set(pinned);
-  const rotatingSize = Math.max(0, size - pinned.length);
+    .slice(0, Math.min(15, size));
+  const selectedSet = new Set(focusSymbols);
+  const pinned = SHARED_METRIC_ROTATION_PINNED
+    .filter((symbol) => symbols.includes(symbol) && !selectedSet.has(symbol))
+    .slice(0, Math.max(0, size - focusSymbols.length));
+  for (const symbol of pinned) selectedSet.add(symbol);
+  const rotatingSize = Math.max(0, size - selectedSet.size);
   let cursor = Math.max(0, flowScanState.cursors[provider] || 0) % symbols.length;
   const rotating = [];
   let examined = 0;
   while (rotating.length < rotatingSize && examined < symbols.length) {
     const symbol = symbols[(cursor + examined) % symbols.length];
     examined += 1;
-    if (pinnedSet.has(symbol)) continue;
+    if (selectedSet.has(symbol)) continue;
     rotating.push(symbol);
+    selectedSet.add(symbol);
   }
   flowScanState.cursors[provider] = (cursor + Math.max(1, examined)) % symbols.length;
-  return [...pinned, ...rotating];
+  return [...focusSymbols, ...pinned, ...rotating];
 }
 
 function sharedMetricRotationPayload() {
@@ -1579,6 +1641,10 @@ async function runContractFlowUniverseScanCycle() {
   return await flowScanState.running;
 }
 
+export async function reconcileContractFlowFocusPool() {
+  return await runContractFlowUniverseScanCycle();
+}
+
 export function startContractFlowUniverseScanner() {
   startSharedFlowMaintenance();
   if (flowScanState.started || !FLOW_SCAN_ENABLED) return;
@@ -1597,6 +1663,55 @@ function provisionalRows(state) {
     if (normalized) rows.push(normalized);
   }
   return rows;
+}
+
+export function getContractFlowInternalFocusSnapshot() {
+  const focus = focusPoolSymbolsByProvider();
+  const rows = [];
+  let activeRows = 0;
+  let connectedRows = 0;
+  for (const provider of PROVIDERS) {
+    for (const symbol of focus.byProvider[provider] || []) {
+      const state = states.get(`${provider}:${symbol}`);
+      if (!state) continue;
+      activeRows += 1;
+      if (state.ws?.readyState === WebSocket.OPEN) connectedRows += 1;
+      finalizeReadyBuckets(state, Date.now());
+      const candidates = [
+        ...provisionalRows(state),
+        ...[...state.completedBuckets.values()],
+      ].filter(Boolean).sort((a, b) => Number(b.start || 0) - Number(a.start || 0));
+      const latest = candidates[0] || null;
+      if (!latest) continue;
+      rows.push({
+        provider,
+        symbol,
+        bucket_time: latest.bucket_time,
+        bucket_end_time: latest.bucket_end_time,
+        buy_quote: asNumber(latest.buy_quote) ?? 0,
+        sell_quote: asNumber(latest.sell_quote) ?? 0,
+        net_quote: (asNumber(latest.buy_quote) ?? 0) - (asNumber(latest.sell_quote) ?? 0),
+        trade_count: asNumber(latest.trade_count) ?? 0,
+        p70_quote: asNumber(latest.p70_quote),
+        p95_quote: asNumber(latest.p95_quote),
+        source: latest.source || 'render_exchange_websocket_histogram',
+        updated_at: latest.updated_at || new Date().toISOString(),
+      });
+    }
+  }
+  return {
+    ok: true,
+    version: VERSION,
+    focus_pool_ready: focus.ready,
+    focus_pool_round: focus.round,
+    target_rows: [...PROVIDERS].reduce((sum, provider) => sum + (focus.byProvider[provider] || []).length, 0),
+    active_rows: activeRows,
+    connected_rows: connectedRows,
+    flow_rows: rows.length,
+    rows,
+    user_read_upstream_requests: 0,
+    user_read_upstream_connections: 0,
+  };
 }
 
 function chooseBucketMs(coverageMs) {
@@ -3719,6 +3834,9 @@ export function getContractFlowHealth() {
     binance_ws_capacity_rejections: binanceFlowWsStats.capacity_rejections,
     production_ws_only: true,
     fixed_symbol_whitelist: false,
+    focus_pool_binding: focusFlowBindingPayload(),
+    focus_pool_15_each_kept_active: true,
+    focus_pool_extra_full_universe_rotation_preserved: true,
     full_universe_scan: flowScanStatusPayload(),
     websocket_ingress: Object.fromEntries(
       Object.entries(flowWsTrafficByProvider).map(([provider, value]) => [provider, { ...value }]),
@@ -3728,7 +3846,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,market_snapshot_rotates_scan:false,shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,focus_pool_binding:focusFlowBindingPayload(),focus_pool_15_each_kept_active:true,focus_pool_extra_full_universe_rotation_preserved:true,market_snapshot_rotates_scan:false,shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();

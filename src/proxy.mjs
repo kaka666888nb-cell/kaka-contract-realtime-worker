@@ -15,12 +15,13 @@ import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-s
 import { getMarketLightSnapshotHealth, handleMarketLightSnapshot, startMarketLightSnapshotScanner } from './market-light-snapshot.mjs';
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { getContractFocusPoolHealth, handleContractFocusPool, startContractFocusPoolScanner } from './contract-focus-pool.mjs';
+import { getContractDeepSharedHealth, handleContractDeepShared, startContractDeepSharedScanner } from './contract-deep-shared.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.89';
+const STEP_VERSION = '650.8.15.90';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -28,6 +29,7 @@ startSpotCurrentSnapshotScanner();
 startMarketLightSnapshotScanner();
 startContractBasisScanner();
 startContractFocusPoolScanner();
+startContractDeepSharedScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -313,6 +315,9 @@ const server = http.createServer(async (req, res) => {
       contract_focus_pool_current_snapshot: '/api/contract-focus-pool/current-snapshot',
       contract_focus_pool_health: '/api/contract-focus-pool/health',
       contract_focus_pool_state: getContractFocusPoolHealth(),
+      contract_deep_shared_current_snapshot: '/api/contract-deep-shared/current-snapshot',
+      contract_deep_shared_health: '/api/contract-deep-shared/health',
+      contract_deep_shared_state: getContractDeepSharedHealth(),
       spot_exact_ticker: '/api/spot-market/exact-ticker',
       spot_exact_ticker_health: '/api/spot-market/exact-ticker-health',
       spot_exact_ticker_state: getSpotExactTickerHealth(),
@@ -805,6 +810,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleMarketLightSnapshot(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
       if (await handleContractFocusPool(req, res, url)) return true;
+      if (await handleContractDeepShared(req, res, url)) return true;
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
@@ -877,5 +883,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + shared five-platform liquidation + shared five-platform derived basis + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
