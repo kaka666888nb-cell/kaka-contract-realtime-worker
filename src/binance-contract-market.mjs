@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.42';
+const VERSION = '650.8.15.43';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -83,6 +83,23 @@ let restNextAllowedAt = 0;
 let restLastSuccessAt = 0;
 let restLastError = '';
 const restoredPendingSymbols = new Set();
+// Step980.6.3.5.3: persisted universe/ticker snapshots are cache material only.
+// They must never become the live identity authority during cold start.
+// Stage them here, then merge only rows whose symbols are present in the
+// official all-symbol live price baseline.
+const restoredUniverseQuarantine = new Map();
+const restoredTickerQuarantine = new Map();
+const restoredSnapshotQuarantineStats = {
+  loaded: false,
+  active: false,
+  loaded_universe_rows: 0,
+  loaded_ticker_rows: 0,
+  loaded_unique_symbols: 0,
+  released_matching_symbols: 0,
+  discarded_symbols: 0,
+  released_at: 0,
+};
+let periodicEnrichmentStarted = false;
 let currentIdentityCandidate = null;
 let currentIdentityCandidateConfirmations = 0;
 let currentIdentityLastCandidateRows = 0;
@@ -661,7 +678,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.42' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.43' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -731,7 +748,7 @@ async function capturePeriodicSnapshot(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.42' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.43' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -789,6 +806,43 @@ async function capturePeriodicSnapshot(name) {
   return state.connectingPromise;
 }
 
+
+function startPeriodicEnrichmentStreams() {
+  if (periodicEnrichmentStarted) return;
+  periodicEnrichmentStarted = true;
+  for (const [name, spec] of Object.entries(PERIODIC_SNAPSHOT_STREAMS)) {
+    schedulePeriodicSnapshot(name, spec.initialDelayMs || 0);
+  }
+}
+
+function mergeRestoredTickerForLiveIdentity(symbol) {
+  const normalized = compact(symbol);
+  if (!normalized) return null;
+  const cached = restoredTickerQuarantine.get(normalized) || null;
+  if (!cached) return null;
+  restoredPendingSymbols.delete(normalized);
+  return cached;
+}
+
+function releaseRestoredSnapshotQuarantine(liveSymbols, observedAt = Date.now()) {
+  if (!restoredSnapshotQuarantineStats.active) return;
+  const live = liveSymbols instanceof Set ? liveSymbols : new Set();
+  const loaded = new Set([
+    ...restoredUniverseQuarantine.keys(),
+    ...restoredTickerQuarantine.keys(),
+  ]);
+  let matching = 0;
+  for (const symbol of loaded) {
+    if (live.has(symbol)) matching += 1;
+  }
+  restoredSnapshotQuarantineStats.released_matching_symbols = matching;
+  restoredSnapshotQuarantineStats.discarded_symbols = Math.max(0, loaded.size - matching);
+  restoredSnapshotQuarantineStats.active = false;
+  restoredSnapshotQuarantineStats.released_at = observedAt;
+  restoredUniverseQuarantine.clear();
+  restoredTickerQuarantine.clear();
+}
+
 function scheduleCurrentPriceBaseline(delayMs) {
   if (currentPriceBaselineTimer || currentPriceBaselineRunning) return;
   currentPriceBaselineTimer = setTimeout(() => {
@@ -812,7 +866,9 @@ function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
     if (last === null || last <= 0) continue;
     currentSymbols.add(identity.symbol);
     upsertUniverse(identity, 'binance_official_public_ws_api_ticker_price_all_symbols', observedAt);
-    tickerBySymbol.set(identity.symbol, mergeNonNull(tickerBySymbol.get(identity.symbol), {
+    const restoredTicker = mergeRestoredTickerForLiveIdentity(identity.symbol);
+    const tickerSeed = mergeNonNull(restoredTicker, tickerBySymbol.get(identity.symbol));
+    tickerBySymbol.set(identity.symbol, mergeNonNull(tickerSeed, {
       provider: PROVIDER,
       market_type: MARKET_TYPE,
       symbol: identity.symbol,
@@ -838,6 +894,8 @@ function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
 
   const reconciliation = reconcileCurrentIdentitySnapshot(currentSymbols, observedAt);
   currentPriceBaselineStats.last_error = reconciliation.accepted ? '' : String(reconciliation.reason || 'reconciliation_rejected');
+  if (reconciliation.accepted) startPeriodicEnrichmentStreams();
+  if (reconciliation.confirmed) releaseRestoredSnapshotQuarantine(currentSymbols, observedAt);
   notifyWaiters();
   schedulePersist();
   return { ...reconciliation, seeded_rows: seeded };
@@ -870,7 +928,7 @@ async function captureCurrentPriceBaseline() {
         socket = new WebSocket(WS_API_URL, {
           handshakeTimeout: 15_000,
           perMessageDeflate: false,
-          headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.42' },
+          headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.43' },
         });
       } catch (error) {
         finish(false, error?.message || error);
@@ -974,13 +1032,24 @@ async function restoreSnapshots() {
       loadSnapshot('universe'),
       loadSnapshot('tickers'),
     ]);
+
+    restoredUniverseQuarantine.clear();
+    restoredTickerQuarantine.clear();
+    restoredSnapshotQuarantineStats.loaded = true;
+    restoredSnapshotQuarantineStats.active = true;
+    restoredSnapshotQuarantineStats.loaded_universe_rows = Array.isArray(universeRows) ? universeRows.length : 0;
+    restoredSnapshotQuarantineStats.loaded_ticker_rows = Array.isArray(tickerRows) ? tickerRows.length : 0;
+    restoredSnapshotQuarantineStats.released_matching_symbols = 0;
+    restoredSnapshotQuarantineStats.discarded_symbols = 0;
+    restoredSnapshotQuarantineStats.released_at = 0;
+
     for (const raw of universeRows) {
       const symbol = compact(raw?.symbol);
       const [fallbackBase, fallbackQuote] = splitQuote(symbol);
       const base = String(raw?.base_asset || fallbackBase).toUpperCase();
       const quote = String(raw?.quote_asset || fallbackQuote).toUpperCase();
       if (!symbol || !base || !quote || !symbolMatchesQuote(symbol, quote)) continue;
-      universeBySymbol.set(symbol, {
+      restoredUniverseQuarantine.set(symbol, {
         ...raw,
         provider: PROVIDER,
         market_type: MARKET_TYPE,
@@ -991,14 +1060,13 @@ async function restoreSnapshots() {
         active: raw?.active !== false,
         source: raw?.source || 'binance_contract_persistent_snapshot',
       });
-      restoredPendingSymbols.add(symbol);
     }
+
     for (const raw of tickerRows) {
       const symbol = compact(raw?.symbol);
       if (!symbol) continue;
-      const restoredUniverse = universeBySymbol.get(symbol);
-      if (!restoredUniverse) continue;
-      tickerBySymbol.set(symbol, {
+      if (!restoredUniverseQuarantine.has(symbol)) continue;
+      restoredTickerQuarantine.set(symbol, {
         ...raw,
         provider: PROVIDER,
         market_type: MARKET_TYPE,
@@ -1006,6 +1074,14 @@ async function restoreSnapshots() {
         source: raw?.source || 'binance_contract_persistent_snapshot',
       });
     }
+
+    restoredSnapshotQuarantineStats.loaded_unique_symbols = new Set([
+      ...restoredUniverseQuarantine.keys(),
+      ...restoredTickerQuarantine.keys(),
+    ]).size;
+
+    // Do not populate the active maps here. The live all-symbol baseline must
+    // establish current identity first; persisted rows are field cache only.
     restoredAt = Date.now();
     notifyWaiters();
   } catch (error) {
@@ -1145,10 +1221,9 @@ export function startBinanceContractMarket() {
   started = true;
   restoreSnapshots().finally(() => {
     for (const name of Object.keys(PERSISTENT_STREAMS)) connectStream(name).catch(() => {});
-    for (const [name, spec] of Object.entries(PERIODIC_SNAPSHOT_STREAMS)) {
-      schedulePeriodicSnapshot(name, spec.initialDelayMs || 0);
-    }
-    scheduleCurrentPriceBaseline(8_000);
+    // Establish live identity before changed-only / mark-price enrichment may
+    // populate the active market maps.
+    scheduleCurrentPriceBaseline(250);
   });
   const watchdog = setInterval(() => {
     for (const name of Object.keys(PERSISTENT_STREAMS)) {
@@ -1158,11 +1233,13 @@ export function startBinanceContractMarket() {
         scheduleReconnect(name);
       }
     }
-    for (const name of Object.keys(PERIODIC_SNAPSHOT_STREAMS)) {
-      const state = streamStatus(name);
-      const socketActive = state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState);
-      if (!state.reconnectTimer && !state.connectingPromise && !socketActive) {
-        schedulePeriodicSnapshot(name, 0);
+    if (periodicEnrichmentStarted) {
+      for (const name of Object.keys(PERIODIC_SNAPSHOT_STREAMS)) {
+        const state = streamStatus(name);
+        const socketActive = state.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState);
+        if (!state.reconnectTimer && !state.connectingPromise && !socketActive) {
+          schedulePeriodicSnapshot(name, 0);
+        }
       }
     }
     if (!currentPriceBaselineTimer && !currentPriceBaselineRunning) {
@@ -1284,6 +1361,20 @@ export function getBinanceContractMarketHealth() {
     realtime_meta_rows: realtimeMetaBySymbol.size,
     usdt_universe_rows: sortedUniverseRows(DEFAULT_QUOTE).length,
     restored_pending_identity_rows: restoredPendingSymbols.size,
+    restored_snapshot_quarantine: {
+      mode: 'persistent_snapshot_fields_only_until_live_all_symbol_identity',
+      persistent_snapshot_identity_authoritative: false,
+      current_identity_authority: 'binance_official_ws_api_ticker_price_all_symbols',
+      enrichment_streams_started_after_live_baseline: periodicEnrichmentStarted,
+      loaded: restoredSnapshotQuarantineStats.loaded,
+      active: restoredSnapshotQuarantineStats.active,
+      loaded_universe_rows: restoredSnapshotQuarantineStats.loaded_universe_rows,
+      loaded_ticker_rows: restoredSnapshotQuarantineStats.loaded_ticker_rows,
+      loaded_unique_symbols: restoredSnapshotQuarantineStats.loaded_unique_symbols,
+      released_matching_symbols: restoredSnapshotQuarantineStats.released_matching_symbols,
+      discarded_symbols: restoredSnapshotQuarantineStats.discarded_symbols,
+      released_at: restoredSnapshotQuarantineStats.released_at ? iso(restoredSnapshotQuarantineStats.released_at) : null,
+    },
     current_identity_reconciliation: {
       mode: 'two_stable_ws_api_all_symbol_latest_price_snapshots_then_prune_mark_and_changed_streams_enrichment_only',
       confirmations_required: CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED,
