@@ -1,6 +1,8 @@
-const STEP_VERSION = '650.8.15.46';
+import { getMarketUniverseRows } from './market-rest.mjs';
+
+const STEP_VERSION = '650.8.15.47';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
-const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget']);
+const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
 const STATS = new Map();
 const META_CACHE = new Map();
@@ -55,6 +57,29 @@ const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_cache';
 const LIQUIDATION_HISTORY_ROUTE = '/api/contract-liquidation/history';
 const LIQUIDATION_HEALTH_ROUTE = '/api/contract-liquidation/health';
 const LIQUIDATION_CURRENT_ROUTE = '/api/contract-liquidation/current-snapshot';
+const LIQUIDATION_MARKET_ROUTE = '/api/contract-liquidation/market-snapshot';
+const LIQUIDATION_MARKET_UNIVERSE_REFRESH_MS = 10 * 60_000;
+const LIQUIDATION_MARKET_CACHE_TTL_MS = 5_000;
+const LIQUIDATION_MARKET_MAX_EVENT_ROWS = 2000;
+const BYBIT_SHARD_ARG_CHAR_BUDGET = 9000;
+const LIQUIDATION_MARKET_PROVIDER_ORDER = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const liquidationMarketUniverse = new Map();
+const liquidationMarketUniverseMeta = new Map();
+const bybitMarketShardKeys = new Set();
+let liquidationMarketCurrentCache = { cachedAt: 0, payload: null };
+let liquidationMarketUniverseRefreshInflight = null;
+const liquidationMarketHealth = {
+  universe_refresh_attempts: 0,
+  universe_refresh_successes: 0,
+  universe_refresh_failures: 0,
+  last_universe_refresh_at: 0,
+  last_universe_refresh_error: '',
+  bybit_shard_rebuilds: 0,
+  bybit_shard_count: 0,
+  bybit_subscribed_symbols: 0,
+  bybit_subscription_chars: 0,
+  bybit_max_shard_subscription_chars: 0,
+};
 const LIQUIDATION_SHARED_TARGETS_PER_PROVIDER = 3;
 const LIQUIDATION_SHARED_ROTATION_MS = 30 * 60_000;
 const LIQUIDATION_SHARED_CACHE_TTL_MS = 5_000;
@@ -413,9 +438,10 @@ function liquidationSharedRound(now = Date.now()) {
 function liquidationSharedCandidateSymbols(provider, now = Date.now()) {
   const safePool = [...new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', ...CORE_SYMBOLS])]
     .map(compactSymbol)
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((symbol) => marketUniverseHasSymbol(provider, symbol));
   const connectedPool = safePool.filter((symbol) => {
-    const feed = FEEDS.get(feedKey(provider, symbol));
+    const feed = feedForSymbol(provider, symbol);
     return Boolean(feed && wsReady(feed.socket) && feed.ready);
   });
   const pool = connectedPool.length >= LIQUIDATION_SHARED_TARGETS_PER_PROVIDER
@@ -453,7 +479,7 @@ function liquidationSharedCandidateSymbols(provider, now = Date.now()) {
 
 function buildSharedCurrentLiquidationRow(provider, candidate, slot, round, now = Date.now()) {
   const symbol = compactSymbol(candidate?.symbol);
-  const feed = FEEDS.get(feedKey(provider, symbol));
+  const feed = feedForSymbol(provider, symbol);
   const observedSinceMs = Number(
     feed?.openedAt
       || (GLOBAL_FEED_PROVIDERS.has(provider) ? SERVICE_STARTED_AT_MS : now),
@@ -550,11 +576,212 @@ function getSharedCurrentLiquidationSnapshot(now = Date.now()) {
   return { ...payload, cache_hit: false, cache_age_ms: 0 };
 }
 
+
+function buildMarketLiquidationRow(provider, symbol, state, feed, statistics, now = Date.now()) {
+  const info = feed || sourceInfo(provider);
+  const recentItems = (state?.recentEvents || feedEvents(feed || { eventsBySymbol: new Map() }, symbol))
+    .filter((row) => integerValue(row?.time_ms) >= now - PERIODS['15m'].durationMs)
+    .slice(0, 5)
+    .map((row) => ({ ...row }));
+  return {
+    id: `contract_liquidation_market:${provider}:${symbol}`,
+    provider,
+    market_type: 'contract',
+    symbol,
+    native_symbol: (() => {
+      try {
+        return providerSymbol(provider, symbol);
+      } catch (_) {
+        return symbol;
+      }
+    })(),
+    quote_asset: 'USDT',
+    period: '15m',
+    connected: Boolean(feed && wsReady(feed.socket) && feed.ready),
+    source: info.source || null,
+    transport: info.transport || null,
+    upstream_host: info.upstream_host || null,
+    coverage: info.coverage || null,
+    coverage_start_ms: statistics.coverage_start_ms,
+    coverage_end_ms: statistics.coverage_end_ms,
+    covered_ms: statistics.covered_ms,
+    coverage_complete: statistics.coverage_complete === true,
+    total_notional: Number(statistics.total_notional || 0),
+    long_notional: Number(statistics.long_notional || 0),
+    short_notional: Number(statistics.short_notional || 0),
+    event_count: Math.max(0, Math.trunc(Number(statistics.event_count || 0))),
+    long_count: Math.max(0, Math.trunc(Number(statistics.long_count || 0))),
+    short_count: Math.max(0, Math.trunc(Number(statistics.short_count || 0))),
+    last_event_at_ms: Number(state?.lastEventAt || 0) || null,
+    timestamp_ms: now,
+    source_time: new Date(now).toISOString(),
+    observed_at: new Date(now).toISOString(),
+    items: recentItems,
+    backend_shared: true,
+    main_layer: true,
+  };
+}
+
+function buildMarketLiquidationSnapshot(now = Date.now()) {
+  const providerCoverage = {};
+  const eventRows = [];
+  let directorySymbolCount = 0;
+  let connectedSymbolCount = 0;
+  let completeSymbolCount = 0;
+  let eventSymbolCount = 0;
+  let totalEvents = 0;
+  let totalNotional = 0;
+  let totalLongNotional = 0;
+  let totalShortNotional = 0;
+
+  for (const provider of LIQUIDATION_MARKET_PROVIDER_ORDER) {
+    const symbols = marketUniverseSymbols(provider);
+    directorySymbolCount += symbols.length;
+    const info = sourceInfo(provider);
+    let providerConnected = 0;
+    let providerComplete = 0;
+    let providerEventSymbols = 0;
+    let providerEvents = 0;
+    let providerTotal = 0;
+    let providerLong = 0;
+    let providerShort = 0;
+    let providerLastEventAt = 0;
+    const providerFeedKeys = new Set();
+
+    for (const symbol of symbols) {
+      const feed = feedForSymbol(provider, symbol);
+      const connected = Boolean(feed && wsReady(feed.socket) && feed.ready);
+      if (feed?.key) providerFeedKeys.add(feed.key);
+      if (!connected) continue;
+      providerConnected += 1;
+      connectedSymbolCount += 1;
+
+      const state = getStats(provider, symbol, {
+        observedSinceMs: Number(feed.openedAt || now),
+      });
+      const statistics = buildStatistics(state, '15m', now);
+      if (statistics.coverage_complete === true) {
+        providerComplete += 1;
+        completeSymbolCount += 1;
+      }
+
+      const eventCount = Math.max(0, Math.trunc(Number(statistics.event_count || 0)));
+      const notional = Number(statistics.total_notional || 0);
+      const longNotional = Number(statistics.long_notional || 0);
+      const shortNotional = Number(statistics.short_notional || 0);
+      providerEvents += eventCount;
+      providerTotal += notional;
+      providerLong += longNotional;
+      providerShort += shortNotional;
+      totalEvents += eventCount;
+      totalNotional += notional;
+      totalLongNotional += longNotional;
+      totalShortNotional += shortNotional;
+      providerLastEventAt = Math.max(providerLastEventAt, Number(state?.lastEventAt || 0));
+
+      if (eventCount > 0) {
+        providerEventSymbols += 1;
+        eventSymbolCount += 1;
+        eventRows.push(buildMarketLiquidationRow(provider, symbol, state, feed, statistics, now));
+      }
+    }
+
+    const directoryRows = symbols.length;
+    const connectedPct = directoryRows > 0 ? (providerConnected * 100) / directoryRows : 0;
+    const completePct = directoryRows > 0 ? (providerComplete * 100) / directoryRows : 0;
+    providerCoverage[provider] = {
+      provider,
+      directory_symbols: directoryRows,
+      connected_symbols: providerConnected,
+      coverage_complete_symbols: providerComplete,
+      event_symbols: providerEventSymbols,
+      events: providerEvents,
+      total_notional: providerTotal,
+      long_notional: providerLong,
+      short_notional: providerShort,
+      connected_pct: connectedPct,
+      coverage_complete_pct: completePct,
+      feed_count: providerFeedKeys.size,
+      last_event_at_ms: providerLastEventAt || null,
+      source: info.source,
+      transport: info.transport,
+      coverage: info.coverage,
+      universe_error: String(liquidationMarketUniverseMeta.get(provider)?.error || ''),
+    };
+  }
+
+  eventRows.sort((a, b) =>
+    Number(b.total_notional || 0) - Number(a.total_notional || 0) ||
+    Number(b.event_count || 0) - Number(a.event_count || 0) ||
+    String(a.provider).localeCompare(String(b.provider)) ||
+    String(a.symbol).localeCompare(String(b.symbol)));
+
+  const returnedRows = eventRows.slice(0, LIQUIDATION_MARKET_MAX_EVENT_ROWS);
+  const providerCount = Object.values(providerCoverage)
+    .filter((row) => Number(row.directory_symbols || 0) > 0).length;
+  const connectedProviderCount = Object.values(providerCoverage)
+    .filter((row) => Number(row.connected_symbols || 0) > 0).length;
+  const fullDirectoryConnected = directorySymbolCount > 0 &&
+    connectedSymbolCount === directorySymbolCount;
+  const fullWindowComplete = directorySymbolCount > 0 &&
+    completeSymbolCount === directorySymbolCount;
+
+  return {
+    rows: returnedRows,
+    row_count: returnedRows.length,
+    untruncated_event_row_count: eventRows.length,
+    rows_truncated: eventRows.length > returnedRows.length,
+    provider_coverage: providerCoverage,
+    provider_count: providerCount,
+    connected_provider_count: connectedProviderCount,
+    directory_symbol_count: directorySymbolCount,
+    connected_symbol_count: connectedSymbolCount,
+    coverage_complete_symbol_count: completeSymbolCount,
+    event_symbol_count: eventSymbolCount,
+    event_count: totalEvents,
+    total_notional: totalNotional,
+    long_notional: totalLongNotional,
+    short_notional: totalShortNotional,
+    connected_coverage_pct: directorySymbolCount > 0
+      ? (connectedSymbolCount * 100) / directorySymbolCount
+      : 0,
+    complete_window_coverage_pct: directorySymbolCount > 0
+      ? (completeSymbolCount * 100) / directorySymbolCount
+      : 0,
+    full_directory_connected: fullDirectoryConnected,
+    full_window_coverage_complete: fullWindowComplete,
+    generated_at: new Date(now).toISOString(),
+  };
+}
+
+function getMarketLiquidationSnapshot(now = Date.now()) {
+  const cached = liquidationMarketCurrentCache;
+  if (cached.payload && now - Number(cached.cachedAt || 0) < LIQUIDATION_MARKET_CACHE_TTL_MS) {
+    return {
+      ...cached.payload,
+      cache_hit: true,
+      cache_age_ms: now - cached.cachedAt,
+    };
+  }
+  const payload = buildMarketLiquidationSnapshot(now);
+  liquidationMarketCurrentCache = { cachedAt: now, payload };
+  return { ...payload, cache_hit: false, cache_age_ms: 0 };
+}
+
 export function getContractLiquidationSharedCurrentHealth() {
   const now = Date.now();
   const snapshot = getSharedCurrentLiquidationSnapshot(now);
+  const marketSnapshot = getMarketLiquidationSnapshot(now);
+  const feeds = [...FEEDS.values()];
+  const marketCollectorFeedCount = feeds.filter((feed) => feed.marketCollector === true).length;
+  const focusedUsdtDuplicateFeedCount = feeds.filter((feed) => {
+    if (feed.marketCollector === true) return false;
+    return [...feed.accessBySymbol.keys()].some((symbol) => quoteFromCompact(compactSymbol(symbol)) === 'USDT');
+  }).length;
+  const expectedMarketCollectorFeedCount = 4 + liquidationMarketHealth.bybit_shard_count;
   return {
     current_snapshot_endpoint: LIQUIDATION_CURRENT_ROUTE,
+    current_snapshot_role: 'focused_fallback',
     current_snapshot_targets_per_provider: LIQUIDATION_SHARED_TARGETS_PER_PROVIDER,
     current_snapshot_rotation_minutes: Math.trunc(LIQUIDATION_SHARED_ROTATION_MS / 60_000),
     current_snapshot_rows: snapshot.row_count,
@@ -564,6 +791,30 @@ export function getContractLiquidationSharedCurrentHealth() {
     current_snapshot_exchange_connections_started_per_read: 0,
     current_snapshot_scales_with_users: false,
     current_snapshot_cache_ttl_seconds: Math.trunc(LIQUIDATION_SHARED_CACHE_TTL_MS / 1000),
+    market_snapshot_endpoint: LIQUIDATION_MARKET_ROUTE,
+    market_snapshot_role: 'official_maximum_public_coverage_main_layer',
+    market_snapshot_directory_symbols: marketSnapshot.directory_symbol_count,
+    market_snapshot_connected_symbols: marketSnapshot.connected_symbol_count,
+    market_snapshot_complete_symbols: marketSnapshot.coverage_complete_symbol_count,
+    market_snapshot_event_symbols: marketSnapshot.event_symbol_count,
+    market_snapshot_event_rows: marketSnapshot.row_count,
+    market_snapshot_full_directory_connected: marketSnapshot.full_directory_connected,
+    market_snapshot_full_window_coverage_complete: marketSnapshot.full_window_coverage_complete,
+    market_snapshot_reads_start_exchange_connections: false,
+    market_snapshot_exchange_connections_started_per_read: 0,
+    market_snapshot_scales_with_users: false,
+    market_snapshot_cache_ttl_seconds: Math.trunc(LIQUIDATION_MARKET_CACHE_TTL_MS / 1000),
+    bybit_market_shard_count: liquidationMarketHealth.bybit_shard_count,
+    bybit_market_subscribed_symbols: liquidationMarketHealth.bybit_subscribed_symbols,
+    bybit_market_subscription_chars: liquidationMarketHealth.bybit_subscription_chars,
+    gate_market_wide_subscription: true,
+    market_collector_feed_count: marketCollectorFeedCount,
+    market_collector_expected_feed_count: expectedMarketCollectorFeedCount,
+    focused_usdt_duplicate_feed_count: focusedUsdtDuplicateFeedCount,
+    market_collector_topology_exact:
+      marketCollectorFeedCount === expectedMarketCollectorFeedCount && focusedUsdtDuplicateFeedCount === 0,
+    market_universe_refresh_minutes: Math.trunc(LIQUIDATION_MARKET_UNIVERSE_REFRESH_MS / 60_000),
+    ...liquidationMarketHealth,
   };
 }
 
@@ -574,6 +825,9 @@ export function getContractLiquidationPersistenceHealth() {
     persistence_enabled: LIQUIDATION_PERSISTENCE_ENABLED,
     history_endpoint: LIQUIDATION_HISTORY_ROUTE,
     current_snapshot_endpoint: LIQUIDATION_CURRENT_ROUTE,
+    current_snapshot_role: 'focused_fallback',
+    market_snapshot_endpoint: LIQUIDATION_MARKET_ROUTE,
+    market_snapshot_role: 'official_maximum_public_coverage_main_layer',
     current_snapshot_targets_per_provider: LIQUIDATION_SHARED_TARGETS_PER_PROVIDER,
     current_snapshot_rotation_minutes: Math.trunc(LIQUIDATION_SHARED_ROTATION_MS / 60_000),
     current_snapshot_reads_start_exchange_connections: false,
@@ -591,6 +845,7 @@ export function getContractLiquidationPersistenceHealth() {
     history_cache_ttl_seconds: Math.trunc(LIQUIDATION_HISTORY_CACHE_TTL_MS / 1000),
     history_stale_seconds: Math.trunc(LIQUIDATION_HISTORY_STALE_MS / 1000),
     exchange_requests_started_by_history_reads: 0,
+    shared_current_health: getContractLiquidationSharedCurrentHealth(),
     ...liquidationPersistenceHealth,
   };
 }
@@ -759,6 +1014,8 @@ function bitgetInstType(symbol) {
 
 function displaySymbolForNative(feed, nativeSymbol) {
   const normalizedNative = compactSymbol(nativeSymbol);
+  const mapped = feed?.nativeToDisplay?.get(normalizedNative);
+  if (mapped) return mapped;
   for (const display of feed.accessBySymbol.keys()) {
     try {
       if (compactSymbol(providerSymbol(feed.provider, display)) === normalizedNative) return display;
@@ -870,6 +1127,7 @@ async function gateContractMultiplier(contract, settle = 'usdt') {
 }
 
 function feedKey(provider, symbol) {
+  if (provider === 'gate') return `${provider}|all|${gateSettle(symbol)}`;
   if (GLOBAL_FEED_PROVIDERS.has(provider)) return `${provider}|all`;
   return `${provider}|${providerSymbol(provider, symbol)}`;
 }
@@ -916,8 +1174,13 @@ function sourceInfo(provider) {
   }
 }
 
-function createFeed(provider, symbol) {
-  const key = feedKey(provider, symbol);
+function createFeed(provider, symbol, {
+  keyOverride = '',
+  subscriptionSymbols = null,
+  marketCollector = false,
+  marketWide = false,
+} = {}) {
+  const key = keyOverride || feedKey(provider, symbol);
   const info = sourceInfo(provider);
   const feed = {
     key,
@@ -935,26 +1198,286 @@ function createFeed(provider, symbol) {
     lastError: '',
     eventsBySymbol: new Map(),
     accessBySymbol: new Map(),
+    nativeToDisplay: new Map(),
+    subscriptionSymbols: Array.isArray(subscriptionSymbols)
+      ? [...new Set(subscriptionSymbols.map(compactSymbol).filter(Boolean))]
+      : [],
     waiters: new Set(),
     heartbeatTimer: null,
-    persistent: GLOBAL_FEED_PROVIDERS.has(provider),
+    persistent: GLOBAL_FEED_PROVIDERS.has(provider) || marketCollector,
     core: false,
+    marketCollector,
+    marketWide: marketWide || GLOBAL_FEED_PROVIDERS.has(provider),
     lastAccessAt: Date.now(),
     ...info,
   };
+  for (const display of feed.subscriptionSymbols) {
+    feed.accessBySymbol.set(display, Date.now());
+    try {
+      feed.nativeToDisplay.set(compactSymbol(providerSymbol(provider, display)), display);
+    } catch (_) {}
+  }
+  if (feed.requestedDisplaySymbol) {
+    feed.nativeToDisplay.set(compactSymbol(feed.requestedNativeSymbol), feed.requestedDisplaySymbol);
+  }
   FEEDS.set(key, feed);
   return feed;
 }
 
-function getFeed(provider, symbol) {
-  const key = feedKey(provider, symbol);
-  return FEEDS.get(key) || createFeed(provider, symbol);
+function feedForSymbol(provider, symbol) {
+  const compact = compactSymbol(symbol);
+  if (!compact) return null;
+  if (provider === 'bybit') {
+    for (const feed of FEEDS.values()) {
+      if (feed.provider === 'bybit' &&
+          feed.marketCollector === true &&
+          feed.accessBySymbol.has(compact)) {
+        return feed;
+      }
+    }
+  }
+  return FEEDS.get(feedKey(provider, compact)) || null;
+}
+
+function getFeed(provider, symbol, { allowDynamic = true } = {}) {
+  const existing = feedForSymbol(provider, symbol);
+  if (existing) return existing;
+  if (!allowDynamic) return null;
+  return createFeed(provider, symbol);
+}
+
+
+function marketUniverseRows(provider) {
+  const rows = liquidationMarketUniverse.get(provider);
+  return rows instanceof Map ? [...rows.values()] : [];
+}
+
+function marketUniverseSymbols(provider) {
+  const rows = liquidationMarketUniverse.get(provider);
+  return rows instanceof Map ? [...rows.keys()] : [];
+}
+
+function marketUniverseHasSymbol(provider, symbol) {
+  const rows = liquidationMarketUniverse.get(provider);
+  if (!(rows instanceof Map) || rows.size === 0) return true;
+  return rows.has(compactSymbol(symbol));
+}
+
+function normalizeMarketUniverseRows(provider, rows) {
+  const normalized = new Map();
+  for (const raw of Array.isArray(rows) ? rows : []) {
+    const symbol = compactSymbol(raw?.symbol);
+    const quote = String(raw?.quote_asset || quoteFromCompact(symbol)).toUpperCase();
+    if (!symbol || quote !== 'USDT' || !supportsNativeContract(provider, symbol)) continue;
+    normalized.set(symbol, {
+      ...raw,
+      provider,
+      market_type: 'contract',
+      symbol,
+      quote_asset: 'USDT',
+    });
+  }
+  return normalized;
+}
+
+
+function seedLiquidationMetaFromSharedUniverse(provider, rows) {
+  if (!(rows instanceof Map)) return;
+  const now = Date.now();
+  for (const [symbol, row] of rows) {
+    if (provider === 'gate') {
+      const multiplier = positiveNumber(row?.contract_multiplier);
+      const native = String(row?.native_symbol || providerSymbol('gate', symbol));
+      if (multiplier != null && native) {
+        META_CACHE.set(`gate:${gateSettle(symbol)}:${native}`, {
+          multiplier,
+          storedAt: now,
+          source: 'shared_market_universe',
+        });
+      }
+    } else if (provider === 'okx') {
+      const faceValue = positiveNumber(row?.contract_value);
+      const valueCurrency = String(row?.contract_value_currency || '').toUpperCase();
+      const native = String(row?.native_symbol || providerSymbol('okx', symbol));
+      if (faceValue != null && native) {
+        META_CACHE.set(`okx:${native}`, {
+          faceValue,
+          valueCurrency,
+          storedAt: now,
+          source: 'shared_market_universe',
+        });
+      }
+    }
+  }
+}
+
+function bybitSubscriptionTopic(symbol) {
+  return `allLiquidation.${providerSymbol('bybit', symbol)}`;
+}
+
+function partitionBybitMarketSymbols(symbols) {
+  const chunks = [];
+  let current = [];
+  let currentChars = 2;
+  for (const symbol of symbols) {
+    const topic = bybitSubscriptionTopic(symbol);
+    const topicChars = JSON.stringify(topic).length + (current.length ? 1 : 0);
+    if (current.length > 0 && currentChars + topicChars > BYBIT_SHARD_ARG_CHAR_BUDGET) {
+      chunks.push(current);
+      current = [];
+      currentChars = 2;
+    }
+    current.push(symbol);
+    currentChars += JSON.stringify(topic).length + (current.length > 1 ? 1 : 0);
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+function closeBybitMarketShards() {
+  for (const key of [...bybitMarketShardKeys]) {
+    const feed = FEEDS.get(key);
+    if (feed) {
+      closeFeed(feed);
+      FEEDS.delete(key);
+    }
+    bybitMarketShardKeys.delete(key);
+  }
+}
+
+let bybitMarketUniverseSignature = '';
+
+function rebuildBybitMarketShards(symbols) {
+  const safeSymbols = [...new Set(symbols.map(compactSymbol).filter(Boolean))].sort();
+  const signature = safeSymbols.join(',');
+  if (signature === bybitMarketUniverseSignature && bybitMarketShardKeys.size > 0) return false;
+
+  closeBybitMarketShards();
+  bybitMarketUniverseSignature = signature;
+
+  const chunks = partitionBybitMarketSymbols(safeSymbols);
+  let totalChars = 0;
+  let maxShardChars = 0;
+  chunks.forEach((chunk, index) => {
+    if (!chunk.length) return;
+    const key = `bybit|market|${index}`;
+    const feed = createFeed('bybit', chunk[0], {
+      keyOverride: key,
+      subscriptionSymbols: chunk,
+      marketCollector: true,
+      marketWide: false,
+    });
+    feed.core = true;
+    feed.persistent = true;
+    feed.marketShardIndex = index;
+    feed.marketShardCount = chunks.length;
+    bybitMarketShardKeys.add(key);
+    const shardChars = JSON.stringify(chunk.map(bybitSubscriptionTopic)).length;
+    totalChars += shardChars;
+    maxShardChars = Math.max(maxShardChars, shardChars);
+    ensureFeed(feed).catch(() => {});
+  });
+
+  liquidationMarketHealth.bybit_shard_rebuilds += 1;
+  liquidationMarketHealth.bybit_shard_count = chunks.length;
+  liquidationMarketHealth.bybit_subscribed_symbols = safeSymbols.length;
+  liquidationMarketHealth.bybit_subscription_chars = totalChars;
+  liquidationMarketHealth.bybit_max_shard_subscription_chars = maxShardChars;
+  return true;
+}
+
+function ensureGlobalLiquidationFeed(provider) {
+  const feed = markCoreFeed(getFeed(provider, 'BTCUSDT'));
+  feed.marketCollector = true;
+  feed.marketWide = true;
+  ensureFeed(feed).catch(() => {});
+  return feed;
+}
+
+async function refreshLiquidationMarketUniverse({ reason = 'scheduled' } = {}) {
+  if (liquidationMarketUniverseRefreshInflight) return await liquidationMarketUniverseRefreshInflight;
+  liquidationMarketUniverseRefreshInflight = (async () => {
+    liquidationMarketHealth.universe_refresh_attempts += 1;
+    const errors = [];
+    for (const provider of LIQUIDATION_MARKET_PROVIDER_ORDER) {
+      try {
+        const rows = await getMarketUniverseRows(provider, 'contract', 'USDT');
+        const normalized = normalizeMarketUniverseRows(provider, rows);
+        if (normalized.size <= 0) throw new Error('empty_usdt_contract_universe');
+        liquidationMarketUniverse.set(provider, normalized);
+        seedLiquidationMetaFromSharedUniverse(provider, normalized);
+        liquidationMarketUniverseMeta.set(provider, {
+          provider,
+          rows: normalized.size,
+          refreshed_at: new Date().toISOString(),
+          reason,
+          error: '',
+        });
+      } catch (error) {
+        errors.push(`${provider}:${String(error?.message || error)}`);
+        const existing = liquidationMarketUniverse.get(provider);
+        if (!(existing instanceof Map) || existing.size === 0) {
+          const fallback = normalizeMarketUniverseRows(
+            provider,
+            CORE_SYMBOLS.map((symbol) => ({
+              provider,
+              market_type: 'contract',
+              symbol,
+              quote_asset: 'USDT',
+              source: 'core_fallback_until_shared_universe_ready',
+            })),
+          );
+          liquidationMarketUniverse.set(provider, fallback);
+        }
+        liquidationMarketUniverseMeta.set(provider, {
+          provider,
+          rows: liquidationMarketUniverse.get(provider)?.size || 0,
+          refreshed_at: new Date().toISOString(),
+          reason,
+          error: String(error?.message || error),
+        });
+      }
+    }
+
+    for (const provider of ['binance', 'okx', 'bitget', 'gate']) {
+      ensureGlobalLiquidationFeed(provider);
+    }
+    rebuildBybitMarketShards(marketUniverseSymbols('bybit'));
+
+    liquidationMarketHealth.last_universe_refresh_at = Date.now();
+    if (errors.length) {
+      liquidationMarketHealth.universe_refresh_failures += 1;
+      liquidationMarketHealth.last_universe_refresh_error = errors.join('|').slice(0, 1000);
+    } else {
+      liquidationMarketHealth.universe_refresh_successes += 1;
+      liquidationMarketHealth.last_universe_refresh_error = '';
+    }
+    liquidationMarketCurrentCache = { cachedAt: 0, payload: null };
+    liquidationSharedCurrentCache = { cachedAt: 0, payload: null };
+    return {
+      ok: errors.length === 0,
+      errors,
+      provider_rows: Object.fromEntries(
+        LIQUIDATION_MARKET_PROVIDER_ORDER.map((provider) => [
+          provider,
+          liquidationMarketUniverse.get(provider)?.size || 0,
+        ]),
+      ),
+    };
+  })().finally(() => {
+    liquidationMarketUniverseRefreshInflight = null;
+  });
+  return await liquidationMarketUniverseRefreshInflight;
 }
 
 function touchFeed(feed, symbol) {
   const now = Date.now();
+  const display = compactSymbol(symbol);
   feed.lastAccessAt = now;
-  feed.accessBySymbol.set(compactSymbol(symbol), now);
+  feed.accessBySymbol.set(display, now);
+  try {
+    feed.nativeToDisplay?.set(compactSymbol(providerSymbol(feed.provider, display)), display);
+  } catch (_) {}
 }
 
 function symbolIsActive(feed, symbol) {
@@ -1084,7 +1607,12 @@ function markFeedGap(feed) {
   const now = Date.now();
   if (GLOBAL_FEED_PROVIDERS.has(feed.provider)) {
     for (const state of STATS.values()) {
-      if (state.provider === feed.provider) state.lastGapAtMs = now;
+      if (state.provider !== feed.provider) continue;
+      if (feed.provider === 'gate') {
+        const expectedSettle = gateSettle(feed.requestedDisplaySymbol);
+        if (gateSettle(state.symbol) !== expectedSettle) continue;
+      }
+      state.lastGapAtMs = now;
     }
     return;
   }
@@ -1306,9 +1834,21 @@ function subscribeFeed(feed) {
     });
   }
   if (feed.provider === 'bybit') {
-    return sendWs(socket, {
+    const symbols = feed.subscriptionSymbols.length
+      ? feed.subscriptionSymbols
+      : [feed.requestedDisplaySymbol];
+    const args = symbols
+      .map((symbol) => {
+        try {
+          return bybitSubscriptionTopic(symbol);
+        } catch (_) {
+          return '';
+        }
+      })
+      .filter(Boolean);
+    return args.length > 0 && sendWs(socket, {
       op: 'subscribe',
-      args: [`allLiquidation.${feed.requestedNativeSymbol}`],
+      args,
     });
   }
   if (feed.provider === 'bitget') {
@@ -1325,7 +1865,7 @@ function subscribeFeed(feed) {
       time: Math.floor(Date.now() / 1000),
       channel: 'futures.public_liquidates',
       event: 'subscribe',
-      payload: [feed.requestedNativeSymbol],
+      payload: [feed.marketWide ? '!all' : feed.requestedNativeSymbol],
     });
   }
   return false;
@@ -1755,31 +2295,43 @@ function markCoreFeed(feed) {
 }
 
 async function bootstrapCollection() {
-  for (const provider of ['binance', 'okx', 'bitget']) {
-    const feed = markCoreFeed(getFeed(provider, 'BTCUSDT'));
-    for (const symbol of [...new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', ...CORE_SYMBOLS])]) {
+  await refreshLiquidationMarketUniverse({ reason: 'startup' });
+
+  // Keep the original 5 x 3 focused snapshot as a compatibility/fallback layer,
+  // but reuse the already-running market collectors. No focused read creates
+  // a second exchange connection.
+  const focusedSymbols = [...new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', ...CORE_SYMBOLS])];
+  for (const provider of LIQUIDATION_MARKET_PROVIDER_ORDER) {
+    for (const symbol of focusedSymbols) {
+      if (!marketUniverseHasSymbol(provider, symbol)) continue;
+      const feed = feedForSymbol(provider, symbol);
+      if (!feed) continue;
       touchFeed(feed, symbol);
-      getStats(provider, symbol, { observedSinceMs: Date.now() });
-    }
-    ensureFeed(feed).catch(() => {});
-  }
-  for (const provider of ['bybit', 'gate']) {
-    for (const symbol of CORE_SYMBOLS) {
-      const feed = markCoreFeed(getFeed(provider, symbol));
-      touchFeed(feed, symbol);
-      getStats(provider, symbol, { observedSinceMs: Date.now() });
-      ensureFeed(feed).catch(() => {});
+      getStats(provider, symbol, {
+        observedSinceMs: Number(feed.openedAt || Date.now()),
+      });
     }
   }
 }
 
 const bootstrapTimer = setTimeout(() => {
-  bootstrapCollection().catch(() => {});
+  bootstrapCollection().catch((error) => {
+    liquidationMarketHealth.last_universe_refresh_error =
+      `startup:${String(error?.message || error)}`.slice(0, 1000);
+  });
 }, 900);
 bootstrapTimer.unref?.();
 
+const marketUniverseRefreshTimer = setInterval(() => {
+  refreshLiquidationMarketUniverse({ reason: 'scheduled' }).catch((error) => {
+    liquidationMarketHealth.last_universe_refresh_error =
+      `scheduled:${String(error?.message || error)}`.slice(0, 1000);
+  });
+}, LIQUIDATION_MARKET_UNIVERSE_REFRESH_MS);
+marketUniverseRefreshTimer.unref?.();
+
 export async function handleContractLiquidation(req, res, url) {
-  if (!['/api/contract-liquidation', LIQUIDATION_HISTORY_ROUTE, LIQUIDATION_HEALTH_ROUTE, LIQUIDATION_CURRENT_ROUTE].includes(url.pathname)) return false;
+  if (!['/api/contract-liquidation', LIQUIDATION_HISTORY_ROUTE, LIQUIDATION_HEALTH_ROUTE, LIQUIDATION_CURRENT_ROUTE, LIQUIDATION_MARKET_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -1819,6 +2371,36 @@ export async function handleContractLiquidation(req, res, url) {
       exchange_connections_started: 0,
       exchange_requests_started: 0,
       shared_feeds_do_not_scale_with_users: true,
+      timestamp_ms: Date.now(),
+    });
+    return true;
+  }
+
+  if (url.pathname === LIQUIDATION_MARKET_ROUTE) {
+    const snapshot = getMarketLiquidationSnapshot(Date.now());
+    sendJson(res, 200, {
+      ok: true,
+      version: STEP_VERSION,
+      source: 'render_shared_official_maximum_five_provider_liquidation_market_snapshot',
+      market_type: 'contract',
+      period: '15m',
+      ...snapshot,
+      aggregation_scope: 'backend_shared_official_maximum_public_coverage',
+      legacy_focused_fallback_endpoint: LIQUIDATION_CURRENT_ROUTE,
+      legacy_focused_targets_per_provider: LIQUIDATION_SHARED_TARGETS_PER_PROVIDER,
+      public_stream_semantics: {
+        binance: 'largest_liquidation_per_symbol_within_1000ms',
+        okx: 'recent_liquidation_orders_not_total_market_count',
+        bybit: 'all_liquidation_stream_500ms',
+        bitget: 'largest_long_and_short_liquidation_per_pair_per_second',
+        gate: 'up_to_one_liquidation_order_per_contract_per_second',
+      },
+      raw_events_persisted: false,
+      exchange_connections_started: 0,
+      exchange_requests_started: 0,
+      shared_feeds_do_not_scale_with_users: true,
+      user_reads_start_exchange_connections: false,
+      user_reads_start_exchange_requests: false,
       timestamp_ms: Date.now(),
     });
     return true;
@@ -1881,8 +2463,43 @@ export async function handleContractLiquidation(req, res, url) {
     sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'invalid_symbol_or_quote' });
     return true;
   }
+  if (quoteFromCompact(symbol) === 'USDT' && !marketUniverseHasSymbol(provider, symbol)) {
+    sendJson(res, 404, {
+      ok: false,
+      version: STEP_VERSION,
+      error: 'symbol_not_in_current_shared_contract_universe',
+      provider,
+      market_type: 'contract',
+      symbol,
+    });
+    return true;
+  }
 
-  const feed = getFeed(provider, symbol);
+  const quote = quoteFromCompact(symbol);
+  let feed = null;
+  if (quote === 'USDT') {
+    feed = getFeed(provider, symbol, { allowDynamic: false });
+    if (!feed) {
+      // The shared market collector may still be in its startup universe phase.
+      // A user read must never create an extra USDT liquidation connection.
+      sendJson(res, 503, {
+        ok: false,
+        version: STEP_VERSION,
+        provider,
+        market_type: 'contract',
+        symbol,
+        error: 'shared_market_liquidation_feed_not_ready',
+        exchange_connections_started: 0,
+        exchange_requests_started: 0,
+        reads_scale_with_users: false,
+      });
+      return true;
+    }
+  } else {
+    // Preserve legacy non-USDT exact-symbol support. Global-capable providers
+    // still collapse to one shared venue/settle feed instead of one per user.
+    feed = getFeed(provider, symbol, { allowDynamic: true });
+  }
   touchFeed(feed, symbol);
   enforceDynamicFeedLimit(provider);
   const state = getStats(provider, symbol, {

@@ -18,7 +18,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.82';
+const STEP_VERSION = '650.8.15.83';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -368,10 +368,11 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation: '/api/contract-liquidation',
       contract_liquidation_history: '/api/contract-liquidation/history',
       contract_liquidation_current_snapshot: '/api/contract-liquidation/current-snapshot',
+      contract_liquidation_market_snapshot: '/api/contract-liquidation/market-snapshot',
       contract_liquidation_health: '/api/contract-liquidation/health',
       contract_liquidation_persistence_health: getContractLiquidationPersistenceHealth(),
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
-      contract_liquidation_scope: 'single_provider_single_symbol_plus_backend_shared_five_by_three',
+      contract_liquidation_scope: 'official_maximum_five_provider_market_layer_plus_focused_five_by_three_fallback_plus_single_symbol',
       market_light_rollout: 'step980_6_3_4_1_binance_changed_only_ticker_fix_ws_api_latest_price_baseline_no_app_cutover',
       contract_funding: '/api/contract-funding',
       contract_funding_history: '/api/contract-funding/history',
