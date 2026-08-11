@@ -1319,6 +1319,23 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
       : null;
   const markPrice = num(item.mark_price ?? item.markPrice ?? item.markPx);
   const indexPrice = num(item.index_price ?? item.indexPrice ?? item.indexPx ?? item.idxPx);
+  const nextFundingRaw = item.next_funding_time ?? item.nextFundingTime ?? item.nextFundingAt;
+  const nextFundingNumber = num(nextFundingRaw);
+  let nextFundingTime = null;
+  let nextFundingTimeMs = null;
+  if (nextFundingNumber !== null && nextFundingNumber > 0) {
+    nextFundingTimeMs = nextFundingNumber < 10_000_000_000
+      ? Math.trunc(nextFundingNumber * 1000)
+      : Math.trunc(nextFundingNumber);
+    const parsed = new Date(nextFundingTimeMs);
+    if (Number.isFinite(parsed.getTime())) nextFundingTime = parsed.toISOString();
+  } else if (nextFundingRaw != null && String(nextFundingRaw).trim()) {
+    const parsedMs = Date.parse(String(nextFundingRaw));
+    if (Number.isFinite(parsedMs)) {
+      nextFundingTimeMs = parsedMs;
+      nextFundingTime = new Date(parsedMs).toISOString();
+    }
+  }
   return {
     provider,
     market_type: market,
@@ -1348,7 +1365,14 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
     spread_percent: spreadPercent,
     mark_price: markPrice,
     index_price: indexPrice,
-    funding_rate: num(item.fundingRate),
+    funding_rate: num(item.funding_rate ?? item.fundingRate),
+    next_funding_time: nextFundingTime,
+    next_funding_time_ms: nextFundingTimeMs,
+    funding_interval_hours: num(item.funding_interval_hours ?? item.fundingIntervalHour ?? item.fundingIntervalHours),
+    funding_cap: num(item.funding_cap ?? item.fundingCap),
+    basis_rate: num(item.basis_rate ?? item.basisRate),
+    basis_value: num(item.basis_value ?? item.basis),
+    provider_total_size: num(item.total_size ?? item.totalSize),
     open_interest: openInterest.open_interest,
     open_interest_value: openInterest.open_interest_value,
     open_interest_unit: openInterest.open_interest_unit,

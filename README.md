@@ -18,3 +18,18 @@ Step788.1.2已经通过的业务逻辑全部保持不变：
 - Binance Render直连REST继续永久禁用。
 
 App继续Step781.2.10，不覆盖main.dart。
+
+## Step980.6.3 / Render 650.8.15.76
+
+Side-by-side backend-only rollout. Existing App endpoints remain unchanged.
+
+New shared endpoints:
+
+- `GET /api/market-light/health`
+- `GET /api/market-light/current-snapshot?market_type=spot|contract`
+- Optional read controls: `provider=...`, `include_rows=0`, `offset=...`, `limit=...`
+
+Scope: primary quote full-directory light data. Spot uses Binance/OKX/Bybit/Bitget/Gate USDT plus Coinbase USD; contracts use Binance/OKX/Bybit/Bitget/Gate USDT perpetual directories. Batch/all-market sources are preferred. Coinbase uses one shared public `ticker_batch` WebSocket rather than per-symbol REST. OKX contracts add batch mark-price and open-interest enrichment. Bitget prefers the public v3 product-level tickers and falls back to the existing v2 path.
+
+Safety: snapshot reads start zero exchange requests/connections, user count does not scale upstream, failed refreshes keep the last verified rows, and missing fields stay missing rather than becoming zero. Old bounded Data Hub endpoints remain active until a later App cutover.
+

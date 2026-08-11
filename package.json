@@ -1,11 +1,11 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.75",
+  "version": "650.8.15.76",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/proxy.mjs",
-    "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs && node --check src/cme-expiry-shared-calendar.mjs",
+    "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs && node --check src/cme-expiry-shared-calendar.mjs && node --check src/market-light-snapshot.mjs",
     "test:step781.2.5": "node tests/step781_2_5_selftest.mjs",
     "test:step781.2.6": "node tests/step781_2_6_selftest.mjs",
     "test:step781.2.7": "node tests/step781_2_7_selftest.mjs",
@@ -20,10 +20,11 @@
     "test:step787.1.1": "node tests/step787_1_1_selftest.mjs",
     "test:step788.1": "node tests/step788_1_selftest.mjs",
     "test:step788.1.2": "node tests/step788_1_2_selftest.mjs",
-    "test:step788.1.2.1": "node tests/step788_1_2_1_selftest.mjs"
+    "test:step788.1.2.1": "node tests/step788_1_2_1_selftest.mjs",
+    "test:step980.6.3": "node tests/step980_6_3_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.74 / Step965.4 Binance shared ratio critical relay"
+  "description": "Kaka contract realtime worker 650.8.15.76 / Step980.6.3 shared primary-quote full-directory market-light snapshot"
 }

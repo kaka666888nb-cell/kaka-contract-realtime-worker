@@ -12,16 +12,18 @@ import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurre
 import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ticker.mjs';
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
+import { getMarketLightSnapshotHealth, handleMarketLightSnapshot, startMarketLightSnapshotScanner } from './market-light-snapshot.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.75';
+const STEP_VERSION = '650.8.15.76';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
 startSpotCurrentSnapshotScanner();
+startMarketLightSnapshotScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -298,6 +300,9 @@ const server = http.createServer(async (req, res) => {
       spot_current_snapshot: '/api/spot-market/current-snapshot',
       spot_current_snapshot_health: '/api/spot-market/health',
       spot_current_snapshot_state: getSpotCurrentSnapshotHealth(),
+      market_light_current_snapshot: '/api/market-light/current-snapshot',
+      market_light_health: '/api/market-light/health',
+      market_light_state: getMarketLightSnapshotHealth(),
       spot_exact_ticker: '/api/spot-market/exact-ticker',
       spot_exact_ticker_health: '/api/spot-market/exact-ticker-health',
       spot_exact_ticker_state: getSpotExactTickerHealth(),
@@ -367,6 +372,7 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_persistence_health: getContractLiquidationPersistenceHealth(),
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
       contract_liquidation_scope: 'single_provider_single_symbol_plus_backend_shared_five_by_three',
+      market_light_rollout: 'step980_6_3_side_by_side_primary_quote_full_directory_no_app_cutover',
       contract_funding: '/api/contract-funding',
       contract_funding_history: '/api/contract-funding/history',
       contract_funding_health: '/api/contract-funding/health',
@@ -619,6 +625,9 @@ const server = http.createServer(async (req, res) => {
         contract_flow_valid_symbol_partial_response_status: 200,
         data_page_spot_current_snapshot_backend_shared: true,
         data_page_spot_current_snapshot_endpoint: '/api/spot-market/current-snapshot',
+        market_light_full_directory_snapshot_endpoint: '/api/market-light/current-snapshot',
+        market_light_snapshot_reads_scale_with_users: false,
+        market_light_failed_refresh_retains_last_verified_rows: true,
         data_page_spot_current_snapshot_targets_per_provider: 20,
         data_page_spot_current_snapshot_reads_open_exchange_request: false,
         data_page_spot_current_snapshot_scales_with_users: false,
@@ -777,6 +786,7 @@ const server = http.createServer(async (req, res) => {
     // queued/paced work; an already-started upstream request is still fully observed.
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
+      if (await handleMarketLightSnapshot(req, res, url)) return true;
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
