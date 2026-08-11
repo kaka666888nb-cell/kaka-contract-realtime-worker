@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.81",
+  "version": "650.8.15.82",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.81 / Step980.6.3.5.3 quarantine persisted identity until live all-symbol baseline"
+  "description": "Kaka contract realtime worker 650.8.15.82 / Step980.6.3.5.4 gate enrichment until 2/2 live all-symbol identity confirmation"
 }
