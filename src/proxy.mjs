@@ -18,7 +18,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.78';
+const STEP_VERSION = '650.8.15.79';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -478,7 +478,7 @@ const server = http.createServer(async (req, res) => {
         bybit_shallow_latest_page_reserves_verified_older_rows: true,
         bybit_btc_eth_quote_pairs_prestarted_from_official_directory: true,
         one_second_history_window_passes_by_time_span_not_page_count: true,
-        binance_contract_market_transport: 'official_websocket_changed_ticker_contract_info_mark_price_plus_low_frequency_ws_api_all_symbol_latest_price_baseline',
+        binance_contract_market_transport: 'official_ws_api_all_symbol_latest_price_identity_plus_changed_ticker_contract_info_mark_price_enrichment',
         binance_contract_market_persistent_snapshot: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
         binance_contract_market_rest_role: 'automatic_rest_disabled_websocket_snapshot_only',
         binance_contract_market_empty_snapshot_never_overwrites: true,

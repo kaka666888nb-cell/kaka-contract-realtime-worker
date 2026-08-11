@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.40';
+const VERSION = '650.8.15.41';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -28,12 +28,14 @@ const MARKET_MARK_PRICE_SNAPSHOT_INTERVAL_MS = 60_000;
 const MARKET_SNAPSHOT_RETRY_MS = 15_000;
 const MARKET_SNAPSHOT_TIMEOUT_MS = 20_000;
 const START_WAIT_MS = 6_500;
-// Step980.6.3.4.1: Binance documents !ticker@arr as a changed-symbol array,
-// so it must never be used as a complete current-universe snapshot. Keep it for
-// 24h statistics only. Current identity + a real latest trade price baseline are
-// instead seeded by the official USDⓈ-M WebSocket API `ticker.price` all-symbol
-// request, intersected with the latest all-market mark-price PERPETUAL UM set.
-// Two stable all-symbol API baselines are required before pruning restored rows.
+// Step980.6.3.4.2: Binance documents !ticker@arr as changed-only, while the
+// USDⓈ-M WebSocket API `ticker.price` without symbol returns the current all-symbol
+// latest-price array. Use two stable `ticker.price` arrays as the authoritative
+// current priced-symbol identity baseline. Do NOT intersect it with !markPrice@arr:
+// after the 2026 market-stream migration Binance may emit TradFi mark-price rows in
+// a separate message, so a one-message mark snapshot is not a complete identity set.
+// Once confirmed, changed ticker / mark-price traffic may enrich only confirmed
+// identities; contractInfo remains the immediate source for listing/delisting changes.
 const CURRENT_IDENTITY_MIN_ABSOLUTE_ROWS = 250;
 const CURRENT_IDENTITY_MIN_RETAIN_RATIO = 0.70;
 const CURRENT_IDENTITY_STABLE_OVERLAP_RATIO = 0.97;
@@ -42,7 +44,6 @@ const WS_API_URL = 'wss://ws-fapi.binance.com/ws-fapi/v1';
 const CURRENT_PRICE_BASELINE_INTERVAL_MS = 10 * 60_000;
 const CURRENT_PRICE_BASELINE_RETRY_MS = 15_000;
 const CURRENT_PRICE_BASELINE_TIMEOUT_MS = 20_000;
-const CURRENT_MARK_PRICE_IDENTITY_MAX_AGE_MS = 2 * 60_000;
 const WS_CONNECT_GAP_MS = 3_000;
 const WS_CONNECT_WINDOW_MS = 5 * 60_000;
 const WS_MAX_CONNECT_ATTEMPTS_5M = 15;
@@ -80,6 +81,8 @@ let currentIdentityLastPrunedRows = 0;
 let currentIdentityTotalPrunedRows = 0;
 let currentIdentityLastPrunedAt = 0;
 let currentIdentityRejectedPartialSnapshots = 0;
+let confirmedCurrentIdentitySymbols = new Set();
+let currentIdentityConfirmedAt = 0;
 let latestMarkPricePerpetualSymbols = new Set();
 let latestMarkPriceIdentityAt = 0;
 let currentPriceBaselineTimer = null;
@@ -90,6 +93,7 @@ const currentPriceBaselineStats = {
   failed: 0,
   last_rows: 0,
   last_intersection_rows: 0,
+  last_valid_identity_rows: 0,
   last_at: 0,
   last_error: '',
 };
@@ -299,6 +303,16 @@ function currentIdentityMinimumRows() {
   );
 }
 
+function currentIdentityConfirmed() {
+  return currentIdentityCandidateConfirmations >= CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED &&
+    confirmedCurrentIdentitySymbols.size >= CURRENT_IDENTITY_MIN_ABSOLUTE_ROWS;
+}
+
+function symbolAllowedByConfirmedIdentity(symbol) {
+  if (!currentIdentityConfirmed()) return true;
+  return confirmedCurrentIdentitySymbols.has(compact(symbol));
+}
+
 function reconcileCurrentIdentitySnapshot(symbols, observedAt = Date.now()) {
   if (!(symbols instanceof Set) || !symbols.size) return { accepted: false, reason: 'empty' };
   const minimumRows = currentIdentityMinimumRows();
@@ -344,6 +358,8 @@ function reconcileCurrentIdentitySnapshot(symbols, observedAt = Date.now()) {
     };
   }
 
+  confirmedCurrentIdentitySymbols = new Set(symbols);
+  currentIdentityConfirmedAt = observedAt;
   const allKnownSymbols = new Set([
     ...universeBySymbol.keys(),
     ...tickerBySymbol.keys(),
@@ -389,7 +405,7 @@ function handleTickerMessage(raw) {
   let accepted = 0;
   for (const item of rows) {
     const identity = normalizedPerpetual(item);
-    if (!identity) continue;
+    if (!identity || !symbolAllowedByConfirmedIdentity(identity.symbol)) continue;
     upsertTicker(item, identity, 'binance_official_public_ticker_websocket', now);
     accepted += 1;
   }
@@ -447,7 +463,7 @@ function handleMarkPriceMessage(raw) {
   const currentSymbols = new Set();
   for (const item of rows) {
     const identity = normalizedPerpetual(item);
-    if (!identity) continue;
+    if (!identity || !symbolAllowedByConfirmedIdentity(identity.symbol)) continue;
     currentSymbols.add(identity.symbol);
     const fundingRate = finite(item?.r ?? item?.fundingRate ?? item?.funding_rate);
     const nextFundingTimeMs = finite(item?.T ?? item?.nextFundingTime ?? item?.next_funding_time);
@@ -480,9 +496,8 @@ function handleMarkPriceMessage(raw) {
     latestMarkPriceIdentityAt = now;
     notifyWaiters();
     schedulePersist();
-    // A fresh complete mark-price universe unlocks the low-frequency all-symbol
-    // WebSocket API latest-price baseline. This starts one shared backend request,
-    // never one request per App user.
+    // A mark-price update may accelerate the shared startup baseline, but it is
+    // enrichment only and is never used as the authoritative full identity set.
     if (!currentPriceBaselineRunning && !currentPriceBaselineTimer) {
       scheduleCurrentPriceBaseline(750);
     }
@@ -500,14 +515,16 @@ function handleContractInfoMessage(raw) {
     if (!symbol) continue;
     const contractType = String(item.ct ?? item.contractType ?? '').toUpperCase();
     const contractStatus = String(item.cs ?? item.contractStatus ?? item.status ?? '').toUpperCase();
-    if (contractType && contractType !== 'PERPETUAL') continue;
+    if (contractType && !['PERPETUAL', 'TRADIFI_PERPETUAL'].includes(contractType)) continue;
     if (contractStatus && !['TRADING', 'PRE_DELIVERING', 'PRE_SETTLE'].includes(contractStatus)) {
+      confirmedCurrentIdentitySymbols.delete(symbol);
       removeSymbol(symbol);
       accepted += 1;
       continue;
     }
     const identity = normalizedPerpetual(item);
     if (!identity) continue;
+    if (currentIdentityConfirmed()) confirmedCurrentIdentitySymbols.add(identity.symbol);
     upsertUniverse(identity, 'binance_official_public_contract_info_websocket', now);
     accepted += 1;
   }
@@ -623,7 +640,7 @@ async function connectStream(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.40' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.41' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -693,7 +710,7 @@ async function capturePeriodicSnapshot(name) {
       socket = new WebSocket(url, {
         handshakeTimeout: 15_000,
         perMessageDeflate: false,
-        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.40' },
+        headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.41' },
       });
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -760,37 +777,24 @@ function scheduleCurrentPriceBaseline(delayMs) {
   currentPriceBaselineTimer.unref?.();
 }
 
-function currentMarkPriceIdentityReady(now = Date.now()) {
-  return latestMarkPricePerpetualSymbols.size >= CURRENT_IDENTITY_MIN_ABSOLUTE_ROWS &&
-    latestMarkPriceIdentityAt > 0 &&
-    now - latestMarkPriceIdentityAt <= CURRENT_MARK_PRICE_IDENTITY_MAX_AGE_MS;
-}
-
 function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
   const rows = Array.isArray(resultRows) ? resultRows : [];
   currentPriceBaselineStats.last_rows = rows.length;
   currentPriceBaselineStats.last_at = observedAt;
-  if (!currentMarkPriceIdentityReady(observedAt)) {
-    currentPriceBaselineStats.last_error = 'mark_price_identity_not_ready_or_stale';
-    return { accepted: false, reason: currentPriceBaselineStats.last_error, rows: rows.length };
-  }
 
   const currentSymbols = new Set();
   let seeded = 0;
   for (const item of rows) {
-    const symbol = compact(item?.symbol ?? item?.s);
-    if (!symbol || !latestMarkPricePerpetualSymbols.has(symbol)) continue;
-    const [base, quote] = splitQuote(symbol);
-    if (!base || !quote) continue;
+    const identity = normalizedPerpetual(item);
+    if (!identity) continue;
     const last = finite(item?.price ?? item?.c ?? item?.lastPrice);
     if (last === null || last <= 0) continue;
-    const identity = { symbol, rawSymbol: symbol, base, quote };
-    currentSymbols.add(symbol);
+    currentSymbols.add(identity.symbol);
     upsertUniverse(identity, 'binance_official_public_ws_api_ticker_price_all_symbols', observedAt);
-    tickerBySymbol.set(symbol, mergeNonNull(tickerBySymbol.get(symbol), {
+    tickerBySymbol.set(identity.symbol, mergeNonNull(tickerBySymbol.get(identity.symbol), {
       provider: PROVIDER,
       market_type: MARKET_TYPE,
-      symbol,
+      symbol: identity.symbol,
       last_price: last,
       price: last,
       source_time: item?.time ? iso(item.time) : iso(observedAt),
@@ -801,11 +805,14 @@ function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
     seeded += 1;
   }
 
+  currentPriceBaselineStats.last_valid_identity_rows = currentSymbols.size;
+  // Backward-compatible diagnostic name retained for one release; this is no
+  // longer a mark-price intersection count.
   currentPriceBaselineStats.last_intersection_rows = currentSymbols.size;
   if (seeded < CURRENT_IDENTITY_MIN_ABSOLUTE_ROWS) {
-    currentPriceBaselineStats.last_error = `price_baseline_intersection_too_small:${seeded}`;
+    currentPriceBaselineStats.last_error = `price_baseline_identity_too_small:${seeded}`;
     currentIdentityRejectedPartialSnapshots += 1;
-    return { accepted: false, reason: 'intersection_too_small', rows: seeded };
+    return { accepted: false, reason: 'identity_too_small', rows: seeded };
   }
 
   const reconciliation = reconcileCurrentIdentitySnapshot(currentSymbols, observedAt);
@@ -817,10 +824,6 @@ function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
 
 async function captureCurrentPriceBaseline() {
   if (currentPriceBaselineRunning) return false;
-  if (!currentMarkPriceIdentityReady()) {
-    scheduleCurrentPriceBaseline(CURRENT_PRICE_BASELINE_RETRY_MS);
-    return false;
-  }
   currentPriceBaselineRunning = true;
   currentPriceBaselineStats.attempts += 1;
   let socket = null;
@@ -846,7 +849,7 @@ async function captureCurrentPriceBaseline() {
         socket = new WebSocket(WS_API_URL, {
           handshakeTimeout: 15_000,
           perMessageDeflate: false,
-          headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.40' },
+          headers: { 'user-agent': 'KakaWeb3-Market-Worker/650.8.15.41' },
         });
       } catch (error) {
         finish(false, error?.message || error);
@@ -1245,7 +1248,7 @@ export function getBinanceContractMarketHealth() {
     usdt_universe_rows: sortedUniverseRows(DEFAULT_QUOTE).length,
     restored_pending_identity_rows: restoredPendingSymbols.size,
     current_identity_reconciliation: {
-      mode: 'two_stable_ws_api_all_symbol_latest_price_snapshots_intersect_mark_price_perpetual_then_prune',
+      mode: 'two_stable_ws_api_all_symbol_latest_price_snapshots_then_prune_mark_and_changed_streams_enrichment_only',
       confirmations_required: CURRENT_IDENTITY_CONFIRMATIONS_REQUIRED,
       candidate_confirmations: currentIdentityCandidateConfirmations,
       last_candidate_rows: currentIdentityLastCandidateRows,
@@ -1258,11 +1261,14 @@ export function getBinanceContractMarketHealth() {
       total_pruned_rows: currentIdentityTotalPrunedRows,
       last_pruned_at: currentIdentityLastPrunedAt ? iso(currentIdentityLastPrunedAt) : null,
       changed_only_ticker_stream_not_used_as_full_identity: true,
+      mark_price_stream_not_used_as_full_identity: true,
+      confirmed_identity_rows: confirmedCurrentIdentitySymbols.size,
+      confirmed_identity_at: currentIdentityConfirmedAt ? iso(currentIdentityConfirmedAt) : null,
       mark_price_perpetual_identity_rows: latestMarkPricePerpetualSymbols.size,
       mark_price_perpetual_identity_at: latestMarkPriceIdentityAt ? iso(latestMarkPriceIdentityAt) : null,
     },
     current_price_baseline: {
-      transport: 'official_usds_m_websocket_api_ticker_price_all_symbols',
+      transport: 'official_usds_m_websocket_api_ticker_price_all_symbols_authoritative_priced_identity',
       endpoint: 'ws-fapi.binance.com/ws-fapi/v1',
       interval_seconds_after_confirmed: Math.round(CURRENT_PRICE_BASELINE_INTERVAL_MS / 1000),
       retry_seconds_until_confirmed: Math.round(CURRENT_PRICE_BASELINE_RETRY_MS / 1000),
@@ -1317,7 +1323,7 @@ export function getBinanceContractMarketHealth() {
       markPrice: Math.round(MARKET_MARK_PRICE_SNAPSHOT_INTERVAL_MS / 1000),
     },
     funding_current_source: 'binance_official_public_mark_price_websocket_periodic_snapshot',
-    source: 'binance_official_periodic_market_snapshots_with_persistent_cold_start_and_confirmed_identity_reconciliation_no_automatic_rest',
+    source: 'binance_official_ws_api_all_symbol_price_identity_plus_changed_market_enrichment_with_persistent_cold_start_no_automatic_rest',
     time: new Date().toISOString(),
   };
 }
