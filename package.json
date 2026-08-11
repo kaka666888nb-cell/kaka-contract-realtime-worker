@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.82",
+  "version": "650.8.15.83",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.82 / Step980.6.3.5.4 gate enrichment until 2/2 live all-symbol identity confirmation"
+  "description": "Kaka contract realtime worker 650.8.15.83 / Step980.6.4 official maximum five-provider liquidation market layer with focused 5x3 fallback"
 }
