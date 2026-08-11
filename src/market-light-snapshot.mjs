@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.86';
+const STEP_VERSION = '650.8.15.87';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -78,6 +78,10 @@ const okxContractBatchEnrichment = {
   index_rows: 0,
   open_interest_rows: 0,
   patch_rows: 0,
+  applied_patch_rows: 0,
+  applied_mark_rows: 0,
+  applied_index_rows: 0,
+  applied_open_interest_rows: 0,
   mark_host: '',
   index_host: '',
   open_interest_host: '',
@@ -162,13 +166,26 @@ function rowTimeMs(row) {
   return 0;
 }
 
+function providerNativeIdentityKey(provider, market, value) {
+  let key = compact(value);
+  // OKX market-rest canonicalizes native SWAP IDs such as BTC-USDT-SWAP
+  // to BTCUSDT before storing the shared directory/ticker identity. The
+  // market-light compact() intentionally preserves semantic suffix letters,
+  // so enrichment rows must use the same canonical identity key or the
+  // official mark/index/OI batches will never merge into the active rows.
+  if (provider === 'okx' && market === 'contract' && key.endsWith('SWAP')) {
+    key = key.slice(0, -4);
+  }
+  return key;
+}
+
 function directoryIdentityMaps(provider, market) {
   const rows = directoryRowsByKey.get(keyFor(market, provider)) || [];
   const byDisplay = new Map();
   const byNative = new Map();
   for (const row of rows) {
     const display = compact(row?.symbol);
-    const native = compact(row?.native_symbol ?? row?.raw_symbol ?? row?.symbol);
+    const native = providerNativeIdentityKey(provider, market, row?.native_symbol ?? row?.raw_symbol ?? row?.symbol);
     if (display) byDisplay.set(display, row);
     if (native) byNative.set(native, row);
   }
@@ -177,7 +194,7 @@ function directoryIdentityMaps(provider, market) {
 
 function normalizeRow(provider, market, raw, observedAt, primaryQuote, identities = null) {
   if (!raw || typeof raw !== 'object') return null;
-  const rawNative = compact(raw.native_symbol ?? raw.raw_symbol ?? raw.symbol);
+  const rawNative = providerNativeIdentityKey(provider, market, raw.native_symbol ?? raw.raw_symbol ?? raw.symbol);
   const rawDisplay = compact(raw.symbol);
   const identity = identities?.byNative?.get(rawNative) || identities?.byDisplay?.get(rawDisplay) || null;
   const hasDirectoryIdentity = Boolean((identities?.byNative?.size || 0) + (identities?.byDisplay?.size || 0));
@@ -298,7 +315,7 @@ async function fetchJson(url, { timeoutMs = 15_000 } = {}) {
     const response = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.86 market-light',
+        'user-agent': 'KakaWeb3/650.8.15.87 market-light',
       },
       signal: controller.signal,
     });
@@ -395,7 +412,7 @@ function mergeRowsByNative(baseRows, patchRows, provider, market, observedAt, pr
     if (row) base.set(row.symbol, row);
   }
   for (const raw of Array.isArray(patchRows) ? patchRows : []) {
-    const native = compact(raw?.native_symbol ?? raw?.raw_symbol ?? raw?.symbol);
+    const native = providerNativeIdentityKey(provider, market, raw?.native_symbol ?? raw?.raw_symbol ?? raw?.symbol);
     const display = compact(raw?.symbol);
     const identity = identities.byNative.get(native) || identities.byDisplay.get(display) || null;
     const symbol = compact(identity?.symbol ?? display);
@@ -445,6 +462,7 @@ async function loadOkxContractBatchEnrichment(observedAt) {
       patches.set(key, {
         provider: 'okx',
         market_type: 'contract',
+        symbol: providerNativeIdentityKey('okx', 'contract', raw),
         raw_symbol: raw,
         native_symbol: raw,
         source_time: observedAt,
@@ -534,7 +552,16 @@ async function loadProviderRows(provider, market, observedAt) {
   const baseRows = await loadMarketTickers(provider, market, []);
   if (provider === 'okx' && market === 'contract') {
     const patches = await loadOkxContractBatchEnrichment(observedAt).catch(() => []);
-    return mergeRowsByNative(baseRows, patches, provider, market, observedAt, 'USDT');
+    const merged = mergeRowsByNative(baseRows, patches, provider, market, observedAt, 'USDT');
+    okxContractBatchEnrichment.applied_mark_rows = merged.filter((row) => row?.mark_price_source === 'okx_public_mark_price_batch' && positive(row?.mark_price) != null).length;
+    okxContractBatchEnrichment.applied_index_rows = merged.filter((row) => row?.index_price_source === 'okx_public_index_tickers_usdt_batch' && positive(row?.index_price) != null).length;
+    okxContractBatchEnrichment.applied_open_interest_rows = merged.filter((row) => row?.open_interest_source === 'okx_public_open_interest_batch' && row?.open_interest != null).length;
+    okxContractBatchEnrichment.applied_patch_rows = merged.filter((row) =>
+      row?.mark_price_source === 'okx_public_mark_price_batch' ||
+      row?.index_price_source === 'okx_public_index_tickers_usdt_batch' ||
+      row?.open_interest_source === 'okx_public_open_interest_batch'
+    ).length;
+    return merged;
   }
   return baseRows;
 }
@@ -1172,7 +1199,7 @@ export function getMarketLightSnapshotHealth() {
       binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
-      okx_contract: 'official_SWAP_tickers_batch + dual-host public mark-price batch + USDT index-tickers batch + public open-interest batch; funding remains missing unless officially supplied by a batch source',
+      okx_contract: 'official_SWAP_tickers_batch + canonical OKX SWAP identity merge + dual-host public mark-price batch + USDT index-tickers batch + public open-interest batch; funding remains missing unless officially supplied by a batch source',
       bybit_spot: 'official_spot_tickers_batch',
       bybit_contract: 'official_linear_tickers_batch including mark/index/OI/funding/BBO',
       bitget_spot: 'official_v3_SPOT_tickers_product_batch with v2 fallback',
@@ -1183,9 +1210,10 @@ export function getMarketLightSnapshotHealth() {
     provider_coverage: providerCoverage,
     okx_contract_batch_enrichment: {
       ...okxContractBatchEnrichment,
-      mark_ready: okxContractBatchEnrichment.mark_rows > 0,
-      index_ready: okxContractBatchEnrichment.index_rows > 0,
-      open_interest_ready: okxContractBatchEnrichment.open_interest_rows > 0,
+      mark_ready: okxContractBatchEnrichment.mark_rows > 0 && okxContractBatchEnrichment.applied_mark_rows > 0,
+      index_ready: okxContractBatchEnrichment.index_rows > 0 && okxContractBatchEnrichment.applied_index_rows > 0,
+      open_interest_ready: okxContractBatchEnrichment.open_interest_rows > 0 && okxContractBatchEnrichment.applied_open_interest_rows > 0,
+      canonical_okx_swap_identity_merge: true,
       dual_host_fallback_enabled: true,
       index_batch_mode: 'quoteCcy=USDT',
       mark_batch_mode: 'instType=SWAP',
