@@ -14,18 +14,20 @@ import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-his
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
 import { getMarketLightSnapshotHealth, handleMarketLightSnapshot, startMarketLightSnapshotScanner } from './market-light-snapshot.mjs';
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
+import { getContractFocusPoolHealth, handleContractFocusPool, startContractFocusPoolScanner } from './contract-focus-pool.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.87';
+const STEP_VERSION = '650.8.15.88';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
 startSpotCurrentSnapshotScanner();
 startMarketLightSnapshotScanner();
 startContractBasisScanner();
+startContractFocusPoolScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -308,6 +310,9 @@ const server = http.createServer(async (req, res) => {
       contract_basis_current_snapshot: '/api/contract-basis/current-snapshot',
       contract_basis_health: '/api/contract-basis/health',
       contract_basis_state: getContractBasisHealth(),
+      contract_focus_pool_current_snapshot: '/api/contract-focus-pool/current-snapshot',
+      contract_focus_pool_health: '/api/contract-focus-pool/health',
+      contract_focus_pool_state: getContractFocusPoolHealth(),
       spot_exact_ticker: '/api/spot-market/exact-ticker',
       spot_exact_ticker_health: '/api/spot-market/exact-ticker-health',
       spot_exact_ticker_state: getSpotExactTickerHealth(),
@@ -799,6 +804,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
       if (await handleMarketLightSnapshot(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
+      if (await handleContractFocusPool(req, res, url)) return true;
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
