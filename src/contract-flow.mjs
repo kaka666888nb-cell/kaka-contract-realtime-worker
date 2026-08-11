@@ -4,7 +4,7 @@ import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.90';
+const VERSION = '650.8.15.91';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -1694,6 +1694,19 @@ export function getContractFlowInternalFocusSnapshot() {
         trade_count: asNumber(latest.trade_count) ?? 0,
         p70_quote: asNumber(latest.p70_quote),
         p95_quote: asNumber(latest.p95_quote),
+        large_buy_quote: asNumber(latest.large_buy_quote),
+        large_sell_quote: asNumber(latest.large_sell_quote),
+        large_net_quote: (asNumber(latest.large_buy_quote) ?? 0) - (asNumber(latest.large_sell_quote) ?? 0),
+        medium_buy_quote: asNumber(latest.medium_buy_quote),
+        medium_sell_quote: asNumber(latest.medium_sell_quote),
+        small_buy_quote: asNumber(latest.small_buy_quote),
+        small_sell_quote: asNumber(latest.small_sell_quote),
+        large_buy_count: asNumber(latest.large_buy_count),
+        large_sell_count: asNumber(latest.large_sell_count),
+        medium_buy_count: asNumber(latest.medium_buy_count),
+        medium_sell_count: asNumber(latest.medium_sell_count),
+        small_buy_count: asNumber(latest.small_buy_count),
+        small_sell_count: asNumber(latest.small_sell_count),
         source: latest.source || 'render_exchange_websocket_histogram',
         updated_at: latest.updated_at || new Date().toISOString(),
       });

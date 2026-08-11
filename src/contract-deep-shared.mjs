@@ -2,7 +2,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { getContractDepthSharedOrderbook } from './contract-depth.mjs';
 import { getContractFlowInternalFocusSnapshot, reconcileContractFlowFocusPool } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const SNAPSHOT_ROUTE = '/api/contract-deep-shared/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-deep-shared/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -300,6 +300,19 @@ function currentPayload() {
         flow_trade_count: finite(flowRow?.trade_count),
         flow_p70_quote: finite(flowRow?.p70_quote),
         flow_p95_quote: finite(flowRow?.p95_quote),
+        flow_large_buy_quote: finite(flowRow?.large_buy_quote),
+        flow_large_sell_quote: finite(flowRow?.large_sell_quote),
+        flow_large_net_quote: finite(flowRow?.large_net_quote),
+        flow_medium_buy_quote: finite(flowRow?.medium_buy_quote),
+        flow_medium_sell_quote: finite(flowRow?.medium_sell_quote),
+        flow_small_buy_quote: finite(flowRow?.small_buy_quote),
+        flow_small_sell_quote: finite(flowRow?.small_sell_quote),
+        flow_large_buy_count: finite(flowRow?.large_buy_count),
+        flow_large_sell_count: finite(flowRow?.large_sell_count),
+        flow_medium_buy_count: finite(flowRow?.medium_buy_count),
+        flow_medium_sell_count: finite(flowRow?.medium_sell_count),
+        flow_small_buy_count: finite(flowRow?.small_buy_count),
+        flow_small_sell_count: finite(flowRow?.small_sell_count),
         flow_source: flowRow?.source || null,
       });
     }
@@ -314,6 +327,17 @@ function currentPayload() {
   }
   const depthFreshRows = rows.filter((row) => row.depth_ready === true).length;
   const flowRows = rows.filter((row) => row.flow_ready === true).length;
+  const largeTradeSchemaRows = rows.filter((row) =>
+    row.flow_ready === true &&
+    row.flow_trade_count != null && row.flow_trade_count > 0 &&
+    row.flow_p95_quote != null &&
+    row.flow_large_buy_quote != null &&
+    row.flow_large_sell_quote != null
+  ).length;
+  const largeTradeValueRows = rows.filter((row) =>
+    row.flow_ready === true &&
+    ((row.flow_large_buy_quote ?? 0) + (row.flow_large_sell_quote ?? 0)) > 0
+  ).length;
   const payload = {
     ok: true,
     version: VERSION,
@@ -330,6 +354,10 @@ function currentPayload() {
     flow_active_rows: Number(flow.active_rows || 0),
     flow_connected_rows: Number(flow.connected_rows || 0),
     flow_value_rows: flowRows,
+    large_trade_schema_rows: largeTradeSchemaRows,
+    large_trade_value_rows: largeTradeValueRows,
+    large_trade_fields_derived_from_existing_flow_histogram: true,
+    large_trade_user_reads_open_exchange_work: false,
     depth_levels: DEPTH_LEVELS,
     depth_sample_per_provider_per_cycle: DEPTH_SAMPLE_PER_PROVIDER_PER_CYCLE,
     scan_interval_seconds: SCAN_INTERVAL_MS / 1000,
@@ -366,6 +394,10 @@ export function getContractDeepSharedHealth() {
     flow_active_rows: payload.flow_active_rows,
     flow_connected_rows: payload.flow_connected_rows,
     flow_value_rows: payload.flow_value_rows,
+    large_trade_schema_rows: payload.large_trade_schema_rows,
+    large_trade_value_rows: payload.large_trade_value_rows,
+    large_trade_fields_derived_from_existing_flow_histogram: true,
+    large_trade_user_reads_open_exchange_work: false,
     provider_coverage: payload.provider_coverage,
     depth_levels: DEPTH_LEVELS,
     depth_sample_per_provider_per_cycle: DEPTH_SAMPLE_PER_PROVIDER_PER_CYCLE,
