@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.79",
+  "version": "650.8.15.80",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.79 / Step980.6.3.4.2 Binance all-symbol priced identity baseline and stale re-add guard"
+  "description": "Kaka contract realtime worker 650.8.15.80 / Step980.6.3.5.1 identity persistence checkpoint and shared response cache closure"
 }
