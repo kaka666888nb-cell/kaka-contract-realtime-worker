@@ -2,7 +2,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { getContractDepthSharedOrderbook } from './contract-depth.mjs';
 import { getContractFlowInternalFocusSnapshot, reconcileContractFlowFocusPool } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.3';
 const SNAPSHOT_ROUTE = '/api/contract-deep-shared/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-deep-shared/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -162,15 +162,59 @@ function buildDepthRow(focusRow, payload, now) {
   };
 }
 
+function depthRecoveryPriority(row, now) {
+  const key = `${row.provider}:${row.symbol}`;
+  const current = depthState.get(key) || null;
+  // A row that just failed a refresh is retried first inside the same bounded
+  // budget; missing rows come next, then genuinely stale rows.
+  if (String(current?.depth_last_refresh_error || '').trim()) return 0;
+  if (String(current?.depth_error || '').trim()) return 0;
+  if (!current || !Number(current.depth_sampled_at_ms || 0)) return 1;
+  const ageMs = Math.max(0, now - Number(current.depth_sampled_at_ms || 0));
+  if (ageMs > DEPTH_STALE_MS) return 2;
+  return 9;
+}
+
 function nextDepthTargets(focus) {
   const targets = [];
+  const now = Date.now();
   for (const provider of PROVIDERS) {
     const rows = focus.byProvider[provider] || [];
     if (!rows.length) continue;
-    let cursor = Math.max(0, Number(cursors[provider] || 0)) % rows.length;
     const count = Math.min(DEPTH_SAMPLE_PER_PROVIDER_PER_CYCLE, rows.length);
-    for (let i = 0; i < count; i += 1) targets.push(rows[(cursor + i) % rows.length]);
-    cursors[provider] = (cursor + count) % rows.length;
+    const selected = [];
+    const selectedKeys = new Set();
+
+    // Step992.3: cold-start and refresh recovery always consume the same bounded
+    // four-per-provider budget first. Missing/failed rows are retried before
+    // already-healthy rows; this changes ordering only, never request volume.
+    const recoveryRows = rows
+      .map((row, index) => ({ row, index, priority: depthRecoveryPriority(row, now) }))
+      .filter((item) => item.priority < 9)
+      .sort((a, b) => a.priority - b.priority || a.index - b.index);
+    for (const item of recoveryRows) {
+      if (selected.length >= count) break;
+      const key = `${provider}:${item.row.symbol}`;
+      if (selectedKeys.has(key)) continue;
+      selected.push(item.row);
+      selectedKeys.add(key);
+    }
+
+    // Preserve the existing round-robin refresh for the remaining budget so
+    // healthy rows keep refreshing and no provider can exceed the old cap.
+    let cursor = Math.max(0, Number(cursors[provider] || 0)) % rows.length;
+    let visited = 0;
+    while (selected.length < count && visited < rows.length) {
+      const row = rows[(cursor + visited) % rows.length];
+      const key = `${provider}:${row.symbol}`;
+      if (!selectedKeys.has(key)) {
+        selected.push(row);
+        selectedKeys.add(key);
+      }
+      visited += 1;
+    }
+    cursors[provider] = (cursor + Math.max(1, visited)) % rows.length;
+    targets.push(...selected);
   }
   return targets;
 }
@@ -184,16 +228,49 @@ async function runBoundedByProvider(targets) {
       depthReadAttempts += 1;
       try {
         const payload = await getContractDepthSharedOrderbook(provider, target.symbol, DEPTH_LEVELS);
+        const previous = depthState.get(key) || null;
         const row = buildDepthRow(target, payload, Date.now());
-        depthState.set(key, row);
+        depthState.set(key, {
+          ...row,
+          depth_refresh_failure_count: Number(previous?.depth_refresh_failure_count || 0),
+          depth_last_refresh_error: '',
+          depth_last_refresh_failed_at_ms: null,
+          depth_last_refresh_failed_at: null,
+        });
         depthReadSuccesses += 1;
       } catch (error) {
         depthReadFailures += 1;
-        const previous = depthState.get(key);
-        if (previous) {
+        const now = Date.now();
+        const message = String(error?.message || error).slice(0, 220);
+        const previous = depthState.get(key) || null;
+        if (previous && Number(previous.depth_sampled_at_ms || 0) > 0) {
+          // Step992.3: a transient refresh failure must not destroy a still-fresh
+          // verified orderbook. Keep the last good sample usable until its normal
+          // 95s freshness expires, while exposing the refresh failure separately
+          // and prioritising this row on the next bounded scan.
           depthState.set(key, {
             ...previous,
-            depth_error: String(error?.message || error).slice(0, 220),
+            depth_error: '',
+            depth_last_refresh_error: message,
+            depth_last_refresh_failed_at_ms: now,
+            depth_last_refresh_failed_at: new Date(now).toISOString(),
+            depth_refresh_failure_count: Number(previous.depth_refresh_failure_count || 0) + 1,
+          });
+        } else {
+          depthState.set(key, {
+            provider: target.provider,
+            symbol: target.symbol,
+            base_asset: target.base_asset,
+            role: target.role,
+            slot: target.slot,
+            quote_asset: 'USDT',
+            depth_sampled_at_ms: 0,
+            depth_sampled_at: null,
+            depth_error: message,
+            depth_last_refresh_error: message,
+            depth_last_refresh_failed_at_ms: now,
+            depth_last_refresh_failed_at: new Date(now).toISOString(),
+            depth_refresh_failure_count: 1,
           });
         }
       }
@@ -273,6 +350,8 @@ function currentPayload() {
   for (const provider of PROVIDERS) {
     let depthFresh = 0;
     let depthAny = 0;
+    let depthRefreshErrors = 0;
+    let depthMissing = 0;
     let flowActive = 0;
     let flowConnected = 0;
     let flowRows = 0;
@@ -281,7 +360,9 @@ function currentPayload() {
       const depth = depthState.get(key) || null;
       const ageMs = depth ? Math.max(0, now - Number(depth.depth_sampled_at_ms || 0)) : null;
       const fresh = ageMs != null && ageMs <= DEPTH_STALE_MS && !String(depth?.depth_error || '').trim();
-      if (depth) depthAny += 1;
+      if (depth && Number(depth.depth_sampled_at_ms || 0) > 0) depthAny += 1;
+      else depthMissing += 1;
+      if (String(depth?.depth_last_refresh_error || '').trim()) depthRefreshErrors += 1;
       if (fresh) depthFresh += 1;
       const flowRow = flowByKey.get(key) || null;
       if (flowRow) flowRows += 1;
@@ -322,10 +403,14 @@ function currentPayload() {
       target: (focus.byProvider[provider] || []).length,
       depth_any: depthAny,
       depth_fresh: depthFresh,
+      depth_missing: depthMissing,
+      depth_refresh_error_rows: depthRefreshErrors,
       flow_rows: flowRows,
     };
   }
   const depthFreshRows = rows.filter((row) => row.depth_ready === true).length;
+  const depthRefreshErrorRows = rows.filter((row) => String(row.depth_last_refresh_error || '').trim()).length;
+  const depthMissingRows = rows.filter((row) => !Number(row.depth_sampled_at_ms || 0)).length;
   const flowRows = rows.filter((row) => row.flow_ready === true).length;
   const largeTradeSchemaRows = rows.filter((row) =>
     row.flow_ready === true &&
@@ -350,7 +435,12 @@ function currentPayload() {
     target_rows: TARGET_ROWS,
     row_count: rows.length,
     depth_fresh_rows: depthFreshRows,
-    depth_any_rows: rows.filter((row) => row.depth_sampled_at_ms != null).length,
+    depth_any_rows: rows.filter((row) => Number(row.depth_sampled_at_ms || 0) > 0).length,
+    depth_missing_rows: depthMissingRows,
+    depth_refresh_error_rows: depthRefreshErrorRows,
+    depth_recovery_priority_enabled: true,
+    depth_refresh_failures_preserve_last_good_until_stale: true,
+    depth_recovery_does_not_raise_per_cycle_request_cap: true,
     flow_active_rows: Number(flow.active_rows || 0),
     flow_connected_rows: Number(flow.connected_rows || 0),
     flow_value_rows: flowRows,
@@ -391,6 +481,11 @@ export function getContractDeepSharedHealth() {
     target_rows: TARGET_ROWS,
     depth_fresh_rows: payload.depth_fresh_rows,
     depth_any_rows: payload.depth_any_rows,
+    depth_missing_rows: payload.depth_missing_rows,
+    depth_refresh_error_rows: payload.depth_refresh_error_rows,
+    depth_recovery_priority_enabled: true,
+    depth_refresh_failures_preserve_last_good_until_stale: true,
+    depth_recovery_does_not_raise_per_cycle_request_cap: true,
     flow_active_rows: payload.flow_active_rows,
     flow_connected_rows: payload.flow_connected_rows,
     flow_value_rows: payload.flow_value_rows,
