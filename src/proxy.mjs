@@ -16,12 +16,13 @@ import { getMarketLightSnapshotHealth, handleMarketLightSnapshot, startMarketLig
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { getContractFocusPoolHealth, handleContractFocusPool, startContractFocusPoolScanner } from './contract-focus-pool.mjs';
 import { getContractDeepSharedHealth, handleContractDeepShared, startContractDeepSharedScanner } from './contract-deep-shared.mjs';
+import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.91';
+const STEP_VERSION = '650.8.15.92';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -309,6 +310,9 @@ const server = http.createServer(async (req, res) => {
       market_light_current_snapshot: '/api/market-light/current-snapshot',
       market_light_health: '/api/market-light/health',
       market_light_state: getMarketLightSnapshotHealth(),
+      source_capabilities_current_snapshot: '/api/source-capabilities/current-snapshot',
+      source_capabilities_health: '/api/source-capabilities/health',
+      source_capabilities_state: getSourceCapabilityRegistryHealth(),
       contract_basis_current_snapshot: '/api/contract-basis/current-snapshot',
       contract_basis_health: '/api/contract-basis/health',
       contract_basis_state: getContractBasisHealth(),
@@ -644,6 +648,12 @@ const server = http.createServer(async (req, res) => {
         market_light_full_directory_snapshot_endpoint: '/api/market-light/current-snapshot',
         market_light_snapshot_reads_scale_with_users: false,
         market_light_failed_refresh_retains_last_verified_rows: true,
+        source_capability_registry_endpoint: '/api/source-capabilities/current-snapshot',
+        source_capability_registry_official_first: true,
+        source_capability_registry_cross_provider_substitution: false,
+        source_capability_registry_cross_quote_substitution: false,
+        source_capability_registry_user_reads_scale_exchange_upstream: false,
+        binance_contract_full_market_bbo_shared_ws: true,
         contract_basis_shared_current_endpoint: '/api/contract-basis/current-snapshot',
         contract_basis_reuses_market_light_only: true,
         contract_basis_additional_exchange_requests_per_build: 0,
@@ -808,6 +818,7 @@ const server = http.createServer(async (req, res) => {
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
       if (await handleMarketLightSnapshot(req, res, url)) return true;
+      if (await handleSourceCapabilityRegistry(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
       if (await handleContractFocusPool(req, res, url)) return true;
       if (await handleContractDeepShared(req, res, url)) return true;

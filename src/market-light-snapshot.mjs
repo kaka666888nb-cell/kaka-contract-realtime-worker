@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.87';
+const STEP_VERSION = '650.8.15.92';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -43,6 +43,15 @@ const COINBASE_SUBSCRIBE_GAP_MS = Math.max(130, Number(process.env.KAKA_MARKET_L
 const COINBASE_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_COINBASE_RECONNECT_MIN_MS || 2_000));
 const COINBASE_RECONNECT_MAX_MS = Math.max(COINBASE_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_COINBASE_RECONNECT_MAX_MS || 30_000));
 const COINBASE_MAX_PRODUCT_IDS = Math.max(50, Math.min(2_000, Number(process.env.KAKA_MARKET_LIGHT_COINBASE_MAX_PRODUCT_IDS || 1_200)));
+
+// Step990: Binance USDⓈ-M exposes one official all-symbol best bid/ask stream.
+// Keep it as exactly one shared backend WebSocket, independent of user count.
+// The 2026 merged UM+CM payload is filtered to st=1 (USDⓈ-M) and current USDT identities.
+const BINANCE_CONTRACT_BOOK_TICKER_WS_URL = 'wss://fstream.binance.com/public/ws/!bookTicker';
+const BINANCE_CONTRACT_BOOK_TICKER_WS_API_URL = 'wss://ws-fapi.binance.com/ws-fapi/v1';
+const BINANCE_BOOK_BASELINE_TTL_MS = Math.max(60_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_BOOK_BASELINE_TTL_MS || 10 * 60_000));
+const BINANCE_BOOK_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_BOOK_RECONNECT_MIN_MS || 2_000));
+const BINANCE_BOOK_RECONNECT_MAX_MS = Math.max(BINANCE_BOOK_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_BOOK_RECONNECT_MAX_MS || 30_000));
 
 const rowsByKey = new Map();
 const metaByKey = new Map();
@@ -105,6 +114,29 @@ const coinbase = {
   subscribeMessages: 0,
   messages: 0,
   tickerUpdates: 0,
+};
+
+const binanceContractBookTicker = {
+  socket: null,
+  connecting: null,
+  reconnectTimer: null,
+  reconnectAttempt: 0,
+  ready: false,
+  openedAt: 0,
+  lastMessageAt: 0,
+  lastError: '',
+  rows: new Map(),
+  connectAttempts: 0,
+  messages: 0,
+  acceptedUpdates: 0,
+  rejectedCoinMUpdates: 0,
+  baselineConnecting: null,
+  baselineAt: 0,
+  baselineAttempts: 0,
+  baselineSuccesses: 0,
+  baselineFailures: 0,
+  baselineRows: 0,
+  baselineLastError: '',
 };
 
 function keyFor(market, provider) {
@@ -219,6 +251,8 @@ function normalizeRow(provider, market, raw, observedAt, primaryQuote, identitie
     quote_symbol: quote,
     settle_asset: identity?.settle_asset ?? raw.settle_asset ?? null,
     contract_type: identity?.contract_type ?? raw.contract_type ?? null,
+    trading_status: String(identity?.status ?? raw.trading_status ?? raw.status ?? 'TRADING').trim().toUpperCase() || 'TRADING',
+    active: identity?.active !== false && raw.active !== false,
     last_price: lastPrice,
     price: lastPrice,
     source_time: sourceTime,
@@ -256,6 +290,9 @@ function fieldCoverage(rows) {
     open_interest: 'open_interest',
     open_interest_value: 'open_interest_value',
     basis_rate: 'basis_rate',
+    high_24h: 'high_24h',
+    low_24h: 'low_24h',
+    trading_status: 'trading_status',
   };
   const result = { rows: rows.length };
   for (const [name, field] of Object.entries(fields)) {
@@ -550,6 +587,12 @@ async function loadProviderRows(provider, market, observedAt) {
     }
   }
   const baseRows = await loadMarketTickers(provider, market, []);
+  if (provider === 'binance' && market === 'contract') {
+    ensureBinanceContractBookTicker().catch(() => {});
+    await refreshBinanceContractBookTickerBaseline().catch(() => false);
+    const patches = [...binanceContractBookTicker.rows.values()];
+    return mergeRowsByNative(baseRows, patches, provider, market, observedAt, 'USDT');
+  }
   if (provider === 'okx' && market === 'contract') {
     const patches = await loadOkxContractBatchEnrichment(observedAt).catch(() => []);
     const merged = mergeRowsByNative(baseRows, patches, provider, market, observedAt, 'USDT');
@@ -823,6 +866,8 @@ function coinbaseTickerRow(ticker, messageTime) {
     base_asset: base,
     quote_asset: 'USD',
     quote_symbol: 'USD',
+    trading_status: 'TRADING',
+    active: true,
     last_price: last,
     price: last,
     price_change_percent_24h: finite(ticker?.price_percent_chg_24_h ?? ticker?.price_percent_chg_24h),
@@ -993,6 +1038,232 @@ async function ensureCoinbaseTickerBatch() {
   return await coinbase.connecting;
 }
 
+function binanceContractBookTickerRow(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const symbolTypeRaw = raw.st;
+  const symbolType = symbolTypeRaw == null ? null : integer(symbolTypeRaw);
+  if (symbolType != null && symbolType !== 1) {
+    binanceContractBookTicker.rejectedCoinMUpdates += 1;
+    return null;
+  }
+  const symbol = compact(raw.s ?? raw.symbol);
+  if (!symbol || !symbol.endsWith('USDT')) return null;
+  const bestBid = positive(raw.b ?? raw.bestBid ?? raw.bidPrice);
+  const bestAsk = positive(raw.a ?? raw.bestAsk ?? raw.askPrice);
+  if (bestBid == null || bestAsk == null || bestAsk < bestBid) return null;
+  const sourceTime = isoMs(raw.E ?? raw.T ?? raw.time) || new Date().toISOString();
+  return {
+    provider: 'binance',
+    market_type: 'contract',
+    symbol,
+    raw_symbol: symbol,
+    native_symbol: symbol,
+    best_bid: bestBid,
+    best_ask: bestAsk,
+    bid_price: bestBid,
+    ask_price: bestAsk,
+    spread_percent: bestAsk > 0 ? ((bestAsk - bestBid) / bestAsk) * 100 : null,
+    source_time: sourceTime,
+    cached_at: sourceTime,
+    best_bid_ask_source: 'binance_usdm_all_book_tickers_shared_websocket',
+  };
+}
+
+async function refreshBinanceContractBookTickerBaseline({ force = false } = {}) {
+  if (!force && binanceContractBookTicker.baselineAt > 0 && Date.now() - binanceContractBookTicker.baselineAt <= BINANCE_BOOK_BASELINE_TTL_MS) {
+    return true;
+  }
+  if (binanceContractBookTicker.baselineConnecting) return await binanceContractBookTicker.baselineConnecting;
+  binanceContractBookTicker.baselineConnecting = (async () => {
+    const WebSocketCtor = await resolveWebSocketCtor();
+    binanceContractBookTicker.baselineAttempts += 1;
+    const socket = new WebSocketCtor(BINANCE_CONTRACT_BOOK_TICKER_WS_API_URL);
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const requestId = `kaka-step990-book-${Date.now()}`;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        closeWs(socket);
+        reject(new Error('binance_contract_book_ticker_ws_api_timeout'));
+      }, 12_000);
+      timeout.unref?.();
+
+      wsListen(socket, 'open', () => {
+        if (!sendWs(socket, { id: requestId, method: 'ticker.book' })) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            closeWs(socket);
+            reject(new Error('binance_contract_book_ticker_ws_api_send_failed'));
+          }
+        }
+      });
+
+      wsListen(socket, 'message', async (event) => {
+        if (settled) return;
+        try {
+          const text = await wsMessageText(event);
+          const decoded = JSON.parse(text);
+          if (String(decoded?.id ?? '') !== requestId) return;
+          if (Number(decoded?.status || 0) !== 200 || !Array.isArray(decoded?.result)) {
+            throw new Error(`binance_contract_book_ticker_ws_api_status_${decoded?.status || 0}`);
+          }
+          let accepted = 0;
+          for (const item of decoded.result) {
+            const row = binanceContractBookTickerRow(item);
+            if (!row) continue;
+            binanceContractBookTicker.rows.set(row.symbol, {
+              ...row,
+              best_bid_ask_source: 'binance_usdm_ws_api_ticker_book_all_baseline',
+            });
+            accepted += 1;
+          }
+          if (!accepted) throw new Error('binance_contract_book_ticker_ws_api_rows_empty');
+          binanceContractBookTicker.baselineAt = Date.now();
+          binanceContractBookTicker.baselineRows = accepted;
+          binanceContractBookTicker.baselineSuccesses += 1;
+          binanceContractBookTicker.baselineLastError = '';
+          settled = true;
+          clearTimeout(timeout);
+          closeWs(socket);
+          resolve(true);
+        } catch (error) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            closeWs(socket);
+            reject(error);
+          }
+        }
+      });
+
+      wsListen(socket, 'error', (error) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(error instanceof Error ? error : new Error('binance_contract_book_ticker_ws_api_error'));
+        }
+      });
+
+      wsListen(socket, 'close', () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(new Error('binance_contract_book_ticker_ws_api_closed_before_response'));
+        }
+      });
+    });
+  })()
+    .catch((error) => {
+      binanceContractBookTicker.baselineFailures += 1;
+      binanceContractBookTicker.baselineLastError = String(error?.message || error).slice(0, 320);
+      return false;
+    })
+    .finally(() => {
+      binanceContractBookTicker.baselineConnecting = null;
+    });
+  return await binanceContractBookTicker.baselineConnecting;
+}
+
+function scheduleBinanceContractBookTickerReconnect() {
+  if (binanceContractBookTicker.reconnectTimer) return;
+  const delay = Math.min(
+    BINANCE_BOOK_RECONNECT_MAX_MS,
+    BINANCE_BOOK_RECONNECT_MIN_MS * (2 ** Math.min(binanceContractBookTicker.reconnectAttempt, 5)),
+  );
+  binanceContractBookTicker.reconnectAttempt += 1;
+  binanceContractBookTicker.reconnectTimer = setTimeout(() => {
+    binanceContractBookTicker.reconnectTimer = null;
+    ensureBinanceContractBookTicker().catch(() => {});
+  }, delay);
+  binanceContractBookTicker.reconnectTimer.unref?.();
+}
+
+async function openBinanceContractBookTicker() {
+  const WebSocketCtor = await resolveWebSocketCtor();
+  binanceContractBookTicker.connectAttempts += 1;
+  const socket = new WebSocketCtor(BINANCE_CONTRACT_BOOK_TICKER_WS_URL);
+  binanceContractBookTicker.socket = socket;
+  binanceContractBookTicker.ready = false;
+  binanceContractBookTicker.lastError = '';
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      closeWs(socket);
+      reject(new Error('binance_contract_all_book_ticker_connect_timeout'));
+    }, 10_000);
+    timeout.unref?.();
+
+    wsListen(socket, 'open', () => {
+      if (settled) return;
+      binanceContractBookTicker.openedAt = Date.now();
+      binanceContractBookTicker.reconnectAttempt = 0;
+      binanceContractBookTicker.ready = true;
+      refreshBinanceContractBookTickerBaseline().catch(() => {});
+      settled = true;
+      clearTimeout(timeout);
+      resolve(true);
+    });
+
+    wsListen(socket, 'message', async (event) => {
+      try {
+        const text = await wsMessageText(event);
+        const decoded = JSON.parse(text);
+        const payload = decoded?.data ?? decoded;
+        const items = Array.isArray(payload) ? payload : [payload];
+        binanceContractBookTicker.messages += 1;
+        binanceContractBookTicker.lastMessageAt = Date.now();
+        for (const item of items) {
+          const row = binanceContractBookTickerRow(item);
+          if (!row) continue;
+          binanceContractBookTicker.rows.set(row.symbol, row);
+          binanceContractBookTicker.acceptedUpdates += 1;
+        }
+      } catch (error) {
+        binanceContractBookTicker.lastError = String(error?.message || error).slice(0, 320);
+      }
+    });
+
+    wsListen(socket, 'error', (error) => {
+      binanceContractBookTicker.lastError = String(error?.message || error || 'binance_contract_all_book_ticker_socket_error').slice(0, 320);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error('binance_contract_all_book_ticker_socket_error'));
+      }
+    });
+
+    wsListen(socket, 'close', () => {
+      binanceContractBookTicker.ready = false;
+      if (binanceContractBookTicker.socket === socket) binanceContractBookTicker.socket = null;
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error('binance_contract_all_book_ticker_closed_before_open'));
+      }
+      scheduleBinanceContractBookTickerReconnect();
+    });
+  });
+}
+
+async function ensureBinanceContractBookTicker() {
+  if (wsReady(binanceContractBookTicker.socket) && binanceContractBookTicker.ready) return true;
+  if (binanceContractBookTicker.connecting) return await binanceContractBookTicker.connecting;
+  binanceContractBookTicker.connecting = openBinanceContractBookTicker()
+    .catch((error) => {
+      binanceContractBookTicker.lastError = String(error?.message || error).slice(0, 320);
+      scheduleBinanceContractBookTickerReconnect();
+      return false;
+    })
+    .finally(() => {
+      binanceContractBookTicker.connecting = null;
+    });
+  return await binanceContractBookTicker.connecting;
+}
+
 export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {}) {
   if (running) return false;
   running = true;
@@ -1001,6 +1272,7 @@ export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {})
   const cycleRound = round + 1;
   try {
     ensureCoinbaseTickerBatch().catch(() => {});
+    ensureBinanceContractBookTicker().catch(() => {});
     const targets = [
       ...SPOT_PROVIDERS.map((provider) => ({ provider, market: 'spot' })),
       ...CONTRACT_PROVIDERS.map((provider) => ({ provider, market: 'contract' })),
@@ -1028,6 +1300,7 @@ export function startMarketLightSnapshotScanner() {
   if (started || process.env.KAKA_DISABLE_MARKET_LIGHT_SCANNER === '1') return;
   started = true;
   ensureCoinbaseTickerBatch().catch(() => {});
+  ensureBinanceContractBookTicker().catch(() => {});
   refreshDirectoryCounts().catch(() => {});
   scanTimer = setTimeout(() => {
     runMarketLightSnapshotCycle({ reason: 'startup' }).catch(() => {});
@@ -1040,6 +1313,7 @@ export function startMarketLightSnapshotScanner() {
   directoryInterval = setInterval(() => {
     refreshDirectoryCounts().catch(() => {});
     ensureCoinbaseTickerBatch().catch(() => {});
+    ensureBinanceContractBookTicker().catch(() => {});
   }, DIRECTORY_INTERVAL_MS);
   directoryInterval.unref?.();
 }
@@ -1190,13 +1464,15 @@ export function getMarketLightSnapshotHealth() {
       approximate_batch_attempts_per_cycle: 11,
       approximate_batch_attempts_per_minute_at_default_interval: Math.round((60_000 / SCAN_INTERVAL_MS) * 11 * 10) / 10,
       coinbase_shared_market_ws_connections: 1,
+      binance_contract_all_book_ticker_shared_ws_connections: 1,
+      binance_contract_bbo_ws_api_baseline_requests_per_10m: 1,
       per_user_upstream_requests: 0,
       per_user_upstream_connections: 0,
       note: 'collector budget only; shared caches/governors may reduce physical upstream calls further',
     },
     full_market_light_source_notes: {
       binance_spot: 'official_all_24h_tickers_batch',
-      binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot',
+      binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot + official USDⓈ-M !bookTicker one shared websocket for all-symbol BBO',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
       okx_contract: 'official_SWAP_tickers_batch + canonical OKX SWAP identity merge + dual-host public mark-price batch + USDT index-tickers batch + public open-interest batch; funding remains missing unless officially supplied by a batch source',
@@ -1219,6 +1495,35 @@ export function getMarketLightSnapshotHealth() {
       mark_batch_mode: 'instType=SWAP',
       additional_user_scaled_requests: 0,
       additional_user_scaled_connections: 0,
+    },
+    binance_contract_all_book_ticker: {
+      source: 'binance_usdm_all_book_tickers_shared_websocket',
+      url: BINANCE_CONTRACT_BOOK_TICKER_WS_URL,
+      connected: wsReady(binanceContractBookTicker.socket) && binanceContractBookTicker.ready,
+      cached_rows: binanceContractBookTicker.rows.size,
+      connect_attempts: binanceContractBookTicker.connectAttempts,
+      messages: binanceContractBookTicker.messages,
+      accepted_updates: binanceContractBookTicker.acceptedUpdates,
+      rejected_coin_m_updates: binanceContractBookTicker.rejectedCoinMUpdates,
+      opened_at: binanceContractBookTicker.openedAt ? new Date(binanceContractBookTicker.openedAt).toISOString() : null,
+      last_message_at: binanceContractBookTicker.lastMessageAt ? new Date(binanceContractBookTicker.lastMessageAt).toISOString() : null,
+      last_error: binanceContractBookTicker.lastError,
+      update_speed_seconds: 5,
+      ws_api_baseline_url: BINANCE_CONTRACT_BOOK_TICKER_WS_API_URL,
+      ws_api_baseline_method: 'ticker.book',
+      ws_api_baseline_symbol_omitted_returns_all: true,
+      ws_api_baseline_ttl_minutes: BINANCE_BOOK_BASELINE_TTL_MS / 60_000,
+      ws_api_baseline_attempts: binanceContractBookTicker.baselineAttempts,
+      ws_api_baseline_successes: binanceContractBookTicker.baselineSuccesses,
+      ws_api_baseline_failures: binanceContractBookTicker.baselineFailures,
+      ws_api_baseline_rows: binanceContractBookTicker.baselineRows,
+      ws_api_baseline_at: binanceContractBookTicker.baselineAt ? new Date(binanceContractBookTicker.baselineAt).toISOString() : null,
+      ws_api_baseline_last_error: binanceContractBookTicker.baselineLastError,
+      filters_usdm_symbol_type_st_1: true,
+      primary_quote_filter: 'USDT',
+      shared_backend_connections: 1,
+      per_user_connections: 0,
+      per_user_requests: 0,
     },
     coinbase_ticker_batch: {
       source: 'coinbase_advanced_trade_public_ticker_batch_websocket',

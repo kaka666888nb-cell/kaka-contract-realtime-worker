@@ -1,0 +1,175 @@
+import { getMarketLightSnapshotHealth } from './market-light-snapshot.mjs';
+
+const VERSION = '650.8.15.1';
+const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
+const HEALTH_ROUTE = '/api/source-capabilities/health';
+
+const DECISION_POLICY = Object.freeze({
+  official_first: true,
+  derived_only_when_official_missing: true,
+  official_limitations_must_be_exposed: true,
+  cross_provider_substitution: false,
+  cross_quote_substitution: false,
+  missing_stays_null: true,
+  user_reads_scale_exchange_upstream: false,
+  full_market_equals_breadth: true,
+  focus_15_equals_depth: true,
+});
+
+const CAPABILITIES = Object.freeze([
+  // Binance
+  { provider: 'binance', market: 'spot', capability: 'directory', official_available: true, official_scope: 'full_market', transport: 'REST', batch_mode: 'exchange_info', rate_limit_class: 'light_cached', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/rest-api' },
+  { provider: 'binance', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'full_market', transport: 'REST', batch_mode: 'all_symbols_batch', rate_limit_class: 'light_cached', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/rest-api' },
+  { provider: 'binance', market: 'spot', capability: 'bbo', official_available: true, official_scope: 'full_market', transport: 'REST/WS', batch_mode: 'shared_batch_or_stream', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'leave_null_if_source_missing', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/ws-streams/~' },
+  { provider: 'binance', market: 'contract', capability: 'directory', official_available: true, official_scope: 'full_market', transport: 'WS/shared_identity', batch_mode: 'all_market_identity', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
+  { provider: 'binance', market: 'contract', capability: 'ticker_24h', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_market_ticker', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
+  { provider: 'binance', market: 'contract', capability: 'mark_index_funding', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_market_mark_price', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'funding_history_separate', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
+  { provider: 'binance', market: 'contract', capability: 'bbo', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_book_tickers_stream', rate_limit_class: 'one_shared_connection_5s', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step990', fallback_policy: 'last_verified_shared_snapshot_or_null', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
+  { provider: 'binance', market: 'contract', capability: 'open_interest_current', official_available: true, official_scope: 'per_symbol', transport: 'REST', batch_mode: 'not_full_market_batch', rate_limit_class: 'medium', collector: 'slow-stats-collector', target_layer: 'slow_stats_or_focus', current_integration: 'deferred_step993', fallback_policy: 'derived_or_missing_only_if_semantically_valid', history_policy: '5m_1h_1d', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
+  { provider: 'binance', market: 'contract', capability: 'adl_risk', official_available: true, official_scope: 'symbol_level', transport: 'REST', batch_mode: 'not_full_market_light', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'risk', current_integration: 'deferred_step993', fallback_policy: 'missing', history_policy: 'slow_snapshot', source_url: 'https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/change-log' },
+
+  // OKX
+  { provider: 'okx', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SPOT_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SWAP_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'mark_index_open_interest', official_available: true, official_scope: 'batch', transport: 'REST', batch_mode: 'SWAP_plus_USDT_index_plus_OI', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'oi_history_deferred', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'funding_rate', official_available: true, official_scope: 'per_symbol_or_ws_subscription', transport: 'REST/WS', batch_mode: 'not_full_market_batch', rate_limit_class: 'medium', collector: 'slow-stats-collector', target_layer: 'slow_stats', current_integration: 'deferred_step994', fallback_policy: 'missing', history_policy: '5m_1h_1d', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'price_limit_security_fund_adl', official_available: true, official_scope: 'public_symbol_or_channel', transport: 'REST/WS', batch_mode: 'slow_or_event', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'risk', current_integration: 'deferred_step994', fallback_policy: 'missing', history_policy: 'slow_snapshot_or_event', source_url: 'https://www.okx.com/docs-v5/en/' },
+
+  // Bybit
+  { provider: 'bybit', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'category_batch', transport: 'REST/WS', batch_mode: 'spot_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://bybit-exchange.github.io/docs/v5/websocket/public/ticker' },
+  { provider: 'bybit', market: 'contract', capability: 'linear_ticker_mark_index_oi_funding_bbo', official_available: true, official_scope: 'category_batch', transport: 'REST/WS', batch_mode: 'linear_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'selected_fields_bucketed_elsewhere', source_url: 'https://bybit-exchange.github.io/docs/v5/websocket/public/ticker' },
+  { provider: 'bybit', market: 'contract', capability: 'open_interest_history', official_available: true, official_scope: 'per_symbol', transport: 'REST', batch_mode: 'not_full_market_batch', rate_limit_class: 'medium', collector: 'slow-stats-collector', target_layer: 'history', current_integration: 'deferred_step995', fallback_policy: 'missing', history_policy: '5m_1h_1d', source_url: 'https://bybit-exchange.github.io/docs/v5/market/open-interest' },
+
+  // Bitget
+  { provider: 'bitget', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'product_batch', transport: 'REST/WS', batch_mode: 'SPOT_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'leave_null_if_official_row_omits_quote', history_policy: 'none', source_url: 'https://www.bitget.com/api-doc/uta/changelog' },
+  { provider: 'bitget', market: 'contract', capability: 'ticker_mark_index_oi_funding_bbo', official_available: true, official_scope: 'product_batch', transport: 'REST/WS', batch_mode: 'USDT_FUTURES_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'selected_fields_bucketed_elsewhere', source_url: 'https://www.bitget.com/api-doc/uta/changelog' },
+  { provider: 'bitget', market: 'contract', capability: 'next_funding_time_interval', official_available: true, official_scope: 'per_symbol', transport: 'REST', batch_mode: 'not_full_market_light', rate_limit_class: 'medium', collector: 'slow-stats-collector', target_layer: 'slow_stats', current_integration: 'deferred_step991', fallback_policy: 'missing', history_policy: 'none', source_url: 'https://www.bitget.com/api-doc/contract/market/Get-Symbol-Next-Funding-Time' },
+  { provider: 'bitget', market: 'spot', capability: 'whale_fund_net_capital_flow', official_available: true, official_scope: 'official_trading_data', transport: 'REST', batch_mode: 'slow_stats', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'funds_official', current_integration: 'deferred_step991', fallback_policy: 'keep_derived_separate', history_policy: '5m_1h_1d_where_supported', source_url: 'https://www.bitget.com/api-doc/uta/public/trading-data/Get-Spot-Whale-Net-Flow' },
+  { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short', official_available: true, official_scope: 'official_trading_data', transport: 'REST', batch_mode: 'per_symbol_or_public_stat', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'deferred_step991', fallback_policy: 'keep_derived_separate', history_policy: '5m_1h_1d_where_supported', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
+
+  // Gate
+  { provider: 'gate', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'all_spot_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'ticker_mark_index_funding_bbo', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'USDT_futures_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'selected_fields_bucketed_elsewhere', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'open_interest', official_available: true, official_scope: 'contract_stats_or_semantic_field_requires_verification', transport: 'REST', batch_mode: 'not_relabel_total_size', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'slow_stats', current_integration: 'deferred_step992', fallback_policy: 'missing_not_provider_total_size', history_policy: '5m_1h_1d', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'contract_stats_top_trader_risk', official_available: true, official_scope: 'per_contract_or_public_stats', transport: 'REST', batch_mode: 'slow_stats', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'contract_stats_risk', current_integration: 'deferred_step992', fallback_policy: 'missing', history_policy: '5m_1h_1d_where_useful', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+
+  // Coinbase is project spot-only.
+  { provider: 'coinbase', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'multi_product_public_ws', transport: 'WS', batch_mode: 'ticker_batch_5s', rate_limit_class: 'one_shared_connection', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
+  { provider: 'coinbase', market: 'spot', capability: 'bbo', official_available: true, official_scope: 'ticker_or_level2_not_ticker_batch', transport: 'WS', batch_mode: 'no_light_batch_bbo', rate_limit_class: 'higher_bandwidth', collector: 'deep-market-collector', target_layer: 'focus_or_user_exact', current_integration: 'intentionally_not_market_light', fallback_policy: 'missing_in_full_market_light', history_policy: 'none', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
+  { provider: 'coinbase', market: 'spot', capability: 'market_trades_level2_candles', official_available: true, official_scope: 'per_product_public_ws', transport: 'WS', batch_mode: 'deep_or_user_exact', rate_limit_class: 'deep', collector: 'deep-market-collector', target_layer: 'focus_or_user_exact', current_integration: 'deferred_step995', fallback_policy: 'missing', history_policy: 'on_demand', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
+]);
+
+let totalReads = 0;
+
+function runtimeCoverage() {
+  const health = getMarketLightSnapshotHealth();
+  const out = {};
+  for (const [key, value] of Object.entries(health?.provider_coverage || {})) {
+    out[key] = {
+      rows: Number(value?.row_count || 0),
+      directory: Number(value?.directory_count || 0),
+      exact: Number(value?.row_count || 0) > 0 && Number(value?.row_count || 0) === Number(value?.directory_count || 0) && value?.stale !== true && !String(value?.last_error || ''),
+      stale: Boolean(value?.stale),
+      last_error: String(value?.last_error || ''),
+      field_coverage: { ...(value?.field_coverage || {}) },
+    };
+  }
+  return { health, coverage: out };
+}
+
+function registrySnapshot({ includeCapabilities = true } = {}) {
+  const { health, coverage } = runtimeCoverage();
+  const marketKeys = Object.keys(coverage);
+  const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
+  const binanceContract = coverage['contract:binance'] || {};
+  const coinbaseSpot = coverage['spot:coinbase'] || {};
+  const binanceBboReady = Number(binanceContract?.field_coverage?.best_bid || 0) === Number(binanceContract?.rows || 0) &&
+    Number(binanceContract?.field_coverage?.best_ask || 0) === Number(binanceContract?.rows || 0) && Number(binanceContract?.rows || 0) > 0;
+  const tradingStatusReady = marketKeys.length === 11 && marketKeys.every((key) => {
+    const item = coverage[key] || {};
+    return Number(item?.field_coverage?.trading_status || 0) === Number(item?.rows || 0) && Number(item?.rows || 0) > 0;
+  });
+  const payload = {
+    ok: true,
+    version: VERSION,
+    schema_version: '1.0',
+    source: 'kaka_runtime_official_public_source_capability_registry',
+    source_checked_at: '2026-08-12',
+    provider_keys: ['binance', 'okx', 'bybit', 'bitget', 'gate', 'coinbase'],
+    contract_provider_keys: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
+    coinbase_project_scope: 'spot_only',
+    decision_policy: DECISION_POLICY,
+    collector_targets: ['market-light-collector', 'liquidation-collector', 'deep-market-collector', 'slow-stats-collector'],
+    runtime_market_light_version: health?.version || null,
+    runtime_market_light_11_exact: allMarketExact,
+    runtime_market_light_coverage: coverage,
+    step990_light_gap_status: {
+      binance_contract_all_market_bbo_ready: binanceBboReady,
+      coinbase_ticker_batch_bbo_available: false,
+      coinbase_bbo_policy: 'ticker_batch_officially_omits_best_bid_ask; keep full-market-light null; use focus/user-exact higher-bandwidth source only',
+      okx_funding_policy: 'official_available_but_not_full-market-light-batch; Step994 slow-stats',
+      bitget_next_funding_policy: 'official_per-symbol; Step991 slow-stats',
+      gate_open_interest_policy: 'do_not_relabel ticker total_size as OI; Step992 verified contract-stats semantics',
+      missing_policy: 'never fabricate zero; never cross-provider or cross-quote substitute',
+    },
+    trading_status_full_market_ready: tradingStatusReady,
+    capabilities: includeCapabilities ? CAPABILITIES : [],
+    capability_count: CAPABILITIES.length,
+    exchange_requests_started_by_user_read: 0,
+    exchange_connections_started_by_user_read: 0,
+    user_reads_trigger_collector: false,
+    reads_scale_with_users: false,
+    timestamp_ms: Date.now(),
+  };
+  return payload;
+}
+
+export function getSourceCapabilityRegistryHealth() {
+  const payload = registrySnapshot({ includeCapabilities: false });
+  return {
+    ...payload,
+    health_endpoint: HEALTH_ROUTE,
+    snapshot_endpoint: SNAPSHOT_ROUTE,
+    total_reads: totalReads,
+    ready: payload.runtime_market_light_11_exact &&
+      payload.step990_light_gap_status.binance_contract_all_market_bbo_ready &&
+      payload.trading_status_full_market_ready,
+  };
+}
+
+function sendJson(res, status, payload) {
+  if (res.headersSent) return;
+  const body = Buffer.from(JSON.stringify(payload));
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, OPTIONS',
+    'content-length': String(body.length),
+  });
+  res.end(body);
+}
+
+export async function handleSourceCapabilityRegistry(req, res, url) {
+  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE].includes(url.pathname)) return false;
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET, OPTIONS',
+      'cache-control': 'no-store',
+    });
+    res.end();
+    return true;
+  }
+  if (req.method !== 'GET') {
+    sendJson(res, 405, { ok: false, version: VERSION, error: 'method_not_allowed' });
+    return true;
+  }
+  totalReads += 1;
+  if (url.pathname === HEALTH_ROUTE) {
+    sendJson(res, 200, getSourceCapabilityRegistryHealth());
+    return true;
+  }
+  sendJson(res, 200, registrySnapshot({ includeCapabilities: true }));
+  return true;
+}
