@@ -2,9 +2,10 @@ import { getMarketLightSnapshotHealth } from './market-light-snapshot.mjs';
 import { getBinanceAdvancedStatsHealth } from './binance-advanced-stats.mjs';
 import { getBitgetAdvancedStatsHealth } from './bitget-advanced-stats.mjs';
 import { getGateAdvancedStatsHealth } from './gate-advanced-stats.mjs';
+import { getOkxAdvancedStatsHealth } from './okx-advanced-stats.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 
-const VERSION = '650.8.15.6';
+const VERSION = '650.8.15.7';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -36,8 +37,8 @@ const CAPABILITIES = Object.freeze([
   { provider: 'okx', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SPOT_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
   { provider: 'okx', market: 'contract', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SWAP_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
   { provider: 'okx', market: 'contract', capability: 'mark_index_open_interest', official_available: true, official_scope: 'batch', transport: 'REST', batch_mode: 'SWAP_plus_USDT_index_plus_OI', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'oi_history_deferred', source_url: 'https://www.okx.com/docs-v5/en/' },
-  { provider: 'okx', market: 'contract', capability: 'funding_rate', official_available: true, official_scope: 'per_symbol_or_ws_subscription', transport: 'REST/WS', batch_mode: 'not_full_market_batch', rate_limit_class: 'medium', collector: 'slow-stats-collector', target_layer: 'slow_stats', current_integration: 'deferred_step994', fallback_policy: 'missing', history_policy: '5m_1h_1d', source_url: 'https://www.okx.com/docs-v5/en/' },
-  { provider: 'okx', market: 'contract', capability: 'price_limit_security_fund_adl', official_available: true, official_scope: 'public_symbol_or_channel', transport: 'REST/WS', batch_mode: 'slow_or_event', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'risk', current_integration: 'deferred_step994', fallback_policy: 'missing', history_policy: 'slow_snapshot_or_event', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'funding_rate', official_available: true, official_scope: 'per_symbol_focus15', transport: 'public_REST', batch_mode: 'shared_focus15_5m', rate_limit_class: 'medium_shared', collector: 'okx-advanced-slow-stats', target_layer: 'slow_stats', current_integration: 'ready_step994', fallback_policy: 'last_verified_until_stale_then_missing; empty nextFundingRate stays null', history_policy: 'current_shared_5m; existing_history_endpoint_separate', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'price_limit_security_fund_adl', official_available: true, official_scope: 'focus15_price_limit_plus_shared_security_fund_plus_public_adl_warning_channel', transport: 'public_REST_plus_public_WS', batch_mode: 'price_limit_focus15_5m; security_fund_all_swap_6h; one_shared_adl_ws', rate_limit_class: 'slow_shared', collector: 'okx-advanced-slow-stats', target_layer: 'risk', current_integration: 'ready_step994', fallback_policy: 'last_verified_until_stale_then_missing; ADL normal silence remains null and is never fabricated', history_policy: 'slow_snapshot_or_event; active_ADL_event_memory_only', source_url: 'https://www.okx.com/docs-v5/en/' },
 
   // Bybit
   { provider: 'bybit', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'category_batch', transport: 'REST/WS', batch_mode: 'spot_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://bybit-exchange.github.io/docs/v5/websocket/public/ticker' },
@@ -90,6 +91,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const binanceAdvanced = getBinanceAdvancedStatsHealth();
   const bitgetAdvanced = getBitgetAdvancedStatsHealth();
   const gateAdvanced = getGateAdvancedStatsHealth();
+  const okxAdvanced = getOkxAdvancedStatsHealth();
   const liquidationHistory = getContractLiquidationPersistenceHealth();
   const marketKeys = Object.keys(coverage);
   const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
@@ -111,7 +113,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
     contract_provider_keys: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
     coinbase_project_scope: 'spot_only',
     decision_policy: DECISION_POLICY,
-    collector_targets: ['market-light-collector', 'liquidation-collector', 'deep-market-collector', 'slow-stats-collector', 'binance-advanced-slow-stats'],
+    collector_targets: ['market-light-collector', 'liquidation-collector', 'deep-market-collector', 'slow-stats-collector', 'binance-advanced-slow-stats', 'okx-advanced-slow-stats'],
     runtime_market_light_version: health?.version || null,
     runtime_market_light_11_exact: allMarketExact,
     runtime_market_light_coverage: coverage,
@@ -125,6 +127,33 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       missing_policy: 'never fabricate zero; never cross-provider or cross-quote substitute',
     },
     trading_status_full_market_ready: tradingStatusReady,
+    okx_step994: {
+      ready: okxAdvanced.ready === true,
+      version: okxAdvanced.version || null,
+      focus_target: Number(okxAdvanced.focus_target || 0),
+      row_count: Number(okxAdvanced.row_count || 0),
+      core_target_count: Number(okxAdvanced.core_target_count || 0),
+      open_interest_rows: Number(okxAdvanced.open_interest_rows || 0),
+      core_open_interest_rows: Number(okxAdvanced.core_open_interest_rows || 0),
+      funding_rows: Number(okxAdvanced.funding_rows || 0),
+      core_funding_rows: Number(okxAdvanced.core_funding_rows || 0),
+      price_limit_coverage_rows: Number(okxAdvanced.price_limit_coverage_rows || 0),
+      price_limit_enabled_rows: Number(okxAdvanced.price_limit_enabled_rows || 0),
+      core_price_limit_coverage_rows: Number(okxAdvanced.core_price_limit_coverage_rows || 0),
+      security_fund_record_count: Number(okxAdvanced.security_fund_record_count || 0),
+      security_fund_focus_rows: Number(okxAdvanced.security_fund_focus_rows || 0),
+      adl_warning_channel_ready: okxAdvanced.adl_warning_channel_ready === true,
+      adl_warning_active_rows: Number(okxAdvanced.adl_warning_active_rows || 0),
+      adl_warning_subscribed_families: Number(okxAdvanced.adl_warning_subscribed_families || 0),
+      adl_warning_desired_families: Number(okxAdvanced.adl_warning_desired_families || 0),
+      market_light_oi_reused_only: okxAdvanced.market_light_oi_reused_only === true,
+      market_light_oi_additional_exchange_requests: Number(okxAdvanced.market_light_oi_additional_exchange_requests || 0),
+      adl_warning_normal_state_not_fabricated: okxAdvanced.adl_warning_normal_state_not_fabricated === true,
+      adl_warning_one_shared_connection: okxAdvanced.adl_warning_one_shared_connection === true,
+      provider_request_governor_reused: okxAdvanced.provider_request_governor_reused === true,
+      custom_provider_governor_created: okxAdvanced.custom_provider_governor_created === true,
+      user_reads_scale_with_users: false,
+    },
     binance_step993: {
       ready: binanceAdvanced.ready === true,
       version: binanceAdvanced.version || null,
@@ -227,6 +256,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.step990_light_gap_status.binance_contract_all_market_bbo_ready &&
       payload.trading_status_full_market_ready &&
       payload.binance_step993.ready &&
+      payload.okx_step994.ready &&
       payload.bitget_step991.ready &&
       payload.gate_step992.ready &&
       payload.step997_liquidation_history.ready,

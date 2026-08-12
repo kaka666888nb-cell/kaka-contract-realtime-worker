@@ -20,12 +20,13 @@ import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } fro
 import { getBinanceAdvancedStatsHealth, handleBinanceAdvancedStats, startBinanceAdvancedStatsScanner } from './binance-advanced-stats.mjs';
 import { getBitgetAdvancedStatsHealth, handleBitgetAdvancedStats, startBitgetAdvancedStatsScanner } from './bitget-advanced-stats.mjs';
 import { getGateAdvancedStatsHealth, handleGateAdvancedStats, startGateAdvancedStatsScanner } from './gate-advanced-stats.mjs';
+import { getOkxAdvancedStatsHealth, handleOkxAdvancedStats, startOkxAdvancedStatsScanner } from './okx-advanced-stats.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.103';
+const STEP_VERSION = '650.8.15.104';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -37,6 +38,7 @@ startContractDeepSharedScanner();
 startBinanceAdvancedStatsScanner();
 startBitgetAdvancedStatsScanner();
 startGateAdvancedStatsScanner();
+startOkxAdvancedStatsScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -322,6 +324,9 @@ const server = http.createServer(async (req, res) => {
       gate_advanced_current_snapshot: '/api/gate-advanced/current-snapshot',
       gate_advanced_health: '/api/gate-advanced/health',
       gate_advanced_state: getGateAdvancedStatsHealth(),
+      okx_advanced_current_snapshot: '/api/okx-advanced/current-snapshot',
+      okx_advanced_health: '/api/okx-advanced/health',
+      okx_advanced_state: getOkxAdvancedStatsHealth(),
       contract_basis_current_snapshot: '/api/contract-basis/current-snapshot',
       contract_basis_health: '/api/contract-basis/health',
       contract_basis_state: getContractBasisHealth(),
@@ -680,6 +685,14 @@ const server = http.createServer(async (req, res) => {
         gate_advanced_official_stats_health_endpoint: '/api/gate-advanced/health',
         gate_advanced_official_stats_ready: getGateAdvancedStatsHealth().ready,
         gate_advanced_user_reads_scale_exchange_upstream: false,
+        okx_advanced_official_stats_endpoint: '/api/okx-advanced/current-snapshot',
+        okx_advanced_official_stats_health_endpoint: '/api/okx-advanced/health',
+        okx_advanced_official_stats_ready: getOkxAdvancedStatsHealth().ready,
+        okx_advanced_market_light_oi_reused_only: true,
+        okx_advanced_market_light_oi_additional_exchange_requests: 0,
+        okx_advanced_adl_warning_one_shared_connection: true,
+        okx_advanced_adl_warning_normal_state_not_fabricated: true,
+        okx_advanced_user_reads_scale_exchange_upstream: false,
         gate_liquidation_history_deferred_to_step997: false,
         gate_liquidation_history_step997_ready: true,
         binance_contract_full_market_bbo_shared_ws: true,
@@ -851,6 +864,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleBinanceAdvancedStats(req, res, url)) return true;
       if (await handleBitgetAdvancedStats(req, res, url)) return true;
       if (await handleGateAdvancedStats(req, res, url)) return true;
+      if (await handleOkxAdvancedStats(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
       if (await handleContractFocusPool(req, res, url)) return true;
       if (await handleContractDeepShared(req, res, url)) return true;
