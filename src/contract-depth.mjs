@@ -1,5 +1,5 @@
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.91';
+const STEP_VERSION = '650.8.15.92';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -1952,6 +1952,16 @@ export function getContractDepthHealth() {
         (wsReady(state.tradesConnection?.socket) ? 1 : 0);
     }, 0),
     coinbase_level2_mode: 'advanced_trade_public_websocket_alias_aware',
+    coinbase_level2_public_no_auth: true,
+    coinbase_level2_channel: 'level2',
+    coinbase_level2_heartbeats_subscribed: true,
+    coinbase_level2_exact_on_demand_bounded: true,
+    coinbase_level2_full_market_always_on: false,
+    coinbase_market_trades_public_rest: true,
+    coinbase_market_trades_endpoint: '/products/{product_id}/trades',
+    coinbase_market_trades_side_field_is_maker: true,
+    coinbase_market_trades_output_side_is_taker: true,
+    coinbase_market_trades_same_cache_inflight_circuit: true,
     coinbase_level2_symbols: COINBASE_L2_STATES.size,
     coinbase_level2_connections: [...COINBASE_L2_STATES.values()].filter((state) => wsReady(state.socket)).length,
     coinbase_level2_max_symbols: COINBASE_L2_MAX_SYMBOLS,

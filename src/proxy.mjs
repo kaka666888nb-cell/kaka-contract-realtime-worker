@@ -21,12 +21,13 @@ import { getBinanceAdvancedStatsHealth, handleBinanceAdvancedStats, startBinance
 import { getBitgetAdvancedStatsHealth, handleBitgetAdvancedStats, startBitgetAdvancedStatsScanner } from './bitget-advanced-stats.mjs';
 import { getGateAdvancedStatsHealth, handleGateAdvancedStats, startGateAdvancedStatsScanner } from './gate-advanced-stats.mjs';
 import { getOkxAdvancedStatsHealth, handleOkxAdvancedStats, startOkxAdvancedStatsScanner } from './okx-advanced-stats.mjs';
+import { getBybitAdvancedStatsHealth, handleBybitAdvancedStats, startBybitAdvancedStatsScanner } from './bybit-advanced-stats.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.105';
+const STEP_VERSION = '650.8.15.106';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -39,6 +40,7 @@ startBinanceAdvancedStatsScanner();
 startBitgetAdvancedStatsScanner();
 startGateAdvancedStatsScanner();
 startOkxAdvancedStatsScanner();
+startBybitAdvancedStatsScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -327,6 +329,9 @@ const server = http.createServer(async (req, res) => {
       okx_advanced_current_snapshot: '/api/okx-advanced/current-snapshot',
       okx_advanced_health: '/api/okx-advanced/health',
       okx_advanced_state: getOkxAdvancedStatsHealth(),
+      bybit_advanced_current_snapshot: '/api/bybit-advanced/current-snapshot',
+      bybit_advanced_health: '/api/bybit-advanced/health',
+      bybit_advanced_state: getBybitAdvancedStatsHealth(),
       contract_basis_current_snapshot: '/api/contract-basis/current-snapshot',
       contract_basis_health: '/api/contract-basis/health',
       contract_basis_state: getContractBasisHealth(),
@@ -693,6 +698,14 @@ const server = http.createServer(async (req, res) => {
         okx_advanced_adl_warning_one_shared_connection: true,
         okx_advanced_adl_warning_normal_state_not_fabricated: true,
         okx_advanced_user_reads_scale_exchange_upstream: false,
+        bybit_advanced_official_stats_endpoint: '/api/bybit-advanced/current-snapshot',
+        bybit_advanced_official_stats_health_endpoint: '/api/bybit-advanced/health',
+        bybit_advanced_official_stats_ready: getBybitAdvancedStatsHealth().ready,
+        bybit_advanced_current_oi_reuses_market_light: true,
+        bybit_advanced_user_reads_scale_exchange_upstream: false,
+        coinbase_step995_ticker_batch_existing_shared: true,
+        coinbase_step995_level2_existing_bounded_exact: true,
+        coinbase_step995_market_trades_existing_public_exact: true,
         gate_liquidation_history_deferred_to_step997: false,
         gate_liquidation_history_step997_ready: true,
         binance_contract_full_market_bbo_shared_ws: true,
@@ -865,6 +878,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleBitgetAdvancedStats(req, res, url)) return true;
       if (await handleGateAdvancedStats(req, res, url)) return true;
       if (await handleOkxAdvancedStats(req, res, url)) return true;
+      if (await handleBybitAdvancedStats(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
       if (await handleContractFocusPool(req, res, url)) return true;
       if (await handleContractDeepShared(req, res, url)) return true;
