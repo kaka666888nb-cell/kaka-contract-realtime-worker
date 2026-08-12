@@ -1,7 +1,8 @@
 import { getMarketLightSnapshotHealth } from './market-light-snapshot.mjs';
 import { getBitgetAdvancedStatsHealth } from './bitget-advanced-stats.mjs';
+import { getGateAdvancedStatsHealth } from './gate-advanced-stats.mjs';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.3';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -52,8 +53,11 @@ const CAPABILITIES = Object.freeze([
   // Gate
   { provider: 'gate', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'all_spot_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'ticker_mark_index_funding_bbo', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'USDT_futures_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'selected_fields_bucketed_elsewhere', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
-  { provider: 'gate', market: 'contract', capability: 'open_interest', official_available: true, official_scope: 'contract_stats_or_semantic_field_requires_verification', transport: 'REST', batch_mode: 'not_relabel_total_size', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'slow_stats', current_integration: 'deferred_step992', fallback_policy: 'missing_not_provider_total_size', history_policy: '5m_1h_1d', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
-  { provider: 'gate', market: 'contract', capability: 'contract_stats_top_trader_risk', official_available: true, official_scope: 'per_contract_or_public_stats', transport: 'REST', batch_mode: 'slow_stats', rate_limit_class: 'slow', collector: 'slow-stats-collector', target_layer: 'contract_stats_risk', current_integration: 'deferred_step992', fallback_policy: 'missing', history_policy: '5m_1h_1d_where_useful', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'open_interest', official_available: true, official_scope: 'per_contract_contract_stats', transport: 'REST', batch_mode: 'focus15_5m_contract_stats', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step992_focus15_contract_stats', fallback_policy: 'missing_not_provider_total_size', history_policy: '5m_1h_1d_future_rollup', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'contract_stats_top_trader_taker_account', official_available: true, official_scope: 'per_contract_contract_stats', transport: 'REST', batch_mode: 'focus15_5m_contract_stats', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step992', fallback_policy: 'missing_keep_derived_separate', history_policy: '5m_1h_1d_future_rollup', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'risk_limit_tiers', official_available: true, official_scope: 'public_per_contract_or_top100_market', transport: 'REST', batch_mode: 'focus15_per_contract', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step992', fallback_policy: 'missing', history_policy: 'reference_snapshot', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'insurance_fund', official_available: true, official_scope: 'public_settlement_history', transport: 'REST', batch_mode: 'one_shared_low_frequency_request', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step992', fallback_policy: 'last_verified_shared_snapshot_or_missing', history_policy: 'official_history', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'liquidation_history_query', official_available: true, official_scope: 'public_market_liq_orders', transport: 'REST', batch_mode: 'event_history', rate_limit_class: 'event_history', collector: 'liquidation-collector', target_layer: 'liquidation_history', current_integration: 'deferred_step997', fallback_policy: 'do_not_mix_into_step992_contract_stats', history_policy: 'unified_events_and_buckets_step997', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
 
   // Coinbase is project spot-only.
   { provider: 'coinbase', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'multi_product_public_ws', transport: 'WS', batch_mode: 'ticker_batch_5s', rate_limit_class: 'one_shared_connection', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
@@ -82,6 +86,7 @@ function runtimeCoverage() {
 function registrySnapshot({ includeCapabilities = true } = {}) {
   const { health, coverage } = runtimeCoverage();
   const bitgetAdvanced = getBitgetAdvancedStatsHealth();
+  const gateAdvanced = getGateAdvancedStatsHealth();
   const marketKeys = Object.keys(coverage);
   const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
   const binanceContract = coverage['contract:binance'] || {};
@@ -112,7 +117,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       coinbase_bbo_policy: 'ticker_batch_officially_omits_best_bid_ask; keep full-market-light null; use focus/user-exact higher-bandwidth source only',
       okx_funding_policy: 'official_available_but_not_full-market-light-batch; Step994 slow-stats',
       bitget_next_funding_policy: 'official current-fund-rate supports optional symbol/category batch; ready Step991 market-light',
-      gate_open_interest_policy: 'do_not_relabel ticker total_size as OI; Step992 verified contract-stats semantics',
+      gate_open_interest_policy: 'Gate ContractStat open_interest/open_interest_usd ready on focus15; never relabel ticker total_size as OI',
       missing_policy: 'never fabricate zero; never cross-provider or cross-quote substitute',
     },
     trading_status_full_market_ready: tradingStatusReady,
@@ -125,6 +130,21 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       funding_row_count: Number(bitgetAdvanced.funding_row_count || 0),
       risk_reserve_pool_count: Number(bitgetAdvanced.risk_reserve_pool_count || 0),
       oi_limit_row_count: Number(bitgetAdvanced.oi_limit_row_count || 0),
+      user_reads_scale_with_users: false,
+    },
+    gate_step992: {
+      ready: gateAdvanced.ready === true,
+      version: gateAdvanced.version || null,
+      contract_core_stats_rows: Number(gateAdvanced.contract_core_stats_rows || 0),
+      contract_stats_rows: Number(gateAdvanced.contract_stats_rows || 0),
+      risk_limit_rows: Number(gateAdvanced.risk_limit_rows || 0),
+      open_interest_rows: Number(gateAdvanced.open_interest_rows || 0),
+      top_trader_rows: Number(gateAdvanced.top_trader_rows || 0),
+      taker_stats_rows: Number(gateAdvanced.taker_stats_rows || 0),
+      account_stats_rows: Number(gateAdvanced.account_stats_rows || 0),
+      liquidation_reference_rows: Number(gateAdvanced.liquidation_reference_rows || 0),
+      insurance_record_count: Number(gateAdvanced.insurance_record_count || 0),
+      liquidation_history_deferred_to_step997: gateAdvanced.liquidation_history_deferred_to_step997 === true,
       user_reads_scale_with_users: false,
     },
     capabilities: includeCapabilities ? CAPABILITIES : [],
@@ -148,7 +168,8 @@ export function getSourceCapabilityRegistryHealth() {
     ready: payload.runtime_market_light_11_exact &&
       payload.step990_light_gap_status.binance_contract_all_market_bbo_ready &&
       payload.trading_status_full_market_ready &&
-      payload.bitget_step991.ready,
+      payload.bitget_step991.ready &&
+      payload.gate_step992.ready,
   };
 }
 
