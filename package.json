@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.94",
+  "version": "650.8.15.95",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.94 / Step992 Gate official ContractStat Top Trader risk tiers insurance shared statistics"
+  "description": "Kaka contract realtime worker 650.8.15.95 / Step992.1 Gate focus startup-lock release and official InsuranceRecord t-b parser correction"
 }
