@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.50';
+const STEP_VERSION = '650.8.15.51';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -73,10 +73,14 @@ const GATE_LIQ_ORDERS_POLL_MS = 60_000;
 const GATE_LIQ_ORDERS_LIMIT = 100;
 const GATE_OFFICIAL_FINALIZED_MINUTE_RETENTION_MS = 3 * HOUR_BUCKET_MS;
 const BITGET_LIQ_HISTORY_POLL_MS = 60_000;
-const BITGET_LIQ_HISTORY_DELAY_MS = Math.max(10 * MINUTE_BUCKET_MS, Number(process.env.KAKA_BITGET_LIQ_HISTORY_DELAY_MS || 10 * MINUTE_BUCKET_MS));
+const BITGET_LIQ_HISTORY_DELAY_MS = Math.max(30 * MINUTE_BUCKET_MS, Number(process.env.KAKA_BITGET_LIQ_HISTORY_DELAY_MS || 30 * MINUTE_BUCKET_MS));
 const BITGET_LIQ_HISTORY_LIMIT = 100;
 const BITGET_LIQ_HISTORY_MAX_PAGES_PER_CATEGORY = Math.max(2, Math.min(20, Number(process.env.KAKA_BITGET_LIQ_HISTORY_MAX_PAGES_PER_CATEGORY || 20)));
-const BITGET_LIQ_HISTORY_REQUEST_GAP_MS = Math.max(220, Number(process.env.KAKA_BITGET_LIQ_HISTORY_REQUEST_GAP_MS || 350));
+const BITGET_LIQ_HISTORY_REQUEST_GAP_MS = Math.max(350, Number(process.env.KAKA_BITGET_LIQ_HISTORY_REQUEST_GAP_MS || 350));
+const BITGET_LIQ_HISTORY_RETRY_BASE_MS = Math.max(10 * MINUTE_BUCKET_MS, Number(process.env.KAKA_BITGET_LIQ_HISTORY_RETRY_BASE_MS || 15 * MINUTE_BUCKET_MS));
+const BITGET_LIQ_HISTORY_RETRY_MAX_MS = Math.max(BITGET_LIQ_HISTORY_RETRY_BASE_MS, Number(process.env.KAKA_BITGET_LIQ_HISTORY_RETRY_MAX_MS || 2 * HOUR_BUCKET_MS));
+const BITGET_LIQ_HISTORY_DEFERRED_RETENTION_MS = 3 * 24 * HOUR_BUCKET_MS;
+const BITGET_LIQ_HISTORY_MAX_DEFERRED_WINDOWS = 240;
 const BITGET_LIQ_HISTORY_CATEGORIES = Object.freeze(['USDT-FUTURES','USDC-FUTURES','COIN-FUTURES']);
 const BITGET_OFFICIAL_FINALIZED_MINUTE_RETENTION_MS = 6 * HOUR_BUCKET_MS;
 const LIQUIDATION_HISTORY_ROUTE = '/api/contract-liquidation/history';
@@ -134,6 +138,8 @@ let gateLiqOrdersLastWindowStart = 0;
 let bitgetLiqHistoryInflight = null;
 let bitgetLiqHistoryLastWindowStart = 0;
 let bitgetLiqHistoryPendingWindowStart = 0;
+let bitgetLiqHistoryPollRound = 0;
+const bitgetLiqHistoryDeferredWindows = new Map();
 const bitgetLiqHistoryHealth = {
   enabled: LIQUIDATION_PERSISTENCE_ENABLED,
   endpoint: '/api/v3/market/liquidations',
@@ -149,6 +155,7 @@ const bitgetLiqHistoryHealth = {
   page_limit: BITGET_LIQ_HISTORY_LIMIT,
   max_pages_per_category: BITGET_LIQ_HISTORY_MAX_PAGES_PER_CATEGORY,
   max_requests_per_reconciliation: BITGET_LIQ_HISTORY_CATEGORIES.length * BITGET_LIQ_HISTORY_MAX_PAGES_PER_CATEGORY,
+  shared_background_collector: true,
   user_reads_trigger_requests: false,
   reads_scale_with_users: false,
   ws_live_then_rest_reconcile: true,
@@ -156,19 +163,31 @@ const bitgetLiqHistoryHealth = {
   zero_event_rows_persisted: false,
   coverage_state_process_memory_only: true,
   coverage_state_persisted: false,
-  delayed_zero_conflict_keeps_existing_ws: true,
+  official_empty_does_not_overwrite_existing_ws: true,
   official_rows_must_not_reduce_existing_ws_event_count: true,
-  failed_window_retry_same_start: true,
-  pending_window_cleared_only_after_success: true,
-  amount_semantics: 'REST docs omit unit; normalize amount as quote-coin notional only because the official public liquidation WS uses the identical symbol/side/price/amount/ts schema and explicitly defines amount as quote coin',
-  amount_unit_source: 'REST_history_unit_not_stated; matching_official_public_liquidation_WS_same_symbol_side_price_amount_ts_schema_explicitly_states_amount_unit_quote_coin',
+  failed_window_blocks_new_windows: false,
+  deferred_retry_enabled: true,
+  deferred_retry_base_seconds: Math.round(BITGET_LIQ_HISTORY_RETRY_BASE_MS/1000),
+  deferred_retry_max_seconds: Math.round(BITGET_LIQ_HISTORY_RETRY_MAX_MS/1000),
+  max_deferred_windows: BITGET_LIQ_HISTORY_MAX_DEFERRED_WINDOWS,
+  pending_window_cleared_after_every_attempt: true,
+  amount_semantics: 'REST docs omit amount unit; normalize amount as quote-coin notional only by matching the official public liquidation WS identical symbol/side/price/amount/ts schema whose amount unit is explicitly quote coin',
+  amount_unit_source: 'REST_history_unit_not_stated; matching_official_public_liquidation_WS_identical_schema_explicitly_states_amount_unit_quote_coin',
   provider_request_governor_reused: true,
+  provider_governor_transport: 'global_fetch_provider_request_governor_652.1C.2_plus_endpoint_350ms_serial_gap',
   side_semantics: 'buy=long_position_liquidation;sell=short_position_liquidation',
+  collector_ready: false,
+  official_endpoint_operational: false,
+  official_response_cycles: 0,
+  official_category_responses: 0,
+  official_empty_category_responses: 0,
   attempts: 0, successes: 0, failures: 0, complete_windows: 0,
-  incomplete_windows: 0, page_cap_windows: 0, parsed_events: 0, skipped_rows: 0,
-  zero_windows: 0, ws_conflict_retry_windows: 0,
+  deferred_windows_total: 0, delayed_conflict_deferred_windows: 0, incomplete_deferred_windows: 0,
+  page_cap_windows: 0, parsed_events: 0, skipped_rows: 0,
+  official_empty_windows_seen: 0, ws_conflict_retry_windows: 0,
   last_rows: 0, last_requests: 0, last_window_start: null, last_window_end: null, pending_window_start: null,
-  last_completed_at: null, last_error: '',
+  deferred_windows: 0, next_deferred_retry_at: null, last_deferred_reason: '',
+  last_official_response_at: null, last_completed_at: null, last_error: '',
 };
 const gateLiqOrdersHealth = {
   enabled: LIQUIDATION_PERSISTENCE_ENABLED,
@@ -1469,6 +1488,7 @@ async function scanBitgetLiquidationCategory(category, startMs, endMs) {
   let crossedStart=false;
   let exhausted=false;
   let pageCap=false;
+  let firstPageEmpty=false;
   const targetRows=[];
   const seen=new Set();
   for(let page=0; page<BITGET_LIQ_HISTORY_MAX_PAGES_PER_CATEGORY; page+=1){
@@ -1476,6 +1496,7 @@ async function scanBitgetLiquidationCategory(category, startMs, endMs) {
     const result=await bitgetLiquidationHistoryPage(category,cursor);
     requests+=1;
     const list=result.list;
+    if(requests===1 && list.length===0) firstPageEmpty=true;
     if(list.length===0){ exhausted=true; crossedStart=true; break; }
     let minTs=Number.POSITIVE_INFINITY;
     for(const raw of list){
@@ -1491,7 +1512,15 @@ async function scanBitgetLiquidationCategory(category, startMs, endMs) {
     cursor=result.cursor;
     if(page===BITGET_LIQ_HISTORY_MAX_PAGES_PER_CATEGORY-1) pageCap=true;
   }
-  return { category, rows: targetRows, requests, complete: crossedStart || exhausted, page_cap: pageCap && !(crossedStart||exhausted) };
+  return {
+    category,
+    rows: targetRows,
+    requests,
+    official_response: true,
+    first_page_empty: firstPageEmpty,
+    complete: crossedStart || exhausted,
+    page_cap: pageCap && !(crossedStart||exhausted),
+  };
 }
 
 function materializeBitgetOfficialMinuteRows(categoryResults, startMs, endMs) {
@@ -1521,10 +1550,65 @@ function materializeBitgetOfficialMinuteRows(categoryResults, startMs, endMs) {
   return { rows, parsed, skipped };
 }
 
-function nextBitgetOfficialWindowStart(lastWindowStart, pendingWindowStart, latestEligibleStart) {
-  if (Number(pendingWindowStart || 0) > 0) return Number(pendingWindowStart);
-  if (Number(lastWindowStart || 0) > 0) return Number(lastWindowStart) + MINUTE_BUCKET_MS;
-  return Number(latestEligibleStart || 0);
+function bitgetLiquidationRetryDelayMs(attempts) {
+  const safeAttempts = Math.max(1, Number(attempts || 1));
+  const factor = 2 ** Math.min(3, safeAttempts - 1);
+  return Math.min(BITGET_LIQ_HISTORY_RETRY_MAX_MS, BITGET_LIQ_HISTORY_RETRY_BASE_MS * factor);
+}
+
+function pruneBitgetLiquidationDeferredWindows(now = Date.now()) {
+  for (const [startMs, state] of [...bitgetLiqHistoryDeferredWindows.entries()]) {
+    if (now - startMs > BITGET_LIQ_HISTORY_DEFERRED_RETENTION_MS) bitgetLiqHistoryDeferredWindows.delete(startMs);
+  }
+  while (bitgetLiqHistoryDeferredWindows.size > BITGET_LIQ_HISTORY_MAX_DEFERRED_WINDOWS) {
+    const oldest = [...bitgetLiqHistoryDeferredWindows.keys()].sort((a,b)=>a-b)[0];
+    if (oldest == null) break;
+    bitgetLiqHistoryDeferredWindows.delete(oldest);
+  }
+}
+
+function bitgetDueDeferredWindow(now = Date.now()) {
+  pruneBitgetLiquidationDeferredWindows(now);
+  return [...bitgetLiqHistoryDeferredWindows.entries()]
+    .filter(([,state]) => Number(state?.next_retry_at || 0) <= now)
+    .sort((a,b) => Number(a[1]?.next_retry_at || 0) - Number(b[1]?.next_retry_at || 0) || a[0]-b[0])[0] || null;
+}
+
+function deferBitgetLiquidationWindow(startMs, reason, now = Date.now()) {
+  const previous = bitgetLiqHistoryDeferredWindows.get(startMs) || {};
+  const attempts = Math.max(0, Number(previous.attempts || 0)) + 1;
+  const delayMs = bitgetLiquidationRetryDelayMs(attempts);
+  bitgetLiqHistoryDeferredWindows.set(startMs, {
+    attempts,
+    reason: String(reason || 'official_history_delayed'),
+    first_deferred_at: Number(previous.first_deferred_at || now),
+    last_deferred_at: now,
+    next_retry_at: now + delayMs,
+  });
+  pruneBitgetLiquidationDeferredWindows(now);
+  bitgetLiqHistoryHealth.deferred_windows_total += 1;
+  bitgetLiqHistoryHealth.deferred_windows = bitgetLiqHistoryDeferredWindows.size;
+  bitgetLiqHistoryHealth.last_deferred_reason = String(reason || '').slice(0, 500);
+  const next = [...bitgetLiqHistoryDeferredWindows.values()]
+    .map((state)=>Number(state?.next_retry_at||0))
+    .filter((value)=>value>0)
+    .sort((a,b)=>a-b)[0] || 0;
+  bitgetLiqHistoryHealth.next_deferred_retry_at = next ? liquidationIso(next) : null;
+  return { attempts, delayMs, nextRetryAt: now + delayMs };
+}
+
+function chooseBitgetOfficialWindow(latestEligibleStartMs, now = Date.now()) {
+  bitgetLiqHistoryPollRound += 1;
+  const due = bitgetDueDeferredWindow(now);
+  const hasNew = Number(latestEligibleStartMs || 0) > Number(bitgetLiqHistoryLastWindowStart || 0);
+  // Never let one delayed REST minute block the shared collector. Alternate due
+  // retries with fresh eligible minutes when both exist.
+  if (due && (!hasNew || bitgetLiqHistoryPollRound % 2 === 0)) {
+    return { startMs: Number(due[0]), retry: true };
+  }
+  if (hasNew) return { startMs: Number(latestEligibleStartMs), retry: false };
+  if (due) return { startMs: Number(due[0]), retry: true };
+  return null;
 }
 
 async function loadExistingBitgetMinuteRows(startMs) {
@@ -1577,11 +1661,15 @@ async function pollBitgetOfficialLiquidationMinute(now=Date.now(),{force=false}=
   const delayedNow=now-BITGET_LIQ_HISTORY_DELAY_MS;
   const latestEligibleEndMs=Math.floor(delayedNow/MINUTE_BUCKET_MS)*MINUTE_BUCKET_MS;
   const latestEligibleStartMs=latestEligibleEndMs-MINUTE_BUCKET_MS;
-  const startMs=nextBitgetOfficialWindowStart(bitgetLiqHistoryLastWindowStart,bitgetLiqHistoryPendingWindowStart,latestEligibleStartMs);
+  const selection=chooseBitgetOfficialWindow(latestEligibleStartMs,now);
+  if(!selection||selection.startMs<=0||selection.startMs>latestEligibleStartMs)return null;
+
+  const startMs=selection.startMs;
   const endMs=startMs+MINUTE_BUCKET_MS;
-  if(startMs<=0||startMs>latestEligibleStartMs)return null;
-  if(bitgetLiqHistoryPendingWindowStart<=0)bitgetLiqHistoryPendingWindowStart=startMs;
-  bitgetLiqHistoryHealth.pending_window_start=liquidationIso(bitgetLiqHistoryPendingWindowStart);
+  if(!selection.retry) bitgetLiqHistoryLastWindowStart=Math.max(bitgetLiqHistoryLastWindowStart,startMs);
+  bitgetLiqHistoryPendingWindowStart=startMs;
+  bitgetLiqHistoryHealth.pending_window_start=liquidationIso(startMs);
+
   bitgetLiqHistoryInflight=(async()=>{
     bitgetLiqHistoryHealth.attempts+=1;
     bitgetLiqHistoryHealth.last_window_start=liquidationIso(startMs);
@@ -1595,43 +1683,83 @@ async function pollBitgetOfficialLiquidationMinute(now=Date.now(),{force=false}=
         results.push(result);
         await new Promise((resolve)=>setTimeout(resolve,BITGET_LIQ_HISTORY_REQUEST_GAP_MS));
       }
+
+      // A valid code=00000/list response for all three official categories proves
+      // the shared REST collector is operational even when Bitget is delayed and
+      // returns no rows for this minute. Delay must never be rewritten as zero data.
+      const officialCycleReady=results.length===BITGET_LIQ_HISTORY_CATEGORIES.length &&
+        results.every((result)=>result.official_response===true);
+      if(officialCycleReady){
+        bitgetLiqHistoryHealth.collector_ready=true;
+        bitgetLiqHistoryHealth.official_endpoint_operational=true;
+        bitgetLiqHistoryHealth.official_response_cycles+=1;
+        bitgetLiqHistoryHealth.official_category_responses+=results.length;
+        bitgetLiqHistoryHealth.official_empty_category_responses+=results.filter((result)=>result.first_page_empty===true).length;
+        bitgetLiqHistoryHealth.last_official_response_at=new Date().toISOString();
+      }
+
       const complete=results.every((r)=>r.complete===true);
       if(results.some((r)=>r.page_cap===true))bitgetLiqHistoryHealth.page_cap_windows+=1;
       const rawCount=results.reduce((sum,r)=>sum+r.rows.length,0);
       bitgetLiqHistoryHealth.last_rows=rawCount;
       bitgetLiqHistoryHealth.last_requests=requestCount;
+
       if(!complete){
-        bitgetLiqHistoryHealth.incomplete_windows+=1;
-        throw new Error('bitget_liquidation_history_scan_did_not_cross_target_minute_before_page_cap');
+        bitgetLiqHistoryHealth.incomplete_deferred_windows+=1;
+        const deferred=deferBitgetLiquidationWindow(startMs,'scan_incomplete_or_page_cap',Date.now());
+        bitgetLiqHistoryHealth.last_error='';
+        return {ok:true,deferred:true,reason:'scan_incomplete_or_page_cap',startMs,endMs,requests:requestCount,retry_after_ms:deferred.delayMs};
       }
+
       const materialized=materializeBitgetOfficialMinuteRows(results,startMs,endMs);
       bitgetLiqHistoryHealth.parsed_events+=materialized.parsed;
       bitgetLiqHistoryHealth.skipped_rows+=materialized.skipped;
       if(materialized.skipped>0){
-        bitgetLiqHistoryHealth.incomplete_windows+=1;
-        throw new Error(`bitget_liquidation_history_normalization_incomplete:${materialized.skipped}`);
+        bitgetLiqHistoryHealth.incomplete_deferred_windows+=1;
+        const deferred=deferBitgetLiquidationWindow(startMs,`normalization_incomplete:${materialized.skipped}`,Date.now());
+        bitgetLiqHistoryHealth.last_error='';
+        return {ok:true,deferred:true,reason:'normalization_incomplete',startMs,endMs,requests:requestCount,retry_after_ms:deferred.delayMs};
       }
+
       const existingRows=await loadExistingBitgetMinuteRows(startMs);
+
+      if(materialized.rows.length===0){
+        // Official history explicitly warns that data can be delayed. An empty
+        // response cannot erase a non-empty WS minute, and it is not persisted
+        // as a fake zero minute even when WS also has no row.
+        bitgetLiqHistoryHealth.official_empty_windows_seen+=1;
+        if(existingRows.length>0){
+          bitgetLiqHistoryHealth.ws_conflict_retry_windows+=1;
+          bitgetLiqHistoryHealth.delayed_conflict_deferred_windows+=1;
+        }
+        const reason=existingRows.length>0?'rest_empty_while_ws_has_data':'rest_empty_delay_unknown';
+        const deferred=deferBitgetLiquidationWindow(startMs,reason,Date.now());
+        bitgetLiqHistoryHealth.last_error='';
+        return {ok:true,deferred:true,reason,startMs,endMs,requests:requestCount,retry_after_ms:deferred.delayMs};
+      }
+
       const coverageCheck=bitgetOfficialRowsCoverExistingWs(materialized.rows,existingRows);
       if(!coverageCheck.ready){
-        bitgetLiqHistoryHealth.incomplete_windows+=1;
         bitgetLiqHistoryHealth.ws_conflict_retry_windows+=1;
-        throw new Error(`bitget_liquidation_history_delayed_conflict:${coverageCheck.reason}`);
+        bitgetLiqHistoryHealth.delayed_conflict_deferred_windows+=1;
+        const deferred=deferBitgetLiquidationWindow(startMs,coverageCheck.reason,Date.now());
+        bitgetLiqHistoryHealth.last_error='';
+        return {ok:true,deferred:true,reason:coverageCheck.reason,startMs,endMs,requests:requestCount,retry_after_ms:deferred.delayMs};
       }
-      if(materialized.rows.length>0){
-        await replaceBitgetOfficialMinuteRows(startMs,materialized.rows);
-      }else{
-        bitgetLiqHistoryHealth.zero_windows+=1;
-      }
-      bitgetLiqHistoryLastWindowStart=startMs;
-      bitgetLiqHistoryPendingWindowStart=0;
-      bitgetLiqHistoryHealth.pending_window_start=null;
+
+      await replaceBitgetOfficialMinuteRows(startMs,materialized.rows);
+      bitgetLiqHistoryDeferredWindows.delete(startMs);
+      bitgetLiqHistoryHealth.deferred_windows=bitgetLiqHistoryDeferredWindows.size;
+      const next=[...bitgetLiqHistoryDeferredWindows.values()]
+        .map((state)=>Number(state?.next_retry_at||0)).filter((value)=>value>0).sort((a,b)=>a-b)[0]||0;
+      bitgetLiqHistoryHealth.next_deferred_retry_at=next?liquidationIso(next):null;
       bitgetOfficialFinalizedMinuteStarts.set(startMs,Date.now());
       pruneBitgetOfficialFinalizedMinutes();
       bitgetLiqHistoryHealth.complete_windows+=1;
       bitgetLiqHistoryHealth.successes+=1;
       bitgetLiqHistoryHealth.last_completed_at=new Date().toISOString();
       bitgetLiqHistoryHealth.last_error='';
+      bitgetLiqHistoryHealth.last_deferred_reason='';
       liquidationPersistenceHealth.minute_persisted_rows_total+=materialized.rows.length;
       liquidationHistoryCache.clear();
       return {ok:true,startMs,endMs,rows:rawCount,persisted:materialized.rows.length,complete:true,requests:requestCount};
@@ -1639,8 +1767,13 @@ async function pollBitgetOfficialLiquidationMinute(now=Date.now(),{force=false}=
       bitgetLiqHistoryHealth.failures+=1;
       bitgetLiqHistoryHealth.last_requests=requestCount;
       bitgetLiqHistoryHealth.last_error=String(error?.message||error).slice(0,500);
+      deferBitgetLiquidationWindow(startMs,`transport_or_parse_error:${bitgetLiqHistoryHealth.last_error}`,Date.now());
       throw error;
-    }finally{bitgetLiqHistoryInflight=null;}
+    }finally{
+      bitgetLiqHistoryPendingWindowStart=0;
+      bitgetLiqHistoryHealth.pending_window_start=null;
+      bitgetLiqHistoryInflight=null;
+    }
   })();
   return bitgetLiqHistoryInflight;
 }
@@ -3506,4 +3639,4 @@ export async function handleContractLiquidation(req, res, url) {
   return true;
 }
 
-export const __contractLiquidationV46ClosureTest = Object.freeze({ bitgetLiquidationEventFromOfficialRow, nextBitgetOfficialWindowStart, bitgetOfficialRowsCoverExistingWs });
+export const __contractLiquidationV46ClosureTest = Object.freeze({ bitgetLiquidationEventFromOfficialRow, bitgetOfficialRowsCoverExistingWs, bitgetLiquidationRetryDelayMs, chooseBitgetOfficialWindow, deferBitgetLiquidationWindow });

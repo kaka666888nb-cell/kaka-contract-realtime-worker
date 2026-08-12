@@ -8,7 +8,7 @@ import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 import { getContractFlowHealth } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.11';
+const VERSION = '650.8.15.12';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -58,7 +58,7 @@ const CAPABILITIES = Object.freeze([
   { provider: 'bitget', market: 'spot', capability: 'whale_fund_net_capital_flow', official_available: true, official_scope: 'per_symbol_focus_intersection', transport: 'REST', batch_mode: 'shared_focus15_slow_stats', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'funds_official', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: 'official_periods_plus_future_bucket_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/trading-data/Get-Spot-Whale-Net-Flow' },
   { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short', official_available: true, official_scope: 'per_symbol_focus15', transport: 'REST', batch_mode: 'four_official_5m_focus_lanes', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: '5m_official_then_future_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
   { provider: 'bitget', market: 'contract', capability: 'risk_reserve_position_tier_oi_limit_index_components', official_available: true, official_scope: 'batch_plus_focus15', transport: 'REST', batch_mode: 'risk_reserve_all_and_oi_limit_batch_plus_focus_tier_index', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step991', fallback_policy: 'missing', history_policy: 'risk_reserve_future_history_step1000; current_reference_now', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve-All' },
-  { provider: 'bitget', market: 'contract', capability: 'liquidation_history', official_available: true, official_scope: 'category_wide_public_history_three_product_types', transport: 'public_REST', batch_mode: 'delayed_closed_minute_reconcile_after_public_ws_live_ingress', rate_limit_class: '5_per_sec_ip_bounded_350ms_gap', collector: 'liquidation-collector', target_layer: 'unified_history', current_integration: 'ready_v46_closure_step997_2', fallback_policy: 'live_ws_provisional_then_official_rest_reconcile; incomplete/page-capped REST never overwrites', history_policy: 'official_last_3_days_source_reconciles_nonzero_1m_buckets', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Liquidations' },
+  { provider: 'bitget', market: 'contract', capability: 'liquidation_history', official_available: true, official_scope: 'category_wide_public_history_three_product_types', transport: 'public_REST', batch_mode: 'shared_background_delayed_closed_minute_reconcile_with_nonblocking_deferred_retry_after_public_ws_live_ingress', rate_limit_class: '5_per_sec_ip_bounded_350ms_gap', collector: 'liquidation-collector', target_layer: 'unified_history', current_integration: 'ready_v46_closure_step997_2_1', fallback_policy: 'live_ws_provisional_then_official_rest_reconcile; official empty/delayed/conflicting REST never overwrites; failed windows defer without blocking newer windows', history_policy: 'official_last_3_days_source_reconciles_nonzero_1m_buckets', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Liquidations' },
 
   // Gate
   { provider: 'gate', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'all_spot_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
@@ -224,16 +224,22 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         Number(contractFlow.binance_official_taker?.official_coverage_rows || 0) === 15 &&
         contractFlow.binance_official_taker?.existing_edge_relay_governor_reused === true &&
         contractFlow.binance_official_taker?.custom_provider_governor_created === false &&
-        liquidationHistory.bitget_liquidations_history?.complete_windows > 0 &&
+        liquidationHistory.bitget_liquidations_history?.collector_ready === true &&
+        liquidationHistory.bitget_liquidations_history?.official_endpoint_operational === true &&
+        Number(liquidationHistory.bitget_liquidations_history?.official_response_cycles || 0) > 0 &&
         liquidationHistory.bitget_liquidations_history?.public_no_auth === true &&
+        liquidationHistory.bitget_liquidations_history?.shared_background_collector === true &&
         liquidationHistory.bitget_liquidations_history?.provider_request_governor_reused === true &&
         liquidationHistory.bitget_liquidations_history?.coverage_state_process_memory_only === true &&
         liquidationHistory.bitget_liquidations_history?.coverage_state_persisted === false &&
-        liquidationHistory.bitget_liquidations_history?.failed_window_retry_same_start === true &&
-        liquidationHistory.bitget_liquidations_history?.pending_window_cleared_only_after_success === true &&
-        Number(liquidationHistory.bitget_liquidations_history?.reconciliation_delay_seconds || 0) >= 600 &&
+        liquidationHistory.bitget_liquidations_history?.official_empty_does_not_overwrite_existing_ws === true &&
+        liquidationHistory.bitget_liquidations_history?.failed_window_blocks_new_windows === false &&
+        liquidationHistory.bitget_liquidations_history?.deferred_retry_enabled === true &&
+        liquidationHistory.bitget_liquidations_history?.pending_window_cleared_after_every_attempt === true &&
+        Number(liquidationHistory.bitget_liquidations_history?.reconciliation_delay_seconds || 0) >= 1800 &&
         Number(liquidationHistory.bitget_liquidations_history?.max_pages_per_category || 0) === 20 &&
-        liquidationHistory.bitget_liquidations_history?.user_reads_trigger_requests === false,
+        liquidationHistory.bitget_liquidations_history?.user_reads_trigger_requests === false &&
+        liquidationHistory.bitget_liquidations_history?.reads_scale_with_users === false,
       binance_adl_capability_ready: Number(binanceAdvanced.adl_official_coverage_rows || 0) === 15 && binanceAdvanced.edge_relay_only === true && binanceAdvanced.render_direct_binance_rest === false,
       binance_open_interest_history_ready: contractFlow.binance_open_interest_history_official_ready === true && contractFlow.binance_open_interest_history_edge_relay_only === true,
       binance_open_interest_history_endpoint: contractFlow.binance_open_interest_history_endpoint || null,
@@ -246,21 +252,28 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       binance_official_taker_requests_per_focus_cycle_max: Number(contractFlow.binance_official_taker?.requests_per_full_focus_cycle_max || 0),
       binance_official_taker_existing_edge_relay_governor_reused: contractFlow.binance_official_taker?.existing_edge_relay_governor_reused === true,
       binance_official_taker_user_reads_trigger_exchange_requests: contractFlow.binance_official_taker?.user_reads_trigger_exchange_requests === true,
-      bitget_liquidation_history_ready: Number(liquidationHistory.bitget_liquidations_history?.complete_windows || 0) > 0 && liquidationHistory.bitget_liquidations_history?.public_no_auth === true,
+      bitget_liquidation_history_ready: liquidationHistory.bitget_liquidations_history?.collector_ready === true && liquidationHistory.bitget_liquidations_history?.official_endpoint_operational === true,
+      bitget_liquidation_history_collector_ready: liquidationHistory.bitget_liquidations_history?.collector_ready === true,
+      bitget_liquidation_history_official_endpoint_operational: liquidationHistory.bitget_liquidations_history?.official_endpoint_operational === true,
+      bitget_liquidation_history_official_response_cycles: Number(liquidationHistory.bitget_liquidations_history?.official_response_cycles || 0),
       bitget_liquidation_history_complete_windows: Number(liquidationHistory.bitget_liquidations_history?.complete_windows || 0),
+      bitget_liquidation_history_deferred_windows: Number(liquidationHistory.bitget_liquidations_history?.deferred_windows || 0),
       bitget_liquidation_history_endpoint: liquidationHistory.bitget_liquidations_history?.endpoint || null,
       bitget_liquidation_history_categories: liquidationHistory.bitget_liquidations_history?.categories || [],
+      bitget_liquidation_history_shared_background_collector: liquidationHistory.bitget_liquidations_history?.shared_background_collector === true,
       bitget_liquidation_history_provider_governor_reused: liquidationHistory.bitget_liquidations_history?.provider_request_governor_reused === true,
       bitget_liquidation_history_reconciliation_delay_seconds: Number(liquidationHistory.bitget_liquidations_history?.reconciliation_delay_seconds || 0),
       bitget_liquidation_history_max_pages_per_category: Number(liquidationHistory.bitget_liquidations_history?.max_pages_per_category || 0),
       bitget_liquidation_history_pending_window_start: liquidationHistory.bitget_liquidations_history?.pending_window_start || null,
       bitget_liquidation_history_coverage_state_process_memory_only: liquidationHistory.bitget_liquidations_history?.coverage_state_process_memory_only === true,
       bitget_liquidation_history_coverage_state_persisted: liquidationHistory.bitget_liquidations_history?.coverage_state_persisted === true,
-      bitget_liquidation_history_delayed_zero_conflict_keeps_existing_ws: liquidationHistory.bitget_liquidations_history?.delayed_zero_conflict_keeps_existing_ws === true,
-      bitget_liquidation_history_failed_window_retry_same_start: liquidationHistory.bitget_liquidations_history?.failed_window_retry_same_start === true,
-      bitget_liquidation_history_pending_window_cleared_only_after_success: liquidationHistory.bitget_liquidations_history?.pending_window_cleared_only_after_success === true,
+      bitget_liquidation_history_official_empty_does_not_overwrite_existing_ws: liquidationHistory.bitget_liquidations_history?.official_empty_does_not_overwrite_existing_ws === true,
+      bitget_liquidation_history_failed_window_blocks_new_windows: liquidationHistory.bitget_liquidations_history?.failed_window_blocks_new_windows === true,
+      bitget_liquidation_history_deferred_retry_enabled: liquidationHistory.bitget_liquidations_history?.deferred_retry_enabled === true,
+      bitget_liquidation_history_pending_window_cleared_after_every_attempt: liquidationHistory.bitget_liquidations_history?.pending_window_cleared_after_every_attempt === true,
       bitget_liquidation_history_amount_unit_source: liquidationHistory.bitget_liquidations_history?.amount_unit_source || null,
       bitget_liquidation_history_user_reads_trigger_requests: liquidationHistory.bitget_liquidations_history?.user_reads_trigger_requests === true,
+      bitget_liquidation_history_reads_scale_with_users: liquidationHistory.bitget_liquidations_history?.reads_scale_with_users === true,
       no_new_binance_direct_render_rest: true,
       user_reads_scale_exchange_upstream: false,
     },

@@ -4,7 +4,7 @@ import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.92';
+const VERSION = '650.8.15.93';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -535,7 +535,7 @@ const BINANCE_OFFICIAL_TAKER_REFRESH_MS = Math.max(5 * 60_000, Number(process.en
 const BINANCE_OFFICIAL_TAKER_STALE_MS = Math.max(8 * 60_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_STALE_MS || 12 * 60_000));
 const BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT = Math.max(3, Math.min(500, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT || 288)));
 const BINANCE_OFFICIAL_TAKER_START_DELAY_MS = Math.max(20_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_START_DELAY_MS || 45_000));
-const BINANCE_OFFICIAL_TAKER_RETRY_MS = Math.max(30_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_RETRY_MS || 60_000));
+const BINANCE_OFFICIAL_TAKER_RETRY_MS = Math.max(30_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_RETRY_MS || 30_000));
 const binanceOfficialTakerBySymbol = new Map();
 let binanceOfficialTakerInflight = null;
 let binanceOfficialTakerRecoveryTimer = null;
@@ -2309,6 +2309,8 @@ function binanceOfficialTakerHealthPayload() {
     stale_seconds: Math.round(BINANCE_OFFICIAL_TAKER_STALE_MS/1000),
     requests_per_full_focus_cycle_max: 15,
     focus_change_missing_only_recovery: true,
+    incomplete_focus_recovery_seconds: Math.round(BINANCE_OFFICIAL_TAKER_RETRY_MS/1000),
+    incomplete_focus_recovery_uses_existing_edge_relay_deferral: true,
     existing_edge_relay_governor_reused: true,
     custom_provider_governor_created: false,
     user_reads_trigger_exchange_requests: false,
