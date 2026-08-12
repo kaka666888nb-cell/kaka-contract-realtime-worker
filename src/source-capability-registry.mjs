@@ -2,8 +2,9 @@ import { getMarketLightSnapshotHealth } from './market-light-snapshot.mjs';
 import { getBinanceAdvancedStatsHealth } from './binance-advanced-stats.mjs';
 import { getBitgetAdvancedStatsHealth } from './bitget-advanced-stats.mjs';
 import { getGateAdvancedStatsHealth } from './gate-advanced-stats.mjs';
+import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 
-const VERSION = '650.8.15.5';
+const VERSION = '650.8.15.6';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -58,7 +59,7 @@ const CAPABILITIES = Object.freeze([
   { provider: 'gate', market: 'contract', capability: 'contract_stats_top_trader_taker_account', official_available: true, official_scope: 'per_contract_contract_stats', transport: 'REST', batch_mode: 'focus15_5m_contract_stats', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step992', fallback_policy: 'missing_keep_derived_separate', history_policy: '5m_1h_1d_future_rollup', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'risk_limit_tiers', official_available: true, official_scope: 'public_per_contract_or_top100_market', transport: 'REST', batch_mode: 'focus15_per_contract', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step992', fallback_policy: 'missing', history_policy: 'reference_snapshot', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'insurance_fund', official_available: true, official_scope: 'public_settlement_history', transport: 'REST', batch_mode: 'one_shared_low_frequency_request', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step992', fallback_policy: 'last_verified_shared_snapshot_or_missing', history_policy: 'official_history', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
-  { provider: 'gate', market: 'contract', capability: 'liquidation_history_query', official_available: true, official_scope: 'public_market_liq_orders', transport: 'REST', batch_mode: 'event_history', rate_limit_class: 'event_history', collector: 'liquidation-collector', target_layer: 'liquidation_history', current_integration: 'deferred_step997', fallback_policy: 'do_not_mix_into_step992_contract_stats', history_policy: 'unified_events_and_buckets_step997', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'liquidation_event_history', official_available: true, official_scope: 'public_all_usdt_closed_minute_liq_orders', transport: 'REST+existing_public_WS', batch_mode: 'one_closed_minute_liq_orders_request_per_60s_plus_shared_ws', rate_limit_class: 'bounded_background_event_history', collector: 'liquidation-collector', target_layer: 'liquidation_history', current_integration: 'ready_step997', fallback_policy: 'complete_liq_orders_minute_owns_gate_1m_history; truncated_window_never_overwrites; never_cross_provider_substitute', history_policy: '1m_base_plus_5m_15m_and_1h_base_plus_6h_24h', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
 
   // Coinbase is project spot-only.
   { provider: 'coinbase', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'multi_product_public_ws', transport: 'WS', batch_mode: 'ticker_batch_5s', rate_limit_class: 'one_shared_connection', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
@@ -89,6 +90,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const binanceAdvanced = getBinanceAdvancedStatsHealth();
   const bitgetAdvanced = getBitgetAdvancedStatsHealth();
   const gateAdvanced = getGateAdvancedStatsHealth();
+  const liquidationHistory = getContractLiquidationPersistenceHealth();
   const marketKeys = Object.keys(coverage);
   const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
   const binanceContract = coverage['contract:binance'] || {};
@@ -166,6 +168,41 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       liquidation_reference_rows: Number(gateAdvanced.liquidation_reference_rows || 0),
       insurance_record_count: Number(gateAdvanced.insurance_record_count || 0),
       liquidation_history_deferred_to_step997: gateAdvanced.liquidation_history_deferred_to_step997 === true,
+      liquidation_history_step997_ready: gateAdvanced.liquidation_history_step997_ready === true,
+      user_reads_scale_with_users: false,
+    },
+    step997_liquidation_history: {
+      ready: liquidationHistory.persistence_enabled === true &&
+        liquidationHistory.step997_unified_history_ready === true &&
+        JSON.stringify(liquidationHistory.step997_history_intervals || []) === JSON.stringify(['1m', '5m', '15m', '1H', '6H', '24H']) &&
+        liquidationHistory.step997_default_history_backward_compatible_1h === true &&
+        liquidationHistory.raw_events_persisted === false &&
+        liquidationHistory.zero_event_rows_persisted === false &&
+        liquidationHistory.exchange_requests_started_by_history_reads === 0 &&
+        liquidationHistory.gate_liq_orders?.public_no_auth === true &&
+        liquidationHistory.gate_liq_orders?.user_reads_trigger_requests === false &&
+        liquidationHistory.gate_liq_orders?.reads_scale_with_users === false &&
+        liquidationHistory.gate_liq_orders?.left_field_ignored === true &&
+        liquidationHistory.gate_liq_orders?.size_decimal_header === true &&
+        Number(liquidationHistory.gate_liq_orders?.additional_contract_metadata_requests || 0) === 0,
+      version: liquidationHistory.version || null,
+      history_endpoint: liquidationHistory.history_endpoint || null,
+      intervals: Array.isArray(liquidationHistory.step997_history_intervals) ? [...liquidationHistory.step997_history_intervals] : [],
+      default_backward_compatible_1h: liquidationHistory.step997_default_history_backward_compatible_1h === true,
+      minute_storage_table: liquidationHistory.minute_storage_table || null,
+      hour_storage_table: liquidationHistory.storage_table || null,
+      gate_coverage_table: liquidationHistory.gate_minute_coverage_table || null,
+      aggregation_rpc: liquidationHistory.step997_history_rpc || null,
+      raw_events_persisted: liquidationHistory.raw_events_persisted === true,
+      zero_event_rows_persisted: liquidationHistory.zero_event_rows_persisted === true,
+      gate_liq_orders_public_no_auth: liquidationHistory.gate_liq_orders?.public_no_auth === true,
+      gate_liq_orders_poll_seconds: Number(liquidationHistory.gate_liq_orders?.polling_interval_seconds || 0),
+      gate_liq_orders_successes: Number(liquidationHistory.gate_liq_orders?.successes || 0),
+      gate_liq_orders_complete_windows: Number(liquidationHistory.gate_liq_orders?.complete_windows || 0),
+      gate_liq_orders_truncated_windows: Number(liquidationHistory.gate_liq_orders?.truncated_windows || 0),
+      gate_left_field_ignored: liquidationHistory.gate_liq_orders?.left_field_ignored === true,
+      gate_size_decimal_header: liquidationHistory.gate_liq_orders?.size_decimal_header === true,
+      gate_additional_contract_metadata_requests: Number(liquidationHistory.gate_liq_orders?.additional_contract_metadata_requests || 0),
       user_reads_scale_with_users: false,
     },
     capabilities: includeCapabilities ? CAPABILITIES : [],
@@ -191,7 +228,8 @@ export function getSourceCapabilityRegistryHealth() {
       payload.trading_status_full_market_ready &&
       payload.binance_step993.ready &&
       payload.bitget_step991.ready &&
-      payload.gate_step992.ready,
+      payload.gate_step992.ready &&
+      payload.step997_liquidation_history.ready,
   };
 }
 

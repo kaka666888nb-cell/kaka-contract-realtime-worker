@@ -25,7 +25,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.102';
+const STEP_VERSION = '650.8.15.103';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -400,6 +400,9 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_health: '/api/contract-liquidation/health',
       contract_liquidation_persistence_health: getContractLiquidationPersistenceHealth(),
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
+      contract_liquidation_history_intervals_step997: ['1m', '5m', '15m', '1H', '6H', '24H'],
+      contract_liquidation_history_default_backward_compatible: '1h',
+      contract_liquidation_gate_liq_orders_background_only: true,
       contract_liquidation_scope: 'official_maximum_five_provider_market_layer_plus_focused_five_by_three_fallback_plus_single_symbol',
       market_light_rollout: 'step980_6_3_4_1_binance_changed_only_ticker_fix_ws_api_latest_price_baseline_no_app_cutover',
       contract_funding: '/api/contract-funding',
@@ -677,7 +680,8 @@ const server = http.createServer(async (req, res) => {
         gate_advanced_official_stats_health_endpoint: '/api/gate-advanced/health',
         gate_advanced_official_stats_ready: getGateAdvancedStatsHealth().ready,
         gate_advanced_user_reads_scale_exchange_upstream: false,
-        gate_liquidation_history_deferred_to_step997: true,
+        gate_liquidation_history_deferred_to_step997: false,
+        gate_liquidation_history_step997_ready: true,
         binance_contract_full_market_bbo_shared_ws: true,
         contract_basis_shared_current_endpoint: '/api/contract-basis/current-snapshot',
         contract_basis_reuses_market_light_only: true,

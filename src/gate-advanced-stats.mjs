@@ -1,6 +1,6 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.3';
 const SNAPSHOT_ROUTE = '/api/gate-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/gate-advanced/health';
 const BASES = Object.freeze([
@@ -486,7 +486,7 @@ function snapshotPayload({ includeRows = true } = {}) {
       contract_stats: 'Gate official public per-contract 5m ContractStat; focus15 only because endpoint is per contract',
       risk_limit_tiers: 'Gate official public per-contract risk tiers; focus15 shared slow stats',
       insurance_fund: 'Gate official public futures insurance fund history; one shared low-frequency request',
-      liquidation_history: 'Gate official liq_orders exists but intentionally deferred to Step997 unified liquidation event/history pipeline',
+      liquidation_history: 'Gate official public liq_orders is owned by Step997 contract-liquidation background history pipeline; user reads never call Gate',
     },
     official_semantics: {
       open_interest: 'ContractStat open_interest is contract count; open_interest_usd is quote-currency notional; never relabel futures ticker total_size as OI',
@@ -495,7 +495,7 @@ function snapshotPayload({ includeRows = true } = {}) {
       top_trader: 'Gate official top_lsr_account/top_lsr_size plus newer top-long/top-short size/account fields when supplied by current API',
       taker_size: 'Gate official long_taker_size/short_taker_size when supplied by current API',
       user_counts: 'Gate official long_users/short_users when supplied by current API',
-      liquidation_reference: 'ContractStat 5m liquidation aggregate fields are preserved as Gate official statistics only; they do not replace Step997 unified liquidation event/history pipeline',
+      liquidation_reference: 'ContractStat 5m liquidation aggregate fields remain reference statistics only; Step997 unified history is owned by contract-liquidation and Gate public liq_orders',
       risk_limit_tiers: 'Gate official position risk limit, initial/maintenance margin rates, max leverage and deduction',
       insurance_fund: 'Gate official futures insurance fund history',
     },
@@ -508,7 +508,11 @@ function snapshotPayload({ includeRows = true } = {}) {
     exchange_connections_started_by_user_read: 0,
     user_reads_trigger_collector: false,
     reads_scale_with_users: false,
-    liquidation_history_deferred_to_step997: true,
+    liquidation_history_deferred_to_step997: false,
+    liquidation_history_step997_ready: true,
+    liquidation_history_step997_owner: 'contract-liquidation',
+    liquidation_history_step997_route: '/api/contract-liquidation/history',
+    liquidation_history_step997_gate_liq_orders_background_only: true,
     last_focus_started_at: lastFocusStartedAt,
     last_focus_completed_at: lastFocusCompletedAt,
     last_focus_error: lastFocusError,

@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.48';
+const STEP_VERSION = '650.8.15.49';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -53,7 +53,25 @@ const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 const LIQUIDATION_PERSISTENCE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 const LIQUIDATION_HOUR_TABLE = 'app_contract_liquidation_1h_cache';
-const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_cache';
+// Step997: persist exact non-zero one-minute event buckets as the short-resolution
+// history base. 5m/15m are derived from 1m; 1H/6H/24H remain based on the
+// long-lived 1h aggregate store. Raw events remain process-memory only.
+const LIQUIDATION_MINUTE_TABLE = 'app_contract_liquidation_1m_cache';
+const LIQUIDATION_GATE_COVERAGE_TABLE = 'app_contract_liquidation_gate_1m_coverage';
+const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_step997_cache';
+const LIQUIDATION_STEP997_HISTORY_RPC = 'kaka_contract_liquidation_history_step997';
+const LIQUIDATION_MINUTE_RETENTION_HOURS = 30;
+const STEP997_HISTORY_INTERVALS = Object.freeze({
+  '1m': { canonical: '1m', durationMs: MINUTE_BUCKET_MS, base: 'minute', maxHours: 24 },
+  '5m': { canonical: '5m', durationMs: 5 * MINUTE_BUCKET_MS, base: 'minute', maxHours: 24 },
+  '15m': { canonical: '15m', durationMs: 15 * MINUTE_BUCKET_MS, base: 'minute', maxHours: 24 },
+  '1h': { canonical: '1H', durationMs: HOUR_BUCKET_MS, base: 'hour', maxHours: 336 },
+  '6h': { canonical: '6H', durationMs: 6 * HOUR_BUCKET_MS, base: 'hour', maxHours: 336 },
+  '24h': { canonical: '24H', durationMs: 24 * HOUR_BUCKET_MS, base: 'hour', maxHours: 336 },
+});
+const GATE_LIQ_ORDERS_POLL_MS = 60_000;
+const GATE_LIQ_ORDERS_LIMIT = 100;
+const GATE_OFFICIAL_FINALIZED_MINUTE_RETENTION_MS = 3 * HOUR_BUCKET_MS;
 const LIQUIDATION_HISTORY_ROUTE = '/api/contract-liquidation/history';
 const LIQUIDATION_HEALTH_ROUTE = '/api/contract-liquidation/health';
 const LIQUIDATION_CURRENT_ROUTE = '/api/contract-liquidation/current-snapshot';
@@ -96,9 +114,44 @@ const LIQUIDATION_HISTORY_STALE_MS = 30 * 60_000;
 const LIQUIDATION_HISTORY_CACHE_MAX = 64;
 const liquidationPersistQueue = new Map();
 const liquidationPersistGate = new Map();
+const liquidationMinutePersistQueue = new Map();
+const liquidationMinutePersistGate = new Map();
+const gateOfficialFinalizedMinuteStarts = new Map();
 const liquidationHistoryCache = new Map();
 const liquidationHistoryInflight = new Map();
 let liquidationPersistInflight = null;
+let liquidationMinutePersistInflight = null;
+let gateLiqOrdersInflight = null;
+let gateLiqOrdersLastWindowStart = 0;
+const gateLiqOrdersHealth = {
+  enabled: LIQUIDATION_PERSISTENCE_ENABLED,
+  endpoint: '/futures/{settle}/liq_orders',
+  public_no_auth: true,
+  polling_interval_seconds: Math.trunc(GATE_LIQ_ORDERS_POLL_MS / 1000),
+  max_rows_per_closed_minute: GATE_LIQ_ORDERS_LIMIT,
+  max_time_window_seconds: 60,
+  user_reads_trigger_requests: false,
+  reads_scale_with_users: false,
+  left_field_ignored: true,
+  size_decimal_header: true,
+  contract_multiplier_source: 'shared_market_universe_only_no_per_event_rest',
+  additional_contract_metadata_requests: 0,
+  max_transport_attempts_per_closed_minute: 2,
+  signed_position_semantics: 'size>0 short_position_liquidation; size<0 long_position_liquidation',
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  complete_windows: 0,
+  truncated_windows: 0,
+  normalization_incomplete_windows: 0,
+  parsed_events: 0,
+  skipped_rows: 0,
+  last_rows: 0,
+  last_window_start: null,
+  last_window_end: null,
+  last_completed_at: null,
+  last_error: '',
+};
 const liquidationPersistenceHealth = {
   last_flush_at: 0,
   last_flush_rows: 0,
@@ -106,6 +159,10 @@ const liquidationPersistenceHealth = {
   last_cleanup_at: 0,
   cleanup_error: '',
   persisted_rows_total: 0,
+  minute_last_flush_at: 0,
+  minute_last_flush_rows: 0,
+  minute_flush_error: '',
+  minute_persisted_rows_total: 0,
 };
 
 function liquidationSupabaseHeaders(extra = {}) {
@@ -138,7 +195,7 @@ function liquidationBucketCoverage(state, bucket, now = Date.now()) {
   };
 }
 
-function liquidationPersistRow(state, bucket, now = Date.now()) {
+function liquidationPersistRow(state, bucket, now = Date.now(), source = 'render_public_liquidation_ws_hour_bucket_v1') {
   if (!state || !bucket || Number(bucket.event_count || 0) <= 0) return null;
   const provider = normalizeProvider(state.provider);
   const symbol = compactSymbol(state.symbol);
@@ -173,7 +230,7 @@ function liquidationPersistRow(state, bucket, now = Date.now()) {
     coverage_complete: coverage.coverage_complete,
     observed_since: liquidationIso(coverage.observed_since_ms),
     last_gap_at: liquidationIso(coverage.last_gap_at_ms),
-    source: 'render_public_liquidation_ws_hour_bucket_v1',
+    source,
     cached_at: new Date(now).toISOString(),
   };
 }
@@ -188,6 +245,94 @@ function liquidationPersistSignature(row) {
     row.bucket_closed === true,
     row.coverage_complete === true,
   ]);
+}
+
+function capLiquidationMinutePersistQueue() {
+  while (liquidationMinutePersistQueue.size > LIQUIDATION_PERSIST_QUEUE_MAX) {
+    const first = liquidationMinutePersistQueue.keys().next().value;
+    if (!first) break;
+    liquidationMinutePersistQueue.delete(first);
+  }
+}
+
+function pruneGateOfficialFinalizedMinutes(now = Date.now()) {
+  for (const [startMs, finalizedAt] of [...gateOfficialFinalizedMinuteStarts.entries()]) {
+    if (now - Number(finalizedAt || 0) > GATE_OFFICIAL_FINALIZED_MINUTE_RETENTION_MS) {
+      gateOfficialFinalizedMinuteStarts.delete(startMs);
+    }
+  }
+}
+
+function queueLiquidationMinuteBucket(state, bucket, now = Date.now()) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) return;
+  if (normalizeProvider(state?.provider) === 'gate') {
+    // Step997 Gate 1m history is owned by the public liq_orders closed-minute
+    // collector. Never let the lower-fidelity websocket aggregate overwrite it.
+    return;
+  }
+  const row = liquidationPersistRow(state, bucket, now, 'render_public_liquidation_ws_minute_bucket_v1');
+  if (!row) return;
+  const key = `${row.provider}|${row.symbol}|${row.bucket_start}`;
+  const signature = liquidationPersistSignature(row);
+  const gate = liquidationMinutePersistGate.get(key);
+  if (gate?.signature === signature && now - Number(gate.at || 0) < 3 * 60_000) return;
+  liquidationMinutePersistQueue.set(key, { row, signature });
+  capLiquidationMinutePersistQueue();
+}
+
+async function upsertLiquidationMinuteRows(rows) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED || rows.length === 0) return 0;
+  let written = 0;
+  for (let index = 0; index < rows.length; index += 250) {
+    const chunk = rows.slice(index, index + 250);
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/${LIQUIDATION_MINUTE_TABLE}?on_conflict=provider,market_type,symbol,bucket_start`,
+      {
+        method: 'POST',
+        headers: liquidationSupabaseHeaders({
+          'content-type': 'application/json',
+          prefer: 'resolution=merge-duplicates,return=minimal',
+        }),
+        body: JSON.stringify(chunk),
+        signal: AbortSignal.timeout(15000),
+      },
+    );
+    const responseText = await response.text();
+    if (!response.ok) throw new Error(`liquidation_minute_upsert_http_${response.status}:${responseText.slice(0, 220)}`);
+    written += chunk.length;
+  }
+  return written;
+}
+
+async function flushLiquidationMinutePersistQueue() {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED || liquidationMinutePersistInflight || liquidationMinutePersistQueue.size === 0) {
+    return liquidationMinutePersistInflight;
+  }
+  const batch = [...liquidationMinutePersistQueue.entries()].slice(0, 1000);
+  for (const [key] of batch) liquidationMinutePersistQueue.delete(key);
+  liquidationMinutePersistInflight = (async () => {
+    try {
+      const written = await upsertLiquidationMinuteRows(batch.map((entry) => entry[1].row));
+      const now = Date.now();
+      for (const [key, entry] of batch) liquidationMinutePersistGate.set(key, { signature: entry.signature, at: now });
+      liquidationPersistenceHealth.minute_last_flush_at = now;
+      liquidationPersistenceHealth.minute_last_flush_rows = written;
+      liquidationPersistenceHealth.minute_persisted_rows_total += written;
+      liquidationPersistenceHealth.minute_flush_error = '';
+      liquidationHistoryCache.clear();
+      return written;
+    } catch (error) {
+      for (const [key, entry] of batch) {
+        if (!liquidationMinutePersistQueue.has(key)) liquidationMinutePersistQueue.set(key, entry);
+      }
+      capLiquidationMinutePersistQueue();
+      liquidationPersistenceHealth.minute_flush_error = String(error?.message || error).slice(0, 300);
+      throw error;
+    } finally {
+      liquidationMinutePersistInflight = null;
+    }
+  })();
+  return liquidationMinutePersistInflight;
 }
 
 function capLiquidationPersistQueue() {
@@ -265,6 +410,16 @@ async function flushLiquidationPersistQueue() {
   return liquidationPersistInflight;
 }
 
+function queueRecentLiquidationMinuteBuckets(now = Date.now()) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) return;
+  const cutoff = now - 5 * MINUTE_BUCKET_MS;
+  for (const state of STATS.values()) {
+    for (const bucket of state.minuteBuckets.values()) {
+      if (Number(bucket.end_ms || 0) >= cutoff) queueLiquidationMinuteBucket(state, bucket, now);
+    }
+  }
+}
+
 function queueRecentLiquidationHourBuckets(now = Date.now()) {
   if (!LIQUIDATION_PERSISTENCE_ENABLED) return;
   const cutoff = now - 3 * HOUR_BUCKET_MS;
@@ -340,6 +495,197 @@ function normalizePersistedLiquidationHour(raw) {
     cached_at: raw.cached_at || null,
   };
   return row.event_count > 0 && row.total_notional > 0 ? row : null;
+}
+
+async function readPersistedLiquidationMinutes({ hours = 6, provider = '', symbol = '', limit = 5000 } = {}) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) throw new Error('liquidation_history_persistence_disabled');
+  const safeHours = Math.max(1, Math.min(LIQUIDATION_MINUTE_RETENTION_HOURS, Math.trunc(Number(hours) || 6)));
+  const safeProvider = normalizeProvider(provider);
+  const safeSymbol = compactSymbol(symbol);
+  const safeLimit = Math.max(1, Math.min(15000, Math.trunc(Number(limit) || 5000)));
+  const now = Date.now();
+  const query = new URLSearchParams({
+    select: 'provider,market_type,symbol,quote_asset,bucket_start,bucket_end,long_notional,short_notional,total_notional,long_count,short_count,event_count,largest_event_id,largest_event_side,largest_event_notional,largest_event_price,largest_event_time,latest_event_time,bucket_closed,provisional,coverage_complete,observed_since,last_gap_at,source,cached_at',
+    bucket_start: `gte.${new Date(now - safeHours * HOUR_BUCKET_MS).toISOString()}`,
+    order: 'bucket_start.desc,provider.asc,symbol.asc',
+    limit: String(safeLimit),
+  });
+  if (safeProvider) query.set('provider', `eq.${safeProvider}`);
+  if (safeSymbol) query.set('symbol', `eq.${safeSymbol}`);
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${LIQUIDATION_MINUTE_TABLE}?${query}`, {
+    headers: liquidationSupabaseHeaders({ accept: 'application/json' }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`liquidation_minute_history_store_http_${response.status}:${text.slice(0, 220)}`);
+  const decoded = JSON.parse(text);
+  return (Array.isArray(decoded) ? decoded : []).map(normalizePersistedLiquidationHour).filter(Boolean);
+}
+
+function canonicalStep997HistoryInterval(raw) {
+  const key = String(raw || '').trim().toLowerCase();
+  return STEP997_HISTORY_INTERVALS[key] || null;
+}
+
+function persistedHistorySummary(rows) {
+  return rows.reduce((acc, row) => {
+    acc.long_notional += Number(row.long_notional || 0);
+    acc.short_notional += Number(row.short_notional || 0);
+    acc.total_notional += Number(row.total_notional || 0);
+    acc.long_count += Number(row.long_count || 0);
+    acc.short_count += Number(row.short_count || 0);
+    acc.event_count += Number(row.event_count || 0);
+    if (!acc.largest_event || Number(row.largest_event_notional || 0) > Number(acc.largest_event.largest_event_notional || 0)) {
+      acc.largest_event = row.largest_event_notional ? {
+        provider: row.provider,
+        symbol: row.symbol,
+        largest_event_id: row.largest_event_id,
+        largest_event_side: row.largest_event_side,
+        largest_event_notional: row.largest_event_notional,
+        largest_event_price: row.largest_event_price,
+        largest_event_time: row.largest_event_time,
+      } : acc.largest_event;
+    }
+    return acc;
+  }, { long_notional: 0, short_notional: 0, total_notional: 0, long_count: 0, short_count: 0, event_count: 0, largest_event: null });
+}
+
+function aggregatePersistedLiquidationRows(rows, spec) {
+  if (!spec) return rows;
+  const durationMs = Number(spec.durationMs || HOUR_BUCKET_MS);
+  const grouped = new Map();
+  for (const row of rows) {
+    const startMs = Number(row.bucket_start_ms || Date.parse(row.bucket_start || ''));
+    if (!Number.isFinite(startMs)) continue;
+    const aggregateStart = Math.floor(startMs / durationMs) * durationMs;
+    const key = `${row.provider}|${row.symbol}|${aggregateStart}`;
+    let target = grouped.get(key);
+    if (!target) {
+      target = {
+        provider: row.provider,
+        market_type: 'contract',
+        symbol: row.symbol,
+        quote_asset: row.quote_asset || quoteFromCompact(row.symbol),
+        bucket_start: new Date(aggregateStart).toISOString(),
+        bucket_end: new Date(aggregateStart + durationMs).toISOString(),
+        bucket_start_ms: aggregateStart,
+        bucket_end_ms: aggregateStart + durationMs,
+        long_notional: 0,
+        short_notional: 0,
+        total_notional: 0,
+        long_count: 0,
+        short_count: 0,
+        event_count: 0,
+        largest_event_id: null,
+        largest_event_side: null,
+        largest_event_notional: null,
+        largest_event_price: null,
+        largest_event_time: null,
+        latest_event_time: null,
+        bucket_closed: true,
+        provisional: false,
+        coverage_complete: true,
+        observed_since: null,
+        last_gap_at: null,
+        source: `render_step997_unified_${spec.canonical}_from_${spec.base}_event_buckets_v1`,
+        cached_at: null,
+        source_bucket_count: 0,
+      };
+      grouped.set(key, target);
+    }
+    target.long_notional += Number(row.long_notional || 0);
+    target.short_notional += Number(row.short_notional || 0);
+    target.total_notional += Number(row.total_notional || 0);
+    target.long_count += Number(row.long_count || 0);
+    target.short_count += Number(row.short_count || 0);
+    target.event_count += Number(row.event_count || 0);
+    target.source_bucket_count += 1;
+    target.bucket_closed = target.bucket_closed && row.bucket_closed === true;
+    target.provisional = target.provisional || row.provisional === true;
+    target.coverage_complete = target.coverage_complete && row.coverage_complete === true;
+    if (!target.observed_since || (row.observed_since && Date.parse(row.observed_since) < Date.parse(target.observed_since))) target.observed_since = row.observed_since || target.observed_since;
+    if (row.last_gap_at && (!target.last_gap_at || Date.parse(row.last_gap_at) > Date.parse(target.last_gap_at))) target.last_gap_at = row.last_gap_at;
+    if (row.latest_event_time && (!target.latest_event_time || Date.parse(row.latest_event_time) > Date.parse(target.latest_event_time))) target.latest_event_time = row.latest_event_time;
+    if (Number(row.largest_event_notional || 0) > Number(target.largest_event_notional || 0)) {
+      target.largest_event_id = row.largest_event_id;
+      target.largest_event_side = row.largest_event_side;
+      target.largest_event_notional = row.largest_event_notional;
+      target.largest_event_price = row.largest_event_price;
+      target.largest_event_time = row.largest_event_time;
+    }
+    if (!target.cached_at || (row.cached_at && Date.parse(row.cached_at) > Date.parse(target.cached_at))) target.cached_at = row.cached_at || target.cached_at;
+  }
+  return [...grouped.values()].sort((a, b) => b.bucket_start_ms - a.bucket_start_ms || a.provider.localeCompare(b.provider) || a.symbol.localeCompare(b.symbol));
+}
+
+async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', symbol = '', limit = 2500 } = {}) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) throw new Error('liquidation_history_persistence_disabled');
+  const spec = canonicalStep997HistoryInterval(interval);
+  if (!spec) throw new Error('unsupported_liquidation_history_interval');
+  const safeHours = Math.max(1, Math.min(spec.maxHours, Math.trunc(Number(hours) || 6)));
+  const safeProvider = normalizeProvider(provider);
+  const safeSymbol = compactSymbol(symbol);
+  const safeLimit = Math.max(1, Math.min(5000, Math.trunc(Number(limit) || 2500)));
+  const key = `step997|${spec.canonical}|${safeHours}|${safeProvider}|${safeSymbol}|${safeLimit}`;
+  const now = Date.now();
+  pruneLiquidationHistoryCache(now);
+  const cached = liquidationHistoryCache.get(key);
+  if (cached && now - Number(cached.cachedAt || 0) <= LIQUIDATION_HISTORY_CACHE_TTL_MS) {
+    return { ...cached.payload, cache_hit: true, cache_age_ms: now - cached.cachedAt };
+  }
+  if (liquidationHistoryInflight.has(key)) return await liquidationHistoryInflight.get(key);
+
+  const inflight = (async () => {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${LIQUIDATION_STEP997_HISTORY_RPC}`, {
+      method: 'POST',
+      headers: liquidationSupabaseHeaders({ 'content-type': 'application/json', accept: 'application/json' }),
+      body: JSON.stringify({
+        p_interval: spec.canonical,
+        p_hours: safeHours,
+        p_provider: safeProvider || null,
+        p_symbol: safeSymbol || null,
+        p_limit: safeLimit,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`liquidation_step997_history_rpc_http_${response.status}:${text.slice(0, 220)}`);
+    const decoded = JSON.parse(text);
+    const rows = (Array.isArray(decoded) ? decoded : []).map((raw) => {
+      const normalized = normalizePersistedLiquidationHour(raw);
+      if (!normalized) return null;
+      normalized.source_bucket_count = Math.max(1, Math.trunc(Number(raw?.source_bucket_count || 1)));
+      normalized.source = String(raw?.source || `render_step997_unified_${spec.canonical}_from_${spec.base}_event_buckets_v1`);
+      return normalized;
+    }).filter(Boolean);
+    const providers = [...new Set(rows.map((row) => row.provider))].sort();
+    const pairs = new Set(rows.map((row) => `${row.provider}|${row.symbol}`));
+    const payload = {
+      rows,
+      row_count: rows.length,
+      provider_coverage: providers,
+      provider_count: providers.length,
+      pair_count: pairs.size,
+      summary: persistedHistorySummary(rows),
+      hours: safeHours,
+      provider: safeProvider || null,
+      symbol: safeSymbol || null,
+      interval: spec.canonical,
+      base_interval: spec.base === 'minute' ? '1m' : '1H',
+      zero_event_rows_persisted: false,
+      coverage_semantics: 'event_buckets_only_no_fabricated_zero_rows',
+      persistence_enabled: true,
+      aggregation_location: 'supabase_rpc_shared_server_side',
+      aggregation_rpc: LIQUIDATION_STEP997_HISTORY_RPC,
+      cache_hit: false,
+      cache_age_ms: 0,
+    };
+    liquidationHistoryCache.set(key, { cachedAt: Date.now(), payload });
+    pruneLiquidationHistoryCache();
+    return payload;
+  })().finally(() => liquidationHistoryInflight.delete(key));
+  liquidationHistoryInflight.set(key, inflight);
+  return await inflight;
 }
 
 async function readPersistedLiquidationHours({ hours = 6, provider = '', symbol = '', limit = 2500 } = {}) {
@@ -825,6 +1171,206 @@ export function getContractLiquidationSharedCurrentHealth() {
   };
 }
 
+async function gateLiqOrdersJson(urls) {
+  let lastError = null;
+  for (const target of urls) {
+    try {
+      const response = await fetch(target, {
+        headers: { accept: 'application/json', 'X-Gate-Size-Decimal': '1' },
+        signal: AbortSignal.timeout(15000),
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`gate_liq_orders_http_${response.status}:${text.slice(0, 220)}`);
+      const decoded = JSON.parse(text);
+      if (!Array.isArray(decoded)) throw new Error('gate_liq_orders_payload_not_array');
+      return decoded;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('gate_liq_orders_unavailable');
+}
+
+async function upsertGateLiquidationCoverage({ startMs, endMs, rowCount, parsedRowCount = 0, skippedRowCount = 0, truncated, normalizationComplete, complete }) {
+  const row = {
+    settle: 'usdt',
+    bucket_start: liquidationIso(startMs),
+    bucket_end: liquidationIso(endMs),
+    row_count: Math.max(0, Math.trunc(Number(rowCount || 0))),
+    parsed_row_count: Math.max(0, Math.trunc(Number(parsedRowCount || 0))),
+    skipped_row_count: Math.max(0, Math.trunc(Number(skippedRowCount || 0))),
+    truncated: truncated === true,
+    normalization_complete: normalizationComplete === true,
+    complete: complete === true,
+    source: 'gate_official_public_futures_liq_orders_closed_minute_v1',
+    cached_at: new Date().toISOString(),
+  };
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/${LIQUIDATION_GATE_COVERAGE_TABLE}?on_conflict=settle,bucket_start`,
+    {
+      method: 'POST',
+      headers: liquidationSupabaseHeaders({
+        'content-type': 'application/json',
+        prefer: 'resolution=merge-duplicates,return=minimal',
+      }),
+      body: JSON.stringify([row]),
+      signal: AbortSignal.timeout(15000),
+    },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(`gate_liq_coverage_upsert_http_${response.status}:${text.slice(0, 220)}`);
+}
+
+async function replaceGateOfficialMinuteRows(startMs, rows) {
+  const startIso = liquidationIso(startMs);
+  const deleteQuery = new URLSearchParams({ provider: 'eq.gate', bucket_start: `eq.${startIso}` });
+  const del = await fetch(`${SUPABASE_URL}/rest/v1/${LIQUIDATION_MINUTE_TABLE}?${deleteQuery}`, {
+    method: 'DELETE',
+    headers: liquidationSupabaseHeaders({ prefer: 'return=minimal' }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const deleteText = await del.text();
+  if (!del.ok) throw new Error(`gate_liq_minute_replace_delete_http_${del.status}:${deleteText.slice(0, 220)}`);
+  if (rows.length) await upsertLiquidationMinuteRows(rows);
+}
+
+function gateOfficialMinuteRows(rawRows, startMs, endMs) {
+  const buckets = new Map();
+  let skipped = 0;
+  for (const raw of rawRows) {
+    const native = String(raw?.contract || '').trim().toUpperCase();
+    const symbol = compactSymbol(native);
+    const timeMs = integerValue(raw?.time) * 1000;
+    const signedPositionSize = numberValue(raw?.size);
+    const rawOrderSize = numberValue(raw?.order_size);
+    const contracts = rawOrderSize != null && rawOrderSize !== 0
+      ? Math.abs(rawOrderSize)
+      : signedPositionSize != null ? Math.abs(signedPositionSize) : null;
+    const price = positiveNumber(raw?.fill_price) ?? positiveNumber(raw?.order_price);
+    if (!native || !symbol || timeMs < startMs || timeMs >= endMs || signedPositionSize == null || signedPositionSize === 0 || contracts == null || contracts <= 0 || price == null) {
+      skipped += 1;
+      continue;
+    }
+    let target = buckets.get(symbol);
+    if (!target) {
+      target = { state: { provider: 'gate', symbol, observedSinceMs: startMs, createdAt: startMs, lastGapAtMs: 0 }, bucket: createBucket(startMs, MINUTE_BUCKET_MS) };
+      buckets.set(symbol, target);
+    }
+    target.events = target.events || [];
+    target.events.push({ native, symbol, timeMs, signedPositionSize, contracts, price });
+  }
+  return { buckets, skipped };
+}
+
+async function materializeGateOfficialMinuteRows(rawRows, startMs, endMs) {
+  const prepared = gateOfficialMinuteRows(rawRows, startMs, endMs);
+  const rows = [];
+  let parsed = 0;
+  for (const { state, bucket, events = [] } of prepared.buckets.values()) {
+    for (const event of events) {
+      const multiplier = gateContractMultiplierFromSharedCache(event.native, 'usdt');
+      const quantity = event.contracts * multiplier;
+      const notional = event.price * quantity;
+      if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(notional) || notional <= 0) {
+        prepared.skipped += 1;
+        continue;
+      }
+      // Gate official SDK semantics: positive size = short position,
+      // negative size = long position. `left` is intentionally ignored.
+      applyEventToBucket(bucket, {
+        id: `gate-liq-orders:${event.native}:${event.timeMs}:${event.signedPositionSize}:${event.contracts}:${event.price}`,
+        provider: 'gate',
+        symbol: event.symbol,
+        time_ms: event.timeMs,
+        price: event.price,
+        quantity,
+        quantity_contracts: event.contracts,
+        quantity_unit: 'base_asset',
+        notional,
+        liquidation_side: event.signedPositionSize > 0 ? 'short' : 'long',
+        order_side: event.signedPositionSize > 0 ? 'buy' : 'sell',
+        price_type: 'official_liq_orders_fill_or_order_price',
+      });
+      parsed += 1;
+    }
+    const row = liquidationPersistRow(state, bucket, Date.now(), 'gate_official_public_futures_liq_orders_closed_minute_v1');
+    if (!row) continue;
+    row.bucket_closed = true;
+    row.provisional = false;
+    row.coverage_complete = true;
+    row.observed_since = liquidationIso(startMs);
+    row.last_gap_at = null;
+    rows.push(row);
+  }
+  return { rows, parsed, skipped: prepared.skipped };
+}
+
+async function pollGateOfficialLiquidationMinute(now = Date.now(), { force = false } = {}) {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED || gateLiqOrdersInflight) return gateLiqOrdersInflight;
+  const endMs = Math.floor(now / MINUTE_BUCKET_MS) * MINUTE_BUCKET_MS;
+  const startMs = endMs - MINUTE_BUCKET_MS;
+  if (startMs <= 0 || (!force && gateLiqOrdersLastWindowStart === startMs)) return null;
+  gateLiqOrdersLastWindowStart = startMs;
+  gateLiqOrdersInflight = (async () => {
+    gateLiqOrdersHealth.attempts += 1;
+    gateLiqOrdersHealth.last_window_start = liquidationIso(startMs);
+    gateLiqOrdersHealth.last_window_end = liquidationIso(endMs);
+    try {
+      const from = Math.floor(startMs / 1000);
+      const to = Math.floor(endMs / 1000) - 1;
+      const query = `from=${from}&to=${to}&limit=${GATE_LIQ_ORDERS_LIMIT}`;
+      const rawRows = await gateLiqOrdersJson([
+        `https://fx-api.gateio.ws/api/v4/futures/usdt/liq_orders?${query}`,
+        `https://api.gateio.ws/api/v4/futures/usdt/liq_orders?${query}`,
+      ]);
+      const truncated = rawRows.length >= GATE_LIQ_ORDERS_LIMIT;
+      gateLiqOrdersHealth.last_rows = rawRows.length;
+      if (truncated) gateLiqOrdersHealth.truncated_windows += 1;
+
+      let materialized = { rows: [], parsed: 0, skipped: 0 };
+      let normalizationComplete = false;
+      let complete = false;
+      if (!truncated) {
+        materialized = await materializeGateOfficialMinuteRows(rawRows, startMs, endMs);
+        normalizationComplete = materialized.skipped === 0;
+        complete = normalizationComplete;
+        gateLiqOrdersHealth.parsed_events += materialized.parsed;
+        gateLiqOrdersHealth.skipped_rows += materialized.skipped;
+        if (!normalizationComplete) gateLiqOrdersHealth.normalization_incomplete_windows += 1;
+      }
+
+      await upsertGateLiquidationCoverage({
+        startMs,
+        endMs,
+        rowCount: rawRows.length,
+        parsedRowCount: materialized.parsed,
+        skippedRowCount: materialized.skipped,
+        truncated,
+        normalizationComplete,
+        complete,
+      });
+      if (complete) {
+        await replaceGateOfficialMinuteRows(startMs, materialized.rows);
+        gateOfficialFinalizedMinuteStarts.set(startMs, Date.now());
+        gateLiqOrdersHealth.complete_windows += 1;
+        liquidationPersistenceHealth.minute_persisted_rows_total += materialized.rows.length;
+        liquidationHistoryCache.clear();
+      }
+      gateLiqOrdersHealth.successes += 1;
+      gateLiqOrdersHealth.last_completed_at = new Date().toISOString();
+      gateLiqOrdersHealth.last_error = '';
+      return { ok: true, startMs, endMs, rows: rawRows.length, complete, truncated };
+    } catch (error) {
+      gateLiqOrdersHealth.failures += 1;
+      gateLiqOrdersHealth.last_error = String(error?.message || error).slice(0, 500);
+      throw error;
+    } finally {
+      gateLiqOrdersInflight = null;
+    }
+  })();
+  return gateLiqOrdersInflight;
+}
+
 export function getContractLiquidationPersistenceHealth() {
   return {
     ok: true,
@@ -840,9 +1386,21 @@ export function getContractLiquidationPersistenceHealth() {
     current_snapshot_reads_start_exchange_connections: false,
     current_snapshot_scales_with_users: false,
     storage_table: LIQUIDATION_HOUR_TABLE,
+    minute_storage_table: LIQUIDATION_MINUTE_TABLE,
+    gate_minute_coverage_table: LIQUIDATION_GATE_COVERAGE_TABLE,
+    step997_history_rpc: LIQUIDATION_STEP997_HISTORY_RPC,
     raw_events_persisted: false,
     aggregate_period: '1h',
     aggregate_retention_days: LIQUIDATION_HOUR_RETENTION_DAYS,
+    step997_unified_history_ready: LIQUIDATION_PERSISTENCE_ENABLED,
+    step997_history_intervals: ['1m', '5m', '15m', '1H', '6H', '24H'],
+    step997_default_history_backward_compatible_1h: true,
+    minute_aggregate_retention_hours: LIQUIDATION_MINUTE_RETENTION_HOURS,
+    minute_persist_queue: liquidationMinutePersistQueue.size,
+    minute_persist_inflight: Boolean(liquidationMinutePersistInflight),
+    zero_event_rows_persisted: false,
+    raw_events_process_memory_only: true,
+    gate_liq_orders: { ...gateLiqOrdersHealth },
     close_grace_seconds: Math.trunc(LIQUIDATION_CLOSE_GRACE_MS / 1000),
     persist_flush_seconds: Math.trunc(LIQUIDATION_PERSIST_FLUSH_MS / 1000),
     persist_queue: liquidationPersistQueue.size,
@@ -859,7 +1417,11 @@ export function getContractLiquidationPersistenceHealth() {
 
 if (LIQUIDATION_PERSISTENCE_ENABLED) {
   const persistTimer = setInterval(() => {
+    queueRecentLiquidationMinuteBuckets();
     queueRecentLiquidationHourBuckets();
+    flushLiquidationMinutePersistQueue().catch((error) => {
+      console.error(`[Step${STEP_VERSION}] liquidation minute flush failed: ${error?.message || error}`);
+    });
     flushLiquidationPersistQueue().catch((error) => {
       console.error(`[Step${STEP_VERSION}] liquidation hour flush failed: ${error?.message || error}`);
     });
@@ -873,13 +1435,26 @@ if (LIQUIDATION_PERSISTENCE_ENABLED) {
   }, 6 * 60 * 60_000);
   cleanupTimer.unref?.();
   const startupPersistenceTimer = setTimeout(() => {
+    queueRecentLiquidationMinuteBuckets();
     queueRecentLiquidationHourBuckets();
+    flushLiquidationMinutePersistQueue().catch(() => {});
     flushLiquidationPersistQueue().catch(() => {});
     cleanupLiquidationPersistence().catch((error) => {
       liquidationPersistenceHealth.cleanup_error = String(error?.message || error).slice(0, 300);
     });
   }, 5_000);
   startupPersistenceTimer.unref?.();
+}
+
+if (LIQUIDATION_PERSISTENCE_ENABLED) {
+  const gateStartupTimer = setTimeout(() => {
+    pollGateOfficialLiquidationMinute(Date.now(), { force: true }).catch(() => {});
+  }, 12_000);
+  gateStartupTimer.unref?.();
+  const gatePollTimer = setInterval(() => {
+    pollGateOfficialLiquidationMinute().catch(() => {});
+  }, GATE_LIQ_ORDERS_POLL_MS);
+  gatePollTimer.unref?.();
 }
 
 async function resolveWebSocketCtor() {
@@ -1131,6 +1706,12 @@ async function gateContractMultiplier(contract, settle = 'usdt') {
   const multiplier = positiveNumber(decoded?.quanto_multiplier) ?? 1;
   META_CACHE.set(key, { multiplier, storedAt: Date.now() });
   return multiplier;
+}
+
+function gateContractMultiplierFromSharedCache(contract, settle = 'usdt') {
+  const cached = META_CACHE.get(`gate:${settle}:${contract}`);
+  if (!cached || Date.now() - Number(cached.storedAt || 0) > META_FRESH_MS) return null;
+  return positiveNumber(cached.multiplier);
 }
 
 function feedKey(provider, symbol) {
@@ -1655,7 +2236,9 @@ function updateStats(row, observedSinceMs = null) {
   if (seenAt && Date.now() - seenAt <= DEDUPE_RETENTION_MS) return false;
   state.dedupe.set(id, timeMs);
   state.lastEventAt = Math.max(state.lastEventAt || 0, timeMs);
-  applyEventToBucket(bucketFor(state.minuteBuckets, timeMs, MINUTE_BUCKET_MS), row);
+  const minuteBucket = bucketFor(state.minuteBuckets, timeMs, MINUTE_BUCKET_MS);
+  applyEventToBucket(minuteBucket, row);
+  queueLiquidationMinuteBucket(state, minuteBucket);
   applyEventToBucket(bucketFor(state.quarterBuckets, timeMs, QUARTER_BUCKET_MS), row);
   const hourBucket = bucketFor(state.hourBuckets, timeMs, HOUR_BUCKET_MS);
   applyEventToBucket(hourBucket, row);
@@ -2451,6 +3034,37 @@ export async function handleContractLiquidation(req, res, url) {
       return true;
     }
     try {
+      const requestedIntervalRaw = url.searchParams.get('interval');
+      if (requestedIntervalRaw) {
+        const spec = canonicalStep997HistoryInterval(requestedIntervalRaw);
+        if (!spec) {
+          sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_liquidation_history_interval', supported_intervals: ['1m', '5m', '15m', '1H', '6H', '24H'] });
+          return true;
+        }
+        const unified = await readStep997UnifiedHistory({
+          interval: requestedIntervalRaw,
+          hours: url.searchParams.get('hours'),
+          provider: providerFilter,
+          symbol: symbolFilter,
+          limit: url.searchParams.get('limit'),
+        });
+        sendJson(res, 200, {
+          ok: true,
+          version: STEP_VERSION,
+          source: 'render_step997_unified_five_provider_liquidation_history',
+          market_type: 'contract',
+          ...unified,
+          storage_tables: { minute: LIQUIDATION_MINUTE_TABLE, hour: LIQUIDATION_HOUR_TABLE },
+          aggregate_period: spec.canonical,
+          available_intervals: ['1m', '5m', '15m', '1H', '6H', '24H'],
+          raw_events_persisted: false,
+          exchange_requests_started: 0,
+          user_reads_start_exchange_requests: false,
+          reads_scale_with_users: false,
+          timestamp_ms: Date.now(),
+        });
+        return true;
+      }
       const persisted = await readPersistedLiquidationHours({
         hours: url.searchParams.get('hours'),
         provider: providerFilter,
@@ -2465,9 +3079,13 @@ export async function handleContractLiquidation(req, res, url) {
         ...persisted,
         storage_table: LIQUIDATION_HOUR_TABLE,
         aggregate_period: '1h',
+        step997_default_backward_compatible: true,
+        available_intervals: ['1m', '5m', '15m', '1H', '6H', '24H'],
         aggregate_retention_days: LIQUIDATION_HOUR_RETENTION_DAYS,
         raw_events_persisted: false,
         exchange_requests_started: 0,
+        user_reads_start_exchange_requests: false,
+        reads_scale_with_users: false,
         timestamp_ms: Date.now(),
       });
     } catch (error) {
