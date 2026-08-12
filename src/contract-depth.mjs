@@ -1,5 +1,5 @@
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.90';
+const STEP_VERSION = '650.8.15.91';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -19,6 +19,7 @@ const STALE_MS = 20_000;
 const META_FRESH_MS = 6 * 60 * 60_000;
 const TRANSIENT_COOLDOWN_MS = 90_000;
 const RESTRICTED_COOLDOWN_MS = 30 * 60_000;
+const BITGET_ORDERBOOK_RATE_LIMIT_COOLDOWN_MS = 30_000;
 
 // Gate official BTC-M perpetual sizing:
 // BTC_USD is an inverse contract with a face value of 1 USD per contract.
@@ -1168,7 +1169,23 @@ async function loadBitget(view, symbol, limit) {
   }
   const requestLimit = limit <= 1 ? 1 : limit <= 5 ? 5 : limit <= 15 ? 15 : 50;
   const url = `https://api.bitget.com/api/v2/mix/market/merge-depth?productType=${encodeURIComponent(bitgetProductType(symbol))}&symbol=${encodeURIComponent(native)}&precision=scale0&limit=${requestLimit}`;
-  const data = await fetchJson(url);
+  let data;
+  try {
+    data = await fetchJson(url);
+  } catch (error) {
+    // Step993.4: Bitget documents merge-depth at 20 req/s/IP. A public
+    // market-data 429 is therefore treated as a short rate-limit cooldown,
+    // not the generic 30-minute restricted/region circuit. This remains
+    // per-symbol and bounded by the deep scanner's existing four-per-cycle cap.
+    if (Number(error?.statusCode || 0) === 429) {
+      error.cooldownMs = Math.max(
+        Number(error?.cooldownMs || 0),
+        BITGET_ORDERBOOK_RATE_LIMIT_COOLDOWN_MS,
+      );
+      error.reason = 'bitget_public_depth_rate_limit';
+    }
+    throw error;
+  }
   if (String(data?.code || '') !== '00000' || !data?.data) throw new Error(`bitget_orderbook_${data?.code ?? 'invalid'}`);
   const bids = normalizeLevels(data.data.bids, { side: 'bid' }).slice(0, limit);
   const asks = normalizeLevels(data.data.asks, { side: 'ask' }).slice(0, limit);
@@ -1909,6 +1926,9 @@ export function getContractDepthHealth() {
     shared_background_orderbook_last_error: SHARED_BACKGROUND_STATS.last_error,
     shared_background_orderbook_uses_same_cache_inflight_governor: true,
     shared_background_user_reads_open_upstream: false,
+    bitget_contract_orderbook_rate_limit_recovery_enabled: true,
+    bitget_contract_orderbook_429_cooldown_ms: BITGET_ORDERBOOK_RATE_LIMIT_COOLDOWN_MS,
+    bitget_contract_orderbook_rate_limit_does_not_raise_request_cap: true,
     binance_contract_rest_disabled: true,
     binance_spot_depth_transport: 'official_data_api_rest_with_endpoint_cache_inflight_and_circuit',
     fdusd_spot_identity_enabled: true,
