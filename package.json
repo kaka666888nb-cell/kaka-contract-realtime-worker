@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.101",
+  "version": "650.8.15.102",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.101 / Step993.3 Binance official-unrated ADL semantics + focus last-good guard"
+  "description": "Kaka contract realtime worker 650.8.15.102 / Step993.4 Bitget deep circuit fairness + Step993 final gate"
 }
