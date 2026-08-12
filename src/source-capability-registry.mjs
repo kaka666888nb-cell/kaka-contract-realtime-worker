@@ -7,7 +7,7 @@ import { getBybitAdvancedStatsHealth } from './bybit-advanced-stats.mjs';
 import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 
-const VERSION = '650.8.15.9';
+const VERSION = '650.8.15.10';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -181,10 +181,10 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       user_reads_scale_with_users: false,
     },
     coinbase_step995: {
-      ready: marketLight.coinbase_ticker_batch?.connected === true &&
-        Number(marketLight.coinbase_ticker_batch?.product_ids || 0) > 0 &&
-        Number(marketLight.coinbase_ticker_batch?.cached_rows || 0) > 0 &&
-        marketLight.coinbase_ticker_batch?.best_bid_ask_in_ticker_batch === false &&
+      ready: health.coinbase_ticker_batch?.connected === true &&
+        Number(health.coinbase_ticker_batch?.product_ids || 0) > 0 &&
+        Number(health.coinbase_ticker_batch?.cached_rows || 0) > 0 &&
+        health.coinbase_ticker_batch?.best_bid_ask_in_ticker_batch === false &&
         contractDepth.coinbase_level2_mode === 'advanced_trade_public_websocket_alias_aware' &&
         contractDepth.coinbase_level2_public_no_auth === true &&
         contractDepth.coinbase_level2_exact_on_demand_bounded === true &&
@@ -192,10 +192,10 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         contractDepth.coinbase_market_trades_public_rest === true &&
         contractDepth.coinbase_market_trades_side_field_is_maker === true &&
         contractDepth.coinbase_market_trades_output_side_is_taker === true,
-      ticker_batch_connected: marketLight.coinbase_ticker_batch?.connected === true,
-      ticker_batch_product_ids: Number(marketLight.coinbase_ticker_batch?.product_ids || 0),
-      ticker_batch_cached_rows: Number(marketLight.coinbase_ticker_batch?.cached_rows || 0),
-      ticker_batch_best_bid_ask_available: marketLight.coinbase_ticker_batch?.best_bid_ask_in_ticker_batch === true,
+      ticker_batch_connected: health.coinbase_ticker_batch?.connected === true,
+      ticker_batch_product_ids: Number(health.coinbase_ticker_batch?.product_ids || 0),
+      ticker_batch_cached_rows: Number(health.coinbase_ticker_batch?.cached_rows || 0),
+      ticker_batch_best_bid_ask_available: health.coinbase_ticker_batch?.best_bid_ask_in_ticker_batch === true,
       level2_mode: contractDepth.coinbase_level2_mode || null,
       level2_public_no_auth: contractDepth.coinbase_level2_public_no_auth === true,
       level2_max_symbols: Number(contractDepth.coinbase_level2_max_symbols || 0),
