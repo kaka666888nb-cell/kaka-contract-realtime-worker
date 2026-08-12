@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const BASE = 'https://api.bitget.com';
@@ -20,6 +20,8 @@ let focusRunning = null;
 let batchRunning = null;
 let focusTimer = null;
 let batchTimer = null;
+let focusRecoveryTimer = null;
+let fundingRecoveryTimer = null;
 let focusInterval = null;
 let batchInterval = null;
 let round = 0;
@@ -113,7 +115,7 @@ async function fetchJson(path, { timeoutMs = 18_000, lane = 'unknown' } = {}) {
     const response = await fetch(`${BASE}${path}`, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.93 bitget-advanced-shared',
+        'user-agent': 'KakaWeb3/650.8.15.96 bitget-advanced-shared',
       },
       signal: controller.signal,
     });
@@ -558,20 +560,80 @@ async function refreshBatchStats(reason = 'interval') {
   }
 }
 
+function focusStartupReady() {
+  const focus = bitgetFocusTargets();
+  if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) return false;
+  return focus.rows.every((target) => {
+    const row = contractRows.get(target.symbol);
+    return Boolean(
+      row?.active_buy_sell &&
+      row?.long_short &&
+      row?.position_long_short &&
+      row?.account_long_short &&
+      row?.position_tier &&
+      row?.index_components
+    );
+  });
+}
+
+function fundingStartupReady() {
+  const snapshot = getMarketLightInternalSnapshot({ market: 'contract', provider: 'bitget' });
+  const directoryCount = Number(snapshot?.directory_count || 0);
+  const rowCount = Number(snapshot?.row_count || 0);
+  if (snapshot?.ok !== true || snapshot?.stale === true || String(snapshot?.last_error || '').trim()) return false;
+  if (directoryCount <= 0 || rowCount !== directoryCount) return false;
+  let officialFundingRows = 0;
+  for (const raw of Array.isArray(snapshot?.rows) ? snapshot.rows : []) {
+    if (raw?.funding_rate != null || raw?.funding_interval_hours != null || raw?.next_funding_time != null) officialFundingRows += 1;
+  }
+  return officialFundingRows === directoryCount && fundingRows.size === directoryCount;
+}
+
+function scheduleFocusStartupRecovery() {
+  if (!started || focusStartupReady() || focusRecoveryTimer) return;
+  focusRecoveryTimer = setTimeout(async () => {
+    focusRecoveryTimer = null;
+    await refreshFocusStats('startup_recovery').catch(() => false);
+    if (!focusStartupReady()) scheduleFocusStartupRecovery();
+  }, STARTUP_RETRY_MS);
+  focusRecoveryTimer.unref?.();
+}
+
+function scheduleFundingStartupRecovery() {
+  if (!started || fundingStartupReady() || fundingRecoveryTimer) return;
+  fundingRecoveryTimer = setTimeout(() => {
+    fundingRecoveryTimer = null;
+    refreshFundingRowsFromMarketLight();
+    if (fundingStartupReady()) {
+      if (lastBatchError.includes('funding:market_light_shared_funding_not_ready')) {
+        lastBatchError = lastBatchError
+          .split('|')
+          .filter((part) => part && part !== 'funding:market_light_shared_funding_not_ready')
+          .join('|');
+      }
+      lastBatchCompletedAt = new Date().toISOString();
+      responseCache.clear();
+      return;
+    }
+    scheduleFundingStartupRecovery();
+  }, STARTUP_RETRY_MS);
+  fundingRecoveryTimer.unref?.();
+}
+
 export function startBitgetAdvancedStatsScanner() {
   if (started || process.env.KAKA_DISABLE_BITGET_ADVANCED_STATS === '1') return;
   started = true;
 
   focusTimer = setTimeout(async () => {
-    const ok = await refreshFocusStats('startup');
-    if (!ok) {
-      const retry = setTimeout(() => refreshFocusStats('startup_retry').catch(() => {}), STARTUP_RETRY_MS);
-      retry.unref?.();
-    }
+    await refreshFocusStats('startup').catch(() => false);
+    if (!focusStartupReady()) scheduleFocusStartupRecovery();
   }, START_DELAY_MS);
   focusTimer.unref?.();
 
-  batchTimer = setTimeout(() => refreshBatchStats('startup').catch(() => {}), Math.min(START_DELAY_MS + 1_000, 12_000));
+  batchTimer = setTimeout(async () => {
+    await refreshBatchStats('startup').catch(() => false);
+    if (!fundingStartupReady()) scheduleFundingStartupRecovery();
+  }, Math.min(START_DELAY_MS + 1_000, 12_000));
   batchTimer.unref?.();
 
   focusInterval = setInterval(() => refreshFocusStats('interval').catch(() => {}), FOCUS_REFRESH_MS);
@@ -720,6 +782,11 @@ export function getBitgetAdvancedStatsHealth() {
     response_cache_misses: responseCacheMisses,
     focus_running: Boolean(focusRunning),
     batch_running: Boolean(batchRunning),
+    focus_lock_release_after_completion: true,
+    startup_recovery_until_focus_ready: true,
+    funding_startup_recovery_until_market_light_ready: true,
+    funding_startup_recovery_reuses_market_light_only: true,
+    funding_startup_recovery_additional_exchange_requests: 0,
   };
 }
 
