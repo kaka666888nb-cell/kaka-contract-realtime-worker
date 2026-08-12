@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.104",
+  "version": "650.8.15.105",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.104 / Step994 OKX official funding + price limit + security fund + ADL warning shared advanced stats"
+  "description": "Kaka contract realtime worker 650.8.15.105 / Step994.1 OKX focus-family security fund correction"
 }
