@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.108",
+  "version": "650.8.15.109",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.108 / V46 closure Step993.5 + Step997.2 Binance official history/taker and Bitget official liquidation history"
+  "description": "Kaka contract realtime worker 650.8.15.109 / V46 closure Bitget delayed liquidation REST nonblocking shared reconciler + Binance shared recovery"
 }
