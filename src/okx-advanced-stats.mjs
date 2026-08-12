@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const SNAPSHOT_ROUTE = '/api/okx-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/okx-advanced/health';
 const BASE = 'https://www.okx.com';
@@ -295,43 +295,74 @@ function parsePriceLimit(payload, target) {
   };
 }
 
-function parseSecurityFund(payload) {
+function parseSecurityFund(payload, requestedFamily = '') {
   const rows = Array.isArray(payload?.data) ? payload.data : [];
-  const out = new Map();
-  for (const row of rows) {
-    const type = String(row?.instType || '').toUpperCase();
-    const family = String(row?.instFamily || '').trim().toUpperCase();
-    if (type !== 'SWAP' || !family) continue;
-    const details = (Array.isArray(row?.details) ? row.details : [])
-      .map((item) => ({
-        balance: finite(item?.balance),
-        amount_change: finite(item?.amt),
-        currency: String(item?.ccy || '') || null,
-        type: String(item?.type || '') || null,
-        ts: Number(item?.ts || 0) || null,
-        source_time: isoMs(item?.ts),
-      }))
-      .filter((item) => item.balance != null || item.amount_change != null || item.ts != null)
-      .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
-    const latest = details[0] || null;
-    out.set(family, {
-      inst_type: type,
-      inst_family: family,
-      total_usd: finite(row?.total),
-      latest_balance: latest?.balance ?? null,
-      latest_amount_change: latest?.amount_change ?? null,
-      latest_currency: latest?.currency ?? null,
-      latest_type: latest?.type ?? null,
-      latest_time_ms: latest?.ts ?? null,
-      latest_time: latest?.source_time ?? null,
-      detail_count: details.length,
-      details,
-      official_endpoint: '/api/v5/public/insurance-fund',
-      source: 'okx_official_public_security_fund_daily',
-      updated_at: new Date().toISOString(),
-    });
-  }
-  return out;
+  const requested = String(requestedFamily || '').trim().toUpperCase();
+  if (!requested || rows.length === 0) return null;
+
+  const row = rows.find((item) => {
+    const family = String(item?.instFamily || item?.uly || '').trim().toUpperCase();
+    return family && family === requested;
+  }) || rows[0];
+
+  const type = String(row?.instType || 'SWAP').toUpperCase();
+  if (type && type !== 'SWAP') return null;
+
+  const responseFamily = String(row?.instFamily || row?.uly || '').trim().toUpperCase();
+  if (responseFamily && responseFamily !== requested) return null;
+
+  const details = (Array.isArray(row?.details) ? row.details : [])
+    .map((item) => ({
+      balance: finite(item?.balance),
+      amount_change: finite(item?.amt),
+      currency: String(item?.ccy || '') || null,
+      type: String(item?.type || '') || null,
+      ts: Number(item?.ts || 0) || null,
+      source_time: isoMs(item?.ts),
+    }))
+    .filter((item) => item.balance != null || item.amount_change != null || item.ts != null)
+    .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+
+  const latest = details[0] || null;
+  const total = finite(row?.total);
+  if (total == null && details.length === 0) return null;
+
+  return {
+    inst_type: 'SWAP',
+    inst_family: requested,
+    requested_uly: requested,
+    response_family: responseFamily || null,
+    total_balance: total,
+    total_usd: total,
+    latest_balance: latest?.balance ?? null,
+    latest_amount_change: latest?.amount_change ?? null,
+    latest_currency: latest?.currency ?? null,
+    latest_type: latest?.type ?? null,
+    latest_time_ms: latest?.ts ?? null,
+    latest_time: latest?.source_time ?? null,
+    detail_count: details.length,
+    details,
+    official_endpoint: '/api/v5/public/insurance-fund',
+    official_query_scope: 'instType=SWAP + uly=<focus instFamily>',
+    source: 'okx_official_public_security_fund_focus_family_slow_shared',
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function securityFundFocusState() {
+  const focus = okxFocusTargets();
+  const targets = focus.rows;
+  const readyTargets = targets.filter((target) =>
+    isFresh(securityFundRows.get(target.inst_family)?.updated_at, SECURITY_FUND_STALE_MS)
+  );
+  return {
+    focus_ready: focus.focus_ready,
+    target_count: targets.length,
+    ready_count: readyTargets.length,
+    missing_targets: targets.filter((target) =>
+      !isFresh(securityFundRows.get(target.inst_family)?.updated_at, SECURITY_FUND_STALE_MS)
+    ),
+  };
 }
 
 function parseAdlWarningPush(payload) {
@@ -410,6 +441,7 @@ async function refreshFocusStats(reason = 'scheduled', { missingOnly = false } =
     if (failures > 0 && successes === 0) totalFocusFailures += 1;
     lastFocusCompletedAt = new Date().toISOString();
     round += 1;
+    if (!securityFundStartupReady()) scheduleSecurityFundStartupRecovery();
     responseCache.clear();
     return successes > 0 || targets.length === 0;
   })();
@@ -421,28 +453,63 @@ async function refreshFocusStats(reason = 'scheduled', { missingOnly = false } =
   }
 }
 
-async function refreshSecurityFund(reason = 'scheduled') {
+async function refreshSecurityFund(reason = 'scheduled', { missingOnly = false } = {}) {
   if (securityFundRunning) return await securityFundRunning;
   const task = (async () => {
     lastSecurityFundStartedAt = new Date().toISOString();
     lastSecurityFundError = '';
     totalSecurityFundBuilds += 1;
-    try {
-      const payload = await fetchJson('/api/v5/public/insurance-fund?instType=SWAP', { lane: 'security_fund', timeoutMs: 20_000 });
-      const parsed = parseSecurityFund(payload);
-      if (!parsed.size) throw new Error('okx_security_fund_rows_empty');
-      securityFundRows.clear();
-      for (const [family, row] of parsed) securityFundRows.set(family, row);
-      setLane('security_fund', { last_rows: parsed.size });
-      lastSecurityFundCompletedAt = new Date().toISOString();
-      responseCache.clear();
-      return true;
-    } catch (error) {
+
+    const focus = okxFocusTargets();
+    if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) {
+      const error = new Error(`okx_security_fund_focus_not_ready:${focus.rows.length}/${FOCUS_TARGET}`);
       totalSecurityFundFailures += 1;
-      lastSecurityFundError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
+      lastSecurityFundError = `${reason}:${error.message}`;
       return false;
     }
+
+    const targets = missingOnly
+      ? focus.rows.filter((target) =>
+          !isFresh(securityFundRows.get(target.inst_family)?.updated_at, SECURITY_FUND_STALE_MS)
+        )
+      : focus.rows;
+
+    let successes = 0;
+    let failures = 0;
+    for (const target of targets) {
+      try {
+        const path = `/api/v5/public/insurance-fund?instType=SWAP&uly=${encodeURIComponent(target.inst_family)}`;
+        const payload = await fetchJson(path, { lane: 'security_fund', timeoutMs: 20_000 });
+        const parsed = parseSecurityFund(payload, target.inst_family);
+        if (!parsed) throw new Error(`okx_security_fund_payload_invalid:${target.inst_family}`);
+        securityFundRows.set(target.inst_family, parsed);
+        successes += 1;
+      } catch (error) {
+        failures += 1;
+        lastSecurityFundError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
+      }
+      await sleep(PER_REQUEST_GAP_MS);
+    }
+
+    const state = securityFundFocusState();
+    setLane('security_fund', { last_rows: state.ready_count });
+    if (failures > 0 && successes === 0) totalSecurityFundFailures += 1;
+    if (successes > 0) {
+      lastSecurityFundCompletedAt = new Date().toISOString();
+      responseCache.clear();
+    }
+
+    if (!state.focus_ready || state.target_count !== FOCUS_TARGET || state.ready_count !== FOCUS_TARGET) {
+      if (!lastSecurityFundError) {
+        lastSecurityFundError = `${reason}:okx_security_fund_focus_coverage:${state.ready_count}/${FOCUS_TARGET}`;
+      }
+      return false;
+    }
+
+    lastSecurityFundError = '';
+    return true;
   })();
+
   securityFundRunning = task;
   try {
     return await task;
@@ -584,13 +651,14 @@ function scheduleFocusStartupRecovery() {
   focusRecoveryTimer.unref?.();
 }
 function securityFundStartupReady() {
-  return securityFundRows.size > 0 && isFresh(lastSecurityFundCompletedAt, SECURITY_FUND_STALE_MS);
+  const state = securityFundFocusState();
+  return state.focus_ready && state.target_count === FOCUS_TARGET && state.ready_count === FOCUS_TARGET;
 }
 function scheduleSecurityFundStartupRecovery() {
   if (securityFundRecoveryTimer || securityFundStartupReady()) return;
   securityFundRecoveryTimer = setTimeout(async () => {
     securityFundRecoveryTimer = null;
-    await refreshSecurityFund('startup_recovery').catch(() => false);
+    await refreshSecurityFund('startup_recovery_missing_only', { missingOnly: true }).catch(() => false);
     if (!securityFundStartupReady()) scheduleSecurityFundStartupRecovery();
   }, Math.max(30_000, STARTUP_RETRY_MS * 2));
   securityFundRecoveryTimer.unref?.();
@@ -729,7 +797,7 @@ function snapshotPayload({ includeRows = true } = {}) {
     official_endpoint_rate_policy: {
       funding_rate: 'public REST; IP + instrument ID; shared focus15 every 5m',
       price_limit: 'public REST; shared focus15 every 5m',
-      security_fund: '10 requests/2s/IP; collector intentionally uses one all-SWAP request every 6h',
+      security_fund: '10 requests/2s/IP; official SWAP query requires uly; focus15 families every 6h with missing-only recovery',
       open_interest: 'reused from market-light official SWAP batch; zero duplicate Step994 requests',
       adl_warning: 'one shared public websocket connection; focus15 instFamily subscriptions; no push in normal state',
     },
@@ -737,7 +805,7 @@ function snapshotPayload({ includeRows = true } = {}) {
       open_interest: 'OKX official public open-interest SWAP batch already owned by market-light',
       funding_rate: 'OKX official current funding rate; nextFundingRate may be empty and stays null',
       price_limit: 'OKX official highest buy limit / lowest sell limit; enabled=false is official coverage and limits may be null',
-      security_fund: 'OKX official security fund; regular_update removed in 2026; liquidation_balance_deposit/bankruptcy_loss change is daily around 08:00 UTC',
+      security_fund: 'OKX official security fund queried by instType=SWAP + uly per focus family; regular_update removed in 2026; daily balance-change events remain around 08:00 UTC',
       adl_warning: 'OKX public adl-warning pushes only warning/adl once per second; silence is not fabricated as a per-symbol normal value',
     },
     separate_from_derived_data: true,
@@ -814,6 +882,10 @@ export function getOkxAdvancedStatsHealth() {
     startup_recovery_until_focus_ready: true,
     startup_recovery_missing_only: true,
     security_fund_startup_recovery: true,
+    security_fund_startup_recovery_missing_only: true,
+    security_fund_uly_parameter_required: true,
+    security_fund_all_swap_query_disabled: true,
+    security_fund_requests_per_full_cycle_max: FOCUS_TARGET,
   };
 }
 
@@ -858,6 +930,7 @@ export const __okxAdvancedTest = Object.freeze({
   parseFunding,
   parsePriceLimit,
   parseSecurityFund,
+  securityFundFocusState,
   parseAdlWarningPush,
   nativeSymbol,
   instFamily,
