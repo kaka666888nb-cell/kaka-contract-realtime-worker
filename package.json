@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.102",
+  "version": "650.8.15.103",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.102 / Step993.4 Bitget deep circuit fairness + Step993 final gate"
+  "description": "Kaka contract realtime worker 650.8.15.103 / Step997 unified liquidation history buckets + Gate official liq_orders"
 }
