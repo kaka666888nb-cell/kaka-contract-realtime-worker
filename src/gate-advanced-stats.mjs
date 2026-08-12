@@ -1,6 +1,6 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const SNAPSHOT_ROUTE = '/api/gate-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/gate-advanced/health';
 const BASES = Object.freeze([
@@ -22,6 +22,7 @@ let focusRunning = null;
 let insuranceRunning = null;
 let focusTimer = null;
 let insuranceTimer = null;
+let focusRecoveryTimer = null;
 let focusInterval = null;
 let insuranceInterval = null;
 let round = 0;
@@ -103,7 +104,7 @@ async function fetchGate(path, { lane = 'unknown', timeoutMs = 18_000 } = {}) {
       const response = await fetch(`${base}${path}`, {
         headers: {
           accept: 'application/json',
-          'user-agent': 'KakaWeb3/650.8.15.94 gate-advanced-shared',
+          'user-agent': 'KakaWeb3/650.8.15.95 gate-advanced-shared',
         },
         signal: controller.signal,
       });
@@ -231,12 +232,18 @@ function parseRiskTiers(payload, target) {
 
 function parseInsurance(payload) {
   const rows = Array.isArray(payload) ? payload : [];
-  return rows.map((row) => ({
-    time: integer(row?.time),
-    source_time: isoSeconds(row?.time),
-    balance: finite(row?.balance),
-    source: 'gate_official_public_futures_insurance_fund_history',
-  })).filter((row) => row.time != null || row.balance != null);
+  return rows.map((row) => {
+    // Gate official InsuranceRecord model:
+    // t = Unix timestamp in seconds, b = insurance balance.
+    const time = integer(row?.t);
+    const balance = finite(row?.b);
+    return {
+      time,
+      source_time: isoSeconds(time),
+      balance,
+      source: 'gate_official_public_futures_insurance_fund_history',
+    };
+  }).filter((row) => row.time != null || row.balance != null);
 }
 
 async function collectContractStats(targets) {
@@ -271,8 +278,11 @@ async function collectRiskTiers(targets) {
 
 async function refreshFocusStats(reason = 'scheduled') {
   if (focusRunning) return await focusRunning;
-  let task;
-  task = (async () => {
+
+  // Yield before the readiness check so focusRunning receives this Promise
+  // before any startup precondition failure can finish the task.
+  const task = (async () => {
+    await Promise.resolve();
     lastFocusStartedAt = new Date().toISOString();
     lastFocusError = '';
     totalFocusBuilds += 1;
@@ -318,27 +328,37 @@ async function refreshFocusStats(reason = 'scheduled') {
       totalFocusFailures += 1;
       lastFocusError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
       return false;
-    } finally {
-      if (focusRunning === task) focusRunning = null;
     }
   })();
+
   focusRunning = task;
-  return await task;
+  try {
+    return await task;
+  } finally {
+    if (focusRunning === task) focusRunning = null;
+  }
 }
 
 async function refreshInsurance(reason = 'scheduled') {
   if (insuranceRunning) return await insuranceRunning;
-  let task;
-  task = (async () => {
+
+  const task = (async () => {
+    await Promise.resolve();
     lastInsuranceStartedAt = new Date().toISOString();
     lastInsuranceError = '';
     totalInsuranceBuilds += 1;
     try {
       const payload = await fetchGate('/futures/usdt/insurance?limit=100', { lane: 'insurance_fund' });
       const rows = parseInsurance(payload);
-      if (!rows.length) throw new Error('gate_insurance_rows_empty');
+      setLane('insurance_fund', {
+        last_rows: rows.length,
+        last_payload_rows: Array.isArray(payload) ? payload.length : 0,
+        official_model_fields: 't,b',
+      });
+      if (!rows.length) {
+        throw new Error(`gate_insurance_rows_empty:payload_rows=${Array.isArray(payload) ? payload.length : 0}`);
+      }
       insuranceRows = rows;
-      setLane('insurance_fund', { last_rows: rows.length });
       lastInsuranceCompletedAt = new Date().toISOString();
       responseCache.clear();
       return true;
@@ -346,12 +366,25 @@ async function refreshInsurance(reason = 'scheduled') {
       totalInsuranceFailures += 1;
       lastInsuranceError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
       return false;
-    } finally {
-      if (insuranceRunning === task) insuranceRunning = null;
     }
   })();
+
   insuranceRunning = task;
-  return await task;
+  try {
+    return await task;
+  } finally {
+    if (insuranceRunning === task) insuranceRunning = null;
+  }
+}
+
+function scheduleFocusStartupRecovery() {
+  if (!started || contractRows.size >= FOCUS_TARGET || focusRecoveryTimer) return;
+  focusRecoveryTimer = setTimeout(async () => {
+    focusRecoveryTimer = null;
+    const ok = await refreshFocusStats('startup_recovery').catch(() => false);
+    if (!ok && contractRows.size < FOCUS_TARGET) scheduleFocusStartupRecovery();
+  }, STARTUP_RETRY_MS);
+  focusRecoveryTimer.unref?.();
 }
 
 export function startGateAdvancedStatsScanner() {
@@ -359,13 +392,16 @@ export function startGateAdvancedStatsScanner() {
   started = true;
   focusTimer = setTimeout(async () => {
     const ok = await refreshFocusStats('startup');
-    if (!ok) {
-      const retry = setTimeout(() => refreshFocusStats('startup_retry').catch(() => {}), STARTUP_RETRY_MS);
-      retry.unref?.();
-    }
+    if (!ok) scheduleFocusStartupRecovery();
   }, START_DELAY_MS);
   focusTimer.unref?.();
-  insuranceTimer = setTimeout(() => refreshInsurance('startup').catch(() => {}), Math.min(START_DELAY_MS + 1_500, 14_000));
+  insuranceTimer = setTimeout(async () => {
+    const ok = await refreshInsurance('startup').catch(() => false);
+    if (!ok) {
+      const retry = setTimeout(() => refreshInsurance('startup_retry').catch(() => {}), STARTUP_RETRY_MS);
+      retry.unref?.();
+    }
+  }, Math.min(START_DELAY_MS + 1_500, 14_000));
   insuranceTimer.unref?.();
   focusInterval = setInterval(() => refreshFocusStats('interval').catch(() => {}), FOCUS_REFRESH_MS);
   focusInterval.unref?.();
@@ -507,6 +543,10 @@ export function getGateAdvancedStatsHealth() {
     response_cache_misses: responseCacheMisses,
     focus_running: Boolean(focusRunning),
     insurance_running: Boolean(insuranceRunning),
+    focus_lock_release_after_completion: true,
+    startup_recovery_until_focus_ready: true,
+    insurance_official_model_fields: 't,b',
+    insurance_parser_matches_official_model: true,
   };
 }
 
