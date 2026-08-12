@@ -6,8 +6,9 @@ import { getOkxAdvancedStatsHealth } from './okx-advanced-stats.mjs';
 import { getBybitAdvancedStatsHealth } from './bybit-advanced-stats.mjs';
 import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
+import { getContractFlowHealth } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.10';
+const VERSION = '650.8.15.11';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -34,6 +35,8 @@ const CAPABILITIES = Object.freeze([
   { provider: 'binance', market: 'contract', capability: 'bbo', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_book_tickers_stream', rate_limit_class: 'one_shared_connection_5s', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step990', fallback_policy: 'last_verified_shared_snapshot_or_null', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
   { provider: 'binance', market: 'contract', capability: 'open_interest_current', official_available: true, official_scope: 'per_symbol_focus15', transport: 'authenticated_edge_relay_to_official_REST', batch_mode: 'shared_focus15_5m', rate_limit_class: 'medium_shared', collector: 'binance-advanced-slow-stats', target_layer: 'slow_stats_or_focus', current_integration: 'ready_step993', fallback_policy: 'last_verified_until_stale_then_missing; never derived_as_official', history_policy: '5m_1h_1d_history_remains_separate', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
   { provider: 'binance', market: 'contract', capability: 'adl_risk', official_available: true, official_scope: 'all_symbols_official_then_focus15_filter', transport: 'authenticated_edge_relay_to_official_REST', batch_mode: 'one_shared_all_symbol_request_per_30m', rate_limit_class: 'slow_shared', collector: 'binance-advanced-slow-stats', target_layer: 'risk', current_integration: 'ready_step993', fallback_policy: 'last_verified_until_stale_then_null; successful exact-symbol no-rating is official_unrated and remains null', history_policy: 'slow_snapshot', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
+  { provider: 'binance', market: 'contract', capability: 'open_interest_history', official_available: true, official_scope: 'per_symbol_shared_history', transport: 'authenticated_edge_relay_to_official_REST_plus_shared_supabase_cache', batch_mode: 'existing_contract_flow_5m_history_no_duplicate_collector', rate_limit_class: 'existing_shared', collector: 'contract-flow-metric-history', target_layer: 'history', current_integration: 'ready_v46_closure', fallback_policy: 'last_persisted_verified_history; no derived-as-official', history_policy: 'official_5m_openInterestHist_persisted_72h', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
+  { provider: 'binance', market: 'contract', capability: 'long_short_and_taker_stats', official_available: true, official_scope: 'per_symbol_shared_focus_and_history', transport: 'authenticated_edge_relay_to_official_REST', batch_mode: 'existing_contract_flow_long_short_plus_focus15_official_taker_5m', rate_limit_class: 'shared_bounded', collector: 'contract-flow-metric-history', target_layer: 'history_and_focus', current_integration: 'ready_v46_closure', fallback_policy: 'long_short_last_persisted; taker_last_shared_memory_until_stale; never substitute derived flow as official taker', history_policy: '5m_long_short_persisted_plus_5m_taker_shared_memory', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
 
   // OKX
   { provider: 'okx', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SPOT_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
@@ -55,6 +58,7 @@ const CAPABILITIES = Object.freeze([
   { provider: 'bitget', market: 'spot', capability: 'whale_fund_net_capital_flow', official_available: true, official_scope: 'per_symbol_focus_intersection', transport: 'REST', batch_mode: 'shared_focus15_slow_stats', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'funds_official', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: 'official_periods_plus_future_bucket_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/trading-data/Get-Spot-Whale-Net-Flow' },
   { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short', official_available: true, official_scope: 'per_symbol_focus15', transport: 'REST', batch_mode: 'four_official_5m_focus_lanes', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: '5m_official_then_future_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
   { provider: 'bitget', market: 'contract', capability: 'risk_reserve_position_tier_oi_limit_index_components', official_available: true, official_scope: 'batch_plus_focus15', transport: 'REST', batch_mode: 'risk_reserve_all_and_oi_limit_batch_plus_focus_tier_index', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step991', fallback_policy: 'missing', history_policy: 'risk_reserve_future_history_step1000; current_reference_now', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve-All' },
+  { provider: 'bitget', market: 'contract', capability: 'liquidation_history', official_available: true, official_scope: 'category_wide_public_history_three_product_types', transport: 'public_REST', batch_mode: 'delayed_closed_minute_reconcile_after_public_ws_live_ingress', rate_limit_class: '5_per_sec_ip_bounded_350ms_gap', collector: 'liquidation-collector', target_layer: 'unified_history', current_integration: 'ready_v46_closure_step997_2', fallback_policy: 'live_ws_provisional_then_official_rest_reconcile; incomplete/page-capped REST never overwrites', history_policy: 'official_last_3_days_source_reconciles_nonzero_1m_buckets', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Liquidations' },
 
   // Gate
   { provider: 'gate', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'all_spot_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
@@ -97,6 +101,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const okxAdvanced = getOkxAdvancedStatsHealth();
   const bybitAdvanced = getBybitAdvancedStatsHealth();
   const contractDepth = getContractDepthHealth();
+  const contractFlow = getContractFlowHealth();
   const liquidationHistory = getContractLiquidationPersistenceHealth();
   const marketKeys = Object.keys(coverage);
   const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
@@ -206,6 +211,59 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       market_trades_output_side_is_taker: contractDepth.coinbase_market_trades_output_side_is_taker === true,
       user_reads_scale_full_market_upstream: false,
     },
+    v46_closure: {
+      ready: binanceAdvanced.focus_target === 15 &&
+        Number(binanceAdvanced.adl_official_coverage_rows || 0) === 15 &&
+        binanceAdvanced.edge_relay_only === true &&
+        binanceAdvanced.render_direct_binance_rest === false &&
+        contractFlow.binance_open_interest_history_official_ready === true &&
+        contractFlow.binance_open_interest_history_edge_relay_only === true &&
+        contractFlow.binance_long_short_history_official_ready === true &&
+        contractFlow.binance_long_short_history_edge_relay_only === true &&
+        contractFlow.binance_official_taker?.ready === true &&
+        Number(contractFlow.binance_official_taker?.official_coverage_rows || 0) === 15 &&
+        contractFlow.binance_official_taker?.existing_edge_relay_governor_reused === true &&
+        contractFlow.binance_official_taker?.custom_provider_governor_created === false &&
+        liquidationHistory.bitget_liquidations_history?.complete_windows > 0 &&
+        liquidationHistory.bitget_liquidations_history?.public_no_auth === true &&
+        liquidationHistory.bitget_liquidations_history?.provider_request_governor_reused === true &&
+        liquidationHistory.bitget_liquidations_history?.coverage_state_process_memory_only === true &&
+        liquidationHistory.bitget_liquidations_history?.coverage_state_persisted === false &&
+        liquidationHistory.bitget_liquidations_history?.failed_window_retry_same_start === true &&
+        liquidationHistory.bitget_liquidations_history?.pending_window_cleared_only_after_success === true &&
+        Number(liquidationHistory.bitget_liquidations_history?.reconciliation_delay_seconds || 0) >= 600 &&
+        Number(liquidationHistory.bitget_liquidations_history?.max_pages_per_category || 0) === 20 &&
+        liquidationHistory.bitget_liquidations_history?.user_reads_trigger_requests === false,
+      binance_adl_capability_ready: Number(binanceAdvanced.adl_official_coverage_rows || 0) === 15 && binanceAdvanced.edge_relay_only === true && binanceAdvanced.render_direct_binance_rest === false,
+      binance_open_interest_history_ready: contractFlow.binance_open_interest_history_official_ready === true && contractFlow.binance_open_interest_history_edge_relay_only === true,
+      binance_open_interest_history_endpoint: contractFlow.binance_open_interest_history_endpoint || null,
+      binance_open_interest_history_persistence_table: contractFlow.binance_open_interest_history_persistence_table || null,
+      binance_long_short_history_ready: contractFlow.binance_long_short_history_official_ready === true && contractFlow.binance_long_short_history_edge_relay_only === true,
+      binance_long_short_history_endpoints: contractFlow.binance_long_short_history_endpoints || [],
+      binance_official_taker_ready: contractFlow.binance_official_taker?.ready === true,
+      binance_official_taker_coverage_rows: Number(contractFlow.binance_official_taker?.official_coverage_rows || 0),
+      binance_official_taker_endpoint: contractFlow.binance_official_taker?.official_endpoint || null,
+      binance_official_taker_requests_per_focus_cycle_max: Number(contractFlow.binance_official_taker?.requests_per_full_focus_cycle_max || 0),
+      binance_official_taker_existing_edge_relay_governor_reused: contractFlow.binance_official_taker?.existing_edge_relay_governor_reused === true,
+      binance_official_taker_user_reads_trigger_exchange_requests: contractFlow.binance_official_taker?.user_reads_trigger_exchange_requests === true,
+      bitget_liquidation_history_ready: Number(liquidationHistory.bitget_liquidations_history?.complete_windows || 0) > 0 && liquidationHistory.bitget_liquidations_history?.public_no_auth === true,
+      bitget_liquidation_history_complete_windows: Number(liquidationHistory.bitget_liquidations_history?.complete_windows || 0),
+      bitget_liquidation_history_endpoint: liquidationHistory.bitget_liquidations_history?.endpoint || null,
+      bitget_liquidation_history_categories: liquidationHistory.bitget_liquidations_history?.categories || [],
+      bitget_liquidation_history_provider_governor_reused: liquidationHistory.bitget_liquidations_history?.provider_request_governor_reused === true,
+      bitget_liquidation_history_reconciliation_delay_seconds: Number(liquidationHistory.bitget_liquidations_history?.reconciliation_delay_seconds || 0),
+      bitget_liquidation_history_max_pages_per_category: Number(liquidationHistory.bitget_liquidations_history?.max_pages_per_category || 0),
+      bitget_liquidation_history_pending_window_start: liquidationHistory.bitget_liquidations_history?.pending_window_start || null,
+      bitget_liquidation_history_coverage_state_process_memory_only: liquidationHistory.bitget_liquidations_history?.coverage_state_process_memory_only === true,
+      bitget_liquidation_history_coverage_state_persisted: liquidationHistory.bitget_liquidations_history?.coverage_state_persisted === true,
+      bitget_liquidation_history_delayed_zero_conflict_keeps_existing_ws: liquidationHistory.bitget_liquidations_history?.delayed_zero_conflict_keeps_existing_ws === true,
+      bitget_liquidation_history_failed_window_retry_same_start: liquidationHistory.bitget_liquidations_history?.failed_window_retry_same_start === true,
+      bitget_liquidation_history_pending_window_cleared_only_after_success: liquidationHistory.bitget_liquidations_history?.pending_window_cleared_only_after_success === true,
+      bitget_liquidation_history_amount_unit_source: liquidationHistory.bitget_liquidations_history?.amount_unit_source || null,
+      bitget_liquidation_history_user_reads_trigger_requests: liquidationHistory.bitget_liquidations_history?.user_reads_trigger_requests === true,
+      no_new_binance_direct_render_rest: true,
+      user_reads_scale_exchange_upstream: false,
+    },
     binance_step993: {
       ready: binanceAdvanced.ready === true,
       version: binanceAdvanced.version || null,
@@ -307,6 +365,7 @@ export function getSourceCapabilityRegistryHealth() {
     ready: payload.runtime_market_light_11_exact &&
       payload.step990_light_gap_status.binance_contract_all_market_bbo_ready &&
       payload.trading_status_full_market_ready &&
+      payload.v46_closure.ready &&
       payload.binance_step993.ready &&
       payload.okx_step994.ready &&
       payload.bybit_step995.ready &&

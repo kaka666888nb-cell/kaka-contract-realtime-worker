@@ -4,7 +4,7 @@ import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.91';
+const VERSION = '650.8.15.92';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -531,6 +531,26 @@ const BINANCE_OI_CRITICAL_DELAY_MS = 0;
 const BINANCE_RATIO_CRITICAL_TTL_MS = 5 * 60 * 1000;
 const BINANCE_RATIO_FIRST_PAINT_WAIT_MS = 3200;
 const BINANCE_RATIO_CRITICAL_LIMIT = 3;
+const BINANCE_OFFICIAL_TAKER_REFRESH_MS = Math.max(5 * 60_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_REFRESH_MS || 5 * 60_000));
+const BINANCE_OFFICIAL_TAKER_STALE_MS = Math.max(8 * 60_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_STALE_MS || 12 * 60_000));
+const BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT = Math.max(3, Math.min(500, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT || 288)));
+const BINANCE_OFFICIAL_TAKER_START_DELAY_MS = Math.max(20_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_START_DELAY_MS || 45_000));
+const BINANCE_OFFICIAL_TAKER_RETRY_MS = Math.max(30_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_RETRY_MS || 60_000));
+const binanceOfficialTakerBySymbol = new Map();
+let binanceOfficialTakerInflight = null;
+let binanceOfficialTakerRecoveryTimer = null;
+let binanceOfficialTakerRound = 0;
+const binanceOfficialTakerStats = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  background_deferrals: 0,
+  last_started_at: null,
+  last_completed_at: null,
+  last_error: '',
+  last_focus_round: 0,
+  last_successful_focus_round: 0,
+};
 
 
 function percentile(sorted, percentileValue) {
@@ -2225,6 +2245,158 @@ async function refreshBinanceLongShortCritical(state) {
   return state.ratioCriticalPromise;
 }
 
+function parseBinanceOfficialTakerRows(payload, symbol) {
+  const target = symbolKey(symbol);
+  if (!target || !Array.isArray(payload)) return null;
+  const rows = [];
+  for (const item of payload) {
+    const timestampMs = Number(item?.timestamp || 0);
+    const buySellRatio = asNumber(item?.buySellRatio);
+    const buyVolume = asNumber(item?.buyVol);
+    const sellVolume = asNumber(item?.sellVol);
+    if (!Number.isFinite(timestampMs) || timestampMs <= 0) continue;
+    if (buySellRatio == null || buySellRatio < 0 || buyVolume == null || buyVolume < 0 || sellVolume == null || sellVolume < 0) continue;
+    rows.push({
+      source_time_ms: timestampMs,
+      source_time: new Date(timestampMs).toISOString(),
+      buy_sell_ratio: buySellRatio,
+      buy_volume: buyVolume,
+      sell_volume: sellVolume,
+    });
+  }
+  rows.sort((a,b)=>a.source_time_ms-b.source_time_ms);
+  return {
+    provider: 'binance', market_type: 'contract', symbol: target, period: '5m',
+    row_count: rows.length, rows,
+    official_endpoint: '/futures/data/takerlongshortRatio',
+    source: 'binance_official_taker_buy_sell_volume_supabase_edge_relay_shared_focus15',
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function binanceOfficialTakerFocusTargets() {
+  const focus = focusPoolSymbolsByProvider();
+  const rows = focus.byProvider?.binance || [];
+  return { ready: focus.ready === true && rows.length === 15, round: Number(focus.round || 0), symbols: rows.slice(0,15) };
+}
+
+function binanceOfficialTakerEntryFresh(entry) {
+  const updated = Date.parse(String(entry?.updated_at || ''));
+  return Number.isFinite(updated) && Date.now() - updated <= BINANCE_OFFICIAL_TAKER_STALE_MS && Number(entry?.row_count || 0) > 0;
+}
+
+function binanceOfficialTakerHealthPayload() {
+  const focus = binanceOfficialTakerFocusTargets();
+  const coverage = focus.symbols.filter((symbol)=>binanceOfficialTakerEntryFresh(binanceOfficialTakerBySymbol.get(symbol))).length;
+  const totalRows = focus.symbols.reduce((sum,symbol)=>sum+Number(binanceOfficialTakerBySymbol.get(symbol)?.row_count||0),0);
+  const missing = focus.symbols.filter((symbol)=>!binanceOfficialTakerEntryFresh(binanceOfficialTakerBySymbol.get(symbol)));
+  return {
+    ready: focus.ready && coverage === 15,
+    focus_target: 15,
+    focus_round: focus.round,
+    official_coverage_rows: coverage,
+    total_history_rows: totalRows,
+    missing_symbols: missing,
+    official_endpoint: '/futures/data/takerlongshortRatio',
+    official_period: '5m',
+    official_history_limit: BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT,
+    official_response_fields: ['buySellRatio','buyVol','sellVol','timestamp'],
+    transport: 'authenticated_supabase_edge_public_rest_relay_only',
+    render_direct_binance_rest: false,
+    memory_shared_history_only: true,
+    raw_exchange_response_persisted: false,
+    refresh_seconds: Math.round(BINANCE_OFFICIAL_TAKER_REFRESH_MS/1000),
+    stale_seconds: Math.round(BINANCE_OFFICIAL_TAKER_STALE_MS/1000),
+    requests_per_full_focus_cycle_max: 15,
+    focus_change_missing_only_recovery: true,
+    existing_edge_relay_governor_reused: true,
+    custom_provider_governor_created: false,
+    user_reads_trigger_exchange_requests: false,
+    reads_scale_with_users: false,
+    round: binanceOfficialTakerRound,
+    ...binanceOfficialTakerStats,
+  };
+}
+
+async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnly=false }={}) {
+  if (binanceOfficialTakerInflight) return await binanceOfficialTakerInflight;
+  const task=(async()=>{
+    const focus=binanceOfficialTakerFocusTargets();
+    binanceOfficialTakerStats.last_started_at=new Date().toISOString();
+    binanceOfficialTakerStats.last_focus_round=focus.round;
+    if(!focus.ready){
+      binanceOfficialTakerStats.last_error=`${reason}:binance_focus_not_ready:${focus.symbols.length}/15`;
+      return false;
+    }
+    let anySuccess=false;
+    const errors=[];
+    for(const symbol of focus.symbols){
+      const current=binanceOfficialTakerBySymbol.get(symbol);
+      if(missingOnly && binanceOfficialTakerEntryFresh(current)) continue;
+      binanceOfficialTakerStats.attempts+=1;
+      try{
+        const native=nativeContractSymbol('binance',symbol);
+        const payload=await fetchBinanceJson(
+          `https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${encodeURIComponent(native)}&period=5m&limit=${BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT}`,
+          { source:'position_metrics:official_taker_focus15', lane:'auxiliary', priority:-15, deferWhenBusy:true },
+        );
+        const parsed=parseBinanceOfficialTakerRows(payload,symbol);
+        if(!parsed || parsed.row_count<=0) throw new Error('binance_official_taker_empty');
+        binanceOfficialTakerBySymbol.set(symbol,parsed);
+        binanceOfficialTakerStats.successes+=1;
+        anySuccess=true;
+      }catch(error){
+        binanceOfficialTakerStats.failures+=1;
+        const message=String(error?.message||error).slice(0,220);
+        errors.push(`${symbol}:${message}`);
+        if(error?.backgroundDeferred||error?.auxiliaryDeferred){
+          binanceOfficialTakerStats.background_deferrals+=1;
+          break;
+        }
+        if(error?.internalBinanceRestGuard||error?.internalBinanceRelayGuard||[403,418,429,451].includes(Number(error?.status||0))) break;
+      }
+    }
+    if(anySuccess) binanceOfficialTakerRound+=1;
+    binanceOfficialTakerStats.last_completed_at=new Date().toISOString();
+    const health=binanceOfficialTakerHealthPayload();
+    if(health.ready) binanceOfficialTakerStats.last_successful_focus_round=focus.round;
+    binanceOfficialTakerStats.last_error=health.ready?'':errors.join(' | ').slice(0,700);
+    return health.ready;
+  })();
+  binanceOfficialTakerInflight=task;
+  try{return await task;}finally{if(binanceOfficialTakerInflight===task)binanceOfficialTakerInflight=null;}
+}
+
+function scheduleBinanceOfficialTakerRecovery() {
+  if (binanceOfficialTakerRecoveryTimer) return;
+  binanceOfficialTakerRecoveryTimer=setTimeout(async()=>{
+    binanceOfficialTakerRecoveryTimer=null;
+    const ready=await refreshBinanceOfficialTakerFocus('missing_recovery',{missingOnly:true}).catch(()=>false);
+    if(!ready) scheduleBinanceOfficialTakerRecovery();
+  },BINANCE_OFFICIAL_TAKER_RETRY_MS);
+  binanceOfficialTakerRecoveryTimer.unref?.();
+}
+
+function startBinanceOfficialTakerCollector() {
+  const startup=setTimeout(async()=>{
+    const ready=await refreshBinanceOfficialTakerFocus('startup',{missingOnly:true}).catch(()=>false);
+    if(!ready) scheduleBinanceOfficialTakerRecovery();
+  },BINANCE_OFFICIAL_TAKER_START_DELAY_MS);
+  startup.unref?.();
+  const interval=setInterval(async()=>{
+    const focus=binanceOfficialTakerFocusTargets();
+    const focusChanged=focus.ready && Number(binanceOfficialTakerStats.last_successful_focus_round||0)!==Number(focus.round||0);
+    const ready=await refreshBinanceOfficialTakerFocus(focusChanged?'focus_change_missing_only':'interval',{missingOnly:focusChanged}).catch(()=>false);
+    if(!ready) scheduleBinanceOfficialTakerRecovery();
+  },BINANCE_OFFICIAL_TAKER_REFRESH_MS);
+  interval.unref?.();
+  const focusWatcher=setInterval(async()=>{
+    const health=binanceOfficialTakerHealthPayload();
+    if(!health.ready) await refreshBinanceOfficialTakerFocus('focus_missing_watch',{missingOnly:true}).catch(()=>false);
+  },30_000);
+  focusWatcher.unref?.();
+}
+
 function scheduleVenueMetricsRefresh(state) {
   if (!state || state.metricBackgroundTimer) return;
   const delay = state.provider === 'binance' ? 8_000 : 0;
@@ -3846,6 +4018,16 @@ export function getContractFlowHealth() {
     binance_ws_connect_window_blocks: binanceFlowWsStats.window_blocks,
     binance_ws_capacity_rejections: binanceFlowWsStats.capacity_rejections,
     production_ws_only: true,
+    binance_open_interest_history_official_ready: PERSISTENCE_ENABLED,
+    binance_open_interest_history_endpoint: '/futures/data/openInterestHist',
+    binance_open_interest_history_period: '5m',
+    binance_open_interest_history_persistence_table: METRIC_TABLE,
+    binance_open_interest_history_edge_relay_only: true,
+    binance_long_short_history_official_ready: PERSISTENCE_ENABLED,
+    binance_long_short_history_endpoints: ['/futures/data/globalLongShortAccountRatio','/futures/data/topLongShortAccountRatio','/futures/data/topLongShortPositionRatio'],
+    binance_long_short_history_persistence_table: METRIC_TABLE,
+    binance_long_short_history_edge_relay_only: true,
+    binance_official_taker: binanceOfficialTakerHealthPayload(),
     fixed_symbol_whitelist: false,
     focus_pool_binding: focusFlowBindingPayload(),
     focus_pool_15_each_kept_active: true,
@@ -3859,7 +4041,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,focus_pool_binding:focusFlowBindingPayload(),focus_pool_15_each_kept_active:true,focus_pool_extra_full_universe_rotation_preserved:true,market_snapshot_rotates_scan:false,shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,binance_open_interest_history_official_ready:PERSISTENCE_ENABLED,binance_open_interest_history_endpoint:'/futures/data/openInterestHist',binance_open_interest_history_period:'5m',binance_open_interest_history_edge_relay_only:true,binance_long_short_history_official_ready:PERSISTENCE_ENABLED,binance_long_short_history_endpoints:['/futures/data/globalLongShortAccountRatio','/futures/data/topLongShortAccountRatio','/futures/data/topLongShortPositionRatio'],binance_long_short_history_edge_relay_only:true,binance_official_taker:binanceOfficialTakerHealthPayload(),flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,focus_pool_binding:focusFlowBindingPayload(),focus_pool_15_each_kept_active:true,focus_pool_extra_full_universe_rotation_preserved:true,market_snapshot_rotates_scan:false,shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
@@ -3994,6 +4176,13 @@ export async function handleContractFlow(req,res,url){
     }
     return true;
   }
+  if(url.pathname==='/api/contract-flow/binance-official-taker-snapshot'){
+    if(req.method!=='GET'){sendJson(res,405,{ok:false,version:VERSION,error:'method_not_allowed'});return true;}
+    const focus=binanceOfficialTakerFocusTargets();
+    const rows=focus.symbols.map((symbol)=>binanceOfficialTakerBySymbol.get(symbol)).filter(Boolean).map((row)=>({...row,rows:row.rows.map((item)=>({...item}))}));
+    const health=binanceOfficialTakerHealthPayload();
+    sendJson(res,200,{ok:true,version:VERSION,ready:health.ready,source:'shared_background_binance_official_taker_history_edge_relay',focus_target:15,row_count:rows.length,official_coverage_rows:health.official_coverage_rows,exchange_requests_started:0,user_reads_trigger_exchange_requests:false,reads_scale_with_users:false,rows});return true;
+  }
   if(url.pathname==='/api/contract-flow/market-snapshot'){
     if(req.method!=='GET'){sendJson(res,405,{ok:false,version:VERSION,error:'method_not_allowed'});return true;}
     // Step650.8.15.35: snapshot reads must never rotate the scanner.
@@ -4110,5 +4299,9 @@ export async function handleContractFlow(req,res,url){
   sendJson(res,200,payload);return true;
 }
 
+startBinanceOfficialTakerCollector();
+
 setInterval(()=>{const now=Date.now();for(const [key,state] of states.entries()){finalizeReadyBuckets(state,now);if(now-state.lastRequestedAt<=IDLE_CLOSE_MS)continue;closeAndDeleteState(state,'idle');}},60000).unref();
 setInterval(()=>{flushPersistQueue().catch(()=>{});flushMetricPersistQueue().catch(()=>{});},20000).unref();
+
+export const __contractFlowV46ClosureTest = Object.freeze({ parseBinanceOfficialTakerRows });

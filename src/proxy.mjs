@@ -27,7 +27,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.107';
+const STEP_VERSION = '650.8.15.108';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -681,6 +681,9 @@ const server = http.createServer(async (req, res) => {
         binance_advanced_edge_relay_only: true,
         binance_advanced_render_direct_rest_enabled: false,
         binance_advanced_user_reads_scale_exchange_upstream: false,
+        v46_binance_open_interest_history_formalized: true,
+        v46_binance_official_taker_focus15_shared: true,
+        v46_bitget_official_liquidation_history_reconcile: true,
         binance_advanced_adl_official_update_interval_minutes: 30,
         bitget_advanced_official_stats_endpoint: '/api/bitget-advanced/current-snapshot',
         bitget_advanced_official_stats_health_endpoint: '/api/bitget-advanced/health',
