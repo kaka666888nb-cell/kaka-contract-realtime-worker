@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.92';
+const STEP_VERSION = '650.8.15.93';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -59,6 +59,17 @@ const directoryCountByKey = new Map();
 const directoryRowsByKey = new Map();
 const directoryUpdatedAtByKey = new Map();
 const responseCache = new Map();
+
+const bitgetContractFundingBatch = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  rows: 0,
+  applied_rows: 0,
+  last_started_at: null,
+  last_completed_at: null,
+  last_error: '',
+};
 
 let started = false;
 let running = false;
@@ -352,7 +363,7 @@ async function fetchJson(url, { timeoutMs = 15_000 } = {}) {
     const response = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.87 market-light',
+        'user-agent': 'KakaWeb3/650.8.15.93 market-light',
       },
       signal: controller.signal,
     });
@@ -439,6 +450,54 @@ async function loadBitgetV3Rows(market, observedAt) {
   const rows = data.map((item) => bitgetV3Row(item, market, observedAt)).filter(Boolean);
   if (!rows.length) throw new Error('bitget_v3_tickers_rows_empty');
   return rows;
+}
+
+
+async function loadBitgetContractFundingBatch(observedAt) {
+  bitgetContractFundingBatch.attempts += 1;
+  bitgetContractFundingBatch.last_started_at = new Date().toISOString();
+  try {
+    const payload = await fetchJson('https://api.bitget.com/api/v3/market/current-fund-rate?category=USDT-FUTURES');
+    if (String(payload?.code ?? '00000') !== '00000') {
+      throw new Error(`bitget_current_fund_rate_code_${payload?.code ?? 'unknown'}`);
+    }
+    const data = Array.isArray(payload?.data) ? payload.data : [];
+    const rows = [];
+    for (const item of data) {
+      const symbol = compact(item?.symbol);
+      if (!symbol || !symbol.endsWith('USDT')) continue;
+      const nextMs = Number(item?.nextUpdate);
+      rows.push({
+        provider: 'bitget',
+        market_type: 'contract',
+        symbol,
+        raw_symbol: symbol,
+        native_symbol: symbol,
+        funding_rate: finite(item?.fundingRate),
+        funding_interval_hours: finite(item?.fundingRateInterval),
+        next_funding_time: Number.isFinite(nextMs) && nextMs > 0 ? new Date(nextMs).toISOString() : null,
+        next_funding_time_ms: Number.isFinite(nextMs) && nextMs > 0 ? nextMs : null,
+        min_funding_rate: finite(item?.minFundingRate),
+        max_funding_rate: finite(item?.maxFundingRate),
+        cash_dividend: finite(item?.cashDividend),
+        cash_dividend_next_update: isoMs(item?.cashDividendNextUpdate),
+        funding_rate_source: 'bitget_official_v3_current_fund_rate_category_batch',
+        source_time: isoMs(item?.ts) || observedAt,
+        cached_at: observedAt,
+      });
+    }
+    if (!rows.length) throw new Error('bitget_current_fund_rate_rows_empty');
+    bitgetContractFundingBatch.successes += 1;
+    bitgetContractFundingBatch.rows = rows.length;
+    bitgetContractFundingBatch.last_completed_at = new Date().toISOString();
+    bitgetContractFundingBatch.last_error = '';
+    return rows;
+  } catch (error) {
+    bitgetContractFundingBatch.failures += 1;
+    bitgetContractFundingBatch.last_completed_at = new Date().toISOString();
+    bitgetContractFundingBatch.last_error = String(error?.message || error);
+    throw error;
+  }
 }
 
 function mergeRowsByNative(baseRows, patchRows, provider, market, observedAt, primaryQuote) {
@@ -580,11 +639,23 @@ async function loadOkxContractBatchEnrichment(observedAt) {
 
 async function loadProviderRows(provider, market, observedAt) {
   if (provider === 'bitget') {
+    let baseRows = [];
     try {
-      return await loadBitgetV3Rows(market, observedAt);
+      baseRows = await loadBitgetV3Rows(market, observedAt);
     } catch (_) {
-      return await loadMarketTickers(provider, market, []);
+      baseRows = await loadMarketTickers(provider, market, []);
     }
+    if (market === 'contract') {
+      const patches = await loadBitgetContractFundingBatch(observedAt).catch(() => []);
+      const merged = mergeRowsByNative(baseRows, patches, provider, market, observedAt, 'USDT');
+      bitgetContractFundingBatch.applied_rows = merged.filter((row) =>
+        row?.funding_rate_source === 'bitget_official_v3_current_fund_rate_category_batch' &&
+        row?.funding_interval_hours != null &&
+        row?.next_funding_time != null
+      ).length;
+      return merged;
+    }
+    return baseRows;
   }
   const baseRows = await loadMarketTickers(provider, market, []);
   if (provider === 'binance' && market === 'contract') {
@@ -1479,11 +1550,21 @@ export function getMarketLightSnapshotHealth() {
       bybit_spot: 'official_spot_tickers_batch',
       bybit_contract: 'official_linear_tickers_batch including mark/index/OI/funding/BBO',
       bitget_spot: 'official_v3_SPOT_tickers_product_batch with v2 fallback',
-      bitget_contract: 'official_v3_USDT-FUTURES_tickers product batch including mark/index/OI/funding/BBO with v2 fallback',
+      bitget_contract: 'official_v3_USDT-FUTURES_tickers product batch including mark/index/OI/funding/BBO with v2 fallback + official current-fund-rate category batch for next funding time/interval/min-max funding',
       gate_spot: 'official_spot_tickers_batch',
       gate_contract: 'official_USDT_futures_tickers_batch including mark/index/funding/BBO; total_size preserved separately and not relabeled as OI',
     },
     provider_coverage: providerCoverage,
+    bitget_contract_funding_batch: {
+      ...bitgetContractFundingBatch,
+      ready: bitgetContractFundingBatch.rows > 0 &&
+        bitgetContractFundingBatch.applied_rows > 0 &&
+        bitgetContractFundingBatch.last_error === '',
+      official_category_batch_symbol_optional: true,
+      source_endpoint: '/api/v3/market/current-fund-rate?category=USDT-FUTURES',
+      additional_user_scaled_requests: 0,
+      additional_user_scaled_connections: 0,
+    },
     okx_contract_batch_enrichment: {
       ...okxContractBatchEnrichment,
       mark_ready: okxContractBatchEnrichment.mark_rows > 0 && okxContractBatchEnrichment.applied_mark_rows > 0,

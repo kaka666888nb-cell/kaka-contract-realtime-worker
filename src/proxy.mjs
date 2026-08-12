@@ -17,12 +17,13 @@ import { getContractBasisHealth, handleContractBasis, startContractBasisScanner 
 import { getContractFocusPoolHealth, handleContractFocusPool, startContractFocusPoolScanner } from './contract-focus-pool.mjs';
 import { getContractDeepSharedHealth, handleContractDeepShared, startContractDeepSharedScanner } from './contract-deep-shared.mjs';
 import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
+import { getBitgetAdvancedStatsHealth, handleBitgetAdvancedStats, startBitgetAdvancedStatsScanner } from './bitget-advanced-stats.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.92';
+const STEP_VERSION = '650.8.15.93';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -31,6 +32,7 @@ startMarketLightSnapshotScanner();
 startContractBasisScanner();
 startContractFocusPoolScanner();
 startContractDeepSharedScanner();
+startBitgetAdvancedStatsScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -653,6 +655,10 @@ const server = http.createServer(async (req, res) => {
         source_capability_registry_cross_provider_substitution: false,
         source_capability_registry_cross_quote_substitution: false,
         source_capability_registry_user_reads_scale_exchange_upstream: false,
+        bitget_advanced_official_stats_endpoint: '/api/bitget-advanced/current-snapshot',
+        bitget_advanced_official_stats_health_endpoint: '/api/bitget-advanced/health',
+        bitget_advanced_official_stats_ready: getBitgetAdvancedStatsHealth().ready,
+        bitget_advanced_user_reads_scale_exchange_upstream: false,
         binance_contract_full_market_bbo_shared_ws: true,
         contract_basis_shared_current_endpoint: '/api/contract-basis/current-snapshot',
         contract_basis_reuses_market_light_only: true,
@@ -819,6 +825,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
       if (await handleMarketLightSnapshot(req, res, url)) return true;
       if (await handleSourceCapabilityRegistry(req, res, url)) return true;
+      if (await handleBitgetAdvancedStats(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
       if (await handleContractFocusPool(req, res, url)) return true;
       if (await handleContractDeepShared(req, res, url)) return true;
