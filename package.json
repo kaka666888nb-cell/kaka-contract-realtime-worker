@@ -1,11 +1,11 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.92",
+  "version": "650.8.15.93",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/proxy.mjs",
-    "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs && node --check src/cme-expiry-shared-calendar.mjs && node --check src/market-light-snapshot.mjs && node --check src/contract-basis.mjs && node --check src/contract-focus-pool.mjs && node --check src/contract-deep-shared.mjs && node --check src/source-capability-registry.mjs",
+    "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs && node --check src/cme-expiry-shared-calendar.mjs && node --check src/market-light-snapshot.mjs && node --check src/contract-basis.mjs && node --check src/contract-focus-pool.mjs && node --check src/contract-deep-shared.mjs && node --check src/source-capability-registry.mjs && node --check src/bitget-advanced-stats.mjs",
     "test:step781.2.5": "node tests/step781_2_5_selftest.mjs",
     "test:step781.2.6": "node tests/step781_2_6_selftest.mjs",
     "test:step781.2.7": "node tests/step781_2_7_selftest.mjs",
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.92 / Step990 runtime source-capability registry + Binance USDⓈ-M all-market BBO shared websocket"
+  "description": "Kaka contract realtime worker 650.8.15.93 / Step991 Bitget official advanced shared statistics + full-market funding schedule"
 }
