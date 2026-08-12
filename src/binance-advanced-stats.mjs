@@ -4,7 +4,7 @@ import {
   getBinanceContractKlineRelayHealth,
 } from './binance-contract-kline-relay.mjs';
 
-const VERSION = '650.8.15.3';
+const VERSION = '650.8.15.4';
 const SNAPSHOT_ROUTE = '/api/binance-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/binance-advanced/health';
 const FUTURES_BASE = 'https://fapi.binance.com';
@@ -51,6 +51,7 @@ const adlTargetProbeErrors = new Map();
 
 const oiRows = new Map();
 const adlRows = new Map();
+const adlOfficialUnavailable = new Map();
 const responseCache = new Map();
 const laneStats = new Map();
 
@@ -198,15 +199,44 @@ function parseAdlRows(payload) {
   return out;
 }
 
+function classifyExactAdlPayload(payload, targetSymbol) {
+  const symbol = compact(targetSymbol);
+  const parsed = parseAdlRows(payload);
+  const row = parsed.get(symbol) || null;
+  if (row) return { status: 'rated', row, official_unrated: null };
+  const first = Array.isArray(payload) ? payload?.[0] : payload;
+  const payloadType = Array.isArray(payload) ? 'array' : payload && typeof payload === 'object' ? 'object' : typeof payload;
+  const rawSymbol = compact(first?.symbol);
+  const rawRisk = String(first?.adlRisk ?? '').trim().toLowerCase();
+  return {
+    status: 'official_unrated',
+    row: null,
+    official_unrated: {
+      provider: 'binance',
+      market_type: 'contract',
+      quote_asset: 'USDT',
+      symbol,
+      status: 'official_unrated',
+      official_endpoint: '/fapi/v1/symbolAdlRisk',
+      source: 'binance_official_symbol_adl_risk_supabase_edge_relay',
+      payload_type: payloadType,
+      payload_symbol: rawSymbol || null,
+      payload_adl_risk_raw: rawRisk || null,
+      observed_at: new Date().toISOString(),
+    },
+  };
+}
+
 async function refreshAdl(targets, reason) {
   const now = Date.now();
   const lastCompletedMs = Date.parse(String(lastAdlCompletedAt || ''));
   const allSymbolsDue = !Number.isFinite(lastCompletedMs) || now - lastCompletedMs >= ADL_REFRESH_MS;
   let allSymbolsOk = true;
 
-  // Step993.1: a successful all-symbol ADL response is an official 30-minute
-  // snapshot. Startup recovery must not hammer the same all-symbol endpoint
-  // every 15 seconds just because one focus symbol is missing from that array.
+  // Step993.3: one successful all-symbol response is the official 30-minute
+  // snapshot. A focus symbol omitted by that response is not fabricated. It is
+  // eligible for one bounded per-symbol confirmation probe through the same
+  // authenticated Edge relay.
   if (allSymbolsDue) {
     lastAdlStartedAt = new Date().toISOString();
     lastAdlError = '';
@@ -223,6 +253,7 @@ async function refreshAdl(targets, reason) {
           focus_role: target.role,
           focus_slot: target.slot,
         });
+        adlOfficialUnavailable.delete(target.symbol);
         adlTargetProbeErrors.delete(target.symbol);
       }
       setLane('adl_risk_all_symbols', { last_rows: targets.filter((target) => parsed.has(target.symbol)).length });
@@ -236,16 +267,15 @@ async function refreshAdl(targets, reason) {
 
   const missingTargets = targets.filter((target) => {
     const row = adlRows.get(target.symbol);
-    return !row || !isFresh(row.updated_at, ADL_STALE_MS);
+    const unavailable = adlOfficialUnavailable.get(target.symbol);
+    const ratedFresh = row && isFresh(row.updated_at, ADL_STALE_MS);
+    const unavailableFresh = unavailable && isFresh(unavailable.observed_at, ADL_STALE_MS);
+    return !ratedFresh && !unavailableFresh;
   });
   lastAdlRecoveryCandidateCount = missingTargets.length;
   lastAdlTargetRecoveryAttempted = 0;
   lastAdlTargetRecoverySucceeded = 0;
 
-  // The official endpoint accepts an optional symbol. If the all-symbol array
-  // omits a focus contract, probe only that missing contract through the same
-  // authenticated Edge relay. This is bounded to one missing symbol per cycle
-  // and each symbol has a five-minute cooldown. It does not reopen Render REST.
   const hasSuccessfulAllSymbolsSnapshot = Number.isFinite(Date.parse(String(lastAdlCompletedAt || '')));
   const probeTargets = (hasSuccessfulAllSymbolsSnapshot ? missingTargets : [])
     .filter((target) => now - Number(adlTargetProbeAt.get(target.symbol) || 0) >= ADL_TARGET_RECOVERY_COOLDOWN_MS)
@@ -255,27 +285,27 @@ async function refreshAdl(targets, reason) {
     lastAdlTargetRecoveryAttempted += 1;
     try {
       const query = new URLSearchParams({ symbol: target.symbol });
-      // Step993.2: this is the only bounded recovery request that must not use
-      // background fail-fast. Step993.1 proved XRPUSDT could remain missing for
-      // the entire audit because the probe was rejected locally with
-      // binance_kline_relay_background_deferred before Edge/Binance was called.
-      // Queue this single critical request (max one per cycle, same-symbol >=5m)
-      // behind existing higher/equal-priority work instead. Request frequency and
-      // the relay's global/lane rate limits remain unchanged.
       const payload = await relayJson(
         `${FUTURES_BASE}/fapi/v1/symbolAdlRisk?${query.toString()}`,
         'adl_risk_missing_symbol',
         { deferWhenBusy: false, priority: RELAY_PRIORITY + 2 },
       );
-      const parsed = parseAdlRows(payload);
-      const row = parsed.get(target.symbol);
-      if (!row) throw new Error(`binance_adl_payload_missing:${target.symbol}`);
-      adlRows.set(target.symbol, {
-        ...row,
-        base_asset: target.base_asset,
-        focus_role: target.role,
-        focus_slot: target.slot,
-      });
+      const classified = classifyExactAdlPayload(payload, target.symbol);
+      if (classified.status === 'rated') {
+        adlRows.set(target.symbol, {
+          ...classified.row,
+          base_asset: target.base_asset,
+          focus_role: target.role,
+          focus_slot: target.slot,
+        });
+        adlOfficialUnavailable.delete(target.symbol);
+      } else {
+        // The relay/Edge request succeeded, but Binance returned no valid
+        // high/medium/low rating for this exact symbol. This is an official
+        // availability result, not a transport failure. Keep adl_risk=null and
+        // record the limitation explicitly instead of retrying/fabricating.
+        adlOfficialUnavailable.set(target.symbol, classified.official_unrated);
+      }
       adlTargetProbeErrors.delete(target.symbol);
       lastAdlTargetRecoverySucceeded += 1;
     } catch (error) {
@@ -336,7 +366,9 @@ function startupReady() {
   });
   const adlReady = focus.rows.every((target) => {
     const row = adlRows.get(target.symbol);
-    return row && isFresh(row.updated_at, ADL_STALE_MS);
+    const unavailable = adlOfficialUnavailable.get(target.symbol);
+    return (row && isFresh(row.updated_at, ADL_STALE_MS)) ||
+      (unavailable && isFresh(unavailable.observed_at, ADL_STALE_MS));
   });
   return oiReady && adlReady;
 }
@@ -359,7 +391,7 @@ async function refreshCycle(reason = 'interval') {
       const ready = startupReady();
       if (!ready) {
         const missingOi = focus.rows.filter((target) => !oiRows.get(target.symbol) || !isFresh(oiRows.get(target.symbol)?.updated_at, OI_STALE_MS)).length;
-        const missingAdl = focus.rows.filter((target) => !adlRows.get(target.symbol) || !isFresh(adlRows.get(target.symbol)?.updated_at, ADL_STALE_MS)).length;
+        const missingAdl = focus.rows.filter((target) => { const row = adlRows.get(target.symbol); const unavailable = adlOfficialUnavailable.get(target.symbol); return !((row && isFresh(row.updated_at, ADL_STALE_MS)) || (unavailable && isFresh(unavailable.observed_at, ADL_STALE_MS))); }).length;
         lastError = `binance_advanced_not_ready:oi_missing=${missingOi};adl_missing=${missingAdl}`;
       }
       responseCache.clear();
@@ -420,6 +452,9 @@ function snapshotPayload({ includeRows = true } = {}) {
   const rows = targets.map((target) => {
     const oi = oiRows.get(target.symbol);
     const adl = adlRows.get(target.symbol);
+    const unavailable = adlOfficialUnavailable.get(target.symbol);
+    const adlRatedFresh = adl && isFresh(adl.updated_at, ADL_STALE_MS);
+    const adlUnavailableFresh = unavailable && isFresh(unavailable.observed_at, ADL_STALE_MS);
     return {
       provider: 'binance',
       market_type: 'contract',
@@ -431,24 +466,32 @@ function snapshotPayload({ includeRows = true } = {}) {
       open_interest: oi && isFresh(oi.updated_at, OI_STALE_MS) ? oi.open_interest : null,
       open_interest_time_ms: oi && isFresh(oi.updated_at, OI_STALE_MS) ? oi.open_interest_time_ms : null,
       open_interest_time: oi && isFresh(oi.updated_at, OI_STALE_MS) ? oi.open_interest_time : null,
-      adl_risk: adl && isFresh(adl.updated_at, ADL_STALE_MS) ? adl.adl_risk : null,
-      adl_update_time_ms: adl && isFresh(adl.updated_at, ADL_STALE_MS) ? adl.adl_update_time_ms : null,
-      adl_update_time: adl && isFresh(adl.updated_at, ADL_STALE_MS) ? adl.adl_update_time : null,
+      adl_risk: adlRatedFresh ? adl.adl_risk : null,
+      adl_update_time_ms: adlRatedFresh ? adl.adl_update_time_ms : null,
+      adl_update_time: adlRatedFresh ? adl.adl_update_time : null,
       open_interest_source: oi?.source || null,
-      adl_risk_source: adl?.source || null,
+      adl_risk_source: adlRatedFresh ? adl?.source || null : adlUnavailableFresh ? unavailable?.source || null : null,
+      adl_availability: adlRatedFresh ? 'rated' : adlUnavailableFresh ? 'official_unrated' : 'missing',
+      adl_officially_unrated: Boolean(adlUnavailableFresh),
+      adl_official_unrated_observed_at: adlUnavailableFresh ? unavailable?.observed_at || null : null,
     };
   });
   const oiReadyRows = rows.filter((row) => row.open_interest != null).length;
   const adlReadyRows = rows.filter((row) => row.adl_risk != null).length;
+  const adlOfficialUnratedRows = rows.filter((row) => row.adl_officially_unrated === true).length;
+  const adlOfficialCoverageRows = adlReadyRows + adlOfficialUnratedRows;
   const coreRows = rows.filter((row) => row.focus_role === 'core');
   const hotRows = rows.filter((row) => row.focus_role === 'hot');
   const coreOiRows = coreRows.filter((row) => row.open_interest != null).length;
   const coreAdlRows = coreRows.filter((row) => row.adl_risk != null).length;
+  const coreAdlOfficialCoverageRows = coreRows.filter((row) => row.adl_risk != null || row.adl_officially_unrated === true).length;
   const hotOiRows = hotRows.filter((row) => row.open_interest != null).length;
   const hotAdlRows = hotRows.filter((row) => row.adl_risk != null).length;
+  const hotAdlOfficialCoverageRows = hotRows.filter((row) => row.adl_risk != null || row.adl_officially_unrated === true).length;
   const relay = getBinanceContractKlineRelayHealth();
   const missingOpenInterestSymbols = rows.filter((row) => row.open_interest == null).map((row) => row.symbol);
-  const missingAdlSymbols = rows.filter((row) => row.adl_risk == null).map((row) => row.symbol);
+  const missingAdlSymbols = rows.filter((row) => row.adl_risk == null && row.adl_officially_unrated !== true).map((row) => row.symbol);
+  const officialUnratedAdlSymbols = rows.filter((row) => row.adl_officially_unrated === true).map((row) => row.symbol);
   const adlProbeErrors = Object.fromEntries(missingAdlSymbols.map((symbol) => [symbol, adlTargetProbeErrors.get(symbol) || '']).filter((entry) => entry[1]));
 
   const payload = {
@@ -456,8 +499,8 @@ function snapshotPayload({ includeRows = true } = {}) {
     version: VERSION,
     source: 'render_shared_binance_official_focus15_advanced_risk_statistics',
     ready: focus.focus_ready && targetSymbols.length === FOCUS_TARGET &&
-      coreRows.length === CORE_TARGET && coreOiRows === CORE_TARGET && coreAdlRows === CORE_TARGET &&
-      oiReadyRows === FOCUS_TARGET && adlReadyRows === FOCUS_TARGET,
+      coreRows.length === CORE_TARGET && coreOiRows === CORE_TARGET && coreAdlOfficialCoverageRows === CORE_TARGET &&
+      oiReadyRows === FOCUS_TARGET && adlOfficialCoverageRows === FOCUS_TARGET,
     focus_target: FOCUS_TARGET,
     focus_round: focus.focus_round,
     focus_symbols: targetSymbols,
@@ -466,12 +509,17 @@ function snapshotPayload({ includeRows = true } = {}) {
     hot_target_count: hotRows.length,
     open_interest_rows: oiReadyRows,
     adl_risk_rows: adlReadyRows,
+    adl_official_unrated_rows: adlOfficialUnratedRows,
+    adl_official_coverage_rows: adlOfficialCoverageRows,
     core_open_interest_rows: coreOiRows,
     core_adl_risk_rows: coreAdlRows,
+    core_adl_official_coverage_rows: coreAdlOfficialCoverageRows,
     hot_open_interest_rows: hotOiRows,
     hot_adl_risk_rows: hotAdlRows,
+    hot_adl_official_coverage_rows: hotAdlOfficialCoverageRows,
     missing_open_interest_symbols: missingOpenInterestSymbols,
     missing_adl_symbols: missingAdlSymbols,
+    official_unrated_adl_symbols: officialUnratedAdlSymbols,
     last_oi_recovery_candidate_count: lastOiRecoveryCandidateCount,
     last_adl_all_symbols_row_count: lastAdlAllSymbolsRowCount,
     last_adl_recovery_candidate_count: lastAdlRecoveryCandidateCount,
@@ -494,13 +542,14 @@ function snapshotPayload({ includeRows = true } = {}) {
     },
     official_semantics: {
       open_interest_current: 'Binance official present open interest for the exact USDⓈ-M symbol',
-      adl_risk: 'Binance official symbol-level automatic deleveraging risk rating: high/medium/low',
+      adl_risk: 'Binance official symbol-level automatic deleveraging risk rating: high/medium/low when published; a successful exact-symbol response without a valid rating is exposed as official_unrated with adl_risk=null',
       adl_risk_update_interval_minutes: 30,
     },
     official_stats_separate_from_derived: true,
     no_cross_provider_substitution: true,
     no_cross_quote_substitution: true,
     missing_stays_null: true,
+    official_unrated_stays_null: true,
     transport: 'authenticated_supabase_edge_public_rest_relay_only',
     edge_relay_only: true,
     render_direct_binance_rest: false,
@@ -559,6 +608,7 @@ export function getBinanceAdvancedStatsHealth() {
     oi_startup_recovery_missing_only: true,
     adl_startup_recovery_does_not_repeat_all_symbols_inside_30m: true,
     adl_missing_symbol_targeted_recovery: true,
+    adl_successful_exact_symbol_empty_means_official_unrated: true,
     adl_target_requires_successful_all_symbols_snapshot: true,
     adl_target_queue_wait_enabled: true,
     adl_target_defer_when_busy: false,
@@ -611,5 +661,6 @@ export async function handleBinanceAdvancedStats(req, res, url) {
 export const __binanceAdvancedTest = Object.freeze({
   parseOpenInterest,
   parseAdlRows,
+  classifyExactAdlPayload,
   normalizeAdlRisk,
 });

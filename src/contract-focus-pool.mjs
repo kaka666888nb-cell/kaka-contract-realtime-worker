@@ -1,6 +1,6 @@
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.3';
+const VERSION = '650.8.15.4';
 const SNAPSHOT_ROUTE = '/api/contract-focus-pool/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-focus-pool/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -23,7 +23,7 @@ const SCAN_INTERVAL_MS = 60_000;
 const STARTUP_RETRY_MS = 15_000;
 const HOT_REFRESH_MS = 5 * 60_000;
 const RESPONSE_CACHE_TTL_MS = 20_000;
-const STALE_MS = 3 * 60_000;
+const LAST_GOOD_PRESERVE_MS = 3 * 60_000;
 
 let started = false;
 let running = null;
@@ -144,10 +144,50 @@ function sameSymbolSet(a = [], b = []) {
   return left === right;
 }
 
+function canPreservePreviousFocus(previous, now) {
+  const previousBuiltMs = Date.parse(String(previous?.built_at || ''));
+  return previous?.ready === true &&
+    Array.isArray(previous?.rows) && previous.rows.length === POOL_TARGET &&
+    Number.isFinite(previousBuiltMs) && now - previousBuiltMs <= LAST_GOOD_PRESERVE_MS;
+}
+
 function buildProvider(provider, now) {
   const input = getMarketLightInternalSnapshot({ market: 'contract', provider });
   const rows = usableContractRows(input);
   const previous = providerState.get(provider) || null;
+  const inputReady = input?.ok === true &&
+    input.stale !== true &&
+    !String(input.last_error || '').trim() &&
+    Number(input.row_count || 0) === Number(input.directory_count || 0) &&
+    Number(input.directory_count || 0) > 0;
+
+  // Step993.3 stable-layer guard: a transient market-light not-ready window must
+  // not erase an already verified 15-row focus pool. Preserve the last-good
+  // provider composition for at most three minutes; expose the degraded input
+  // separately and fail closed after the bounded preserve window expires.
+  const previousBuiltMs = Date.parse(String(previous?.built_at || ''));
+  const previousPreservable = canPreservePreviousFocus(previous, now);
+  if (!inputReady && previousPreservable) {
+    const preserved = {
+      ...previous,
+      ready: true,
+      input_ready: false,
+      directory_count: Number(input?.directory_count || previous.directory_count || 0),
+      input_row_count: Number(input?.row_count || 0),
+      input_shared_round: Number(input?.shared_round || previous.input_shared_round || 0),
+      input_updated_at: input?.updated_at || previous.input_updated_at || null,
+      input_last_error: String(input?.last_error || 'market_light_transient_not_ready'),
+      preserved_last_good_due_to_transient_input: true,
+      preserved_last_good_age_ms: Math.max(0, now - previousBuiltMs),
+      preserved_last_good_max_ms: LAST_GOOD_PRESERVE_MS,
+      hot_changed_this_build: false,
+      built_at: previous.built_at,
+      last_preserved_at: new Date(now).toISOString(),
+    };
+    providerState.set(provider, preserved);
+    return preserved;
+  }
+
   const coreSelected = coreRowsFrom(rows);
   const coreRows = coreSelected.map((entry, index) => poolRow(provider, entry.row, 'core', index + 1, entry));
   const coreBases = new Set(coreRows.map((row) => row.base_asset));
@@ -179,11 +219,7 @@ function buildProvider(provider, now) {
   }
 
   const poolRows = [...coreRows, ...hotRows];
-  const ready = input?.ok === true &&
-    input.stale !== true &&
-    !String(input.last_error || '').trim() &&
-    Number(input.row_count || 0) === Number(input.directory_count || 0) &&
-    Number(input.directory_count || 0) > 0 &&
+  const ready = inputReady &&
     coreRows.length === CORE_TARGET &&
     hotRows.length === HOT_TARGET &&
     new Set(poolRows.map((row) => row.symbol)).size === POOL_TARGET;
@@ -192,7 +228,10 @@ function buildProvider(provider, now) {
   const current = {
     provider,
     ready,
-    input_ready: input?.ok === true && input.stale !== true && !String(input.last_error || '').trim() && Number(input.row_count || 0) === Number(input.directory_count || 0) && Number(input.directory_count || 0) > 0,
+    input_ready: inputReady,
+    preserved_last_good_due_to_transient_input: false,
+    preserved_last_good_age_ms: 0,
+    preserved_last_good_max_ms: LAST_GOOD_PRESERVE_MS,
     directory_count: Number(input?.directory_count || 0),
     input_row_count: Number(input?.row_count || 0),
     input_shared_round: Number(input?.shared_round || 0),
@@ -317,6 +356,8 @@ function snapshotPayload() {
     hot_refresh_minutes: HOT_REFRESH_MS / 60_000,
     scanner_interval_seconds: SCAN_INTERVAL_MS / 1000,
     startup_retry_seconds: STARTUP_RETRY_MS / 1000,
+    last_good_preserve_seconds: LAST_GOOD_PRESERVE_MS / 1000,
+    transient_input_preserves_last_good_pool: true,
     derived_from_existing_shared_market_light_only: true,
     exchange_requests_started: 0,
     exchange_connections_started: 0,
@@ -357,6 +398,8 @@ export function getContractFocusPoolHealth() {
     hot_refresh_minutes: HOT_REFRESH_MS / 60_000,
     scanner_interval_seconds: SCAN_INTERVAL_MS / 1000,
     startup_retry_seconds: STARTUP_RETRY_MS / 1000,
+    last_good_preserve_seconds: LAST_GOOD_PRESERVE_MS / 1000,
+    transient_input_preserves_last_good_pool: true,
     running: Boolean(running),
     round,
     last_started_at: lastStartedAt,
@@ -378,6 +421,8 @@ export function getContractFocusPoolHealth() {
     provider_state: snapshot.providers,
   };
 }
+
+export const __contractFocusPoolTest = Object.freeze({ canPreservePreviousFocus });
 
 function sendJson(res, status, payload) {
   const body = Buffer.from(JSON.stringify(payload));

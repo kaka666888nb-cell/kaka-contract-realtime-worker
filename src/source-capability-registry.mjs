@@ -3,7 +3,7 @@ import { getBinanceAdvancedStatsHealth } from './binance-advanced-stats.mjs';
 import { getBitgetAdvancedStatsHealth } from './bitget-advanced-stats.mjs';
 import { getGateAdvancedStatsHealth } from './gate-advanced-stats.mjs';
 
-const VERSION = '650.8.15.4';
+const VERSION = '650.8.15.5';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -29,7 +29,7 @@ const CAPABILITIES = Object.freeze([
   { provider: 'binance', market: 'contract', capability: 'mark_index_funding', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_market_mark_price', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'funding_history_separate', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
   { provider: 'binance', market: 'contract', capability: 'bbo', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_book_tickers_stream', rate_limit_class: 'one_shared_connection_5s', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step990', fallback_policy: 'last_verified_shared_snapshot_or_null', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
   { provider: 'binance', market: 'contract', capability: 'open_interest_current', official_available: true, official_scope: 'per_symbol_focus15', transport: 'authenticated_edge_relay_to_official_REST', batch_mode: 'shared_focus15_5m', rate_limit_class: 'medium_shared', collector: 'binance-advanced-slow-stats', target_layer: 'slow_stats_or_focus', current_integration: 'ready_step993', fallback_policy: 'last_verified_until_stale_then_missing; never derived_as_official', history_policy: '5m_1h_1d_history_remains_separate', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
-  { provider: 'binance', market: 'contract', capability: 'adl_risk', official_available: true, official_scope: 'all_symbols_official_then_focus15_filter', transport: 'authenticated_edge_relay_to_official_REST', batch_mode: 'one_shared_all_symbol_request_per_30m', rate_limit_class: 'slow_shared', collector: 'binance-advanced-slow-stats', target_layer: 'risk', current_integration: 'ready_step993', fallback_policy: 'last_verified_until_stale_then_missing', history_policy: 'slow_snapshot', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
+  { provider: 'binance', market: 'contract', capability: 'adl_risk', official_available: true, official_scope: 'all_symbols_official_then_focus15_filter', transport: 'authenticated_edge_relay_to_official_REST', batch_mode: 'one_shared_all_symbol_request_per_30m', rate_limit_class: 'slow_shared', collector: 'binance-advanced-slow-stats', target_layer: 'risk', current_integration: 'ready_step993', fallback_policy: 'last_verified_until_stale_then_null; successful exact-symbol no-rating is official_unrated and remains null', history_policy: 'slow_snapshot', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data' },
 
   // OKX
   { provider: 'okx', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SPOT_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
@@ -131,8 +131,12 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       core_target_count: Number(binanceAdvanced.core_target_count || 0),
       open_interest_rows: Number(binanceAdvanced.open_interest_rows || 0),
       adl_risk_rows: Number(binanceAdvanced.adl_risk_rows || 0),
+      adl_official_unrated_rows: Number(binanceAdvanced.adl_official_unrated_rows || 0),
+      adl_official_coverage_rows: Number(binanceAdvanced.adl_official_coverage_rows || 0),
       core_open_interest_rows: Number(binanceAdvanced.core_open_interest_rows || 0),
       core_adl_risk_rows: Number(binanceAdvanced.core_adl_risk_rows || 0),
+      core_adl_official_coverage_rows: Number(binanceAdvanced.core_adl_official_coverage_rows || 0),
+      official_unrated_adl_symbols: Array.isArray(binanceAdvanced.official_unrated_adl_symbols) ? [...binanceAdvanced.official_unrated_adl_symbols] : [],
       adl_official_update_interval_minutes: Number(binanceAdvanced.adl_official_update_interval_minutes || 0),
       edge_relay_only: binanceAdvanced.edge_relay_only === true,
       render_direct_binance_rest: binanceAdvanced.render_direct_binance_rest === true,
