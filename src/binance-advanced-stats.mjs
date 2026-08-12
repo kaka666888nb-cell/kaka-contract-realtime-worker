@@ -4,7 +4,7 @@ import {
   getBinanceContractKlineRelayHealth,
 } from './binance-contract-kline-relay.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const SNAPSHOT_ROUTE = '/api/binance-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/binance-advanced/health';
 const FUTURES_BASE = 'https://fapi.binance.com';
@@ -18,6 +18,8 @@ const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_BINANCE_AD
 const OI_STALE_MS = Math.max(5 * 60_000, Number(process.env.KAKA_BINANCE_ADVANCED_OI_STALE_MS || 12 * 60_000));
 const ADL_STALE_MS = Math.max(35 * 60_000, Number(process.env.KAKA_BINANCE_ADVANCED_ADL_STALE_MS || 55 * 60_000));
 const ADL_REFRESH_MS = Math.max(30 * 60_000, Number(process.env.KAKA_BINANCE_ADVANCED_ADL_REFRESH_MS || 30 * 60_000));
+const ADL_TARGET_RECOVERY_COOLDOWN_MS = Math.max(5 * 60_000, Number(process.env.KAKA_BINANCE_ADVANCED_ADL_TARGET_RECOVERY_COOLDOWN_MS || 5 * 60_000));
+const ADL_TARGET_RECOVERY_MAX_PER_CYCLE = 1;
 const RELAY_LANE = 'critical';
 const RELAY_PRIORITY = 18;
 
@@ -39,6 +41,13 @@ let lastAdlError = '';
 let lastOiStartedAt = null;
 let lastOiCompletedAt = null;
 let lastOiError = '';
+let lastOiRecoveryCandidateCount = 0;
+let lastAdlAllSymbolsRowCount = 0;
+let lastAdlRecoveryCandidateCount = 0;
+let lastAdlTargetRecoveryAttempted = 0;
+let lastAdlTargetRecoverySucceeded = 0;
+const adlTargetProbeAt = new Map();
+const adlTargetProbeErrors = new Map();
 
 const oiRows = new Map();
 const adlRows = new Map();
@@ -191,47 +200,101 @@ function parseAdlRows(payload) {
 
 async function refreshAdl(targets, reason) {
   const now = Date.now();
-  const hasFreshForAll = targets.every((target) => {
-    const row = adlRows.get(target.symbol);
-    return row && isFresh(row.updated_at, ADL_STALE_MS);
-  });
   const lastCompletedMs = Date.parse(String(lastAdlCompletedAt || ''));
-  if (reason !== 'startup' && reason !== 'startup_recovery' && hasFreshForAll &&
-      Number.isFinite(lastCompletedMs) && now - lastCompletedMs < ADL_REFRESH_MS) {
-    return true;
+  const allSymbolsDue = !Number.isFinite(lastCompletedMs) || now - lastCompletedMs >= ADL_REFRESH_MS;
+  let allSymbolsOk = true;
+
+  // Step993.1: a successful all-symbol ADL response is an official 30-minute
+  // snapshot. Startup recovery must not hammer the same all-symbol endpoint
+  // every 15 seconds just because one focus symbol is missing from that array.
+  if (allSymbolsDue) {
+    lastAdlStartedAt = new Date().toISOString();
+    lastAdlError = '';
+    try {
+      const payload = await relayJson(`${FUTURES_BASE}/fapi/v1/symbolAdlRisk`, 'adl_risk_all_symbols');
+      const parsed = parseAdlRows(payload);
+      lastAdlAllSymbolsRowCount = parsed.size;
+      for (const target of targets) {
+        const row = parsed.get(target.symbol);
+        if (!row) continue;
+        adlRows.set(target.symbol, {
+          ...row,
+          base_asset: target.base_asset,
+          focus_role: target.role,
+          focus_slot: target.slot,
+        });
+        adlTargetProbeErrors.delete(target.symbol);
+      }
+      setLane('adl_risk_all_symbols', { last_rows: targets.filter((target) => parsed.has(target.symbol)).length });
+      lastAdlCompletedAt = new Date().toISOString();
+      responseCache.clear();
+    } catch (error) {
+      allSymbolsOk = false;
+      lastAdlError = String(error?.message || error);
+    }
   }
 
-  lastAdlStartedAt = new Date().toISOString();
-  lastAdlError = '';
-  try {
-    const payload = await relayJson(`${FUTURES_BASE}/fapi/v1/symbolAdlRisk`, 'adl_risk_all_symbols');
-    const parsed = parseAdlRows(payload);
-    for (const target of targets) {
+  const missingTargets = targets.filter((target) => {
+    const row = adlRows.get(target.symbol);
+    return !row || !isFresh(row.updated_at, ADL_STALE_MS);
+  });
+  lastAdlRecoveryCandidateCount = missingTargets.length;
+  lastAdlTargetRecoveryAttempted = 0;
+  lastAdlTargetRecoverySucceeded = 0;
+
+  // The official endpoint accepts an optional symbol. If the all-symbol array
+  // omits a focus contract, probe only that missing contract through the same
+  // authenticated Edge relay. This is bounded to one missing symbol per cycle
+  // and each symbol has a five-minute cooldown. It does not reopen Render REST.
+  const probeTargets = missingTargets
+    .filter((target) => now - Number(adlTargetProbeAt.get(target.symbol) || 0) >= ADL_TARGET_RECOVERY_COOLDOWN_MS)
+    .slice(0, ADL_TARGET_RECOVERY_MAX_PER_CYCLE);
+  for (const target of probeTargets) {
+    adlTargetProbeAt.set(target.symbol, now);
+    lastAdlTargetRecoveryAttempted += 1;
+    try {
+      const query = new URLSearchParams({ symbol: target.symbol });
+      const payload = await relayJson(`${FUTURES_BASE}/fapi/v1/symbolAdlRisk?${query.toString()}`, 'adl_risk_missing_symbol');
+      const parsed = parseAdlRows(payload);
       const row = parsed.get(target.symbol);
-      if (!row) continue;
+      if (!row) throw new Error(`binance_adl_payload_missing:${target.symbol}`);
       adlRows.set(target.symbol, {
         ...row,
         base_asset: target.base_asset,
         focus_role: target.role,
         focus_slot: target.slot,
       });
+      adlTargetProbeErrors.delete(target.symbol);
+      lastAdlTargetRecoverySucceeded += 1;
+    } catch (error) {
+      adlTargetProbeErrors.set(target.symbol, String(error?.message || error));
+      lastAdlError = String(error?.message || error);
     }
-    setLane('adl_risk_all_symbols', { last_rows: targets.filter((target) => parsed.has(target.symbol)).length });
-    lastAdlCompletedAt = new Date().toISOString();
-    responseCache.clear();
-    return true;
-  } catch (error) {
-    lastAdlError = String(error?.message || error);
-    return false;
   }
+  setLane('adl_risk_missing_symbol', { last_rows: lastAdlTargetRecoverySucceeded });
+  responseCache.clear();
+  return allSymbolsOk || lastAdlTargetRecoverySucceeded > 0 || missingTargets.length === 0;
 }
 
-async function refreshOpenInterest(targets) {
+async function refreshOpenInterest(targets, reason) {
   lastOiStartedAt = new Date().toISOString();
   lastOiError = '';
   let successCount = 0;
   const errors = [];
-  for (const target of targets) {
+
+  // Step993.1: during cold-start recovery retry only the missing/stale OI rows.
+  // The first startup and normal five-minute interval still refresh the full
+  // focus15. This prevents already-good early symbols from repeatedly taking
+  // the single Binance relay slot ahead of a later missing symbol.
+  const scanTargets = reason === 'startup_recovery'
+    ? targets.filter((target) => {
+        const row = oiRows.get(target.symbol);
+        return !row || !isFresh(row.updated_at, OI_STALE_MS);
+      })
+    : targets;
+  lastOiRecoveryCandidateCount = scanTargets.length;
+
+  for (const target of scanTargets) {
     try {
       const query = new URLSearchParams({ symbol: target.symbol });
       const payload = await relayJson(`${FUTURES_BASE}/fapi/v1/openInterest?${query.toString()}`, 'open_interest_current');
@@ -249,7 +312,7 @@ async function refreshOpenInterest(targets) {
   lastOiCompletedAt = new Date().toISOString();
   lastOiError = errors.slice(0, 6).join('|');
   responseCache.clear();
-  return successCount > 0;
+  return successCount > 0 || scanTargets.length === 0;
 }
 
 function startupReady() {
@@ -278,7 +341,7 @@ async function refreshCycle(reason = 'interval') {
         throw new Error(`binance_focus_not_ready:${focus.rows.length}/${FOCUS_TARGET}`);
       }
       await refreshAdl(focus.rows, reason);
-      await refreshOpenInterest(focus.rows);
+      await refreshOpenInterest(focus.rows, reason);
       round += 1;
       lastCompletedAt = new Date().toISOString();
       const ready = startupReady();
@@ -325,7 +388,8 @@ export function startBinanceAdvancedStatsScanner() {
   startTimer.unref?.();
 
   refreshInterval = setInterval(async () => {
-    await refreshCycle('interval').catch(() => false);
+    const reason = startupReady() ? 'interval' : 'startup_recovery';
+    await refreshCycle(reason).catch(() => false);
     if (!startupReady()) scheduleStartupRecovery();
   }, REFRESH_MS);
   refreshInterval.unref?.();
@@ -371,6 +435,9 @@ function snapshotPayload({ includeRows = true } = {}) {
   const hotOiRows = hotRows.filter((row) => row.open_interest != null).length;
   const hotAdlRows = hotRows.filter((row) => row.adl_risk != null).length;
   const relay = getBinanceContractKlineRelayHealth();
+  const missingOpenInterestSymbols = rows.filter((row) => row.open_interest == null).map((row) => row.symbol);
+  const missingAdlSymbols = rows.filter((row) => row.adl_risk == null).map((row) => row.symbol);
+  const adlProbeErrors = Object.fromEntries(missingAdlSymbols.map((symbol) => [symbol, adlTargetProbeErrors.get(symbol) || '']).filter((entry) => entry[1]));
 
   const payload = {
     ok: true,
@@ -391,6 +458,14 @@ function snapshotPayload({ includeRows = true } = {}) {
     core_adl_risk_rows: coreAdlRows,
     hot_open_interest_rows: hotOiRows,
     hot_adl_risk_rows: hotAdlRows,
+    missing_open_interest_symbols: missingOpenInterestSymbols,
+    missing_adl_symbols: missingAdlSymbols,
+    last_oi_recovery_candidate_count: lastOiRecoveryCandidateCount,
+    last_adl_all_symbols_row_count: lastAdlAllSymbolsRowCount,
+    last_adl_recovery_candidate_count: lastAdlRecoveryCandidateCount,
+    last_adl_target_recovery_attempted: lastAdlTargetRecoveryAttempted,
+    last_adl_target_recovery_succeeded: lastAdlTargetRecoverySucceeded,
+    adl_target_probe_errors: adlProbeErrors,
     official_endpoints: {
       open_interest_current: '/fapi/v1/openInterest',
       adl_risk: '/fapi/v1/symbolAdlRisk',
@@ -463,8 +538,14 @@ export function getBinanceAdvancedStatsHealth() {
     startup_recovery_until_focus_and_official_stats_ready: true,
     transient_refresh_preserves_last_good_until_stale: true,
     adl_all_symbols_single_request: true,
+    oi_startup_recovery_missing_only: true,
+    adl_startup_recovery_does_not_repeat_all_symbols_inside_30m: true,
+    adl_missing_symbol_targeted_recovery: true,
     open_interest_requests_per_refresh_max: FOCUS_TARGET,
-    adl_requests_per_30m_max: 1,
+    adl_all_symbols_requests_per_30m_max: 1,
+    adl_missing_symbol_recovery_requests_per_cycle_max: ADL_TARGET_RECOVERY_MAX_PER_CYCLE,
+    adl_missing_symbol_probe_cooldown_seconds: Math.round(ADL_TARGET_RECOVERY_COOLDOWN_MS / 1000),
+    adl_requests_per_30m_max: 1 + Math.ceil(ADL_REFRESH_MS / ADL_TARGET_RECOVERY_COOLDOWN_MS) * ADL_TARGET_RECOVERY_MAX_PER_CYCLE,
     response_cache_ttl_seconds: RESPONSE_CACHE_TTL_MS / 1000,
   };
 }
