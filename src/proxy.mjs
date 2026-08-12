@@ -17,6 +17,7 @@ import { getContractBasisHealth, handleContractBasis, startContractBasisScanner 
 import { getContractFocusPoolHealth, handleContractFocusPool, startContractFocusPoolScanner } from './contract-focus-pool.mjs';
 import { getContractDeepSharedHealth, handleContractDeepShared, startContractDeepSharedScanner } from './contract-deep-shared.mjs';
 import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
+import { getBinanceAdvancedStatsHealth, handleBinanceAdvancedStats, startBinanceAdvancedStatsScanner } from './binance-advanced-stats.mjs';
 import { getBitgetAdvancedStatsHealth, handleBitgetAdvancedStats, startBitgetAdvancedStatsScanner } from './bitget-advanced-stats.mjs';
 import { getGateAdvancedStatsHealth, handleGateAdvancedStats, startGateAdvancedStatsScanner } from './gate-advanced-stats.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
@@ -24,7 +25,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.97';
+const STEP_VERSION = '650.8.15.98';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
@@ -33,6 +34,7 @@ startMarketLightSnapshotScanner();
 startContractBasisScanner();
 startContractFocusPoolScanner();
 startContractDeepSharedScanner();
+startBinanceAdvancedStatsScanner();
 startBitgetAdvancedStatsScanner();
 startGateAdvancedStatsScanner();
 let shuttingDown = false;
@@ -660,6 +662,13 @@ const server = http.createServer(async (req, res) => {
         source_capability_registry_cross_provider_substitution: false,
         source_capability_registry_cross_quote_substitution: false,
         source_capability_registry_user_reads_scale_exchange_upstream: false,
+        binance_advanced_official_stats_endpoint: '/api/binance-advanced/current-snapshot',
+        binance_advanced_official_stats_health_endpoint: '/api/binance-advanced/health',
+        binance_advanced_official_stats_ready: getBinanceAdvancedStatsHealth().ready,
+        binance_advanced_edge_relay_only: true,
+        binance_advanced_render_direct_rest_enabled: false,
+        binance_advanced_user_reads_scale_exchange_upstream: false,
+        binance_advanced_adl_official_update_interval_minutes: 30,
         bitget_advanced_official_stats_endpoint: '/api/bitget-advanced/current-snapshot',
         bitget_advanced_official_stats_health_endpoint: '/api/bitget-advanced/health',
         bitget_advanced_official_stats_ready: getBitgetAdvancedStatsHealth().ready,
@@ -835,6 +844,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
       if (await handleMarketLightSnapshot(req, res, url)) return true;
       if (await handleSourceCapabilityRegistry(req, res, url)) return true;
+      if (await handleBinanceAdvancedStats(req, res, url)) return true;
       if (await handleBitgetAdvancedStats(req, res, url)) return true;
       if (await handleGateAdvancedStats(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
