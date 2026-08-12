@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.99",
+  "version": "650.8.15.100",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.99 / Step993.1 Binance missing-first OI + bounded ADL targeted recovery"
+  "description": "Kaka contract realtime worker 650.8.15.100 / Step993.2 Binance bounded ADL target queue recovery"
 }
