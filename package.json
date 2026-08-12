@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.96",
+  "version": "650.8.15.97",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.96 / Step992.2 Bitget focus and shared-funding cold-start recovery final gate"
+  "description": "Kaka contract realtime worker 650.8.15.97 / Step992.3 deep 5x15 cold-start freshness recovery final gate"
 }
