@@ -4,7 +4,7 @@ import {
   getBinanceContractKlineRelayHealth,
 } from './binance-contract-kline-relay.mjs';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.3';
 const SNAPSHOT_ROUTE = '/api/binance-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/binance-advanced/health';
 const FUTURES_BASE = 'https://fapi.binance.com';
@@ -116,7 +116,7 @@ function binanceFocusTargets() {
   };
 }
 
-async function relayJson(url, laneName) {
+async function relayJson(url, laneName, { deferWhenBusy = true, priority = RELAY_PRIORITY } = {}) {
   const startedAt = Date.now();
   setLane(laneName, {
     attempts: Number(laneStats.get(laneName)?.attempts || 0) + 1,
@@ -126,8 +126,8 @@ async function relayJson(url, laneName) {
     const payload = await fetchBinancePublicRestRelayJson(url, {
       source: `step993:${laneName}`,
       lane: RELAY_LANE,
-      priority: RELAY_PRIORITY,
-      deferWhenBusy: true,
+      priority,
+      deferWhenBusy,
     });
     setLane(laneName, {
       successes: Number(laneStats.get(laneName)?.successes || 0) + 1,
@@ -246,7 +246,8 @@ async function refreshAdl(targets, reason) {
   // omits a focus contract, probe only that missing contract through the same
   // authenticated Edge relay. This is bounded to one missing symbol per cycle
   // and each symbol has a five-minute cooldown. It does not reopen Render REST.
-  const probeTargets = missingTargets
+  const hasSuccessfulAllSymbolsSnapshot = Number.isFinite(Date.parse(String(lastAdlCompletedAt || '')));
+  const probeTargets = (hasSuccessfulAllSymbolsSnapshot ? missingTargets : [])
     .filter((target) => now - Number(adlTargetProbeAt.get(target.symbol) || 0) >= ADL_TARGET_RECOVERY_COOLDOWN_MS)
     .slice(0, ADL_TARGET_RECOVERY_MAX_PER_CYCLE);
   for (const target of probeTargets) {
@@ -254,7 +255,18 @@ async function refreshAdl(targets, reason) {
     lastAdlTargetRecoveryAttempted += 1;
     try {
       const query = new URLSearchParams({ symbol: target.symbol });
-      const payload = await relayJson(`${FUTURES_BASE}/fapi/v1/symbolAdlRisk?${query.toString()}`, 'adl_risk_missing_symbol');
+      // Step993.2: this is the only bounded recovery request that must not use
+      // background fail-fast. Step993.1 proved XRPUSDT could remain missing for
+      // the entire audit because the probe was rejected locally with
+      // binance_kline_relay_background_deferred before Edge/Binance was called.
+      // Queue this single critical request (max one per cycle, same-symbol >=5m)
+      // behind existing higher/equal-priority work instead. Request frequency and
+      // the relay's global/lane rate limits remain unchanged.
+      const payload = await relayJson(
+        `${FUTURES_BASE}/fapi/v1/symbolAdlRisk?${query.toString()}`,
+        'adl_risk_missing_symbol',
+        { deferWhenBusy: false, priority: RELAY_PRIORITY + 2 },
+      );
       const parsed = parseAdlRows(payload);
       const row = parsed.get(target.symbol);
       if (!row) throw new Error(`binance_adl_payload_missing:${target.symbol}`);
@@ -466,6 +478,12 @@ function snapshotPayload({ includeRows = true } = {}) {
     last_adl_target_recovery_attempted: lastAdlTargetRecoveryAttempted,
     last_adl_target_recovery_succeeded: lastAdlTargetRecoverySucceeded,
     adl_target_probe_errors: adlProbeErrors,
+    adl_target_requires_successful_all_symbols_snapshot: true,
+    adl_target_queue_wait_enabled: true,
+    adl_target_defer_when_busy: false,
+    adl_target_priority: RELAY_PRIORITY + 2,
+    adl_target_recovery_per_cycle_max: ADL_TARGET_RECOVERY_MAX_PER_CYCLE,
+    adl_target_probe_cooldown_seconds: Math.round(ADL_TARGET_RECOVERY_COOLDOWN_MS / 1000),
     official_endpoints: {
       open_interest_current: '/fapi/v1/openInterest',
       adl_risk: '/fapi/v1/symbolAdlRisk',
@@ -541,6 +559,9 @@ export function getBinanceAdvancedStatsHealth() {
     oi_startup_recovery_missing_only: true,
     adl_startup_recovery_does_not_repeat_all_symbols_inside_30m: true,
     adl_missing_symbol_targeted_recovery: true,
+    adl_target_requires_successful_all_symbols_snapshot: true,
+    adl_target_queue_wait_enabled: true,
+    adl_target_defer_when_busy: false,
     open_interest_requests_per_refresh_max: FOCUS_TARGET,
     adl_all_symbols_requests_per_30m_max: 1,
     adl_missing_symbol_recovery_requests_per_cycle_max: ADL_TARGET_RECOVERY_MAX_PER_CYCLE,
