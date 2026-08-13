@@ -1,11 +1,11 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.128",
+  "version": "650.8.15.129",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/proxy.mjs",
-    "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs && node --check src/cme-expiry-shared-calendar.mjs && node --check src/market-light-snapshot.mjs && node --check src/contract-basis.mjs && node --check src/contract-focus-pool.mjs && node --check src/contract-deep-shared.mjs && node --check src/source-capability-registry.mjs && node --check src/binance-advanced-stats.mjs && node --check src/bitget-advanced-stats.mjs && node --check src/gate-advanced-stats.mjs && node --check src/okx-advanced-stats.mjs && node --check src/isolated-collector-worker.mjs && node --check src/collector-isolation.mjs && node --check src/market-light-bridge.mjs && node --check src/liquidation-bridge.mjs && node --check src/deep-market-bridge.mjs && node --check src/slow-stats-bridge.mjs && node --check src/market-light-bridge-projection.mjs && node --check src/business-source-policy.mjs && node --check src/derivatives-public.mjs",
+    "check": "node --check src/proxy.mjs && node --check src/server.mjs && node --check src/market-rest.mjs && node --check src/binance-rest-guard.mjs && node --check src/binance-contract-kline-relay.mjs && node --check src/binance-contract-market.mjs && node --check src/binance-contract-kline-seed.mjs && node --check src/contract-flow.mjs && node --check src/contract-funding.mjs && node --check src/contract-depth.mjs && node --check src/contract-liquidation.mjs && node --check src/spot-current-snapshot.mjs && node --check src/spot-flow-history.mjs && node --check src/spot-flow-snapshot.mjs && node --check src/spot-exact-ticker.mjs && node --check src/bybit-second-history.mjs && node --check src/cme-expiry-shared-calendar.mjs && node --check src/market-light-snapshot.mjs && node --check src/contract-basis.mjs && node --check src/contract-focus-pool.mjs && node --check src/contract-deep-shared.mjs && node --check src/source-capability-registry.mjs && node --check src/binance-advanced-stats.mjs && node --check src/bitget-advanced-stats.mjs && node --check src/gate-advanced-stats.mjs && node --check src/okx-advanced-stats.mjs && node --check src/isolated-collector-worker.mjs && node --check src/collector-isolation.mjs && node --check src/market-light-bridge.mjs && node --check src/liquidation-bridge.mjs && node --check src/deep-market-bridge.mjs && node --check src/slow-stats-bridge.mjs && node --check src/market-light-bridge-projection.mjs && node --check src/business-source-policy.mjs && node --check src/derivatives-public.mjs && node --check src/hot-score-metrics.mjs",
     "test:step781.2.5": "node tests/step781_2_5_selftest.mjs",
     "test:step781.2.6": "node tests/step781_2_6_selftest.mjs",
     "test:step781.2.7": "node tests/step781_2_7_selftest.mjs",
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka worker 650.8.15.128 / Step1004.6 closes original Step998 with shared realized-liquidation price heatmap buckets derived from existing official public event streams and Gate/Bitget official minute reconciliation"
+  "description": "Kaka worker 650.8.15.129 / Step1004.7 closes original Step999 with five-provider 10-core + 5-hot composite same-venue scoring from existing shared turnover, flow, volatility, OI-change and realized-liquidation activity"
 }
