@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.33';
+const VERSION = '650.8.15.34';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -158,6 +158,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const deepMarketBridge = getDeepMarketBridgeHealth();
   const slowStatsBridge = getSlowStatsBridgeHealth();
   const liquidationHistory = getContractLiquidationPersistenceHealth();
+  const collectorIsolation = getCollectorIsolationHealth();
   const marketKeys = Object.keys(coverage);
   const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
   const binanceContract = coverage['contract:binance'] || {};
@@ -845,6 +846,19 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       user_reads_trigger_exchange_requests: contractFlow?.market_snapshot_shared_cache?.user_reads_trigger_exchange_requests === true,
       database_reads_scale_with_users: contractFlow?.market_snapshot_shared_cache?.database_reads_scale_with_users === true,
     },
+    step1004_pressure_transport_cache: {
+      ready: collectorIsolation?.shared_read_transport_cache?.ready === true &&
+        collectorIsolation?.shared_read_transport_cache?.response_cache_enabled === true &&
+        collectorIsolation?.shared_read_transport_cache?.inflight_coalescing_enabled === true &&
+        collectorIsolation?.shared_read_transport_cache?.stale_while_refresh_enabled === true &&
+        collectorIsolation?.shared_read_transport_cache?.gzip_shared_buffer_enabled === true &&
+        collectorIsolation?.shared_read_transport_cache?.collector_keep_alive_enabled === true &&
+        collectorIsolation?.shared_read_transport_cache?.collector_fetches_scale_with_users === false,
+      version: collectorIsolation?.version || null,
+      shared_read_transport_cache: { ...(collectorIsolation?.shared_read_transport_cache || {}) },
+      reads_scale_local_collector_serialization_with_users: false,
+      gzip_shared_buffer_reused_across_users: true,
+    },
     step1000_history_lifecycle: {
       ready: historyLifecycle?.ready === true && historyLifecycle?.step1000_ready === true,
       version: historyLifecycle?.version || null,
@@ -899,7 +913,8 @@ export function getSourceCapabilityRegistryHealth() {
       payload.step998_liquidation_heatmap.ready &&
       payload.step999_focus_hot_score.ready &&
       payload.step1000_history_lifecycle.ready &&
-      payload.step1004_pressure_shared_read_cache.ready,
+      payload.step1004_pressure_shared_read_cache.ready &&
+      payload.step1004_pressure_transport_cache.ready,
   };
 }
 

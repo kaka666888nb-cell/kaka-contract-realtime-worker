@@ -2,8 +2,10 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.130';
+const VERSION = '650.8.15.132';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -12,6 +14,213 @@ const DEEP_MARKET_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_DEEP_MARKET_
 const SLOW_STATS_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_SLOW_STATS_WORKER_MAX_OLD_MB || 144));
 const RESTART_BASE_MS = Math.max(1_000, Number(process.env.KAKA_COLLECTOR_RESTART_BASE_MS || 2_000));
 const RESTART_MAX_MS = Math.max(RESTART_BASE_MS, Number(process.env.KAKA_COLLECTOR_RESTART_MAX_MS || 30_000));
+
+
+// Step1004.10 pressure transport hardening: large shared snapshots are authoritative
+// backend snapshots, so concurrent user reads must reuse one short-lived serialized
+// response instead of forcing one localhost collector request + JSON serialization per user.
+// The cache is response-only: collectors keep their existing update cadence and no exchange
+// request is started by cache refreshes beyond the already-running collector work.
+const gzipAsync = promisify(gzip);
+const ISOLATED_KEEP_ALIVE_AGENT = new http.Agent({ keepAlive: true, maxSockets: 48, maxFreeSockets: 12 });
+const SHARED_RESPONSE_CACHE_MAX_ENTRIES = 32;
+const SHARED_RESPONSE_MAX_BODY_BYTES = 32 * 1024 * 1024;
+const SHARED_RESPONSE_GZIP_MIN_BYTES = 2 * 1024;
+const sharedResponseCache = new Map();
+const sharedResponseInflight = new Map();
+const sharedResponseStats = {
+  user_requests: 0,
+  fresh_hits: 0,
+  stale_hits: 0,
+  cold_misses: 0,
+  inflight_coalesced: 0,
+  collector_fetches: 0,
+  collector_fetch_errors: 0,
+  gzip_builds: 0,
+  gzip_build_errors: 0,
+  gzip_served_responses: 0,
+  raw_served_responses: 0,
+  raw_bytes_fetched: 0,
+  gzip_bytes_built: 0,
+};
+
+function sharedResponsePolicy(pathname) {
+  const path = String(pathname || '');
+  if (path === '/api/market-light/current-snapshot') return { freshMs: 2_000, staleMs: 10_000 };
+  if (path === '/api/contract-flow/market-snapshot') return { freshMs: 5_000, staleMs: 30_000 };
+  if (path === '/api/contract-liquidation/market-snapshot') return { freshMs: 1_500, staleMs: 8_000 };
+  if (path === '/api/contract-liquidation/heatmap') return { freshMs: 2_000, staleMs: 10_000 };
+  if (path === '/api/contract-focus-pool/current-snapshot') return { freshMs: 5_000, staleMs: 20_000 };
+  if (path === '/api/contract-deep-shared/current-snapshot') return { freshMs: 2_000, staleMs: 10_000 };
+  if (path === '/api/derivatives-public/current-snapshot') return { freshMs: 15_000, staleMs: 60_000 };
+  if (path === '/api/history-lifecycle/current-snapshot') return { freshMs: 30_000, staleMs: 120_000 };
+  return null;
+}
+
+function cleanSharedHeaders(headers = {}) {
+  const result = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    const lower = String(name || '').toLowerCase();
+    if (lower === 'connection' || lower === 'keep-alive' || lower === 'transfer-encoding' || lower === 'content-length' || lower === 'content-encoding' || lower === 'vary') continue;
+    if (value != null) result[name] = value;
+  }
+  result['cache-control'] = 'no-store';
+  return result;
+}
+
+function acceptsGzip(req) {
+  return /(?:^|,|\s)gzip(?:\s|,|;|$)/i.test(String(req?.headers?.['accept-encoding'] || ''));
+}
+
+function pruneSharedResponseCache() {
+  if (sharedResponseCache.size <= SHARED_RESPONSE_CACHE_MAX_ENTRIES) return;
+  const entries = [...sharedResponseCache.entries()].sort((a, b) => Number(a[1]?.storedAt || 0) - Number(b[1]?.storedAt || 0));
+  while (entries.length > SHARED_RESPONSE_CACHE_MAX_ENTRIES) {
+    const [key] = entries.shift();
+    sharedResponseCache.delete(key);
+  }
+}
+
+function fetchIsolatedBuffered(role, path) {
+  const port = isolatedCollectorPort(role);
+  sharedResponseStats.collector_fetches += 1;
+  return new Promise((resolve, reject) => {
+    const upstream = http.request({
+      hostname: '127.0.0.1',
+      port,
+      method: 'GET',
+      path,
+      agent: ISOLATED_KEEP_ALIVE_AGENT,
+      headers: {
+        accept: 'application/json',
+        'accept-encoding': 'identity',
+        host: `127.0.0.1:${port}`,
+      },
+    }, (upstreamRes) => {
+      const chunks = [];
+      let total = 0;
+      upstreamRes.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > SHARED_RESPONSE_MAX_BODY_BYTES) {
+          upstreamRes.destroy(new Error('isolated_shared_response_too_large'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      upstreamRes.on('end', () => {
+        const body = Buffer.concat(chunks);
+        sharedResponseStats.raw_bytes_fetched += body.length;
+        resolve({ statusCode: upstreamRes.statusCode || 502, headers: upstreamRes.headers, body });
+      });
+      upstreamRes.on('error', reject);
+    });
+    upstream.setTimeout(45_000, () => upstream.destroy(new Error(`isolated_${role}_shared_timeout`)));
+    upstream.on('error', reject);
+    upstream.end();
+  });
+}
+
+async function buildSharedResponseEntry(role, path) {
+  const result = await fetchIsolatedBuffered(role, path);
+  let gzipBody = null;
+  if (result.statusCode >= 200 && result.statusCode < 300 && result.body.length >= SHARED_RESPONSE_GZIP_MIN_BYTES) {
+    try {
+      gzipBody = await gzipAsync(result.body, { level: 1 });
+      sharedResponseStats.gzip_builds += 1;
+      sharedResponseStats.gzip_bytes_built += gzipBody.length;
+    } catch {
+      sharedResponseStats.gzip_build_errors += 1;
+      gzipBody = null;
+    }
+  }
+  return { ...result, gzipBody, storedAt: Date.now() };
+}
+
+function sendSharedResponse(req, res, entry, cacheState) {
+  if (res.headersSent) return;
+  const useGzip = Buffer.isBuffer(entry?.gzipBody) && acceptsGzip(req);
+  const body = useGzip ? entry.gzipBody : entry.body;
+  const headers = {
+    ...cleanSharedHeaders(entry?.headers || {}),
+    'content-length': String(body?.length || 0),
+    'x-kaka-shared-response-cache': cacheState,
+    'x-kaka-shared-response-reused': cacheState === 'fresh' || cacheState === 'stale' || cacheState === 'coalesced' ? '1' : '0',
+  };
+  if (useGzip) {
+    headers['content-encoding'] = 'gzip';
+    headers.vary = 'Accept-Encoding';
+    sharedResponseStats.gzip_served_responses += 1;
+  } else {
+    sharedResponseStats.raw_served_responses += 1;
+  }
+  res.writeHead(entry?.statusCode || 502, headers);
+  res.end(body || Buffer.alloc(0));
+}
+
+function startSharedResponseRefresh(key, role, path) {
+  let pending = sharedResponseInflight.get(key);
+  if (pending) return pending;
+  pending = buildSharedResponseEntry(role, path)
+    .then((entry) => {
+      if (entry.statusCode >= 200 && entry.statusCode < 300) {
+        sharedResponseCache.set(key, entry);
+        pruneSharedResponseCache();
+      }
+      return entry;
+    })
+    .catch((error) => {
+      sharedResponseStats.collector_fetch_errors += 1;
+      throw error;
+    })
+    .finally(() => sharedResponseInflight.delete(key));
+  sharedResponseInflight.set(key, pending);
+  return pending;
+}
+
+function proxySharedCachedCollectorGet(req, res, url, role, policy) {
+  sharedResponseStats.user_requests += 1;
+  const key = `${role}:${url.pathname}${url.search}`;
+  const now = Date.now();
+  const cached = sharedResponseCache.get(key);
+  const age = cached ? now - Number(cached.storedAt || 0) : Number.POSITIVE_INFINITY;
+
+  if (cached && age <= policy.freshMs) {
+    sharedResponseStats.fresh_hits += 1;
+    sendSharedResponse(req, res, cached, 'fresh');
+    return;
+  }
+
+  if (cached && age <= policy.staleMs) {
+    sharedResponseStats.stale_hits += 1;
+    startSharedResponseRefresh(key, role, req.url).catch(() => {});
+    sendSharedResponse(req, res, cached, 'stale');
+    return;
+  }
+
+  const existing = sharedResponseInflight.get(key);
+  if (existing) sharedResponseStats.inflight_coalesced += 1;
+  else sharedResponseStats.cold_misses += 1;
+  const pending = existing || startSharedResponseRefresh(key, role, req.url);
+  pending.then((entry) => sendSharedResponse(req, res, entry, existing ? 'coalesced' : 'miss'))
+    .catch((error) => {
+      if (res.headersSent) {
+        res.destroy(error);
+        return;
+      }
+      const body = Buffer.from(JSON.stringify({
+        ok: false,
+        error: 'isolated_collector_shared_cache_unavailable',
+        collector_role: role,
+        message: String(error?.message || error),
+      }));
+      res.writeHead(503, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-length': String(body.length),
+      });
+      res.end(body);
+    });
+}
 
 const ROLES = Object.freeze({
   'market-light': Object.freeze({ port: MARKET_LIGHT_PORT, runtime: 'child_process' }),
@@ -246,16 +455,22 @@ export function requestIsolatedJson(role, path, timeoutMs = 8_000) {
 export function proxyIsolatedCollectorRequest(req, res, url) {
   const role = collectorRoleForPath(url?.pathname);
   if (!role) return false;
+  const policy = req.method === 'GET' ? sharedResponsePolicy(url?.pathname) : null;
+  if (policy) {
+    proxySharedCachedCollectorGet(req, res, url, role, policy);
+    return true;
+  }
+
   const port = isolatedCollectorPort(role);
   const upstream = http.request({
     hostname: '127.0.0.1',
     port,
     method: req.method,
     path: req.url,
+    agent: ISOLATED_KEEP_ALIVE_AGENT,
     headers: {
       ...req.headers,
       host: `127.0.0.1:${port}`,
-      connection: 'close',
     },
   }, (upstreamRes) => {
     const headers = { ...upstreamRes.headers };
@@ -374,6 +589,34 @@ export function getCollectorIsolationHealth() {
     memory_safety_design: 'first_batch_child_processes_plus_second_batch_resource_limited_worker_isolates_plus_projected_internal_bridges',
     projected_internal_bridge_payloads: true,
     full_market_rows_not_copied_to_second_batch: true,
+    shared_read_transport_cache: {
+      ready: true,
+      response_cache_enabled: true,
+      inflight_coalescing_enabled: true,
+      stale_while_refresh_enabled: true,
+      gzip_shared_buffer_enabled: true,
+      collector_keep_alive_enabled: true,
+      collector_fetches_scale_with_users: false,
+      one_refresh_per_key_window: true,
+      cache_entries: sharedResponseCache.size,
+      inflight_keys: sharedResponseInflight.size,
+      max_entries: SHARED_RESPONSE_CACHE_MAX_ENTRIES,
+      max_body_bytes: SHARED_RESPONSE_MAX_BODY_BYTES,
+      user_requests: sharedResponseStats.user_requests,
+      fresh_hits: sharedResponseStats.fresh_hits,
+      stale_hits: sharedResponseStats.stale_hits,
+      cold_misses: sharedResponseStats.cold_misses,
+      inflight_coalesced: sharedResponseStats.inflight_coalesced,
+      collector_fetches: sharedResponseStats.collector_fetches,
+      collector_fetch_errors: sharedResponseStats.collector_fetch_errors,
+      gzip_builds: sharedResponseStats.gzip_builds,
+      gzip_build_errors: sharedResponseStats.gzip_build_errors,
+      gzip_served_responses: sharedResponseStats.gzip_served_responses,
+      raw_served_responses: sharedResponseStats.raw_served_responses,
+      raw_bytes_fetched: sharedResponseStats.raw_bytes_fetched,
+      gzip_bytes_built: sharedResponseStats.gzip_bytes_built,
+      cacheable_routes: 8,
+    },
     timestamp_ms: Date.now(),
   };
 }
