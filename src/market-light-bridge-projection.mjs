@@ -8,6 +8,7 @@ const COMMON_META_KEYS = Object.freeze([
 const DEEP_CONTRACT_KEYS = Object.freeze([
   'symbol', 'base_asset', 'quote_asset', 'quote_symbol',
   'quote_volume_24h', 'price_change_percent_24h',
+  'open_interest', 'open_interest_value', 'open_interest_unit', 'open_interest_value_unit',
   'last_price', 'price', 'source_time', 'cached_at', 'updated_at',
 ]);
 

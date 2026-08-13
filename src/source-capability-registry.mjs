@@ -10,11 +10,11 @@ import {
 } from './slow-stats-bridge.mjs';
 import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './liquidation-bridge.mjs';
-import { getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridgeHealth } from './deep-market-bridge.mjs';
+import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridgeHealth } from './deep-market-bridge.mjs';
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.30';
+const VERSION = '650.8.15.31';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -150,6 +150,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const bybitAdvanced = getBybitAdvancedStatsHealth();
   const derivativesPublic = getDerivativesPublicHealth();
   const contractDepth = getContractDepthHealth();
+  const contractFocus = getContractFocusPoolHealth();
   const contractFlow = getContractFlowHealth();
   const contractDeep = getContractDeepSharedHealth();
   const deepMarketBridge = getDeepMarketBridgeHealth();
@@ -808,6 +809,27 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       reads: Number(liquidationHistory.step998_heatmap_reads || 0),
       runtime: { ...(liquidationHistory.step998_heatmap_health || {}) },
     },
+    step999_focus_hot_score: {
+      ready: contractFocus.ready === true &&
+        contractFocus.step999_composite_hot_score_ready === true &&
+        contractFocus.hot_rank_metric === 'composite_6_factor_same_venue_shared' &&
+        contractFocus.step999_no_additional_exchange_requests === true &&
+        contractFocus.step999_no_cross_provider_or_quote_substitution === true &&
+        contractFocus.step999_realized_liquidation_not_estimated_risk === true &&
+        Number(contractFocus.row_count || 0) === 75,
+      version: contractFocus.version || null,
+      row_count: Number(contractFocus.row_count || 0),
+      hot_rank_metric: contractFocus.hot_rank_metric || null,
+      hot_score_min_factors: Number(contractFocus.step999_hot_score_min_factors || 0),
+      hot_score_weights: { ...(contractFocus.step999_hot_score_weights || {}) },
+      hot_score_sources: Array.isArray(contractFocus.step999_hot_score_sources) ? [...contractFocus.step999_hot_score_sources] : [],
+      flow_metric_health: { ...(contractFocus.step999_flow_metric_health || {}) },
+      liquidation_local_cache: { ...(contractFocus.step999_liquidation_local_cache || {}) },
+      no_additional_exchange_requests: contractFocus.step999_no_additional_exchange_requests === true,
+      no_cross_provider_or_quote_substitution: contractFocus.step999_no_cross_provider_or_quote_substitution === true,
+      realized_liquidation_not_estimated_risk: contractFocus.step999_realized_liquidation_not_estimated_risk === true,
+      reads_scale_with_users: false,
+    },
     capabilities: includeCapabilities ? CAPABILITIES : [],
     capability_count: CAPABILITIES.length,
     exchange_requests_started_by_user_read: 0,
@@ -846,7 +868,8 @@ export function getSourceCapabilityRegistryHealth() {
       payload.collector_isolation_first_batch.ready &&
       payload.collector_isolation_second_batch.ready &&
       payload.step997_liquidation_history.ready &&
-      payload.step998_liquidation_heatmap.ready,
+      payload.step998_liquidation_heatmap.ready &&
+      payload.step999_focus_hot_score.ready,
   };
 }
 
