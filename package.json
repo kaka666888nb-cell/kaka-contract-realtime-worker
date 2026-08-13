@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.111",
+  "version": "650.8.15.112",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.111 / Step1001 Bitget official 5m advanced-stat history reuse + zero-upstream derived rollups"
+  "description": "Kaka contract realtime worker 650.8.15.112 / Step1001.4 shared official 5m Bitget history + robust missing-only Step1000 risk history recovery"
 }
