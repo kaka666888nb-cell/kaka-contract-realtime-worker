@@ -1,6 +1,6 @@
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.124';
+const VERSION = '650.8.15.126';
 const POLL_MS = Math.max(1_000, Number(process.env.KAKA_SLOW_STATS_BRIDGE_POLL_MS || 5_000));
 const STALE_MS = Math.max(10_000, Number(process.env.KAKA_SLOW_STATS_BRIDGE_STALE_MS || 30_000));
 
@@ -9,7 +9,7 @@ let running = false;
 let lastSuccessAt = 0;
 let lastAttemptAt = 0;
 let lastError = '';
-const state = { binance: null, bitget: null, gate: null, okx: null, bybit: null };
+const state = { binance: null, bitget: null, gate: null, okx: null, bybit: null, derivatives: null };
 
 async function poll() {
   if (running) return;
@@ -17,7 +17,7 @@ async function poll() {
   lastAttemptAt = Date.now();
   try {
     const payload = await requestIsolatedJson('slow-stats', '/_isolated/state', 8_000);
-    if (!payload?.ok || !payload?.binance_advanced || !payload?.bitget_advanced || !payload?.gate_advanced || !payload?.okx_advanced || !payload?.bybit_advanced) {
+    if (!payload?.ok || !payload?.binance_advanced || !payload?.bitget_advanced || !payload?.gate_advanced || !payload?.okx_advanced || !payload?.bybit_advanced || !payload?.derivatives_public) {
       throw new Error('slow_stats_bridge_invalid_payload');
     }
     state.binance = payload.binance_advanced;
@@ -25,6 +25,7 @@ async function poll() {
     state.gate = payload.gate_advanced;
     state.okx = payload.okx_advanced;
     state.bybit = payload.bybit_advanced;
+    state.derivatives = payload.derivatives_public;
     lastSuccessAt = Date.now();
     lastError = '';
   } catch (error) {
@@ -68,18 +69,21 @@ export function getBitgetAdvancedStatsHealth() { return health(state.bitget); }
 export function getGateAdvancedStatsHealth() { return health(state.gate); }
 export function getOkxAdvancedStatsHealth() { return health(state.okx); }
 export function getBybitAdvancedStatsHealth() { return health(state.bybit); }
+export function getDerivativesPublicHealth() { return health(state.derivatives); }
 
 export function getSlowStatsBridgeHealth() {
   const meta = metadata();
   return {
     ok: true,
     version: VERSION,
-    ready: meta.isolated_bridge_fresh === true && state.binance != null && state.bitget != null && state.gate != null && state.okx != null && state.bybit != null,
+    ready: meta.isolated_bridge_fresh === true && state.binance != null && state.bitget != null && state.gate != null && state.okx != null && state.bybit != null && state.derivatives != null,
     binance_ready: state.binance?.ready === true,
     bitget_ready: state.bitget?.ready === true,
     gate_ready: state.gate?.ready === true,
     okx_ready: state.okx?.ready === true,
     bybit_ready: state.bybit?.ready === true,
+    derivatives_state_present: state.derivatives != null,
+    derivatives_ready: state.derivatives?.ready === true,
     ...meta,
   };
 }

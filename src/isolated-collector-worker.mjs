@@ -8,7 +8,7 @@ const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT
 process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
 process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
 if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
-const VERSION = '650.8.15.124';
+const VERSION = '650.8.15.126';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -156,6 +156,7 @@ if (ROLE === 'market-light') {
   const gate = await import('./gate-advanced-stats.mjs');
   const okx = await import('./okx-advanced-stats.mjs');
   const bybit = await import('./bybit-advanced-stats.mjs');
+  const derivatives = await import('./derivatives-public.mjs');
 
   marketBridge.startMarketLightBridge();
   deepBridge.startDeepMarketBridge();
@@ -165,6 +166,7 @@ if (ROLE === 'market-light') {
   gate.startGateAdvancedStatsScanner();
   okx.startOkxAdvancedStatsScanner();
   bybit.startBybitAdvancedStatsScanner();
+  derivatives.startDerivativesPublicScanner();
 
   roleVersion = binance.getBinanceAdvancedStatsHealth().version || null;
   handleRoleRoute = async (req, res, url) => {
@@ -173,6 +175,7 @@ if (ROLE === 'market-light') {
     if (await gate.handleGateAdvancedStats(req, res, url)) return true;
     if (await okx.handleOkxAdvancedStats(req, res, url)) return true;
     if (await bybit.handleBybitAdvancedStats(req, res, url)) return true;
+    if (await derivatives.handleDerivativesPublic(req, res, url)) return true;
     return false;
   };
   internalState = () => ({
@@ -196,6 +199,7 @@ if (ROLE === 'market-light') {
     gate_advanced: gate.getGateAdvancedStatsHealth(),
     okx_advanced: okx.getOkxAdvancedStatsHealth(),
     bybit_advanced: bybit.getBybitAdvancedStatsHealth(),
+    derivatives_public: derivatives.getDerivativesPublicHealth(),
     timestamp_ms: Date.now(),
   });
 } else {

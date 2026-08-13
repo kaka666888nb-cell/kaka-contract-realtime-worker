@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 
-const VERSION = '650.8.15.124';
+const VERSION = '650.8.15.126';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -195,7 +195,8 @@ export function collectorRoleForPath(pathname) {
     path.startsWith('/api/bitget-advanced') ||
     path.startsWith('/api/gate-advanced') ||
     path.startsWith('/api/okx-advanced') ||
-    path.startsWith('/api/bybit-advanced')
+    path.startsWith('/api/bybit-advanced') ||
+    path.startsWith('/api/derivatives-public')
   ) return 'slow-stats';
   return null;
 }

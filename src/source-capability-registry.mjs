@@ -5,6 +5,7 @@ import {
   getGateAdvancedStatsHealth,
   getOkxAdvancedStatsHealth,
   getBybitAdvancedStatsHealth,
+  getDerivativesPublicHealth,
   getSlowStatsBridgeHealth,
 } from './slow-stats-bridge.mjs';
 import { getContractDepthHealth } from './contract-depth.mjs';
@@ -13,7 +14,7 @@ import { getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridge
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.27';
+const VERSION = '650.8.15.28';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -32,6 +33,11 @@ const DECISION_POLICY = Object.freeze({
 const CAPABILITIES = Object.freeze([
   { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_first_batch', official_available: true, official_scope: 'backend_architecture', transport: 'separate_node_child_processes_plus_localhost_bridge', batch_mode: 'market_light_and_liquidation_distinct_process_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_1_catchup', fallback_policy: 'role_scoped_restart; sibling collector stays alive', history_policy: 'none', source_url: 'internal_architecture' },
   { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_second_batch', official_available: true, official_scope: 'backend_architecture', transport: 'resource_limited_node_worker_isolates_plus_localhost_bridges', batch_mode: 'deep_market_and_slow_stats_distinct_worker_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_2_2_projected_bridge_memory_safe', fallback_policy: 'role_scoped worker restart; sibling worker and parent remain alive', history_policy: 'none', source_url: 'internal_architecture' },
+  { provider: 'binance', market: 'option', capability: 'option_public_market', official_available: true, official_scope: 'official_public_crypto_options_market', transport: 'official_REST_and_market_WebSocket_exist_but_not_collected_by_current_Kaka_Render', batch_mode: 'none_in_step1004_5', rate_limit_class: 'blocked_by_existing_Kaka_Binance_safety_boundary', collector: 'none', target_layer: 'derivatives_public', current_integration: 'not_collected_step996_existing_binance_safety_policy_preserved', fallback_policy: 'missing; no cross-provider substitution', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-options/api/ws-streams/market' },
+  { provider: 'okx', market: 'option', capability: 'option_public_market', official_available: true, official_scope: 'current_public_crypto_option_instruments_tickers_open_interest', transport: 'official_public_REST_shared_background', batch_mode: 'all_option_instruments_plus_all_option_tickers_plus_bounded_official_instrument_family_OI', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1004_5', fallback_policy: 'last_verified_shared_snapshot_until_refresh; missing fields stay null', history_policy: 'current_only_step1004_5', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'bybit', market: 'option', capability: 'option_public_market', official_available: true, official_scope: 'current_public_crypto_option_instruments_and_tickers', transport: 'official_public_REST_shared_background', batch_mode: 'paginated_option_instruments_plus_option_tickers_per_official_baseCoin', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1004_5', fallback_policy: 'last_verified_shared_snapshot_until_refresh; missing fields stay null', history_policy: 'current_only_step1004_5', source_url: 'https://bybit-exchange.github.io/docs/v5/market/instrument' },
+  { provider: 'gate', market: 'option', capability: 'option_public_market', official_available: true, official_scope: 'current_public_crypto_option_underlyings_and_tickers', transport: 'official_public_REST_shared_background', batch_mode: 'official_underlyings_plus_tickers_per_official_underlying', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1004_5', fallback_policy: 'last_verified_shared_snapshot_until_refresh; missing fields stay null', history_policy: 'current_only_step1004_5', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'bitget', market: 'option', capability: 'option_public_market', official_available: false, official_scope: 'none_in_current_public_crypto_UTA_product_categories', transport: 'none', batch_mode: 'none', rate_limit_class: 'none', collector: 'none', target_layer: 'derivatives_public', current_integration: 'crypto_options_not_in_current_public_crypto_product_family', fallback_policy: 'missing; Stock+ US stock options excluded from crypto derivatives scope', history_policy: 'none', source_url: 'https://www.bitget.com/api-doc/uta/public/Instruments' },
   // Binance
   { provider: 'binance', market: 'spot', capability: 'directory', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST', batch_mode: 'data-api ticker_24hr symbol_omitted TRADING full-market shared baseline', rate_limit_class: '80_weight_per_2m_shared', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
   { provider: 'binance', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST_plus_market_stream', batch_mode: 'data-api ticker_24hr TRADING baseline plus data-stream !miniTicker@arr changed updates', rate_limit_class: 'one_shared_stream_plus_80_weight_per_2m', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
@@ -134,6 +140,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const gateAdvanced = getGateAdvancedStatsHealth();
   const okxAdvanced = getOkxAdvancedStatsHealth();
   const bybitAdvanced = getBybitAdvancedStatsHealth();
+  const derivativesPublic = getDerivativesPublicHealth();
   const contractDepth = getContractDepthHealth();
   const contractFlow = getContractFlowHealth();
   const contractDeep = getContractDeepSharedHealth();
@@ -167,7 +174,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
     business_rule_missing_capability_refs: businessValidation.missing_capability_refs,
     business_rule_duplicate_keys: businessValidation.duplicate_rule_keys,
     business_rules: includeCapabilities ? BUSINESS_SOURCE_RULES : [],
-    collector_targets: ['market-light-collector', 'liquidation-collector', 'deep-market-collector', 'slow-stats-collector', 'binance-advanced-slow-stats', 'okx-advanced-slow-stats'],
+    collector_targets: ['market-light-collector', 'liquidation-collector', 'deep-market-collector', 'slow-stats-collector', 'binance-advanced-slow-stats', 'okx-advanced-slow-stats', 'derivatives-public-slow-stats'],
     runtime_market_light_version: health?.version || null,
     runtime_market_light_11_exact: allMarketExact,
     runtime_market_light_coverage: coverage,
@@ -680,6 +687,54 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         reads_scale_with_users: false,
       };
     })(),
+    step996_derivatives_public: {
+      ready: derivativesPublic.ready === true &&
+        derivativesPublic.providers?.okx?.ready === true &&
+        derivativesPublic.providers?.bybit?.ready === true &&
+        derivativesPublic.providers?.gate?.ready === true &&
+        Number(derivativesPublic.providers?.okx?.row_count || 0) > 0 &&
+        Number(derivativesPublic.providers?.bybit?.row_count || 0) > 0 &&
+        Number(derivativesPublic.providers?.gate?.row_count || 0) > 0 &&
+        derivativesPublic.user_reads_trigger_exchange_requests === false &&
+        derivativesPublic.reads_scale_with_users === false &&
+        derivativesPublic.binance_direct_rest_added === false &&
+        derivativesPublic.binance_option_ws_added === false &&
+        derivativesPublic.bitget_stockplus_options_excluded_from_crypto_scope === true &&
+        derivativesPublic.official_only === true &&
+        derivativesPublic.derived_metrics_fabricated === false &&
+        derivativesPublic.cross_provider_substitution === false &&
+        derivativesPublic.cross_quote_substitution === false &&
+        derivativesPublic.missing_stays_null === true &&
+        derivativesPublic.current_scope_not_truncated === true,
+      version: derivativesPublic.version || null,
+      snapshot_endpoint: derivativesPublic.snapshot_endpoint || '/api/derivatives-public/current-snapshot',
+      health_endpoint: derivativesPublic.health_endpoint || '/api/derivatives-public/health',
+      collector_role: derivativesPublic.collector_role || 'slow-stats',
+      supported_crypto_option_providers: Array.isArray(derivativesPublic.supported_crypto_option_providers) ? [...derivativesPublic.supported_crypto_option_providers] : [],
+      explicit_non_collected_or_unsupported: Array.isArray(derivativesPublic.explicit_non_collected_or_unsupported) ? [...derivativesPublic.explicit_non_collected_or_unsupported] : [],
+      provider_rows: {
+        okx: Number(derivativesPublic.providers?.okx?.row_count || 0),
+        bybit: Number(derivativesPublic.providers?.bybit?.row_count || 0),
+        gate: Number(derivativesPublic.providers?.gate?.row_count || 0),
+      },
+      provider_ready: {
+        binance: derivativesPublic.providers?.binance?.ready === true,
+        okx: derivativesPublic.providers?.okx?.ready === true,
+        bybit: derivativesPublic.providers?.bybit?.ready === true,
+        gate: derivativesPublic.providers?.gate?.ready === true,
+        bitget: derivativesPublic.providers?.bitget?.ready === true,
+      },
+      binance_official_available_but_safety_excluded: derivativesPublic.providers?.binance?.official_available === true && derivativesPublic.binance_direct_rest_added === false && derivativesPublic.binance_option_ws_added === false,
+      bitget_crypto_options_unavailable_policy: derivativesPublic.providers?.bitget?.official_available === false && derivativesPublic.bitget_stockplus_options_excluded_from_crypto_scope === true,
+      user_reads_trigger_exchange_requests: derivativesPublic.user_reads_trigger_exchange_requests === true,
+      reads_scale_with_users: derivativesPublic.reads_scale_with_users === true,
+      official_only: derivativesPublic.official_only === true,
+      derived_metrics_fabricated: derivativesPublic.derived_metrics_fabricated === true,
+      cross_provider_substitution: derivativesPublic.cross_provider_substitution === true,
+      cross_quote_substitution: derivativesPublic.cross_quote_substitution === true,
+      missing_stays_null: derivativesPublic.missing_stays_null === true,
+      current_scope_not_truncated: derivativesPublic.current_scope_not_truncated === true,
+    },
     step997_liquidation_history: {
       ready: liquidationHistory.persistence_enabled === true &&
         liquidationHistory.step997_unified_history_ready === true &&

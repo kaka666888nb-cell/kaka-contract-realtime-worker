@@ -21,6 +21,7 @@ import {
   getGateAdvancedStatsHealth,
   getOkxAdvancedStatsHealth,
   getBybitAdvancedStatsHealth,
+  getDerivativesPublicHealth,
   startSlowStatsBridge,
 } from './slow-stats-bridge.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
@@ -29,7 +30,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.125';
+const STEP_VERSION = '650.8.15.126';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -323,6 +324,9 @@ const server = http.createServer(async (req, res) => {
       source_capabilities_current_snapshot: '/api/source-capabilities/current-snapshot',
       source_capabilities_health: '/api/source-capabilities/health',
       source_capabilities_state: getSourceCapabilityRegistryHealth(),
+      derivatives_public_current_snapshot: '/api/derivatives-public/current-snapshot',
+      derivatives_public_health: '/api/derivatives-public/health',
+      derivatives_public_state: getDerivativesPublicHealth(),
       gate_advanced_current_snapshot: '/api/gate-advanced/current-snapshot',
       gate_advanced_health: '/api/gate-advanced/health',
       gate_advanced_state: getGateAdvancedStatsHealth(),
@@ -445,6 +449,17 @@ const server = http.createServer(async (req, res) => {
         retention_hours: 72,
         metric_merge: 'coalesce_non_null',
         strict_null_numeric: true,
+        derivatives_public_shared_background: true,
+        derivatives_public_collector_role: 'slow-stats',
+        derivatives_public_user_reads_trigger_exchange_requests: false,
+        derivatives_public_reads_scale_with_users: false,
+        derivatives_public_official_only: true,
+        derivatives_public_cross_provider_substitution: false,
+        derivatives_public_cross_quote_substitution: false,
+        derivatives_public_missing_stays_null: true,
+        binance_option_direct_rest_added: false,
+        binance_option_market_ws_added: false,
+        bitget_stockplus_options_excluded_from_crypto_scope: true,
         app_metric_merge: 'time_and_family_key',
         okx_contract_value: true,
         okx_unit_source: 'v2',

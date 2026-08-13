@@ -1,4 +1,4 @@
-export const BUSINESS_SOURCE_POLICY_VERSION = '650.8.15.125';
+export const BUSINESS_SOURCE_POLICY_VERSION = '650.8.15.126';
 
 const RULES = [];
 function add(provider, market, field, {
@@ -240,6 +240,51 @@ add('bitget','spot','whale_net_timestamped_history',{
   layers:['slow_stats'],
   limitation:'Source-native timestamps only; no synthetic interval rollup.',
 });
+
+
+// Step1004.5 closes the original Step996 gap without weakening the established
+// Binance network safety boundary or inventing a Bitget crypto-options family.
+for (const provider of ['binance','okx','bybit','bitget','gate']) {
+  const shared = ['okx','bybit','gate'].includes(provider);
+  const unavailableReason = provider === 'binance'
+    ? 'Official Binance Options public market data exists, but Kaka Render deliberately adds no direct Binance options REST or /market WebSocket path in Step1004.5; values stay missing until that safety boundary is separately redesigned and verified.'
+    : provider === 'bitget'
+      ? 'The current Bitget public crypto UTA product categories do not expose a crypto-options category. Stock+ U.S. stock options are outside this crypto-derivatives scope.'
+      : '';
+  add(provider,'option','directory',{
+    resolution: shared ? 'official_shared' : 'unavailable',
+    capability:'option_public_market',
+    scope: shared ? 'current_public_crypto_options' : 'none_current_Kaka_integration',
+    layers: shared ? ['derivatives_public'] : [],
+    limitation: unavailableReason,
+  });
+  add(provider,'option','ticker',{
+    resolution: shared ? 'official_shared' : 'unavailable',
+    capability:'option_public_market',
+    scope: shared ? 'current_public_crypto_options' : 'none_current_Kaka_integration',
+    layers: shared ? ['derivatives_public'] : [],
+    limitation: unavailableReason,
+  });
+  add(provider,'option','open_interest',{
+    resolution: shared ? 'official_shared' : 'unavailable',
+    capability:'option_public_market',
+    scope: shared ? 'current_public_crypto_options_where_officially_returned' : 'none_current_Kaka_integration',
+    layers: shared ? ['derivatives_public'] : [],
+    limitation: unavailableReason || 'If an official option row does not return open interest, the field stays null.',
+  });
+  const greeksShared = provider === 'bybit' || provider === 'gate';
+  add(provider,'option','iv_greeks',{
+    resolution: greeksShared ? 'official_shared' : 'unavailable',
+    capability:'option_public_market',
+    scope: greeksShared ? 'current_public_crypto_options_where_officially_returned' : 'none_current_shared_field',
+    layers: greeksShared ? ['derivatives_public'] : [],
+    limitation: greeksShared
+      ? 'Only source-native public option IV/Greeks are exposed; absent individual Greeks remain null.'
+      : provider === 'okx'
+        ? 'The Step1004.5 OKX public layer consumes instruments, tickers and official option-family open interest only; IV/Greeks are not fabricated from price inputs.'
+        : unavailableReason,
+  });
+}
 
 export const BUSINESS_SOURCE_RULES = Object.freeze(RULES);
 const RULE_BY_KEY = new Map(
