@@ -1,8 +1,10 @@
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.122';
-const POLL_MS = Math.max(500, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_POLL_MS || 1_500));
-const STALE_MS = Math.max(5_000, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_STALE_MS || 10_000));
+const VERSION = '650.8.15.123';
+const POLL_MS = Math.max(750, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_POLL_MS || 2_000));
+const STALE_MS = Math.max(6_000, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_STALE_MS || 12_000));
+const CONSUMER_ROLE = String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || 'parent').trim() || 'parent';
+const STATE_SCOPE = CONSUMER_ROLE === 'slow-stats' ? 'slow-stats' : 'parent';
 
 let timer = null;
 let running = false;
@@ -19,14 +21,23 @@ async function poll() {
   running = true;
   lastAttemptAt = Date.now();
   try {
-    const payload = await requestIsolatedJson('deep-market', '/_isolated/state', 8_000);
-    if (!payload?.ok || !payload?.focus_health || !payload?.flow_health || !payload?.deep_health) {
-      throw new Error('deep_market_bridge_invalid_payload');
+    const payload = await requestIsolatedJson(
+      'deep-market',
+      `/_isolated/state?scope=${encodeURIComponent(STATE_SCOPE)}`,
+      8_000,
+    );
+    if (!payload?.ok || !payload?.focus_health || !payload?.focus_snapshot) {
+      throw new Error('deep_market_bridge_invalid_focus_payload');
     }
     focusHealth = payload.focus_health;
-    focusSnapshot = payload.focus_snapshot || null;
-    flowHealth = payload.flow_health;
-    deepHealth = payload.deep_health;
+    focusSnapshot = payload.focus_snapshot;
+    if (STATE_SCOPE === 'parent') {
+      if (!payload?.flow_health || !payload?.deep_health) {
+        throw new Error('deep_market_bridge_invalid_parent_payload');
+      }
+      flowHealth = payload.flow_health;
+      deepHealth = payload.deep_health;
+    }
     lastSuccessAt = Date.now();
     lastError = '';
   } catch (error) {
@@ -48,6 +59,8 @@ function metadata() {
   return {
     isolated_bridge: true,
     isolated_bridge_role: 'deep-market',
+    isolated_bridge_consumer_role: CONSUMER_ROLE,
+    isolated_bridge_state_scope: STATE_SCOPE,
     isolated_bridge_version: VERSION,
     isolated_bridge_poll_ms: POLL_MS,
     isolated_bridge_stale_ms: STALE_MS,
@@ -82,11 +95,19 @@ export function getContractFocusPoolHealth() {
 }
 
 export function getContractFlowHealth() {
-  return { ...(flowHealth || { ok: false, version: null }), ...metadata() };
+  return {
+    ...(flowHealth || { ok: false, version: null }),
+    ...metadata(),
+    unavailable_in_slow_stats_scope: STATE_SCOPE !== 'parent',
+  };
 }
 
 export function getContractDeepSharedHealth() {
-  return { ...(deepHealth || { ok: false, version: null, ready: false }), ...metadata() };
+  return {
+    ...(deepHealth || { ok: false, version: null, ready: false }),
+    ...metadata(),
+    unavailable_in_slow_stats_scope: STATE_SCOPE !== 'parent',
+  };
 }
 
 export function getDeepMarketBridgeHealth() {
@@ -94,11 +115,16 @@ export function getDeepMarketBridgeHealth() {
   return {
     ok: true,
     version: VERSION,
-    ready: meta.isolated_bridge_fresh === true && focusHealth != null && focusSnapshot != null && flowHealth != null && deepHealth != null,
+    ready:
+      meta.isolated_bridge_fresh === true &&
+      focusHealth != null &&
+      focusSnapshot != null &&
+      (STATE_SCOPE !== 'parent' || (flowHealth != null && deepHealth != null)),
     focus_ready: focusHealth?.ready === true,
     focus_rows: Number(focusHealth?.row_count || 0),
-    deep_ready: deepHealth?.ready === true,
-    deep_rows: Number(deepHealth?.row_count || 0),
+    deep_ready: STATE_SCOPE === 'parent' ? deepHealth?.ready === true : null,
+    deep_rows: STATE_SCOPE === 'parent' ? Number(deepHealth?.row_count || 0) : null,
+    scoped_payload_reduction: STATE_SCOPE === 'slow-stats',
     ...meta,
   };
 }

@@ -12,7 +12,7 @@ import { getContractLiquidationPersistenceHealth } from './liquidation-bridge.mj
 import { getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridgeHealth } from './deep-market-bridge.mjs';
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.24';
+const VERSION = '650.8.15.25';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -30,7 +30,7 @@ const DECISION_POLICY = Object.freeze({
 
 const CAPABILITIES = Object.freeze([
   { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_first_batch', official_available: true, official_scope: 'backend_architecture', transport: 'separate_node_child_processes_plus_localhost_bridge', batch_mode: 'market_light_and_liquidation_distinct_process_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_1_catchup', fallback_policy: 'role_scoped_restart; sibling collector stays alive', history_policy: 'none', source_url: 'internal_architecture' },
-  { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_second_batch', official_available: true, official_scope: 'backend_architecture', transport: 'separate_node_child_processes_plus_localhost_bridges', batch_mode: 'deep_market_focus_flow_depth_and_slow_stats_advanced_distinct_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_2_catchup', fallback_policy: 'role_scoped_restart; sibling collectors stay alive; parent only bridges', history_policy: 'none', source_url: 'internal_architecture' },
+  { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_second_batch', official_available: true, official_scope: 'backend_architecture', transport: 'resource_limited_node_worker_isolates_plus_localhost_bridges', batch_mode: 'deep_market_and_slow_stats_distinct_worker_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_2_1_memory_safe', fallback_policy: 'role_scoped worker restart; sibling worker and parent remain alive', history_policy: 'none', source_url: 'internal_architecture' },
   // Binance
   { provider: 'binance', market: 'spot', capability: 'directory', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST', batch_mode: 'data-api ticker_24hr symbol_omitted TRADING full-market shared baseline', rate_limit_class: '80_weight_per_2m_shared', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
   { provider: 'binance', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST_plus_market_stream', batch_mode: 'data-api ticker_24hr TRADING baseline plus data-stream !miniTicker@arr changed updates', rate_limit_class: 'one_shared_stream_plus_80_weight_per_2m', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
@@ -548,7 +548,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
           isolation.first_batch_roles_alive === true &&
           isolation.first_batch_child_pids_distinct === true &&
           isolation.first_batch_parent_pid_distinct === true &&
-          isolation.process_level_fault_domains === true &&
+          isolation.first_batch_process_level_fault_domains === true &&
           isolation.one_role_exit_does_not_exit_parent === true &&
           isolation.role_scoped_supervisor_restart === true &&
           marketRole.alive === true &&
@@ -579,14 +579,17 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       return {
         ready:
           isolation.enabled === true &&
+          isolation.second_batch_runtime === 'worker_thread' &&
           isolation.second_batch_roles_alive === true &&
-          isolation.second_batch_child_pids_distinct === true &&
-          isolation.second_batch_parent_pid_distinct === true &&
-          isolation.process_level_fault_domains === true &&
-          isolation.one_role_exit_does_not_exit_parent === true &&
+          isolation.second_batch_thread_ids_distinct === true &&
+          isolation.second_batch_worker_resource_limits_enabled === true &&
+          isolation.second_batch_worker_failure_isolated_from_parent === true &&
+          isolation.second_batch_worker_failure_isolated_from_sibling === true &&
           isolation.role_scoped_supervisor_restart === true &&
           deepRole.alive === true &&
           slowRole.alive === true &&
+          Number(deepRole.thread_id || 0) > 0 &&
+          Number(slowRole.thread_id || 0) > 0 &&
           isolation.contract_focus_pool_parent_scanner_started === false &&
           isolation.contract_flow_parent_scanner_started === false &&
           isolation.contract_deep_parent_scanner_started === false &&
@@ -606,14 +609,18 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
           bybitAdvanced.isolated_bridge === true &&
           bybitAdvanced.isolated_bridge_fresh === true,
         version: isolation.version || null,
-        parent_pid: isolation.parent_pid || null,
-        deep_market_pid: deepRole.pid || null,
-        slow_stats_pid: slowRole.pid || null,
+        runtime: isolation.second_batch_runtime || null,
+        host_pid: isolation.second_batch_host_pid || null,
+        deep_market_thread_id: deepRole.thread_id || null,
+        slow_stats_thread_id: slowRole.thread_id || null,
         roles_alive: isolation.second_batch_roles_alive === true,
-        child_pids_distinct: isolation.second_batch_child_pids_distinct === true,
-        parent_pid_distinct_from_children: isolation.second_batch_parent_pid_distinct === true,
-        process_level_fault_domains: isolation.process_level_fault_domains === true,
+        thread_ids_distinct: isolation.second_batch_thread_ids_distinct === true,
+        worker_resource_limits_enabled: isolation.second_batch_worker_resource_limits_enabled === true,
+        worker_failure_isolated_from_parent: isolation.second_batch_worker_failure_isolated_from_parent === true,
+        worker_failure_isolated_from_sibling: isolation.second_batch_worker_failure_isolated_from_sibling === true,
         role_scoped_supervisor_restart: isolation.role_scoped_supervisor_restart === true,
+        deep_market_max_old_generation_size_mb: Number(deepRole.max_old_generation_size_mb || 0),
+        slow_stats_max_old_generation_size_mb: Number(slowRole.max_old_generation_size_mb || 0),
         parent_focus_scanner_started: isolation.contract_focus_pool_parent_scanner_started === true,
         parent_flow_scanner_started: isolation.contract_flow_parent_scanner_started === true,
         parent_deep_scanner_started: isolation.contract_deep_parent_scanner_started === true,
@@ -631,6 +638,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         gate_ready: gateAdvanced.ready === true,
         okx_ready: okxAdvanced.ready === true,
         bybit_ready: bybitAdvanced.ready === true,
+        scoped_bridge_payloads: true,
         user_reads_trigger_collector: false,
         reads_scale_with_users: false,
       };

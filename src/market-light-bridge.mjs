@@ -1,8 +1,10 @@
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.119';
+const VERSION = '650.8.15.123';
 const POLL_MS = Math.max(500, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_POLL_MS || 1_500));
 const STALE_MS = Math.max(5_000, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_STALE_MS || 10_000));
+const CONSUMER_ROLE = String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || 'parent').trim() || 'parent';
+const STATE_SCOPE = CONSUMER_ROLE === 'deep-market' ? 'deep-market' : CONSUMER_ROLE === 'slow-stats' ? 'slow-stats' : 'parent';
 
 let timer = null;
 let running = false;
@@ -17,7 +19,7 @@ async function poll() {
   running = true;
   lastAttemptAt = Date.now();
   try {
-    const payload = await requestIsolatedJson('market-light', '/_isolated/state', 8_000);
+    const payload = await requestIsolatedJson('market-light', `/_isolated/state?scope=${encodeURIComponent(STATE_SCOPE)}`, 8_000);
     if (!payload?.ok || !payload?.health) throw new Error('market_light_bridge_invalid_payload');
     remoteHealth = payload.health;
     providers.clear();
@@ -78,6 +80,9 @@ export function getMarketLightSnapshotHealth() {
       last_error: lastError || 'bridge_not_ready',
     }),
     isolated_bridge: true,
+    isolated_bridge_consumer_role: CONSUMER_ROLE,
+    isolated_bridge_state_scope: STATE_SCOPE,
+    isolated_bridge_provider_snapshot_count: providers.size,
     isolated_bridge_version: VERSION,
     isolated_bridge_poll_ms: POLL_MS,
     isolated_bridge_stale_ms: STALE_MS,

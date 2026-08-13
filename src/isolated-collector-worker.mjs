@@ -1,9 +1,13 @@
 import http from 'node:http';
+import { isMainThread, threadId, workerData } from 'node:worker_threads';
 import { installProviderGovernorFetch, getProviderGovernorHealth } from './provider-request-governor.mjs';
 
-const ROLE = String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || '').trim();
-const PORT = Number(process.env.KAKA_ISOLATED_COLLECTOR_PORT || 0);
-const VERSION = '650.8.15.122';
+const ROLE = String(workerData?.role || process.env.KAKA_ISOLATED_COLLECTOR_ROLE || '').trim();
+const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT || 0);
+process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
+process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
+if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
+const VERSION = '650.8.15.123';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -31,28 +35,41 @@ if (ROLE === 'market-light') {
   module.startMarketLightSnapshotScanner();
   roleVersion = module.getMarketLightSnapshotHealth().version || null;
   handleRoleRoute = module.handleMarketLightSnapshot;
-  internalState = () => {
+  internalState = (url) => {
+    const scope = String(url?.searchParams?.get('scope') || 'parent');
     const providers = {};
-    for (const provider of ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']) {
-      providers[`spot:${provider}`] = module.getMarketLightInternalSnapshot({
-        market: 'spot',
-        provider,
-      });
-    }
-    for (const provider of ['binance', 'okx', 'bybit', 'bitget', 'gate']) {
-      providers[`contract:${provider}`] = module.getMarketLightInternalSnapshot({
-        market: 'contract',
-        provider,
-      });
+    const wanted = scope === 'deep-market'
+      ? [
+          ['contract', 'binance'], ['contract', 'okx'], ['contract', 'bybit'],
+          ['contract', 'bitget'], ['contract', 'gate'],
+        ]
+      : scope === 'slow-stats'
+        ? [
+            ['spot', 'bitget'],
+            ['contract', 'bitget'], ['contract', 'okx'], ['contract', 'bybit'],
+          ]
+        : [
+            ['spot', 'binance'], ['spot', 'coinbase'], ['spot', 'okx'],
+            ['spot', 'bybit'], ['spot', 'bitget'], ['spot', 'gate'],
+            ['contract', 'binance'], ['contract', 'okx'], ['contract', 'bybit'],
+            ['contract', 'bitget'], ['contract', 'gate'],
+          ];
+
+    for (const [market, provider] of wanted) {
+      providers[`${market}:${provider}`] = module.getMarketLightInternalSnapshot({ market, provider });
     }
     return {
       ok: true,
       collector_role: ROLE,
       collector_version: VERSION,
       module_version: module.getMarketLightSnapshotHealth().version || null,
+      runtime: isMainThread ? 'child_process' : 'worker_thread',
       pid: process.pid,
+      thread_id: isMainThread ? null : threadId,
       ppid: process.ppid,
       uptime_seconds: Math.round(process.uptime()),
+      state_scope: scope,
+      provider_snapshot_count: Object.keys(providers).length,
       provider_governor: getProviderGovernorHealth(),
       health: module.getMarketLightSnapshotHealth(),
       providers,
@@ -68,7 +85,9 @@ if (ROLE === 'market-light') {
     collector_role: ROLE,
     collector_version: VERSION,
     module_version: module.getContractLiquidationPersistenceHealth().version || null,
+    runtime: 'child_process',
     pid: process.pid,
+    thread_id: null,
     ppid: process.ppid,
     uptime_seconds: Math.round(process.uptime()),
     provider_governor: getProviderGovernorHealth(),
@@ -94,22 +113,43 @@ if (ROLE === 'market-light') {
     if (await flowModule.handleContractFlow(req, res, url)) return true;
     return false;
   };
-  internalState = () => ({
-    ok: true,
-    collector_role: ROLE,
-    collector_version: VERSION,
-    module_version: deepModule.getContractDeepSharedHealth().version || null,
-    pid: process.pid,
-    ppid: process.ppid,
-    uptime_seconds: Math.round(process.uptime()),
-    provider_governor: getProviderGovernorHealth(),
-    market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
-    focus_health: focusModule.getContractFocusPoolHealth(),
-    focus_snapshot: focusModule.getContractFocusPoolInternalSnapshot(),
-    flow_health: flowModule.getContractFlowHealth(),
-    deep_health: deepModule.getContractDeepSharedHealth(),
-    timestamp_ms: Date.now(),
-  });
+  internalState = (url) => {
+    const scope = String(url?.searchParams?.get('scope') || 'parent');
+    const focusHealth = focusModule.getContractFocusPoolHealth();
+    const focusSnapshot = focusModule.getContractFocusPoolInternalSnapshot();
+    if (scope === 'slow-stats') {
+      return {
+        ok: true,
+        collector_role: ROLE,
+        collector_version: VERSION,
+        runtime: 'worker_thread',
+        pid: process.pid,
+        thread_id: threadId,
+        state_scope: scope,
+        focus_health: focusHealth,
+        focus_snapshot: focusSnapshot,
+        timestamp_ms: Date.now(),
+      };
+    }
+    return {
+      ok: true,
+      collector_role: ROLE,
+      collector_version: VERSION,
+      module_version: deepModule.getContractDeepSharedHealth().version || null,
+      runtime: 'worker_thread',
+      pid: process.pid,
+      thread_id: threadId,
+      uptime_seconds: Math.round(process.uptime()),
+      state_scope: scope,
+      provider_governor: getProviderGovernorHealth(),
+      market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
+      focus_health: focusHealth,
+      focus_snapshot: focusSnapshot,
+      flow_health: flowModule.getContractFlowHealth(),
+      deep_health: deepModule.getContractDeepSharedHealth(),
+      timestamp_ms: Date.now(),
+    };
+  };
 } else if (ROLE === 'slow-stats') {
   const marketBridge = await import('./market-light-bridge.mjs');
   const deepBridge = await import('./deep-market-bridge.mjs');
@@ -142,8 +182,9 @@ if (ROLE === 'market-light') {
     collector_role: ROLE,
     collector_version: VERSION,
     module_version: binance.getBinanceAdvancedStatsHealth().version || null,
+    runtime: 'worker_thread',
     pid: process.pid,
-    ppid: process.ppid,
+    thread_id: threadId,
     uptime_seconds: Math.round(process.uptime()),
     provider_governor: getProviderGovernorHealth(),
     market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
@@ -168,7 +209,9 @@ const server = http.createServer(async (req, res) => {
       collector_role: ROLE,
       collector_version: VERSION,
       module_version: roleVersion,
+      runtime: isMainThread ? 'child_process' : 'worker_thread',
       pid: process.pid,
+      thread_id: isMainThread ? null : threadId,
       ppid: process.ppid,
       uptime_seconds: Math.round(process.uptime()),
       timestamp_ms: Date.now(),
@@ -177,7 +220,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/_isolated/state') {
-    sendJson(res, 200, internalState());
+    sendJson(res, 200, internalState(url));
     return;
   }
 
@@ -204,7 +247,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[${VERSION}] isolated collector ${ROLE} listening on 127.0.0.1:${PORT} pid=${process.pid}`);
+  console.log(`[${VERSION}] isolated collector ${ROLE} listening on 127.0.0.1:${PORT} runtime=${isMainThread ? 'child_process' : 'worker_thread'} pid=${process.pid} thread=${isMainThread ? 0 : threadId}`);
 });
 
 function shutdown(signal) {
