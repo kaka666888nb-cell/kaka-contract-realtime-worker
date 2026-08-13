@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.113",
+  "version": "650.8.15.114",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.113 / Step1001.5 Bitget shared history + deconflicted risk history recovery + Binance taker anti-starvation"
+  "description": "Kaka contract realtime worker 650.8.15.114 / Step1001.6 Binance spot shared WSS isolation + persisted official taker + Bitget shared recovery"
 }
