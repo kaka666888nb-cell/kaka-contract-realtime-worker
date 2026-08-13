@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.127",
+  "version": "650.8.15.128",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka worker 650.8.15.127 / Step1004.5.1 fixes OKX option family discovery and audit isolation while preserving Step996 shared official public crypto-options scope"
+  "description": "Kaka worker 650.8.15.128 / Step1004.6 closes original Step998 with shared realized-liquidation price heatmap buckets derived from existing official public event streams and Gate/Bitget official minute reconciliation"
 }
