@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { getContractFlowHealth, handleContractFlow, startContractFlowUniverseScanner } from './contract-flow.mjs';
+import { getContractFlowHealth, getContractFocusPoolHealth, getContractDeepSharedHealth, startDeepMarketBridge } from './deep-market-bridge.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
 import { getBinanceLiquidationWsHealth, getContractLiquidationPersistenceHealth, startLiquidationBridge } from './liquidation-bridge.mjs';
 import { handleContractFunding, startContractFundingHistoryMaintainer } from './contract-funding.mjs';
@@ -14,36 +14,31 @@ import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-his
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
 import { getMarketLightSnapshotHealth, startMarketLightBridge } from './market-light-bridge.mjs';
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
-import { getContractFocusPoolHealth, handleContractFocusPool, startContractFocusPoolScanner } from './contract-focus-pool.mjs';
-import { getContractDeepSharedHealth, handleContractDeepShared, startContractDeepSharedScanner } from './contract-deep-shared.mjs';
 import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
-import { getBinanceAdvancedStatsHealth, handleBinanceAdvancedStats, startBinanceAdvancedStatsScanner } from './binance-advanced-stats.mjs';
-import { getBitgetAdvancedStatsHealth, handleBitgetAdvancedStats, startBitgetAdvancedStatsScanner } from './bitget-advanced-stats.mjs';
-import { getGateAdvancedStatsHealth, handleGateAdvancedStats, startGateAdvancedStatsScanner } from './gate-advanced-stats.mjs';
-import { getOkxAdvancedStatsHealth, handleOkxAdvancedStats, startOkxAdvancedStatsScanner } from './okx-advanced-stats.mjs';
-import { getBybitAdvancedStatsHealth, handleBybitAdvancedStats, startBybitAdvancedStatsScanner } from './bybit-advanced-stats.mjs';
+import {
+  getBinanceAdvancedStatsHealth,
+  getBitgetAdvancedStatsHealth,
+  getGateAdvancedStatsHealth,
+  getOkxAdvancedStatsHealth,
+  getBybitAdvancedStatsHealth,
+  startSlowStatsBridge,
+} from './slow-stats-bridge.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.121';
+const STEP_VERSION = '650.8.15.122';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
 startLiquidationBridge();
-startContractFlowUniverseScanner();
+startDeepMarketBridge();
+startSlowStatsBridge();
 startContractFundingHistoryMaintainer();
 startSpotCurrentSnapshotScanner();
 startContractBasisScanner();
-startContractFocusPoolScanner();
-startContractDeepSharedScanner();
-startBinanceAdvancedStatsScanner();
-startBitgetAdvancedStatsScanner();
-startGateAdvancedStatsScanner();
-startOkxAdvancedStatsScanner();
-startBybitAdvancedStatsScanner();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -323,6 +318,7 @@ const server = http.createServer(async (req, res) => {
       market_light_current_snapshot: '/api/market-light/current-snapshot',
       market_light_health: '/api/market-light/health',
       market_light_state: getMarketLightSnapshotHealth(),
+      collector_isolation: getCollectorIsolationHealth(),
       collector_isolation_first_batch: getCollectorIsolationHealth(),
       source_capabilities_current_snapshot: '/api/source-capabilities/current-snapshot',
       source_capabilities_health: '/api/source-capabilities/health',
@@ -882,14 +878,7 @@ const server = http.createServer(async (req, res) => {
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
       if (await handleSourceCapabilityRegistry(req, res, url)) return true;
-      if (await handleBinanceAdvancedStats(req, res, url)) return true;
-      if (await handleBitgetAdvancedStats(req, res, url)) return true;
-      if (await handleGateAdvancedStats(req, res, url)) return true;
-      if (await handleOkxAdvancedStats(req, res, url)) return true;
-      if (await handleBybitAdvancedStats(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
-      if (await handleContractFocusPool(req, res, url)) return true;
-      if (await handleContractDeepShared(req, res, url)) return true;
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
@@ -897,7 +886,6 @@ const server = http.createServer(async (req, res) => {
       if (await handleMarketApi(req, res, url)) return true;
       if (await handleContractDepth(req, res, url)) return true;
       if (await handleContractFunding(req, res, url)) return true;
-      if (await handleContractFlow(req, res, url)) return true;
       return false;
     });
     if (handled) return;
@@ -945,6 +933,7 @@ server.on('upgrade', (req, socket, head) => {
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopCollectorIsolationSupervisor();
   beginBinanceRestShutdown(`shutdown:${signal}`);
   console.log(`[Step${STEP_VERSION}] shutdown ${signal}; new Binance REST blocked immediately`);
   server.close(() => {

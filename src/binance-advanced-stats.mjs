@@ -1,4 +1,4 @@
-import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
+import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import {
   fetchBinancePublicRestRelayJson,
   getBinanceContractKlineRelayHealth,

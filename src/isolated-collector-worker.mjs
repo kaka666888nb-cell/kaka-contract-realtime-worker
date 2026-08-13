@@ -3,7 +3,7 @@ import { installProviderGovernorFetch, getProviderGovernorHealth } from './provi
 
 const ROLE = String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || '').trim();
 const PORT = Number(process.env.KAKA_ISOLATED_COLLECTOR_PORT || 0);
-const VERSION = '650.8.15.119';
+const VERSION = '650.8.15.122';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -74,6 +74,85 @@ if (ROLE === 'market-light') {
     provider_governor: getProviderGovernorHealth(),
     liquidation_persistence: module.getContractLiquidationPersistenceHealth(),
     binance_liquidation_ws: module.getBinanceLiquidationWsHealth(),
+    timestamp_ms: Date.now(),
+  });
+} else if (ROLE === 'deep-market') {
+  const marketBridge = await import('./market-light-bridge.mjs');
+  const focusModule = await import('./contract-focus-pool.mjs');
+  const flowModule = await import('./contract-flow.mjs');
+  const deepModule = await import('./contract-deep-shared.mjs');
+
+  marketBridge.startMarketLightBridge();
+  focusModule.startContractFocusPoolScanner();
+  flowModule.startContractFlowUniverseScanner();
+  deepModule.startContractDeepSharedScanner();
+
+  roleVersion = deepModule.getContractDeepSharedHealth().version || null;
+  handleRoleRoute = async (req, res, url) => {
+    if (await focusModule.handleContractFocusPool(req, res, url)) return true;
+    if (await deepModule.handleContractDeepShared(req, res, url)) return true;
+    if (await flowModule.handleContractFlow(req, res, url)) return true;
+    return false;
+  };
+  internalState = () => ({
+    ok: true,
+    collector_role: ROLE,
+    collector_version: VERSION,
+    module_version: deepModule.getContractDeepSharedHealth().version || null,
+    pid: process.pid,
+    ppid: process.ppid,
+    uptime_seconds: Math.round(process.uptime()),
+    provider_governor: getProviderGovernorHealth(),
+    market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
+    focus_health: focusModule.getContractFocusPoolHealth(),
+    focus_snapshot: focusModule.getContractFocusPoolInternalSnapshot(),
+    flow_health: flowModule.getContractFlowHealth(),
+    deep_health: deepModule.getContractDeepSharedHealth(),
+    timestamp_ms: Date.now(),
+  });
+} else if (ROLE === 'slow-stats') {
+  const marketBridge = await import('./market-light-bridge.mjs');
+  const deepBridge = await import('./deep-market-bridge.mjs');
+  const binance = await import('./binance-advanced-stats.mjs');
+  const bitget = await import('./bitget-advanced-stats.mjs');
+  const gate = await import('./gate-advanced-stats.mjs');
+  const okx = await import('./okx-advanced-stats.mjs');
+  const bybit = await import('./bybit-advanced-stats.mjs');
+
+  marketBridge.startMarketLightBridge();
+  deepBridge.startDeepMarketBridge();
+
+  binance.startBinanceAdvancedStatsScanner();
+  bitget.startBitgetAdvancedStatsScanner();
+  gate.startGateAdvancedStatsScanner();
+  okx.startOkxAdvancedStatsScanner();
+  bybit.startBybitAdvancedStatsScanner();
+
+  roleVersion = binance.getBinanceAdvancedStatsHealth().version || null;
+  handleRoleRoute = async (req, res, url) => {
+    if (await binance.handleBinanceAdvancedStats(req, res, url)) return true;
+    if (await bitget.handleBitgetAdvancedStats(req, res, url)) return true;
+    if (await gate.handleGateAdvancedStats(req, res, url)) return true;
+    if (await okx.handleOkxAdvancedStats(req, res, url)) return true;
+    if (await bybit.handleBybitAdvancedStats(req, res, url)) return true;
+    return false;
+  };
+  internalState = () => ({
+    ok: true,
+    collector_role: ROLE,
+    collector_version: VERSION,
+    module_version: binance.getBinanceAdvancedStatsHealth().version || null,
+    pid: process.pid,
+    ppid: process.ppid,
+    uptime_seconds: Math.round(process.uptime()),
+    provider_governor: getProviderGovernorHealth(),
+    market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
+    deep_market_bridge: deepBridge.getDeepMarketBridgeHealth(),
+    binance_advanced: binance.getBinanceAdvancedStatsHealth(),
+    bitget_advanced: bitget.getBitgetAdvancedStatsHealth(),
+    gate_advanced: gate.getGateAdvancedStatsHealth(),
+    okx_advanced: okx.getOkxAdvancedStatsHealth(),
+    bybit_advanced: bybit.getBybitAdvancedStatsHealth(),
     timestamp_ms: Date.now(),
   });
 } else {

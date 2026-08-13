@@ -1,15 +1,18 @@
 import { getMarketLightSnapshotHealth } from './market-light-bridge.mjs';
-import { getBinanceAdvancedStatsHealth } from './binance-advanced-stats.mjs';
-import { getBitgetAdvancedStatsHealth } from './bitget-advanced-stats.mjs';
-import { getGateAdvancedStatsHealth } from './gate-advanced-stats.mjs';
-import { getOkxAdvancedStatsHealth } from './okx-advanced-stats.mjs';
-import { getBybitAdvancedStatsHealth } from './bybit-advanced-stats.mjs';
+import {
+  getBinanceAdvancedStatsHealth,
+  getBitgetAdvancedStatsHealth,
+  getGateAdvancedStatsHealth,
+  getOkxAdvancedStatsHealth,
+  getBybitAdvancedStatsHealth,
+  getSlowStatsBridgeHealth,
+} from './slow-stats-bridge.mjs';
 import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './liquidation-bridge.mjs';
-import { getContractFlowHealth } from './contract-flow.mjs';
+import { getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridgeHealth } from './deep-market-bridge.mjs';
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.23';
+const VERSION = '650.8.15.24';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -27,6 +30,7 @@ const DECISION_POLICY = Object.freeze({
 
 const CAPABILITIES = Object.freeze([
   { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_first_batch', official_available: true, official_scope: 'backend_architecture', transport: 'separate_node_child_processes_plus_localhost_bridge', batch_mode: 'market_light_and_liquidation_distinct_process_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_1_catchup', fallback_policy: 'role_scoped_restart; sibling collector stays alive', history_policy: 'none', source_url: 'internal_architecture' },
+  { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_second_batch', official_available: true, official_scope: 'backend_architecture', transport: 'separate_node_child_processes_plus_localhost_bridges', batch_mode: 'deep_market_focus_flow_depth_and_slow_stats_advanced_distinct_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_2_catchup', fallback_policy: 'role_scoped_restart; sibling collectors stay alive; parent only bridges', history_policy: 'none', source_url: 'internal_architecture' },
   // Binance
   { provider: 'binance', market: 'spot', capability: 'directory', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST', batch_mode: 'data-api ticker_24hr symbol_omitted TRADING full-market shared baseline', rate_limit_class: '80_weight_per_2m_shared', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
   { provider: 'binance', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST_plus_market_stream', batch_mode: 'data-api ticker_24hr TRADING baseline plus data-stream !miniTicker@arr changed updates', rate_limit_class: 'one_shared_stream_plus_80_weight_per_2m', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
@@ -109,6 +113,9 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const bybitAdvanced = getBybitAdvancedStatsHealth();
   const contractDepth = getContractDepthHealth();
   const contractFlow = getContractFlowHealth();
+  const contractDeep = getContractDeepSharedHealth();
+  const deepMarketBridge = getDeepMarketBridgeHealth();
+  const slowStatsBridge = getSlowStatsBridgeHealth();
   const liquidationHistory = getContractLiquidationPersistenceHealth();
   const marketKeys = Object.keys(coverage);
   const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
@@ -538,9 +545,9 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       const liquidationRole = isolation.roles?.liquidation || {};
       return {
         ready: isolation.enabled === true &&
-          isolation.all_roles_alive === true &&
-          isolation.child_pids_distinct === true &&
-          isolation.parent_pid_distinct_from_children === true &&
+          isolation.first_batch_roles_alive === true &&
+          isolation.first_batch_child_pids_distinct === true &&
+          isolation.first_batch_parent_pid_distinct === true &&
           isolation.process_level_fault_domains === true &&
           isolation.one_role_exit_does_not_exit_parent === true &&
           isolation.role_scoped_supervisor_restart === true &&
@@ -554,15 +561,78 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         parent_pid: isolation.parent_pid || null,
         market_light_pid: marketRole.pid || null,
         liquidation_pid: liquidationRole.pid || null,
-        all_roles_alive: isolation.all_roles_alive === true,
-        child_pids_distinct: isolation.child_pids_distinct === true,
-        parent_pid_distinct_from_children: isolation.parent_pid_distinct_from_children === true,
+        all_roles_alive: isolation.first_batch_roles_alive === true,
+        child_pids_distinct: isolation.first_batch_child_pids_distinct === true,
+        parent_pid_distinct_from_children: isolation.first_batch_parent_pid_distinct === true,
         process_level_fault_domains: isolation.process_level_fault_domains === true,
         role_scoped_supervisor_restart: isolation.role_scoped_supervisor_restart === true,
         market_light_bridge_fresh: health?.isolated_bridge_fresh === true,
         liquidation_bridge_fresh: liquidationHistory?.isolated_bridge_fresh === true,
         market_light_parent_scanner_started: isolation.market_light_parent_scanner_started === true,
         liquidation_parent_module_loaded: isolation.liquidation_parent_module_loaded === true,
+      };
+    })(),
+    collector_isolation_second_batch: (() => {
+      const isolation = getCollectorIsolationHealth();
+      const deepRole = isolation.roles?.['deep-market'] || {};
+      const slowRole = isolation.roles?.['slow-stats'] || {};
+      return {
+        ready:
+          isolation.enabled === true &&
+          isolation.second_batch_roles_alive === true &&
+          isolation.second_batch_child_pids_distinct === true &&
+          isolation.second_batch_parent_pid_distinct === true &&
+          isolation.process_level_fault_domains === true &&
+          isolation.one_role_exit_does_not_exit_parent === true &&
+          isolation.role_scoped_supervisor_restart === true &&
+          deepRole.alive === true &&
+          slowRole.alive === true &&
+          isolation.contract_focus_pool_parent_scanner_started === false &&
+          isolation.contract_flow_parent_scanner_started === false &&
+          isolation.contract_deep_parent_scanner_started === false &&
+          isolation.slow_stats_parent_modules_loaded === false &&
+          deepMarketBridge.isolated_bridge_fresh === true &&
+          slowStatsBridge.isolated_bridge_fresh === true &&
+          contractDeep.isolated_bridge === true &&
+          contractDeep.isolated_bridge_fresh === true &&
+          binanceAdvanced.isolated_bridge === true &&
+          binanceAdvanced.isolated_bridge_fresh === true &&
+          bitgetAdvanced.isolated_bridge === true &&
+          bitgetAdvanced.isolated_bridge_fresh === true &&
+          gateAdvanced.isolated_bridge === true &&
+          gateAdvanced.isolated_bridge_fresh === true &&
+          okxAdvanced.isolated_bridge === true &&
+          okxAdvanced.isolated_bridge_fresh === true &&
+          bybitAdvanced.isolated_bridge === true &&
+          bybitAdvanced.isolated_bridge_fresh === true,
+        version: isolation.version || null,
+        parent_pid: isolation.parent_pid || null,
+        deep_market_pid: deepRole.pid || null,
+        slow_stats_pid: slowRole.pid || null,
+        roles_alive: isolation.second_batch_roles_alive === true,
+        child_pids_distinct: isolation.second_batch_child_pids_distinct === true,
+        parent_pid_distinct_from_children: isolation.second_batch_parent_pid_distinct === true,
+        process_level_fault_domains: isolation.process_level_fault_domains === true,
+        role_scoped_supervisor_restart: isolation.role_scoped_supervisor_restart === true,
+        parent_focus_scanner_started: isolation.contract_focus_pool_parent_scanner_started === true,
+        parent_flow_scanner_started: isolation.contract_flow_parent_scanner_started === true,
+        parent_deep_scanner_started: isolation.contract_deep_parent_scanner_started === true,
+        parent_slow_stats_modules_loaded: isolation.slow_stats_parent_modules_loaded === true,
+        deep_market_bridge_fresh: deepMarketBridge.isolated_bridge_fresh === true,
+        slow_stats_bridge_fresh: slowStatsBridge.isolated_bridge_fresh === true,
+        deep_market_owns_focus_pool: isolation.deep_market_owns_focus_pool === true,
+        deep_market_owns_contract_flow: isolation.deep_market_owns_contract_flow === true,
+        deep_market_owns_deep_shared: isolation.deep_market_owns_deep_shared === true,
+        slow_stats_owns_advanced_modules: isolation.slow_stats_owns_advanced_modules === true,
+        deep_ready: contractDeep.ready === true,
+        deep_rows: Number(contractDeep.row_count || 0),
+        binance_ready: binanceAdvanced.ready === true,
+        bitget_ready: bitgetAdvanced.ready === true,
+        gate_ready: gateAdvanced.ready === true,
+        okx_ready: okxAdvanced.ready === true,
+        bybit_ready: bybitAdvanced.ready === true,
+        user_reads_trigger_collector: false,
+        reads_scale_with_users: false,
       };
     })(),
     step997_liquidation_history: {
@@ -634,6 +704,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.gate_step992.ready &&
       payload.gate_step1003.ready &&
       payload.collector_isolation_first_batch.ready &&
+      payload.collector_isolation_second_batch.ready &&
       payload.step997_liquidation_history.ready,
   };
 }

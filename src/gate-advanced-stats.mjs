@@ -1,4 +1,4 @@
-import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
+import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 
 const VERSION = '650.8.15.4';
 const SNAPSHOT_ROUTE = '/api/gate-advanced/current-snapshot';

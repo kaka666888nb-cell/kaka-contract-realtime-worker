@@ -1,15 +1,19 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 
-const VERSION = '650.8.15.119';
+const VERSION = '650.8.15.122';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
+const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
+const SLOW_STATS_PORT = Number(process.env.KAKA_SLOW_STATS_COLLECTOR_PORT || 10014);
 const RESTART_BASE_MS = Math.max(1_000, Number(process.env.KAKA_COLLECTOR_RESTART_BASE_MS || 2_000));
 const RESTART_MAX_MS = Math.max(RESTART_BASE_MS, Number(process.env.KAKA_COLLECTOR_RESTART_MAX_MS || 30_000));
 
 const ROLES = Object.freeze({
   'market-light': Object.freeze({ port: MARKET_LIGHT_PORT }),
   liquidation: Object.freeze({ port: LIQUIDATION_PORT }),
+  'deep-market': Object.freeze({ port: DEEP_MARKET_PORT }),
+  'slow-stats': Object.freeze({ port: SLOW_STATS_PORT }),
 });
 
 const state = new Map();
@@ -107,12 +111,23 @@ export function isolatedCollectorPort(role) {
 
 export function collectorRoleForPath(pathname) {
   const path = String(pathname || '');
-  if (path === '/api/market-light/current-snapshot' || path === '/api/market-light/health') {
-    return 'market-light';
-  }
-  if (path.startsWith('/api/contract-liquidation')) {
-    return 'liquidation';
-  }
+  if (path === '/api/market-light/current-snapshot' || path === '/api/market-light/health') return 'market-light';
+  if (path.startsWith('/api/contract-liquidation')) return 'liquidation';
+  if (
+    path.startsWith('/api/contract-focus-pool') ||
+    path.startsWith('/api/contract-flow') ||
+    path.startsWith('/api/contract-deep-shared') ||
+    path === '/api/contract-meta' ||
+    path === '/api/gate-usd-flow-self-test' ||
+    path === '/api/gate-contract-stats-live-test'
+  ) return 'deep-market';
+  if (
+    path.startsWith('/api/binance-advanced') ||
+    path.startsWith('/api/bitget-advanced') ||
+    path.startsWith('/api/gate-advanced') ||
+    path.startsWith('/api/okx-advanced') ||
+    path.startsWith('/api/bybit-advanced')
+  ) return 'slow-stats';
   return null;
 }
 
@@ -222,22 +237,51 @@ export function getCollectorIsolationHealth() {
     };
   }
 
-  const pids = Object.values(roles).map((item) => Number(item.pid || 0)).filter((pid) => pid > 0);
+  const roleNames = Object.keys(ROLES);
+  const allPids = roleNames.map((role) => Number(roles[role]?.pid || 0)).filter((pid) => pid > 0);
+  const firstBatchNames = ['market-light', 'liquidation'];
+  const secondBatchNames = ['deep-market', 'slow-stats'];
+  const firstBatchPids = firstBatchNames.map((role) => Number(roles[role]?.pid || 0)).filter((pid) => pid > 0);
+  const secondBatchPids = secondBatchNames.map((role) => Number(roles[role]?.pid || 0)).filter((pid) => pid > 0);
+
   return {
     ok: true,
     version: VERSION,
     enabled: started,
     parent_pid: process.pid,
-    role_count: Object.keys(ROLES).length,
+    role_count: roleNames.length,
     roles,
-    all_roles_alive: Object.values(roles).every((item) => item.alive),
-    child_pids_distinct: pids.length === Object.keys(ROLES).length && new Set(pids).size === pids.length,
-    parent_pid_distinct_from_children: pids.every((pid) => pid !== process.pid),
+    all_roles_alive: roleNames.every((role) => roles[role]?.alive === true),
+    child_pids_distinct: allPids.length === roleNames.length && new Set(allPids).size === allPids.length,
+    parent_pid_distinct_from_children: allPids.every((pid) => pid !== process.pid),
+
+    first_batch_roles: firstBatchNames,
+    first_batch_roles_alive: firstBatchNames.every((role) => roles[role]?.alive === true),
+    first_batch_child_pids_distinct: firstBatchPids.length === firstBatchNames.length && new Set(firstBatchPids).size === firstBatchPids.length,
+    first_batch_parent_pid_distinct: firstBatchPids.every((pid) => pid !== process.pid),
+
+    second_batch_roles: secondBatchNames,
+    second_batch_roles_alive: secondBatchNames.every((role) => roles[role]?.alive === true),
+    second_batch_child_pids_distinct: secondBatchPids.length === secondBatchNames.length && new Set(secondBatchPids).size === secondBatchPids.length,
+    second_batch_parent_pid_distinct: secondBatchPids.every((pid) => pid !== process.pid),
+
     process_level_fault_domains: true,
     one_role_exit_does_not_exit_parent: true,
     role_scoped_supervisor_restart: true,
+
     market_light_parent_scanner_started: false,
     liquidation_parent_module_loaded: false,
+    contract_focus_pool_parent_scanner_started: false,
+    contract_flow_parent_scanner_started: false,
+    contract_deep_parent_scanner_started: false,
+    slow_stats_parent_modules_loaded: false,
+
+    deep_market_owns_focus_pool: true,
+    deep_market_owns_contract_flow: true,
+    deep_market_owns_deep_shared: true,
+    slow_stats_owns_advanced_modules: true,
+    parent_routes_second_batch_to_children: true,
+
     timestamp_ms: Date.now(),
   };
 }
