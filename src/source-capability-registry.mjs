@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.34';
+const VERSION = '650.8.15.35';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -833,6 +833,27 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       realized_liquidation_not_estimated_risk: contractFocus.step999_realized_liquidation_not_estimated_risk === true,
       reads_scale_with_users: false,
     },
+    step1004_focus_membership_stability: {
+      ready: contractFocus.ready === true &&
+        contractFocus.step999_composite_hot_score_ready === true &&
+        contractFocus.step999_hot_membership_hysteresis_ready === true &&
+        Number(contractFocus.hot_membership_min_hold_minutes || 0) >= 30 &&
+        Number(contractFocus.hot_membership_max_replacements_per_refresh || 0) > 0 &&
+        Number(contractFocus.hot_membership_max_replacements_per_refresh || 0) <= 2 &&
+        Number(contractFocus.hot_membership_replacement_min_score_delta || 0) >= 0.05 &&
+        Number(contractFocus.row_count || 0) === 75,
+      version: contractFocus.version || null,
+      hot_membership_min_hold_minutes: Number(contractFocus.hot_membership_min_hold_minutes || 0),
+      hot_membership_max_replacements_per_refresh: Number(contractFocus.hot_membership_max_replacements_per_refresh || 0),
+      hot_membership_replacement_min_score_delta: Number(contractFocus.hot_membership_replacement_min_score_delta || 0),
+      changed_provider_count_last_build: Number(contractFocus.step999_hot_membership_changed_provider_count_last_build || 0),
+      max_replacements_last_build: Number(contractFocus.step999_hot_membership_max_replacements_last_build || 0),
+      min_membership_age_ms: Number(contractFocus.step999_hot_membership_min_age_ms || 0),
+      rationale: 'prevent_5m_hot_membership_churn_from_perpetually_invalidating_focus15_slow_official_stats_and_history',
+      provider_count: Number(contractFocus.provider_count || 0),
+      user_reads_trigger_exchange_requests: false,
+      reads_scale_with_users: false,
+    },
     capabilities: includeCapabilities ? CAPABILITIES : [],
     step1004_pressure_shared_read_cache: {
       ready: contractFlow?.market_snapshot_shared_cache?.ready === true &&
@@ -912,6 +933,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.step997_liquidation_history.ready &&
       payload.step998_liquidation_heatmap.ready &&
       payload.step999_focus_hot_score.ready &&
+      payload.step1004_focus_membership_stability.ready &&
       payload.step1000_history_lifecycle.ready &&
       payload.step1004_pressure_shared_read_cache.ready &&
       payload.step1004_pressure_transport_cache.ready,

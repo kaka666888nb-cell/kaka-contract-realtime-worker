@@ -2,7 +2,7 @@ import http from 'node:http';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 import { getContractFlowHotScoreMetric, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 
-const VERSION = '650.8.15.5';
+const VERSION = '650.8.15.6';
 const SNAPSHOT_ROUTE = '/api/contract-focus-pool/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-focus-pool/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -23,7 +23,10 @@ const POOL_TARGET = CORE_TARGET + HOT_TARGET;
 const HOT_RANK_METRIC = 'composite_6_factor_same_venue_shared';
 const SCAN_INTERVAL_MS = 60_000;
 const STARTUP_RETRY_MS = 15_000;
-const HOT_REFRESH_MS = 5 * 60_000;
+const HOT_SCORE_REFRESH_MS = 60_000;
+const HOT_MEMBERSHIP_MIN_HOLD_MS = 30 * 60_000;
+const HOT_MAX_REPLACEMENTS_PER_REFRESH = 2;
+const HOT_REPLACEMENT_MIN_SCORE_DELTA = 0.05;
 const RESPONSE_CACHE_TTL_MS = 20_000;
 const LAST_GOOD_PRESERVE_MS = 3 * 60_000;
 const HOT_SCORE_MIN_FACTORS = 4;
@@ -230,7 +233,7 @@ function percentileMap(entries) {
   return result;
 }
 
-function compositeHotRows(provider, rows, coreBases, liquidationContext, now = Date.now()) {
+function compositeHotCandidates(provider, rows, coreBases, liquidationContext, now = Date.now()) {
   const candidates = rows
     .filter((row) => !coreBases.has(rowBase(row)))
     .filter((row) => positive(row?.quote_volume_24h) != null)
@@ -288,7 +291,11 @@ function compositeHotRows(provider, rows, coreBases, liquidationContext, now = D
     if (volumeDelta !== 0) return volumeDelta;
     return a.symbol.localeCompare(b.symbol);
   });
-  return candidates.slice(0, HOT_TARGET);
+  return candidates;
+}
+
+function compositeHotRows(provider, rows, coreBases, liquidationContext, now = Date.now()) {
+  return compositeHotCandidates(provider, rows, coreBases, liquidationContext, now).slice(0, HOT_TARGET);
 }
 
 function rowBase(row) {
@@ -349,7 +356,7 @@ function poolRow(provider, row, role, slot, extra = {}) {
     slot,
     selection_reason: role === 'core'
       ? 'fixed_market_cap_priority_available_on_provider'
-      : 'provider_local_composite_hot_score_top5_excluding_core',
+      : 'provider_local_composite_hot_membership_with_30m_hysteresis_excluding_core',
     market_cap_priority: role === 'core' ? Number(extra.marketCapPriority || 0) || null : null,
     heat_rank: role === 'hot' ? Number(extra.heatRank || 0) || null : null,
     heat_metric: role === 'hot' ? HOT_RANK_METRIC : null,
@@ -431,30 +438,68 @@ function buildProvider(provider, now, liquidationContext) {
 
   let hotRows = [];
   let hotRefreshedAt = previous?.hot_refreshed_at_ms || 0;
-  const previousHotStillValid = previous &&
-    Array.isArray(previous.hot_rows) && previous.hot_rows.length === HOT_TARGET &&
-    previous.hot_rows.every((row) => rows.some((candidate) => normalizeSymbol(candidate.symbol) === normalizeSymbol(row.symbol))) &&
-    now - hotRefreshedAt < HOT_REFRESH_MS;
-  if (previousHotStillValid) {
-    const rowBySymbol = new Map(rows.map((row) => [normalizeSymbol(row.symbol), row]));
-    hotRows = previous.hot_rows.map((old, index) => poolRow(
-      provider,
-      rowBySymbol.get(normalizeSymbol(old.symbol)) || old,
-      'hot',
-      CORE_TARGET + index + 1,
-      {
-        heatRank: index + 1,
-        heatScore: old.heat_score,
-        factorCount: old.heat_factor_count,
-        availableWeight: old.heat_available_weight,
-        factorScores: old.heat_factor_scores,
-        flow: { source_time: old.flow_metric_source_time },
-        liq: { total_notional: old.liquidation_notional_15m, event_count: old.liquidation_event_count_15m },
-        oi: { current: old.open_interest_change_current, previous: old.open_interest_change_previous, age_ms: old.open_interest_change_age_ms },
-      },
-    ));
+  let hotMembershipChangedAt = previous?.hot_membership_changed_at_ms || previous?.hot_refreshed_at_ms || 0;
+  let hotReplacementsThisBuild = 0;
+  let hotMembershipReason = previous ? 'membership_held_for_slow_stats_stability' : 'initial_composite_selection';
+  const scoredCandidates = compositeHotCandidates(provider, rows, coreBases, liquidationContext, now);
+  const scoredBySymbol = new Map(scoredCandidates.map((item) => [normalizeSymbol(item.symbol), item]));
+  const currentSymbols = Array.isArray(previous?.hot_rows)
+    ? previous.hot_rows.map((row) => normalizeSymbol(row.symbol)).filter(Boolean)
+    : [];
+  const currentValid = currentSymbols.filter((symbol) => scoredBySymbol.has(symbol));
+  const membershipAgeMs = hotMembershipChangedAt > 0 ? Math.max(0, now - hotMembershipChangedAt) : Number.POSITIVE_INFINITY;
+  const holdElapsed = membershipAgeMs >= HOT_MEMBERSHIP_MIN_HOLD_MS;
+
+  let selectedSymbols = [];
+  if (!previous || currentValid.length !== HOT_TARGET) {
+    // Startup or delisting: fill immediately so the pool stays exactly 10 core + 5 hot.
+    selectedSymbols = scoredCandidates.slice(0, HOT_TARGET).map((item) => item.symbol);
+    hotMembershipChangedAt = now;
+    hotReplacementsThisBuild = previous ? HOT_TARGET - currentValid.length : 0;
+    hotMembershipReason = previous ? 'invalid_or_delisted_hot_filled_immediately' : 'initial_composite_selection';
+  } else if (!holdElapsed) {
+    selectedSymbols = [...currentSymbols];
   } else {
-    hotRows = hotRowsFrom(provider, rows, coreBases, liquidationContext, now).map((scored, index) => poolRow(
+    // Hysteresis: after the minimum hold, replace at most two incumbents and
+    // only when a challenger has a material composite-score advantage.
+    const selected = [...currentSymbols];
+    const incumbents = selected
+      .map((symbol) => scoredBySymbol.get(symbol))
+      .filter(Boolean)
+      .sort((a, b) => (a.score - b.score) || a.symbol.localeCompare(b.symbol));
+    const challengers = scoredCandidates.filter((item) => !selected.includes(item.symbol));
+    let replacements = 0;
+    for (const challenger of challengers) {
+      if (replacements >= HOT_MAX_REPLACEMENTS_PER_REFRESH) break;
+      const incumbent = incumbents.find((item) => selected.includes(item.symbol));
+      if (!incumbent) break;
+      const incumbentReady = Number(incumbent.factorCount || 0) >= HOT_SCORE_MIN_FACTORS;
+      const challengerReady = Number(challenger.factorCount || 0) >= HOT_SCORE_MIN_FACTORS;
+      const materiallyBetter = challengerReady && (!incumbentReady || Number(challenger.score || 0) >= Number(incumbent.score || 0) + HOT_REPLACEMENT_MIN_SCORE_DELTA);
+      if (!materiallyBetter) continue;
+      const index = selected.indexOf(incumbent.symbol);
+      if (index < 0) continue;
+      selected[index] = challenger.symbol;
+      replacements += 1;
+    }
+    selectedSymbols = selected;
+    hotReplacementsThisBuild = replacements;
+    if (replacements > 0) {
+      hotMembershipChangedAt = now;
+      hotMembershipReason = 'bounded_composite_hysteresis_replacement';
+    } else {
+      hotMembershipReason = 'no_material_challenger_membership_held';
+    }
+  }
+
+  // Re-score the selected membership every build from current shared inputs,
+  // while membership itself is held long enough for slow official statistics
+  // and history collectors to catch up.
+  hotRows = selectedSymbols
+    .map((symbol) => scoredBySymbol.get(symbol))
+    .filter(Boolean)
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || a.symbol.localeCompare(b.symbol))
+    .map((scored, index) => poolRow(
       provider,
       scored.row,
       'hot',
@@ -470,8 +515,7 @@ function buildProvider(provider, now, liquidationContext) {
         oi: scored.oi,
       },
     ));
-    hotRefreshedAt = now;
-  }
+  hotRefreshedAt = now;
 
   const poolRows = [...coreRows, ...hotRows];
   const ready = inputReady &&
@@ -500,6 +544,16 @@ function buildProvider(provider, now, liquidationContext) {
     rows: poolRows,
     hot_refreshed_at_ms: hotRefreshedAt,
     hot_refreshed_at: hotRefreshedAt ? new Date(hotRefreshedAt).toISOString() : null,
+    hot_membership_changed_at_ms: hotMembershipChangedAt,
+    hot_membership_changed_at: hotMembershipChangedAt ? new Date(hotMembershipChangedAt).toISOString() : null,
+    hot_membership_age_ms: hotMembershipChangedAt ? Math.max(0, now - hotMembershipChangedAt) : 0,
+    hot_membership_min_hold_ms: HOT_MEMBERSHIP_MIN_HOLD_MS,
+    hot_membership_min_hold_minutes: HOT_MEMBERSHIP_MIN_HOLD_MS / 60_000,
+    hot_membership_hold_elapsed: hotMembershipChangedAt ? now - hotMembershipChangedAt >= HOT_MEMBERSHIP_MIN_HOLD_MS : false,
+    hot_membership_max_replacements_per_refresh: HOT_MAX_REPLACEMENTS_PER_REFRESH,
+    hot_membership_replacement_min_score_delta: HOT_REPLACEMENT_MIN_SCORE_DELTA,
+    hot_replacements_this_build: hotReplacementsThisBuild,
+    hot_membership_reason: hotMembershipReason,
     hot_changed_this_build: hotChanged,
     step999_composite_score_ready: hotRows.length === HOT_TARGET && hotRows.every((row) => row.heat_score != null && Number(row.heat_factor_count || 0) >= HOT_SCORE_MIN_FACTORS),
     hot_score_min_required_factors: HOT_SCORE_MIN_FACTORS,
@@ -598,6 +652,9 @@ function snapshotPayload() {
   const providers = Object.fromEntries(PROVIDERS.map((provider) => [provider, providerPayload(provider)]));
   const rows = PROVIDERS.flatMap((provider) => providers[provider].rows || []);
   const readyProviders = PROVIDERS.filter((provider) => providers[provider].ready).length;
+  const membershipChangedProviders = PROVIDERS.filter((provider) => providers[provider]?.hot_changed_this_build === true).length;
+  const maxReplacementsThisBuild = Math.max(0, ...PROVIDERS.map((provider) => Number(providers[provider]?.hot_replacements_this_build || 0)));
+  const minMembershipAgeMs = Math.min(...PROVIDERS.map((provider) => Number(providers[provider]?.hot_membership_age_ms || 0)));
   const payload = {
     ok: true,
     version: VERSION,
@@ -621,7 +678,14 @@ function snapshotPayload() {
     step999_no_additional_exchange_requests: true,
     step999_no_cross_provider_or_quote_substitution: true,
     step999_realized_liquidation_not_estimated_risk: true,
-    hot_refresh_minutes: HOT_REFRESH_MS / 60_000,
+    step999_hot_membership_hysteresis_ready: readyProviders === PROVIDERS.length && rows.length === PROVIDERS.length * POOL_TARGET && HOT_MEMBERSHIP_MIN_HOLD_MS >= 30 * 60_000 && HOT_MAX_REPLACEMENTS_PER_REFRESH <= 2 && HOT_REPLACEMENT_MIN_SCORE_DELTA >= 0.05,
+    step999_hot_membership_changed_provider_count_last_build: membershipChangedProviders,
+    step999_hot_membership_max_replacements_last_build: maxReplacementsThisBuild,
+    step999_hot_membership_min_age_ms: Number.isFinite(minMembershipAgeMs) ? minMembershipAgeMs : 0,
+    hot_score_refresh_minutes: HOT_SCORE_REFRESH_MS / 60_000,
+    hot_membership_min_hold_minutes: HOT_MEMBERSHIP_MIN_HOLD_MS / 60_000,
+    hot_membership_max_replacements_per_refresh: HOT_MAX_REPLACEMENTS_PER_REFRESH,
+    hot_membership_replacement_min_score_delta: HOT_REPLACEMENT_MIN_SCORE_DELTA,
     scanner_interval_seconds: SCAN_INTERVAL_MS / 1000,
     startup_retry_seconds: STARTUP_RETRY_MS / 1000,
     last_good_preserve_seconds: LAST_GOOD_PRESERVE_MS / 1000,
@@ -650,7 +714,7 @@ export function getContractFocusPoolHealth() {
     ok: true,
     version: VERSION,
     enabled: started || process.env.KAKA_DISABLE_CONTRACT_FOCUS_POOL !== '1',
-    mode: 'five_provider_fixed_10_core_plus_dynamic_5_hot_shared_registry',
+    mode: 'five_provider_fixed_10_core_plus_dynamic_5_hot_shared_registry_with_membership_hysteresis',
     snapshot_endpoint: SNAPSHOT_ROUTE,
     health_endpoint: HEALTH_ROUTE,
     ready: snapshot.ready,
@@ -670,6 +734,10 @@ export function getContractFocusPoolHealth() {
     step999_no_additional_exchange_requests: true,
     step999_no_cross_provider_or_quote_substitution: true,
     step999_realized_liquidation_not_estimated_risk: true,
+    step999_hot_membership_hysteresis_ready: snapshot.step999_hot_membership_hysteresis_ready === true,
+    step999_hot_membership_changed_provider_count_last_build: Number(snapshot.step999_hot_membership_changed_provider_count_last_build || 0),
+    step999_hot_membership_max_replacements_last_build: Number(snapshot.step999_hot_membership_max_replacements_last_build || 0),
+    step999_hot_membership_min_age_ms: Number(snapshot.step999_hot_membership_min_age_ms || 0),
     step999_flow_metric_health: getHotScoreMetricsHealth(),
     step999_liquidation_local_cache: {
       age_ms: liquidationActivityCache.at ? Math.max(0, Date.now() - liquidationActivityCache.at) : null,
@@ -679,7 +747,10 @@ export function getContractFocusPoolHealth() {
       local_collector_port: LIQUIDATION_LOCAL_PORT,
       exchange_requests_started: 0,
     },
-    hot_refresh_minutes: HOT_REFRESH_MS / 60_000,
+    hot_score_refresh_minutes: HOT_SCORE_REFRESH_MS / 60_000,
+    hot_membership_min_hold_minutes: HOT_MEMBERSHIP_MIN_HOLD_MS / 60_000,
+    hot_membership_max_replacements_per_refresh: HOT_MAX_REPLACEMENTS_PER_REFRESH,
+    hot_membership_replacement_min_score_delta: HOT_REPLACEMENT_MIN_SCORE_DELTA,
     scanner_interval_seconds: SCAN_INTERVAL_MS / 1000,
     startup_retry_seconds: STARTUP_RETRY_MS / 1000,
     last_good_preserve_seconds: LAST_GOOD_PRESERVE_MS / 1000,
