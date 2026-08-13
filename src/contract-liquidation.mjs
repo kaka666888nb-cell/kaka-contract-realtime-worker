@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.51';
+const STEP_VERSION = '650.8.15.52';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -87,6 +87,36 @@ const LIQUIDATION_HISTORY_ROUTE = '/api/contract-liquidation/history';
 const LIQUIDATION_HEALTH_ROUTE = '/api/contract-liquidation/health';
 const LIQUIDATION_CURRENT_ROUTE = '/api/contract-liquidation/current-snapshot';
 const LIQUIDATION_MARKET_ROUTE = '/api/contract-liquidation/market-snapshot';
+const LIQUIDATION_HEATMAP_ROUTE = '/api/contract-liquidation/heatmap';
+// Step1004.6 / original Step998: realized liquidation-event price heatmap base.
+// This is NOT an estimated liquidation-risk map. It reuses the existing shared
+// public liquidation collectors and keeps exact provider/symbol/USDT identity.
+// User reads never open an exchange connection or start an exchange request.
+const LIQUIDATION_HEATMAP_BASE_BPS = 25;
+const LIQUIDATION_HEATMAP_RATIO = 1 + LIQUIDATION_HEATMAP_BASE_BPS / 10_000;
+const LIQUIDATION_HEATMAP_LOG_RATIO = Math.log(LIQUIDATION_HEATMAP_RATIO);
+const LIQUIDATION_HEATMAP_RETENTION_MS = 24 * HOUR_BUCKET_MS;
+const LIQUIDATION_HEATMAP_CACHE_TTL_MS = 5_000;
+const LIQUIDATION_HEATMAP_CACHE_MAX = 32;
+const LIQUIDATION_HEATMAP_MAX_SYMBOLS = 75;
+const LIQUIDATION_HEATMAP_MAX_BUCKETS_PER_SYMBOL = 128;
+const LIQUIDATION_HEATMAP_PERIODS = Object.freeze({
+  '15m': 15 * MINUTE_BUCKET_MS,
+  '1h': HOUR_BUCKET_MS,
+  '4h': 4 * HOUR_BUCKET_MS,
+  '12h': 12 * HOUR_BUCKET_MS,
+  '24h': 24 * HOUR_BUCKET_MS,
+});
+let liquidationHeatmapReads = 0;
+const liquidationHeatmapCache = new Map();
+const liquidationHeatmapHealth = {
+  official_gate_minute_replacements: 0,
+  official_bitget_minute_replacements: 0,
+  last_official_gate_replace_at: null,
+  last_official_bitget_replace_at: null,
+  live_events_applied: 0,
+  official_events_applied: 0,
+};
 const LIQUIDATION_MARKET_UNIVERSE_REFRESH_MS = 10 * 60_000;
 const LIQUIDATION_MARKET_STARTUP_RETRY_MS = 15_000;
 const LIQUIDATION_MARKET_CACHE_TTL_MS = 5_000;
@@ -1222,6 +1252,26 @@ export function getContractLiquidationSharedCurrentHealth() {
     current_snapshot_cache_ttl_seconds: Math.trunc(LIQUIDATION_SHARED_CACHE_TTL_MS / 1000),
     market_snapshot_endpoint: LIQUIDATION_MARKET_ROUTE,
     market_snapshot_role: 'official_maximum_public_coverage_main_layer',
+    heatmap_endpoint: LIQUIDATION_HEATMAP_ROUTE,
+    step998_liquidation_heatmap_ready: true,
+    step998_heatmap_semantics: 'realized_liquidation_events_only_not_estimated_risk',
+    step998_heatmap_bucket_bps: LIQUIDATION_HEATMAP_BASE_BPS,
+    step998_heatmap_bucket_mode: 'deterministic_geometric_price_bins',
+    step998_heatmap_periods: Object.keys(LIQUIDATION_HEATMAP_PERIODS),
+    step998_heatmap_retention_hours: Math.trunc(LIQUIDATION_HEATMAP_RETENTION_MS / HOUR_BUCKET_MS),
+    step998_heatmap_quote_scope: 'USDT_perpetual_only',
+    step998_heatmap_process_memory_only: true,
+    step998_heatmap_gate_official_minute_reconcile: true,
+    step998_heatmap_bitget_official_minute_reconcile: true,
+    step998_heatmap_missing_presession_distribution_fabricated: false,
+    step998_heatmap_cross_provider_substitution: false,
+    step998_heatmap_cross_quote_substitution: false,
+    step998_heatmap_user_reads_trigger_requests: false,
+    step998_heatmap_reads_scale_with_users: false,
+    step998_heatmap_reads: liquidationHeatmapReads,
+    step998_heatmap_cache_entries: liquidationHeatmapCache.size,
+    step998_heatmap_exchange_requests_started_by_reads: 0,
+    step998_heatmap_health: { ...liquidationHeatmapHealth },
     market_snapshot_directory_symbols: marketSnapshot.directory_symbol_count,
     market_snapshot_connected_symbols: marketSnapshot.connected_symbol_count,
     market_snapshot_complete_symbols: marketSnapshot.coverage_complete_symbol_count,
@@ -1341,6 +1391,7 @@ function gateOfficialMinuteRows(rawRows, startMs, endMs) {
 async function materializeGateOfficialMinuteRows(rawRows, startMs, endMs) {
   const prepared = gateOfficialMinuteRows(rawRows, startMs, endMs);
   const rows = [];
+  const heatmapEvents = [];
   let parsed = 0;
   for (const { state, bucket, events = [] } of prepared.buckets.values()) {
     for (const event of events) {
@@ -1353,7 +1404,7 @@ async function materializeGateOfficialMinuteRows(rawRows, startMs, endMs) {
       }
       // Gate official SDK semantics: positive size = short position,
       // negative size = long position. `left` is intentionally ignored.
-      applyEventToBucket(bucket, {
+      const normalizedEvent = {
         id: `gate-liq-orders:${event.native}:${event.timeMs}:${event.signedPositionSize}:${event.contracts}:${event.price}`,
         provider: 'gate',
         symbol: event.symbol,
@@ -1366,7 +1417,9 @@ async function materializeGateOfficialMinuteRows(rawRows, startMs, endMs) {
         liquidation_side: event.signedPositionSize > 0 ? 'short' : 'long',
         order_side: event.signedPositionSize > 0 ? 'buy' : 'sell',
         price_type: 'official_liq_orders_fill_or_order_price',
-      });
+      };
+      applyEventToBucket(bucket, normalizedEvent);
+      heatmapEvents.push(normalizedEvent);
       parsed += 1;
     }
     const row = liquidationPersistRow(state, bucket, Date.now(), 'gate_official_public_futures_liq_orders_closed_minute_v1');
@@ -1378,7 +1431,7 @@ async function materializeGateOfficialMinuteRows(rawRows, startMs, endMs) {
     row.last_gap_at = null;
     rows.push(row);
   }
-  return { rows, parsed, skipped: prepared.skipped };
+  return { rows, parsed, skipped: prepared.skipped, heatmapEvents };
 }
 
 async function pollGateOfficialLiquidationMinute(now = Date.now(), { force = false } = {}) {
@@ -1427,6 +1480,7 @@ async function pollGateOfficialLiquidationMinute(now = Date.now(), { force = fal
       });
       if (complete) {
         await replaceGateOfficialMinuteRows(startMs, materialized.rows);
+        replaceProviderOfficialHeatmapMinute('gate', startMs, materialized.heatmapEvents, 'gate_official_liq_orders_closed_minute');
         gateOfficialFinalizedMinuteStarts.set(startMs, Date.now());
         gateLiqOrdersHealth.complete_windows += 1;
         liquidationPersistenceHealth.minute_persisted_rows_total += materialized.rows.length;
@@ -1525,6 +1579,7 @@ async function scanBitgetLiquidationCategory(category, startMs, endMs) {
 
 function materializeBitgetOfficialMinuteRows(categoryResults, startMs, endMs) {
   const buckets=new Map();
+  const heatmapEvents=[];
   let parsed=0, skipped=0;
   for(const result of categoryResults){
     for(const raw of result.rows){
@@ -1536,6 +1591,7 @@ function materializeBitgetOfficialMinuteRows(categoryResults, startMs, endMs) {
         buckets.set(event.symbol,target);
       }
       applyEventToBucket(target.bucket,event);
+      heatmapEvents.push(event);
       parsed+=1;
     }
   }
@@ -1547,7 +1603,7 @@ function materializeBitgetOfficialMinuteRows(categoryResults, startMs, endMs) {
     row.observed_since=liquidationIso(startMs); row.last_gap_at=null;
     rows.push(row);
   }
-  return { rows, parsed, skipped };
+  return { rows, parsed, skipped, heatmapEvents };
 }
 
 function bitgetLiquidationRetryDelayMs(attempts) {
@@ -1748,6 +1804,7 @@ async function pollBitgetOfficialLiquidationMinute(now=Date.now(),{force=false}=
       }
 
       await replaceBitgetOfficialMinuteRows(startMs,materialized.rows);
+      replaceProviderOfficialHeatmapMinute('bitget', startMs, materialized.heatmapEvents, 'bitget_official_liquidations_history_reconciled_minute');
       bitgetLiqHistoryDeferredWindows.delete(startMs);
       bitgetLiqHistoryHealth.deferred_windows=bitgetLiqHistoryDeferredWindows.size;
       const next=[...bitgetLiqHistoryDeferredWindows.values()]
@@ -1782,12 +1839,37 @@ export function getContractLiquidationPersistenceHealth() {
   return {
     ok: true,
     version: STEP_VERSION,
+    collector_process_memory: {
+      rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+      heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+      external_mb: Math.round(process.memoryUsage().external / 1048576),
+    },
     persistence_enabled: LIQUIDATION_PERSISTENCE_ENABLED,
     history_endpoint: LIQUIDATION_HISTORY_ROUTE,
     current_snapshot_endpoint: LIQUIDATION_CURRENT_ROUTE,
     current_snapshot_role: 'focused_fallback',
     market_snapshot_endpoint: LIQUIDATION_MARKET_ROUTE,
     market_snapshot_role: 'official_maximum_public_coverage_main_layer',
+    heatmap_endpoint: LIQUIDATION_HEATMAP_ROUTE,
+    step998_liquidation_heatmap_ready: true,
+    step998_heatmap_semantics: 'realized_liquidation_events_only_not_estimated_risk',
+    step998_heatmap_bucket_bps: LIQUIDATION_HEATMAP_BASE_BPS,
+    step998_heatmap_bucket_mode: 'deterministic_geometric_price_bins',
+    step998_heatmap_periods: Object.keys(LIQUIDATION_HEATMAP_PERIODS),
+    step998_heatmap_retention_hours: Math.trunc(LIQUIDATION_HEATMAP_RETENTION_MS / HOUR_BUCKET_MS),
+    step998_heatmap_quote_scope: 'USDT_perpetual_only',
+    step998_heatmap_process_memory_only: true,
+    step998_heatmap_gate_official_minute_reconcile: true,
+    step998_heatmap_bitget_official_minute_reconcile: true,
+    step998_heatmap_missing_presession_distribution_fabricated: false,
+    step998_heatmap_cross_provider_substitution: false,
+    step998_heatmap_cross_quote_substitution: false,
+    step998_heatmap_user_reads_trigger_requests: false,
+    step998_heatmap_reads_scale_with_users: false,
+    step998_heatmap_reads: liquidationHeatmapReads,
+    step998_heatmap_cache_entries: liquidationHeatmapCache.size,
+    step998_heatmap_exchange_requests_started_by_reads: 0,
+    step998_heatmap_health: { ...liquidationHeatmapHealth },
     current_snapshot_targets_per_provider: LIQUIDATION_SHARED_TARGETS_PER_PROVIDER,
     current_snapshot_rotation_minutes: Math.trunc(LIQUIDATION_SHARED_ROTATION_MS / 60_000),
     current_snapshot_reads_start_exchange_connections: false,
@@ -2511,6 +2593,332 @@ function feedEvents(feed, symbol) {
 }
 
 
+function liquidationHeatmapBinIndex(price) {
+  const value = positiveNumber(price);
+  if (value == null || !Number.isFinite(LIQUIDATION_HEATMAP_LOG_RATIO) || LIQUIDATION_HEATMAP_LOG_RATIO <= 0) return null;
+  const index = Math.floor(Math.log(value) / LIQUIDATION_HEATMAP_LOG_RATIO);
+  return Number.isFinite(index) ? index : null;
+}
+
+function liquidationHeatmapPriceBounds(index) {
+  const lower = Math.exp(Number(index) * LIQUIDATION_HEATMAP_LOG_RATIO);
+  const upper = lower * LIQUIDATION_HEATMAP_RATIO;
+  return {
+    price_lower: lower,
+    price_upper: upper,
+    price_mid: Math.sqrt(lower * upper),
+  };
+}
+
+function createLiquidationHeatmapCell(index) {
+  return {
+    index,
+    long_notional: 0,
+    short_notional: 0,
+    total_notional: 0,
+    long_count: 0,
+    short_count: 0,
+    event_count: 0,
+    min_price: null,
+    max_price: null,
+    latest_event_time_ms: 0,
+  };
+}
+
+function applyLiquidationHeatmapEvent(state, row, sourceKind = 'public_event_stream') {
+  if (!state || !row) return false;
+  const timeMs = integerValue(row.time_ms);
+  const price = positiveNumber(row.price);
+  const notional = positiveNumber(row.notional);
+  const side = String(row.liquidation_side || '').toLowerCase();
+  const index = liquidationHeatmapBinIndex(price);
+  if (timeMs <= 0 || price == null || notional == null || index == null || !['long', 'short'].includes(side)) return false;
+  const minuteStart = Math.floor(timeMs / MINUTE_BUCKET_MS) * MINUTE_BUCKET_MS;
+  if (!(state.heatmapMinutes instanceof Map)) state.heatmapMinutes = new Map();
+  let minute = state.heatmapMinutes.get(minuteStart);
+  if (!minute) {
+    minute = { start_ms: minuteStart, source_kind: sourceKind, bins: new Map() };
+    state.heatmapMinutes.set(minuteStart, minute);
+  }
+  if (!(minute.bins instanceof Map)) minute.bins = new Map();
+  let cell = minute.bins.get(index);
+  if (!cell) {
+    cell = createLiquidationHeatmapCell(index);
+    minute.bins.set(index, cell);
+  }
+  cell.total_notional += notional;
+  cell.event_count += 1;
+  cell.latest_event_time_ms = Math.max(Number(cell.latest_event_time_ms || 0), timeMs);
+  cell.min_price = cell.min_price == null ? price : Math.min(Number(cell.min_price), price);
+  cell.max_price = cell.max_price == null ? price : Math.max(Number(cell.max_price), price);
+  if (side === 'long') {
+    cell.long_notional += notional;
+    cell.long_count += 1;
+  } else {
+    cell.short_notional += notional;
+    cell.short_count += 1;
+  }
+  minute.source_kind = sourceKind;
+  if (sourceKind === 'public_event_stream') liquidationHeatmapHealth.live_events_applied += 1;
+  else liquidationHeatmapHealth.official_events_applied += 1;
+  return true;
+}
+
+function clearProviderHeatmapMinute(provider, startMs) {
+  for (const state of STATS.values()) {
+    if (state.provider !== provider || !(state.heatmapMinutes instanceof Map)) continue;
+    state.heatmapMinutes.delete(startMs);
+  }
+}
+
+function replaceProviderOfficialHeatmapMinute(provider, startMs, events, sourceKind) {
+  clearProviderHeatmapMinute(provider, startMs);
+  for (const event of Array.isArray(events) ? events : []) {
+    const symbol = compactSymbol(event?.symbol);
+    if (!symbol || quoteFromCompact(symbol) !== 'USDT') continue;
+    const state = getStats(provider, symbol);
+    applyLiquidationHeatmapEvent(state, event, sourceKind);
+  }
+  if (provider === 'gate') {
+    liquidationHeatmapHealth.official_gate_minute_replacements += 1;
+    liquidationHeatmapHealth.last_official_gate_replace_at = new Date().toISOString();
+  } else if (provider === 'bitget') {
+    liquidationHeatmapHealth.official_bitget_minute_replacements += 1;
+    liquidationHeatmapHealth.last_official_bitget_replace_at = new Date().toISOString();
+  }
+  liquidationHeatmapCache.clear();
+}
+
+function trimHeatmapState(state, cutoffMs) {
+  if (!(state?.heatmapMinutes instanceof Map)) return;
+  for (const minuteStart of [...state.heatmapMinutes.keys()]) {
+    if (Number(minuteStart) < cutoffMs) state.heatmapMinutes.delete(minuteStart);
+  }
+}
+
+function mergeHeatmapCell(target, cell, provider) {
+  target.long_notional += Number(cell.long_notional || 0);
+  target.short_notional += Number(cell.short_notional || 0);
+  target.total_notional += Number(cell.total_notional || 0);
+  target.long_count += Number(cell.long_count || 0);
+  target.short_count += Number(cell.short_count || 0);
+  target.event_count += Number(cell.event_count || 0);
+  target.latest_event_time_ms = Math.max(Number(target.latest_event_time_ms || 0), Number(cell.latest_event_time_ms || 0));
+  const minPrice = positiveNumber(cell.min_price);
+  const maxPrice = positiveNumber(cell.max_price);
+  if (minPrice != null) target.min_price = target.min_price == null ? minPrice : Math.min(target.min_price, minPrice);
+  if (maxPrice != null) target.max_price = target.max_price == null ? maxPrice : Math.max(target.max_price, maxPrice);
+  target.provider_notional[provider] = Number(target.provider_notional[provider] || 0) + Number(cell.total_notional || 0);
+}
+
+function heatmapCoverageForSymbol(symbol, providerFilter, cutoffMs, now = Date.now()) {
+  const providers = providerFilter ? [providerFilter] : LIQUIDATION_MARKET_PROVIDER_ORDER;
+  const rows = [];
+  for (const provider of providers) {
+    if (!marketUniverseHasSymbol(provider, symbol)) continue;
+    const feed = feedForSymbol(provider, symbol);
+    const state = getStats(provider, symbol, { create: false });
+    const observedSinceMs = Number(state?.observedSinceMs || feed?.openedAt || 0);
+    const lastGapAtMs = Number(state?.lastGapAtMs || 0);
+    const connected = Boolean(feed && wsReady(feed.socket) && feed.ready);
+    const complete = connected && observedSinceMs > 0 && observedSinceMs <= cutoffMs && !(lastGapAtMs >= cutoffMs && lastGapAtMs <= now);
+    rows.push({
+      provider,
+      connected,
+      coverage_complete: complete,
+      observed_since_ms: observedSinceMs || null,
+      last_gap_at_ms: lastGapAtMs || null,
+    });
+  }
+  return {
+    providers: rows,
+    provider_count: rows.length,
+    connected_provider_count: rows.filter((row) => row.connected).length,
+    complete_provider_count: rows.filter((row) => row.coverage_complete).length,
+    coverage_complete: rows.length > 0 && rows.every((row) => row.coverage_complete),
+  };
+}
+
+function buildLiquidationHeatmapSnapshot({ period = '24h', provider = '', symbol = '', limitSymbols = 25 } = {}, now = Date.now()) {
+  const periodKey = Object.hasOwn(LIQUIDATION_HEATMAP_PERIODS, period) ? period : '24h';
+  const durationMs = LIQUIDATION_HEATMAP_PERIODS[periodKey];
+  const cutoffMs = now - durationMs;
+  const normalizedProvider = normalizeProvider(provider);
+  const normalizedSymbol = compactSymbol(symbol);
+  const symbols = new Map();
+
+  for (const state of STATS.values()) {
+    const stateProvider = normalizeProvider(state?.provider);
+    const stateSymbol = compactSymbol(state?.symbol);
+    if (!SUPPORTED_PROVIDERS.has(stateProvider) || !stateSymbol || quoteFromCompact(stateSymbol) !== 'USDT') continue;
+    if (normalizedProvider && stateProvider !== normalizedProvider) continue;
+    if (normalizedSymbol && stateSymbol !== normalizedSymbol) continue;
+    if (!marketUniverseHasSymbol(stateProvider, stateSymbol)) continue;
+    if (!(state.heatmapMinutes instanceof Map)) continue;
+
+    let symbolRow = symbols.get(stateSymbol);
+    if (!symbolRow) {
+      symbolRow = {
+        symbol: stateSymbol,
+        quote_asset: 'USDT',
+        long_notional: 0,
+        short_notional: 0,
+        total_notional: 0,
+        long_count: 0,
+        short_count: 0,
+        event_count: 0,
+        latest_event_time_ms: 0,
+        bins: new Map(),
+        providers: new Map(),
+        source_kinds: new Set(),
+      };
+      symbols.set(stateSymbol, symbolRow);
+    }
+    let providerRow = symbolRow.providers.get(stateProvider);
+    if (!providerRow) {
+      providerRow = { provider: stateProvider, long_notional: 0, short_notional: 0, total_notional: 0, long_count: 0, short_count: 0, event_count: 0, latest_event_time_ms: 0, source_kinds: new Set() };
+      symbolRow.providers.set(stateProvider, providerRow);
+    }
+
+    for (const [minuteStart, minute] of state.heatmapMinutes.entries()) {
+      if (Number(minuteStart) < cutoffMs || Number(minuteStart) > now) continue;
+      if (minute?.source_kind) {
+        symbolRow.source_kinds.add(String(minute.source_kind));
+        providerRow.source_kinds.add(String(minute.source_kind));
+      }
+      for (const [index, cell] of (minute?.bins instanceof Map ? minute.bins.entries() : [])) {
+        let target = symbolRow.bins.get(index);
+        if (!target) {
+          target = { ...createLiquidationHeatmapCell(index), provider_notional: {} };
+          symbolRow.bins.set(index, target);
+        }
+        mergeHeatmapCell(target, cell, stateProvider);
+        symbolRow.long_notional += Number(cell.long_notional || 0);
+        symbolRow.short_notional += Number(cell.short_notional || 0);
+        symbolRow.total_notional += Number(cell.total_notional || 0);
+        symbolRow.long_count += Number(cell.long_count || 0);
+        symbolRow.short_count += Number(cell.short_count || 0);
+        symbolRow.event_count += Number(cell.event_count || 0);
+        symbolRow.latest_event_time_ms = Math.max(symbolRow.latest_event_time_ms, Number(cell.latest_event_time_ms || 0));
+        providerRow.long_notional += Number(cell.long_notional || 0);
+        providerRow.short_notional += Number(cell.short_notional || 0);
+        providerRow.total_notional += Number(cell.total_notional || 0);
+        providerRow.long_count += Number(cell.long_count || 0);
+        providerRow.short_count += Number(cell.short_count || 0);
+        providerRow.event_count += Number(cell.event_count || 0);
+        providerRow.latest_event_time_ms = Math.max(providerRow.latest_event_time_ms, Number(cell.latest_event_time_ms || 0));
+      }
+    }
+  }
+
+  let symbolRows = [...symbols.values()].filter((row) => row.event_count > 0);
+  symbolRows.sort((a, b) => b.total_notional - a.total_notional || b.event_count - a.event_count || a.symbol.localeCompare(b.symbol));
+  const safeLimit = Math.max(1, Math.min(LIQUIDATION_HEATMAP_MAX_SYMBOLS, integerValue(limitSymbols) || 25));
+  if (!normalizedSymbol) symbolRows = symbolRows.slice(0, safeLimit);
+
+  const rows = symbolRows.map((row) => {
+    let priceBuckets = [...row.bins.values()].sort((a, b) => a.index - b.index);
+    const priceBucketCountTotal = priceBuckets.length;
+    if (priceBuckets.length > LIQUIDATION_HEATMAP_MAX_BUCKETS_PER_SYMBOL) {
+      priceBuckets = [...priceBuckets]
+        .sort((a, b) => b.total_notional - a.total_notional)
+        .slice(0, LIQUIDATION_HEATMAP_MAX_BUCKETS_PER_SYMBOL)
+        .sort((a, b) => a.index - b.index);
+    }
+    const maxBucketNotional = priceBuckets.reduce((max, cell) => Math.max(max, Number(cell.total_notional || 0)), 0);
+    priceBuckets = priceBuckets.map((cell) => {
+      const bounds = liquidationHeatmapPriceBounds(cell.index);
+      const dominantSide = Number(cell.long_notional || 0) > Number(cell.short_notional || 0)
+        ? 'long'
+        : Number(cell.short_notional || 0) > Number(cell.long_notional || 0) ? 'short' : 'mixed';
+      return {
+        bucket_index: cell.index,
+        ...bounds,
+        min_event_price: cell.min_price,
+        max_event_price: cell.max_price,
+        long_notional: cell.long_notional,
+        short_notional: cell.short_notional,
+        total_notional: cell.total_notional,
+        long_count: cell.long_count,
+        short_count: cell.short_count,
+        event_count: cell.event_count,
+        latest_event_time_ms: cell.latest_event_time_ms || null,
+        intensity: maxBucketNotional > 0 ? Number(cell.total_notional || 0) / maxBucketNotional : 0,
+        dominant_side: dominantSide,
+        provider_notional: cell.provider_notional,
+      };
+    });
+    const coverage = heatmapCoverageForSymbol(row.symbol, normalizedProvider, cutoffMs, now);
+    return {
+      symbol: row.symbol,
+      quote_asset: row.quote_asset,
+      long_notional: row.long_notional,
+      short_notional: row.short_notional,
+      total_notional: row.total_notional,
+      long_count: row.long_count,
+      short_count: row.short_count,
+      event_count: row.event_count,
+      latest_event_time_ms: row.latest_event_time_ms || null,
+      dominant_side: row.long_notional > row.short_notional ? 'long' : row.short_notional > row.long_notional ? 'short' : 'mixed',
+      source_kinds: [...row.source_kinds].sort(),
+      provider_breakdown: [...row.providers.values()]
+        .sort((a, b) => b.total_notional - a.total_notional || a.provider.localeCompare(b.provider))
+        .map((providerRow) => ({ ...providerRow, source_kinds: [...providerRow.source_kinds].sort() })),
+      coverage,
+      price_buckets: priceBuckets,
+      price_bucket_count: priceBuckets.length,
+      price_bucket_count_total: priceBucketCountTotal,
+      price_buckets_truncated: priceBucketCountTotal > priceBuckets.length,
+    };
+  });
+
+  return {
+    rows,
+    row_count: rows.length,
+    period: periodKey,
+    period_ms: durationMs,
+    provider_filter: normalizedProvider || null,
+    symbol_filter: normalizedSymbol || null,
+    bucket_bps: LIQUIDATION_HEATMAP_BASE_BPS,
+    bucket_mode: 'deterministic_geometric_price_bins',
+    quote_scope: 'USDT_perpetual_only',
+    realized_liquidation_events_only: true,
+    estimated_liquidation_risk: false,
+    raw_events_persisted: false,
+    heatmap_state_process_memory_only: true,
+    official_minute_reconciliation: {
+      gate: true,
+      bitget: true,
+      binance: false,
+      okx: false,
+      bybit: false,
+    },
+    official_history_note: 'Gate complete closed-minute liq_orders and accepted delayed Bitget official liquidation minutes replace the corresponding live heatmap minute; other providers remain exact shared public event-stream observations. Missing pre-session price distribution is never fabricated from time-only history totals.',
+    generated_at: new Date(now).toISOString(),
+  };
+}
+
+function getLiquidationHeatmapSnapshot(params, now = Date.now()) {
+  const key = JSON.stringify([
+    params?.period || '24h',
+    normalizeProvider(params?.provider),
+    compactSymbol(params?.symbol),
+    Math.max(1, Math.min(LIQUIDATION_HEATMAP_MAX_SYMBOLS, integerValue(params?.limitSymbols) || 25)),
+  ]);
+  const cached = liquidationHeatmapCache.get(key);
+  if (cached && now - Number(cached.cachedAt || 0) <= LIQUIDATION_HEATMAP_CACHE_TTL_MS) {
+    return { ...cached.payload, cache_hit: true, cache_age_ms: now - cached.cachedAt };
+  }
+  const payload = buildLiquidationHeatmapSnapshot(params, now);
+  liquidationHeatmapCache.set(key, { cachedAt: now, payload });
+  while (liquidationHeatmapCache.size > LIQUIDATION_HEATMAP_CACHE_MAX) {
+    const first = liquidationHeatmapCache.keys().next().value;
+    if (first == null) break;
+    liquidationHeatmapCache.delete(first);
+  }
+  return { ...payload, cache_hit: false, cache_age_ms: 0 };
+}
+
 function statsKey(provider, symbol) {
   return `${provider}|${compactSymbol(symbol)}`;
 }
@@ -2595,6 +3003,7 @@ function getStats(provider, symbol, { create = true, observedSinceMs = null } = 
       minuteBuckets: new Map(),
       quarterBuckets: new Map(),
       hourBuckets: new Map(),
+      heatmapMinutes: new Map(),
       recentEvents: [],
       dedupe: new Map(),
     };
@@ -2662,6 +3071,8 @@ function updateStats(row, observedSinceMs = null) {
   const hourBucket = bucketFor(state.hourBuckets, timeMs, HOUR_BUCKET_MS);
   applyEventToBucket(hourBucket, row);
   queueLiquidationHourBucket(state, hourBucket);
+  applyLiquidationHeatmapEvent(state, row, 'public_event_stream');
+  liquidationHeatmapCache.clear();
   state.recentEvents.unshift({ ...row });
   state.recentEvents.sort((a, b) => integerValue(b.time_ms) - integerValue(a.time_ms));
   if (state.recentEvents.length > MAX_EVENTS_PER_SYMBOL) {
@@ -2682,6 +3093,7 @@ function trimStatsState(state) {
   trimBucketMap(state.minuteBuckets, now - MINUTE_RETENTION_MS);
   trimBucketMap(state.quarterBuckets, now - QUARTER_RETENTION_MS);
   trimBucketMap(state.hourBuckets, now - HOUR_RETENTION_MS);
+  trimHeatmapState(state, now - LIQUIDATION_HEATMAP_RETENTION_MS);
   state.recentEvents = state.recentEvents.filter((row) => integerValue(row.time_ms) >= now - RECENT_EVENT_RETENTION_MS).slice(0, MAX_EVENTS_PER_SYMBOL);
   for (const [id, timeMs] of [...state.dedupe.entries()]) {
     if (now - Number(timeMs || 0) > DEDUPE_RETENTION_MS) state.dedupe.delete(id);
@@ -3366,7 +3778,7 @@ const marketUniverseRefreshTimer = setInterval(() => {
 marketUniverseRefreshTimer.unref?.();
 
 export async function handleContractLiquidation(req, res, url) {
-  if (!['/api/contract-liquidation', LIQUIDATION_HISTORY_ROUTE, LIQUIDATION_HEALTH_ROUTE, LIQUIDATION_CURRENT_ROUTE, LIQUIDATION_MARKET_ROUTE].includes(url.pathname)) return false;
+  if (!['/api/contract-liquidation', LIQUIDATION_HISTORY_ROUTE, LIQUIDATION_HEALTH_ROUTE, LIQUIDATION_CURRENT_ROUTE, LIQUIDATION_MARKET_ROUTE, LIQUIDATION_HEATMAP_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -3436,6 +3848,55 @@ export async function handleContractLiquidation(req, res, url) {
       shared_feeds_do_not_scale_with_users: true,
       user_reads_start_exchange_connections: false,
       user_reads_start_exchange_requests: false,
+      timestamp_ms: Date.now(),
+    });
+    return true;
+  }
+
+  if (url.pathname === LIQUIDATION_HEATMAP_ROUTE) {
+    const providerFilter = normalizeProvider(url.searchParams.get('provider'));
+    const symbolFilter = compactSymbol(url.searchParams.get('symbol'));
+    const requestedPeriod = String(url.searchParams.get('period') || '24h').trim().toLowerCase();
+    const limitSymbols = url.searchParams.get('limit_symbols');
+    if (providerFilter && !SUPPORTED_PROVIDERS.has(providerFilter)) {
+      sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider: providerFilter });
+      return true;
+    }
+    if (!Object.hasOwn(LIQUIDATION_HEATMAP_PERIODS, requestedPeriod)) {
+      sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_liquidation_heatmap_period', supported_periods: Object.keys(LIQUIDATION_HEATMAP_PERIODS) });
+      return true;
+    }
+    if (symbolFilter && quoteFromCompact(symbolFilter) !== 'USDT') {
+      sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'heatmap_requires_exact_usdt_perpetual_quote', symbol: symbolFilter });
+      return true;
+    }
+    if (symbolFilter) {
+      const providers = providerFilter ? [providerFilter] : LIQUIDATION_MARKET_PROVIDER_ORDER;
+      const exists = providers.some((provider) => marketUniverseHasSymbol(provider, symbolFilter));
+      if (!exists) {
+        sendJson(res, 404, { ok: false, version: STEP_VERSION, error: 'symbol_not_in_current_shared_contract_universe', symbol: symbolFilter, provider: providerFilter || null });
+        return true;
+      }
+    }
+    liquidationHeatmapReads += 1;
+    const snapshot = getLiquidationHeatmapSnapshot({ period: requestedPeriod, provider: providerFilter, symbol: symbolFilter, limitSymbols }, Date.now());
+    sendJson(res, 200, {
+      ok: true,
+      version: STEP_VERSION,
+      source: 'render_step998_realized_liquidation_price_heatmap',
+      market_type: 'contract',
+      ...snapshot,
+      aggregation_scope: providerFilter
+        ? (symbolFilter ? 'single_provider_single_symbol_exact_usdt' : 'single_provider_current_usdt_perpetual_universe')
+        : (symbolFilter ? 'same_symbol_cross_provider_same_usdt_quote' : 'five_provider_current_usdt_perpetual_universe_grouped_by_symbol'),
+      no_cross_provider_price_substitution: true,
+      no_cross_quote_substitution: true,
+      user_reads_start_exchange_connections: false,
+      user_reads_start_exchange_requests: false,
+      exchange_connections_started: 0,
+      exchange_requests_started: 0,
+      reads_scale_with_users: false,
+      zero_events_is_valid: true,
       timestamp_ms: Date.now(),
     });
     return true;
@@ -3639,4 +4100,4 @@ export async function handleContractLiquidation(req, res, url) {
   return true;
 }
 
-export const __contractLiquidationV46ClosureTest = Object.freeze({ bitgetLiquidationEventFromOfficialRow, bitgetOfficialRowsCoverExistingWs, bitgetLiquidationRetryDelayMs, chooseBitgetOfficialWindow, deferBitgetLiquidationWindow });
+export const __contractLiquidationV46ClosureTest = Object.freeze({ bitgetLiquidationEventFromOfficialRow, bitgetOfficialRowsCoverExistingWs, bitgetLiquidationRetryDelayMs, chooseBitgetOfficialWindow, deferBitgetLiquidationWindow, liquidationHeatmapBinIndex, liquidationHeatmapPriceBounds, buildLiquidationHeatmapSnapshot });

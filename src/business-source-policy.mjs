@@ -1,4 +1,4 @@
-export const BUSINESS_SOURCE_POLICY_VERSION = '650.8.15.126';
+export const BUSINESS_SOURCE_POLICY_VERSION = '650.8.15.128';
 
 const RULES = [];
 function add(provider, market, field, {
@@ -174,6 +174,15 @@ for (const provider of ['binance','okx','bybit','bitget','gate']) {
     capability:'liquidation_current',
     scope:'current_USDT_perpetual_public_events',
     layers:['liquidation'],
+  });
+  add(provider,'contract','liquidation_heatmap_actual',{
+    resolution:'derived_same_venue',
+    capability:'liquidation_realized_price_heatmap',
+    inputs:['liquidation_current'],
+    scope:'current_USDT_perpetual_realized_events_up_to_24h_observed_session',
+    layers:['liquidation_heatmap'],
+    limitation:'Actual realized liquidation events are aggregated into deterministic 25bps price bins. This is not an estimated liquidation-risk distribution; missing pre-session price distribution stays missing.',
+    value_semantics:'sum same-provider same-symbol same-USDT-quote realized liquidation event notional/count into price buckets; cross-provider view merges only the exact same symbol and quote',
   });
   add(provider,'contract','basis_mark_index',{
     resolution:'derived_same_venue',

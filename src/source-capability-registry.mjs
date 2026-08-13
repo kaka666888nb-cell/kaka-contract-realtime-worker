@@ -14,7 +14,7 @@ import { getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridge
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.29';
+const VERSION = '650.8.15.30';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -107,6 +107,14 @@ const CAPABILITIES = Object.freeze([
   { provider: 'gate', market: 'contract', capability: 'liquidation_event_history', official_available: true, official_scope: 'public_all_usdt_closed_minute_liq_orders', transport: 'REST+existing_public_WS', batch_mode: 'one_closed_minute_liq_orders_request_per_60s_plus_shared_ws', rate_limit_class: 'bounded_background_event_history', collector: 'liquidation-collector', target_layer: 'liquidation_history', current_integration: 'ready_step997', fallback_policy: 'complete_liq_orders_minute_owns_gate_1m_history; truncated_window_never_overwrites; never_cross_provider_substitute', history_policy: '1m_base_plus_5m_15m_and_1h_base_plus_6h_24h', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'depth20_current_focus', official_available: true, official_scope: 'focus15_current', transport: 'public_orderbook_shared_backend', batch_mode: 'bounded_focus15_depth20', rate_limit_class: 'shared_bounded', collector: 'deep-market-collector', target_layer: 'depth', current_integration: 'ready_step1004_1_5', fallback_policy: 'last verified until stale then null; no cross-provider substitution', history_policy: 'current_only', source_url: 'https://www.gate.com/docs/developers/futures/' },
   { provider: 'gate', market: 'contract', capability: 'liquidation_current', official_available: true, official_scope: 'public_event_stream_current', transport: 'public_WS_or_public_event_endpoint', batch_mode: 'shared_backend_event_collection', rate_limit_class: 'shared_bounded', collector: 'liquidation-collector', target_layer: 'liquidation_current', current_integration: 'ready_step997', fallback_policy: 'verified zero distinct from missing; no cross-provider substitution', history_policy: 'shared_event_buckets_and_history', source_url: 'https://www.gate.com/docs/developers/futures/' },
+
+  // Step1004.6 / original Step998: realized liquidation heatmap is a same-venue derived layer
+  // from already-shared official/public liquidation events. It never estimates future liquidation risk.
+  { provider: 'binance', market: 'contract', capability: 'liquidation_realized_price_heatmap', official_available: true, official_scope: 'public_realized_liquidation_events_same_provider_same_symbol_USDT', transport: 'reuse_existing_shared_liquidation_WS', batch_mode: 'shared_25bps_price_buckets_up_to_24h_observed_session', rate_limit_class: 'zero_additional_exchange_requests', collector: 'liquidation-collector', target_layer: 'liquidation_heatmap', current_integration: 'ready_step1004_6', fallback_policy: 'missing_presession_distribution_stays_missing; no estimated-risk substitution', history_policy: 'process_memory_price_buckets; Step997 time history remains separate', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/web-socket-streams' },
+  { provider: 'okx', market: 'contract', capability: 'liquidation_realized_price_heatmap', official_available: true, official_scope: 'public_realized_liquidation_events_same_provider_same_symbol_USDT', transport: 'reuse_existing_shared_liquidation_WS', batch_mode: 'shared_25bps_price_buckets_up_to_24h_observed_session', rate_limit_class: 'zero_additional_exchange_requests', collector: 'liquidation-collector', target_layer: 'liquidation_heatmap', current_integration: 'ready_step1004_6', fallback_policy: 'missing_presession_distribution_stays_missing; no estimated-risk substitution', history_policy: 'process_memory_price_buckets; Step997 time history remains separate', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'bybit', market: 'contract', capability: 'liquidation_realized_price_heatmap', official_available: true, official_scope: 'public_realized_liquidation_events_same_provider_same_symbol_USDT', transport: 'reuse_existing_shared_liquidation_WS', batch_mode: 'shared_25bps_price_buckets_up_to_24h_observed_session', rate_limit_class: 'zero_additional_exchange_requests', collector: 'liquidation-collector', target_layer: 'liquidation_heatmap', current_integration: 'ready_step1004_6', fallback_policy: 'missing_presession_distribution_stays_missing; no estimated-risk substitution', history_policy: 'process_memory_price_buckets; Step997 time history remains separate', source_url: 'https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation' },
+  { provider: 'bitget', market: 'contract', capability: 'liquidation_realized_price_heatmap', official_available: true, official_scope: 'public_realized_liquidation_events_same_provider_same_symbol_USDT_plus_accepted_delayed_official_minutes', transport: 'reuse_existing_shared_liquidation_WS_plus_existing_official_history_reconcile', batch_mode: 'shared_25bps_price_buckets_up_to_24h_observed_session', rate_limit_class: 'zero_additional_exchange_requests', collector: 'liquidation-collector', target_layer: 'liquidation_heatmap', current_integration: 'ready_step1004_6', fallback_policy: 'official delayed minute replaces live minute only after existing Step997 reconciliation accepts coverage; otherwise live observation remains', history_policy: 'process_memory_price_buckets_with_existing_official_minute_reconcile; Step997 time history remains separate', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Liquidations' },
+  { provider: 'gate', market: 'contract', capability: 'liquidation_realized_price_heatmap', official_available: true, official_scope: 'public_realized_liquidation_events_same_provider_same_symbol_USDT_plus_complete_official_closed_minutes', transport: 'reuse_existing_shared_liquidation_WS_plus_existing_liq_orders_reconcile', batch_mode: 'shared_25bps_price_buckets_up_to_24h_observed_session', rate_limit_class: 'zero_additional_exchange_requests', collector: 'liquidation-collector', target_layer: 'liquidation_heatmap', current_integration: 'ready_step1004_6', fallback_policy: 'complete official liq_orders minute replaces live minute; truncated/incomplete official minute never overwrites', history_policy: 'process_memory_price_buckets_with_existing_official_minute_reconcile; Step997 time history remains separate', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
 
   // Coinbase is project spot-only.
   { provider: 'coinbase', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'multi_product_public_ws', transport: 'WS', batch_mode: 'ticker_batch_5s', rate_limit_class: 'one_shared_connection', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
@@ -769,6 +777,37 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       gate_additional_contract_metadata_requests: Number(liquidationHistory.gate_liq_orders?.additional_contract_metadata_requests || 0),
       user_reads_scale_with_users: false,
     },
+    step998_liquidation_heatmap: {
+      ready: liquidationHistory.step998_liquidation_heatmap_ready === true &&
+        liquidationHistory.heatmap_endpoint === '/api/contract-liquidation/heatmap' &&
+        liquidationHistory.step998_heatmap_semantics === 'realized_liquidation_events_only_not_estimated_risk' &&
+        Number(liquidationHistory.step998_heatmap_bucket_bps || 0) === 25 &&
+        liquidationHistory.step998_heatmap_quote_scope === 'USDT_perpetual_only' &&
+        liquidationHistory.step998_heatmap_gate_official_minute_reconcile === true &&
+        liquidationHistory.step998_heatmap_bitget_official_minute_reconcile === true &&
+        liquidationHistory.step998_heatmap_missing_presession_distribution_fabricated === false &&
+        liquidationHistory.step998_heatmap_cross_provider_substitution === false &&
+        liquidationHistory.step998_heatmap_cross_quote_substitution === false &&
+        liquidationHistory.step998_heatmap_user_reads_trigger_requests === false &&
+        liquidationHistory.step998_heatmap_reads_scale_with_users === false &&
+        Number(liquidationHistory.step998_heatmap_exchange_requests_started_by_reads || 0) === 0,
+      endpoint: liquidationHistory.heatmap_endpoint || null,
+      semantics: liquidationHistory.step998_heatmap_semantics || null,
+      bucket_bps: Number(liquidationHistory.step998_heatmap_bucket_bps || 0),
+      bucket_mode: liquidationHistory.step998_heatmap_bucket_mode || null,
+      periods: Array.isArray(liquidationHistory.step998_heatmap_periods) ? [...liquidationHistory.step998_heatmap_periods] : [],
+      retention_hours: Number(liquidationHistory.step998_heatmap_retention_hours || 0),
+      quote_scope: liquidationHistory.step998_heatmap_quote_scope || null,
+      process_memory_only: liquidationHistory.step998_heatmap_process_memory_only === true,
+      gate_official_minute_reconcile: liquidationHistory.step998_heatmap_gate_official_minute_reconcile === true,
+      bitget_official_minute_reconcile: liquidationHistory.step998_heatmap_bitget_official_minute_reconcile === true,
+      missing_presession_distribution_fabricated: liquidationHistory.step998_heatmap_missing_presession_distribution_fabricated === true,
+      user_reads_trigger_requests: liquidationHistory.step998_heatmap_user_reads_trigger_requests === true,
+      reads_scale_with_users: liquidationHistory.step998_heatmap_reads_scale_with_users === true,
+      exchange_requests_started_by_reads: Number(liquidationHistory.step998_heatmap_exchange_requests_started_by_reads || 0),
+      reads: Number(liquidationHistory.step998_heatmap_reads || 0),
+      runtime: { ...(liquidationHistory.step998_heatmap_health || {}) },
+    },
     capabilities: includeCapabilities ? CAPABILITIES : [],
     capability_count: CAPABILITIES.length,
     exchange_requests_started_by_user_read: 0,
@@ -806,7 +845,8 @@ export function getSourceCapabilityRegistryHealth() {
       payload.gate_step1003.ready &&
       payload.collector_isolation_first_batch.ready &&
       payload.collector_isolation_second_batch.ready &&
-      payload.step997_liquidation_history.ready,
+      payload.step997_liquidation_history.ready &&
+      payload.step998_liquidation_heatmap.ready,
   };
 }
 

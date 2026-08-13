@@ -30,7 +30,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.127';
+const STEP_VERSION = '650.8.15.128';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -411,13 +411,15 @@ const server = http.createServer(async (req, res) => {
       contract_liquidation_history: '/api/contract-liquidation/history',
       contract_liquidation_current_snapshot: '/api/contract-liquidation/current-snapshot',
       contract_liquidation_market_snapshot: '/api/contract-liquidation/market-snapshot',
+      contract_liquidation_heatmap: '/api/contract-liquidation/heatmap',
       contract_liquidation_health: '/api/contract-liquidation/health',
       contract_liquidation_persistence_health: getContractLiquidationPersistenceHealth(),
       contract_liquidation_periods: ['15m', '1h', '4h', '12h', '24h', '3d', '7d', '14d'],
       contract_liquidation_history_intervals_step997: ['1m', '5m', '15m', '1H', '6H', '24H'],
       contract_liquidation_history_default_backward_compatible: '1h',
       contract_liquidation_gate_liq_orders_background_only: true,
-      contract_liquidation_scope: 'official_maximum_five_provider_market_layer_plus_focused_five_by_three_fallback_plus_single_symbol',
+      contract_liquidation_scope: 'official_maximum_five_provider_market_layer_plus_focused_five_by_three_fallback_plus_single_symbol_plus_realized_price_heatmap',
+      contract_liquidation_heatmap_semantics: 'actual_realized_events_only_not_estimated_risk',
       market_light_rollout: 'step980_6_3_4_1_binance_changed_only_ticker_fix_ws_api_latest_price_baseline_no_app_cutover',
       contract_funding: '/api/contract-funding',
       contract_funding_history: '/api/contract-funding/history',
