@@ -2,7 +2,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { getContractDepthSharedOrderbook } from './contract-depth.mjs';
 import { getContractFlowInternalFocusSnapshot, reconcileContractFlowFocusPool } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.5';
+const VERSION = '650.8.15.6';
 const SNAPSHOT_ROUTE = '/api/contract-deep-shared/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-deep-shared/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -18,7 +18,8 @@ const DEPTH_FAILED_RECOVERY_MAX_PER_PROVIDER_PER_CYCLE = 1;
 const DEPTH_HEALTHY_REFRESH_RESERVED_PER_PROVIDER_PER_CYCLE = 3;
 const SCAN_INTERVAL_MS = 15_000;
 const STARTUP_DELAY_MS = 12_000;
-const DEPTH_STALE_MS = 95_000;
+const DEPTH_STALE_MS = Math.max(95_000, Number(process.env.KAKA_DEEP_DEPTH_STALE_MS || 120_000));
+const FOCUS_HANDOVER_GRACE_MS = Math.max(30_000, Number(process.env.KAKA_DEEP_FOCUS_HANDOVER_GRACE_MS || 90_000));
 const RESPONSE_CACHE_TTL_MS = 8_000;
 const FLOW_RECONCILE_MIN_INTERVAL_MS = 60_000;
 
@@ -44,6 +45,11 @@ let depthReadAttempts = 0;
 let depthReadSuccesses = 0;
 let depthReadFailures = 0;
 let depthCooldownSkips = 0;
+let lastGoodCompletePayload = null;
+let lastGoodCompleteAt = 0;
+let lastGoodCompleteSignature = '';
+let focusHandoverCount = 0;
+let focusHandoverServedReads = 0;
 
 const cursors = Object.fromEntries(PROVIDERS.map((provider) => [provider, 0]));
 const depthState = new Map();
@@ -252,39 +258,29 @@ function nextDepthTargets(focus) {
       }
     }
 
-    // Healthy rows always retain the remaining bounded budget. Rows currently
-    // in a failure state are intentionally not selected here; their retry is
-    // handled only by the bounded failed-recovery lane above.
-    let cursor = Math.max(0, Number(cursors[provider] || 0)) % rows.length;
-    let visited = 0;
-    while (selected.length < count && visited < rows.length) {
-      const row = rows[(cursor + visited) % rows.length];
-      const key = `${provider}:${row.symbol}`;
-      const current = depthState.get(key) || null;
-      const cooling = depthRetryNotBeforeMs(current) > now;
-      const failed = Boolean(
-        String(current?.depth_last_refresh_error || '').trim() ||
-        String(current?.depth_error || '').trim()
-      );
-      const hasVerifiedSample = Boolean(current && Number(current.depth_sampled_at_ms || 0) > 0);
+    // Step1004.1.5: remaining healthy slots are age/deadline driven rather
+    // than cursor driven. The oldest verified sample is always refreshed first.
+    const healthy = classified
+      .filter((item) =>
+        item.hasVerifiedSample &&
+        !item.hasFailure &&
+        !item.cooling &&
+        !selectedKeys.has(item.key)
+      )
+      .sort((a, b) => {
+        const aSample = Number(a.current?.depth_sampled_at_ms || 0);
+        const bSample = Number(b.current?.depth_sampled_at_ms || 0);
+        return aSample - bSample || a.index - b.index;
+      });
 
-      if (cooling) {
-        depthCooldownSkips += 1;
-        visited += 1;
-        continue;
-      }
-      if (failed || !hasVerifiedSample) {
-        visited += 1;
-        continue;
-      }
-      if (!selectedKeys.has(key)) {
-        selected.push(row);
-        selectedKeys.add(key);
-      }
-      visited += 1;
+    for (const item of healthy) {
+      if (selected.length >= count) break;
+      selected.push(item.row);
+      selectedKeys.add(item.key);
     }
 
-    cursors[provider] = (cursor + Math.max(1, visited)) % rows.length;
+    // Keep the legacy cursor observable for compatibility only.
+    cursors[provider] = (Number(cursors[provider] || 0) + selected.length) % rows.length;
     targets.push(...selected);
   }
 
@@ -513,13 +509,31 @@ function currentPayload() {
     row.flow_ready === true &&
     ((row.flow_large_buy_quote ?? 0) + (row.flow_large_sell_quote ?? 0)) > 0
   ).length;
+  const desiredFocusSignature = focusSignature(focus);
+  const liveReady =
+    focus.ready &&
+    rows.length === TARGET_ROWS &&
+    depthFreshRows === TARGET_ROWS &&
+    Number(flow.active_rows || 0) === TARGET_ROWS &&
+    Number(flow.connected_rows || 0) === TARGET_ROWS;
+
   const payload = {
     ok: true,
     version: VERSION,
     source: 'render_shared_focus_pool_depth20_plus_existing_contract_flow_websocket',
-    ready: focus.ready && rows.length === TARGET_ROWS && depthFreshRows === TARGET_ROWS && Number(flow.active_rows || 0) === TARGET_ROWS,
+    ready: liveReady,
+    live_ready: liveReady,
     focus_pool_ready: focus.ready,
     focus_pool_round: focus.round,
+    focus_signature: desiredFocusSignature,
+    desired_focus_round: focus.round,
+    desired_focus_signature: desiredFocusSignature,
+    active_focus_round: focus.round,
+    active_focus_signature: desiredFocusSignature,
+    focus_handover_pending: false,
+    focus_handover_serving_last_good: false,
+    focus_handover_age_ms: 0,
+    focus_handover_grace_ms: FOCUS_HANDOVER_GRACE_MS,
     provider_count: PROVIDERS.length,
     target_per_provider: TARGET_PER_PROVIDER,
     target_rows: TARGET_ROWS,
@@ -537,6 +551,11 @@ function currentPayload() {
     healthy_refresh_reserved_per_provider_per_cycle: DEPTH_HEALTHY_REFRESH_RESERVED_PER_PROVIDER_PER_CYCLE,
     failed_rows_cannot_monopolize_provider_cycle: true,
     healthy_rows_refresh_budget_preserved_under_failures: true,
+    healthy_refresh_scheduler: 'oldest_verified_sample_first',
+    cursor_no_longer_controls_healthy_refresh_order: true,
+    stale_threshold_seconds: Math.round(DEPTH_STALE_MS / 1000),
+    atomic_focus_handover_enabled: true,
+    atomic_focus_handover_grace_seconds: Math.round(FOCUS_HANDOVER_GRACE_MS / 1000),
     flow_active_rows: Number(flow.active_rows || 0),
     flow_connected_rows: Number(flow.connected_rows || 0),
     flow_value_rows: flowRows,
@@ -559,6 +578,55 @@ function currentPayload() {
     depth_uses_existing_contract_depth_cache_inflight_governor: true,
     generated_at: lastCompletedAt,
   };
+  if (liveReady) {
+    if (
+      lastGoodCompleteSignature &&
+      lastGoodCompleteSignature !== desiredFocusSignature
+    ) {
+      focusHandoverCount += 1;
+    }
+    lastGoodCompletePayload = clone(payload);
+    lastGoodCompleteAt = now;
+    lastGoodCompleteSignature = desiredFocusSignature;
+    responseCache = { at: Date.now(), payload };
+    return { ...clone(payload), cache_hit: false, cache_age_ms: 0 };
+  }
+
+  const handoverAgeMs = lastGoodCompleteAt > 0
+    ? Math.max(0, now - lastGoodCompleteAt)
+    : null;
+  const focusChanged =
+    Boolean(lastGoodCompletePayload) &&
+    Boolean(lastGoodCompleteSignature) &&
+    lastGoodCompleteSignature !== desiredFocusSignature;
+
+  if (
+    focusChanged &&
+    handoverAgeMs != null &&
+    handoverAgeMs <= FOCUS_HANDOVER_GRACE_MS
+  ) {
+    focusHandoverServedReads += 1;
+    const fallback = {
+      ...clone(lastGoodCompletePayload),
+      ready: true,
+      live_ready: false,
+      focus_handover_pending: true,
+      focus_handover_serving_last_good: true,
+      focus_handover_age_ms: handoverAgeMs,
+      focus_handover_grace_ms: FOCUS_HANDOVER_GRACE_MS,
+      desired_focus_round: focus.round,
+      desired_focus_signature: desiredFocusSignature,
+      active_focus_round: Number(lastGoodCompletePayload?.focus_pool_round || 0),
+      active_focus_signature: lastGoodCompleteSignature,
+      handover_live_depth_fresh_rows: depthFreshRows,
+      handover_live_flow_active_rows: Number(flow.active_rows || 0),
+      handover_live_flow_connected_rows: Number(flow.connected_rows || 0),
+      handover_policy: 'serve_last_complete_real_focus_until_new_focus_complete_or_grace_expires',
+    };
+    responseCache = { at: Date.now(), payload: fallback };
+    return { ...clone(fallback), cache_hit: false, cache_age_ms: 0 };
+  }
+
   responseCache = { at: Date.now(), payload };
   return { ...clone(payload), cache_hit: false, cache_age_ms: 0 };
 }
@@ -588,6 +656,21 @@ export function getContractDeepSharedHealth() {
     healthy_refresh_reserved_per_provider_per_cycle: DEPTH_HEALTHY_REFRESH_RESERVED_PER_PROVIDER_PER_CYCLE,
     failed_rows_cannot_monopolize_provider_cycle: true,
     healthy_rows_refresh_budget_preserved_under_failures: true,
+    healthy_refresh_scheduler: payload.healthy_refresh_scheduler,
+    cursor_no_longer_controls_healthy_refresh_order: payload.cursor_no_longer_controls_healthy_refresh_order === true,
+    stale_threshold_seconds: payload.stale_threshold_seconds,
+    live_ready: payload.live_ready === true,
+    atomic_focus_handover_enabled: true,
+    focus_handover_pending: payload.focus_handover_pending === true,
+    focus_handover_serving_last_good: payload.focus_handover_serving_last_good === true,
+    focus_handover_age_ms: payload.focus_handover_age_ms,
+    focus_handover_grace_seconds: Math.round(FOCUS_HANDOVER_GRACE_MS / 1000),
+    focus_handover_count: focusHandoverCount,
+    focus_handover_served_reads: focusHandoverServedReads,
+    desired_focus_round: payload.desired_focus_round,
+    active_focus_round: payload.active_focus_round,
+    desired_focus_signature: payload.desired_focus_signature,
+    active_focus_signature: payload.active_focus_signature,
     flow_active_rows: payload.flow_active_rows,
     flow_connected_rows: payload.flow_connected_rows,
     flow_value_rows: payload.flow_value_rows,
