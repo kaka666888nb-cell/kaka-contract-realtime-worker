@@ -1,5 +1,5 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
-import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
+import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
 const VERSION = '650.8.15.8';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';

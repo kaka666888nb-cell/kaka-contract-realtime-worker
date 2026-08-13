@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
-import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
+import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
 const VERSION = '650.8.15.3';
 const SNAPSHOT_ROUTE = '/api/okx-advanced/current-snapshot';

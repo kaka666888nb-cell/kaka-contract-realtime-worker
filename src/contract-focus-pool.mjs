@@ -1,4 +1,4 @@
-import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
+import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
 const VERSION = '650.8.15.4';
 const SNAPSHOT_ROUTE = '/api/contract-focus-pool/current-snapshot';

@@ -1,4 +1,4 @@
-import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
+import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
 const STEP_VERSION = '650.8.15.1';
 const CURRENT_ROUTE = '/api/contract-basis/current-snapshot';

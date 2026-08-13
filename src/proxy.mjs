@@ -2,7 +2,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { getContractFlowHealth, handleContractFlow, startContractFlowUniverseScanner } from './contract-flow.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
-import { getBinanceLiquidationWsHealth, getContractLiquidationPersistenceHealth, handleContractLiquidation } from './contract-liquidation.mjs';
+import { getBinanceLiquidationWsHealth, getContractLiquidationPersistenceHealth, startLiquidationBridge } from './liquidation-bridge.mjs';
 import { handleContractFunding, startContractFundingHistoryMaintainer } from './contract-funding.mjs';
 import { beginBinanceRestShutdown, getBinanceRestGuardHealth, runWithBinanceRequestSignal } from './binance-rest-guard.mjs';
 import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
@@ -12,7 +12,7 @@ import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurre
 import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ticker.mjs';
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
-import { getMarketLightSnapshotHealth, handleMarketLightSnapshot, startMarketLightSnapshotScanner } from './market-light-snapshot.mjs';
+import { getMarketLightSnapshotHealth, startMarketLightBridge } from './market-light-bridge.mjs';
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { getContractFocusPoolHealth, handleContractFocusPool, startContractFocusPoolScanner } from './contract-focus-pool.mjs';
 import { getContractDeepSharedHealth, handleContractDeepShared, startContractDeepSharedScanner } from './contract-deep-shared.mjs';
@@ -23,16 +23,19 @@ import { getGateAdvancedStatsHealth, handleGateAdvancedStats, startGateAdvancedS
 import { getOkxAdvancedStatsHealth, handleOkxAdvancedStats, startOkxAdvancedStatsScanner } from './okx-advanced-stats.mjs';
 import { getBybitAdvancedStatsHealth, handleBybitAdvancedStats, startBybitAdvancedStatsScanner } from './bybit-advanced-stats.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
+import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.118';
+const STEP_VERSION = '650.8.15.119';
 installProviderGovernorFetch({ role: 'parent-http-api' });
+startCollectorIsolationSupervisor();
+startMarketLightBridge();
+startLiquidationBridge();
 startContractFlowUniverseScanner();
 startContractFundingHistoryMaintainer();
 startSpotCurrentSnapshotScanner();
-startMarketLightSnapshotScanner();
 startContractBasisScanner();
 startContractFocusPoolScanner();
 startContractDeepSharedScanner();
@@ -320,6 +323,7 @@ const server = http.createServer(async (req, res) => {
       market_light_current_snapshot: '/api/market-light/current-snapshot',
       market_light_health: '/api/market-light/health',
       market_light_state: getMarketLightSnapshotHealth(),
+      collector_isolation_first_batch: getCollectorIsolationHealth(),
       source_capabilities_current_snapshot: '/api/source-capabilities/current-snapshot',
       source_capabilities_health: '/api/source-capabilities/health',
       source_capabilities_state: getSourceCapabilityRegistryHealth(),
@@ -862,6 +866,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (proxyIsolatedCollectorRequest(req, res, url)) return;
+
   const requestAbortController = new AbortController();
   const abortQueuedWork = () => {
     if (!res.writableEnded && !requestAbortController.signal.aborted) requestAbortController.abort();
@@ -875,7 +881,6 @@ const server = http.createServer(async (req, res) => {
     // queued/paced work; an already-started upstream request is still fully observed.
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
-      if (await handleMarketLightSnapshot(req, res, url)) return true;
       if (await handleSourceCapabilityRegistry(req, res, url)) return true;
       if (await handleBinanceAdvancedStats(req, res, url)) return true;
       if (await handleBitgetAdvancedStats(req, res, url)) return true;
@@ -892,7 +897,6 @@ const server = http.createServer(async (req, res) => {
       if (await handleMarketApi(req, res, url)) return true;
       if (await handleContractDepth(req, res, url)) return true;
       if (await handleContractFunding(req, res, url)) return true;
-      if (await handleContractLiquidation(req, res, url)) return true;
       if (await handleContractFlow(req, res, url)) return true;
       return false;
     });
