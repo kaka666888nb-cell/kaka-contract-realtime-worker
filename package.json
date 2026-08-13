@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.116",
+  "version": "650.8.15.117",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.116 / Step1002 OKX official 5m open-interest history shared persistence + explicit backend rollups"
+  "description": "Kaka contract realtime worker 650.8.15.117 / Step1003 Gate official 5m contract-stat history reuse + semantic 1h/1d rollups"
 }
