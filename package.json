@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.130",
+  "version": "650.8.15.131",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka worker 650.8.15.130 / Step1004.8 closes original Step1000 with a bounded 5m/15m/1H/1D history lifecycle and 370-day daily rollup over existing shared persistent data"
+  "description": "Kaka worker 650.8.15.131 / Step1004.8 closes original Step1000 with a bounded 5m/15m/1H/1D history lifecycle and 370-day daily rollup over existing shared persistent data"
 }
