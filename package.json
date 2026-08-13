@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.109",
+  "version": "650.8.15.110",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.109 / V46 closure Bitget delayed liquidation REST nonblocking shared reconciler + Binance shared recovery"
+  "description": "Kaka contract realtime worker 650.8.15.110 / Step1000 Bitget official risk-reserve daily+hourly history shared pool-dedup collector"
 }
