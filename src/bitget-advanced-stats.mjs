@@ -1,10 +1,11 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.7';
+const VERSION = '650.8.15.8';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
+const SPOT_FLOW_HISTORY_ROUTE = '/api/bitget-advanced/spot-flow-history';
 const BASE = 'https://api.bitget.com';
 
 const START_DELAY_MS = Math.max(2_000, Number(process.env.KAKA_BITGET_ADVANCED_START_DELAY_MS || 8_000));
@@ -35,6 +36,14 @@ const OFFICIAL_HISTORY_LANES = Object.freeze([
   'futures_position_long_short',
   'futures_account_long_short',
 ]);
+const SPOT_TIMESTAMPED_HISTORY_LANES = Object.freeze([
+  'spot_whale_flow',
+  'spot_net_flow',
+]);
+const SPOT_TIMESTAMPED_HISTORY_LIMIT = Math.max(
+  36,
+  Math.min(2_016, Number(process.env.KAKA_BITGET_SPOT_TIMESTAMPED_HISTORY_LIMIT || 576)),
+);
 
 let started = false;
 let focusRunning = null;
@@ -86,6 +95,13 @@ const contractOfficial5mHistory = new Map(
 let official5mHistoryCaptures = 0;
 let official5mHistoryRowsCaptured = 0;
 let official5mHistoryLastUpdatedAt = null;
+
+const spotTimestampedHistory = new Map(
+  SPOT_TIMESTAMPED_HISTORY_LANES.map((lane) => [lane, new Map()]),
+);
+let spotHistoryCaptures = 0;
+let spotHistoryRowsCaptured = 0;
+let spotHistoryLastUpdatedAt = null;
 
 const responseCache = new Map();
 const laneStats = new Map();
@@ -157,7 +173,7 @@ async function fetchJson(path, { timeoutMs = 18_000, lane = 'unknown' } = {}) {
     const response = await fetch(`${BASE}${path}`, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.96 bitget-advanced-shared',
+        'user-agent': 'KakaWeb3/650.8.15.118 bitget-advanced-shared',
       },
       signal: controller.signal,
     });
@@ -302,6 +318,182 @@ function captureOfficial5mHistory(lane, symbol, payload) {
   official5mHistoryRowsCaptured += limited.length;
   official5mHistoryLastUpdatedAt = new Date().toISOString();
   return limited.length;
+}
+
+
+function normalizedSpotTimestampedHistoryRow(lane, raw, symbol) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  if (lane === 'spot_whale_flow') {
+    const ts = Number(raw?.date ?? raw?.ts ?? 0);
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    return {
+      provider: 'bitget',
+      market_type: 'spot',
+      symbol,
+      lane,
+      ts,
+      source_time: isoMs(ts),
+      whale_net_volume: finite(raw?.volume),
+      official: true,
+      derived: false,
+      source: 'bitget_official_spot_whale_flow_timestamped',
+    };
+  }
+
+  if (lane === 'spot_net_flow') {
+    const ts = Number(raw?.ts ?? raw?.date ?? 0);
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    return {
+      provider: 'bitget',
+      market_type: 'spot',
+      symbol,
+      lane,
+      ts,
+      source_time: isoMs(ts),
+      net_capital_inflow_24h: finite(raw?.netFlow),
+      official: true,
+      derived: false,
+      source: 'bitget_official_spot_net_capital_24h_timestamped',
+    };
+  }
+
+  return null;
+}
+
+function captureSpotTimestampedHistory(lane, symbol, payload) {
+  const laneMap = spotTimestampedHistory.get(lane);
+  if (!laneMap) return 0;
+
+  const rawRows = Array.isArray(payload?.data) ? payload.data : [];
+  const incoming = rawRows
+    .map((raw) => normalizedSpotTimestampedHistoryRow(lane, raw, symbol))
+    .filter(Boolean);
+
+  const previous = laneMap.get(symbol)?.rows || [];
+  const byTime = new Map();
+  for (const row of [...previous, ...incoming]) {
+    const ts = Number(row?.ts || 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    byTime.set(ts, row);
+  }
+
+  const rows = [...byTime.values()]
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-SPOT_TIMESTAMPED_HISTORY_LIMIT);
+
+  laneMap.set(symbol, {
+    provider: 'bitget',
+    market_type: 'spot',
+    symbol,
+    lane,
+    official: true,
+    native_timestamped_history: true,
+    derived: false,
+    row_count: rows.length,
+    rows,
+    captured_at: new Date().toISOString(),
+    additional_exchange_requests: 0,
+    reused_existing_step991_response_array: true,
+  });
+
+  spotHistoryCaptures += 1;
+  spotHistoryRowsCaptured += incoming.length;
+  spotHistoryLastUpdatedAt = new Date().toISOString();
+  return rows.length;
+}
+
+function spotTimestampedHistoryCoverage() {
+  const focus = bitgetFocusTargets();
+  const spotSymbols = bitgetSpotTargetSymbols(focus.rows);
+  const lanes = {};
+  let allReady = spotSymbols.length > 0;
+
+  for (const lane of SPOT_TIMESTAMPED_HISTORY_LANES) {
+    const laneMap = spotTimestampedHistory.get(lane);
+    const covered = spotSymbols.filter(
+      (symbol) => Number(laneMap?.get(symbol)?.row_count || 0) > 0,
+    ).length;
+    const totalRows = spotSymbols.reduce(
+      (sum, symbol) => sum + Number(laneMap?.get(symbol)?.row_count || 0),
+      0,
+    );
+    lanes[lane] = {
+      spot_coverage: covered,
+      spot_target: spotSymbols.length,
+      official_timestamped_rows: totalRows,
+    };
+    if (covered !== spotSymbols.length) allReady = false;
+  }
+
+  return {
+    ready: focus.focus_ready && spotSymbols.length > 0 && allReady,
+    spot_target: spotSymbols.length,
+    spot_symbols: spotSymbols,
+    official_lane_count: SPOT_TIMESTAMPED_HISTORY_LANES.length,
+    native_timestamped_history_limit: SPOT_TIMESTAMPED_HISTORY_LIMIT,
+    lanes,
+    captures: spotHistoryCaptures,
+    rows_captured_total: spotHistoryRowsCaptured,
+    last_updated_at: spotHistoryLastUpdatedAt,
+    additional_exchange_requests: 0,
+    reused_existing_step991_response_arrays: true,
+    shared_backend_memory: true,
+    native_official_timestamps_only: true,
+    no_synthetic_interval_rollup: true,
+    fund_flow_period_matrix_separate: true,
+    user_reads_trigger_exchange_requests: false,
+    user_reads_trigger_exchange_connections: false,
+    reads_scale_with_users: false,
+  };
+}
+
+function spotTimestampedHistorySnapshot({ symbol, lane } = {}) {
+  const cleanSymbol = compact(symbol);
+  if (!cleanSymbol) {
+    return { ok: false, version: VERSION, error: 'symbol_required' };
+  }
+  if (!SPOT_TIMESTAMPED_HISTORY_LANES.includes(lane)) {
+    return {
+      ok: false,
+      version: VERSION,
+      error: 'unsupported_lane',
+      supported_lanes: [...SPOT_TIMESTAMPED_HISTORY_LANES],
+    };
+  }
+
+  const item = spotTimestampedHistory.get(lane)?.get(cleanSymbol) || null;
+  if (!item) {
+    return {
+      ok: true,
+      version: VERSION,
+      provider: 'bitget',
+      market_type: 'spot',
+      symbol: cleanSymbol,
+      lane,
+      ready: false,
+      official: true,
+      native_timestamped_history: true,
+      derived: false,
+      row_count: 0,
+      rows: [],
+      additional_exchange_requests: 0,
+      user_read_triggered_exchange_requests: false,
+      user_read_triggered_exchange_connections: false,
+      reads_scale_with_users: false,
+    };
+  }
+
+  return {
+    ok: true,
+    version: VERSION,
+    ready: true,
+    ...clone(item),
+    additional_exchange_requests: 0,
+    user_read_triggered_exchange_requests: false,
+    user_read_triggered_exchange_connections: false,
+    reads_scale_with_users: false,
+  };
 }
 
 function averageFinite(rows, field) {
@@ -499,6 +691,7 @@ async function runPerSymbolLane(name, symbols, pathFor, parse) {
     try {
       const payload = await fetchJson(pathFor(symbol), { lane: name });
       if (OFFICIAL_HISTORY_LANES.includes(name)) captureOfficial5mHistory(name, symbol, payload);
+      if (SPOT_TIMESTAMPED_HISTORY_LANES.includes(name)) captureSpotTimestampedHistory(name, symbol, payload);
       const parsed = parse(payload, symbol);
       if (parsed) results.set(symbol, parsed);
     } catch (_) {}
@@ -1361,6 +1554,11 @@ function snapshotPayload({ includeRows = true } = {}) {
     contract_history_user_reads_trigger_exchange_requests: false,
     contract_history_reads_scale_with_users: false,
     contract_history_derived_intervals: contractHistory.derived_intervals,
+    spot_timestamped_history: spotTimestampedHistoryCoverage(),
+    spot_timestamped_history_route: SPOT_FLOW_HISTORY_ROUTE,
+    spot_timestamped_history_ready: spotTimestampedHistoryCoverage().ready,
+    spot_timestamped_history_additional_exchange_requests: 0,
+    spot_timestamped_history_reuses_existing_step991_response_arrays: true,
     focus_refresh_seconds: Math.round(FOCUS_REFRESH_MS / 1000),
     batch_refresh_seconds: Math.round(BATCH_REFRESH_MS / 1000),
     one_per_second_lane_gap_ms: ONE_PER_SECOND_GAP_MS,
@@ -1384,6 +1582,8 @@ function snapshotPayload({ includeRows = true } = {}) {
       spot_whale_flow: 'Bitget official whale buy/sell net volume; never relabeled as our derived taker flow',
       spot_fund_flow: 'Bitget official whale/dolphin/fish buy/sell volume and ratio',
       spot_net_capital_24h: 'Bitget official 24h net capital inflow',
+      spot_whale_net_timestamped_history: 'Whale-flow date rows and 24h net-capital ts rows from the already-existing Step991 response arrays are retained as native official timestamped history with zero additional Bitget requests',
+      spot_fund_flow_history_boundary: 'Spot fund-flow returns an aggregate object for a requested official period and the documented response has no official timestamp, so Step1004 does not relabel backend observation time as official history',
       futures_active_buy_sell: 'Bitget official 5m active buy/sell volume',
       futures_long_short: 'Bitget official 5m long/short ratio',
       futures_position_long_short: 'Bitget official 5m active long/short position ratio',
@@ -1485,7 +1685,7 @@ function sendJson(res, status, payload) {
 }
 
 export async function handleBitgetAdvancedStats(req, res, url) {
-  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, HISTORY_ROUTE].includes(url.pathname)) return false;
+  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, HISTORY_ROUTE, SPOT_FLOW_HISTORY_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -1513,6 +1713,14 @@ export async function handleBitgetAdvancedStats(req, res, url) {
     sendJson(res, payload.ok === false ? 400 : 200, payload);
     return true;
   }
+  if (url.pathname === SPOT_FLOW_HISTORY_ROUTE) {
+    const payload = spotTimestampedHistorySnapshot({
+      symbol: url.searchParams.get('symbol') || '',
+      lane: url.searchParams.get('lane') || '',
+    });
+    sendJson(res, payload.ok === false ? 400 : 200, payload);
+    return true;
+  }
   sendJson(res, 200, snapshotPayload({ includeRows: true }));
   return true;
 }
@@ -1532,3 +1740,9 @@ export const __bitgetAdvancedTest = Object.freeze({
 export const __bitgetStep1000Test = Object.freeze({ parseRiskReserveHistory, riskReservePoolKey, riskHistoryRecoveryDelayMs });
 
 export const __bitgetStep1001Test = Object.freeze({ normalizedHistoryRowForLane, derivedRollupRows, contractHistorySnapshot });
+export const __bitgetStep1004Test = Object.freeze({
+  normalizedSpotTimestampedHistoryRow,
+  captureSpotTimestampedHistory,
+  spotTimestampedHistoryCoverage,
+  spotTimestampedHistorySnapshot,
+});
