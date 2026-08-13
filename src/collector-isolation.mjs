@@ -1,14 +1,15 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
+import { randomUUID } from 'node:crypto';
 
-const VERSION = '650.8.15.123';
+const VERSION = '650.8.15.124';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
 const SLOW_STATS_PORT = Number(process.env.KAKA_SLOW_STATS_COLLECTOR_PORT || 10014);
-const DEEP_MARKET_MAX_OLD_MB = Math.max(48, Number(process.env.KAKA_DEEP_MARKET_WORKER_MAX_OLD_MB || 96));
-const SLOW_STATS_MAX_OLD_MB = Math.max(48, Number(process.env.KAKA_SLOW_STATS_WORKER_MAX_OLD_MB || 112));
+const DEEP_MARKET_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_DEEP_MARKET_WORKER_MAX_OLD_MB || 144));
+const SLOW_STATS_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_SLOW_STATS_WORKER_MAX_OLD_MB || 144));
 const RESTART_BASE_MS = Math.max(1_000, Number(process.env.KAKA_COLLECTOR_RESTART_BASE_MS || 2_000));
 const RESTART_MAX_MS = Math.max(RESTART_BASE_MS, Number(process.env.KAKA_COLLECTOR_RESTART_MAX_MS || 30_000));
 
@@ -27,6 +28,8 @@ const ROLES = Object.freeze({
   }),
 });
 
+const INSTANCE_ID = randomUUID();
+const INSTANCE_STARTED_AT = new Date().toISOString();
 const state = new Map();
 let started = false;
 let shuttingDown = false;
@@ -316,8 +319,17 @@ export function getCollectorIsolationHealth() {
   return {
     ok: true,
     version: VERSION,
+    instance_id: INSTANCE_ID,
+    instance_started_at: INSTANCE_STARTED_AT,
     enabled: started,
     parent_pid: process.pid,
+    host_process_memory: {
+      rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+      heap_total_mb: Math.round(process.memoryUsage().heapTotal / 1048576),
+      heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+      external_mb: Math.round(process.memoryUsage().external / 1048576),
+      array_buffers_mb: Math.round(process.memoryUsage().arrayBuffers / 1048576),
+    },
     role_count: Object.keys(ROLES).length,
     roles,
 
@@ -357,7 +369,9 @@ export function getCollectorIsolationHealth() {
     slow_stats_owns_advanced_modules: true,
     parent_routes_second_batch_to_workers: true,
 
-    memory_safety_design: 'first_batch_child_processes_plus_second_batch_resource_limited_worker_isolates',
+    memory_safety_design: 'first_batch_child_processes_plus_second_batch_resource_limited_worker_isolates_plus_projected_internal_bridges',
+    projected_internal_bridge_payloads: true,
+    full_market_rows_not_copied_to_second_batch: true,
     timestamp_ms: Date.now(),
   };
 }

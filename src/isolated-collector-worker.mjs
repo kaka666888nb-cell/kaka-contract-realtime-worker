@@ -1,13 +1,14 @@
 import http from 'node:http';
 import { isMainThread, threadId, workerData } from 'node:worker_threads';
 import { installProviderGovernorFetch, getProviderGovernorHealth } from './provider-request-governor.mjs';
+import { projectMarketLightSnapshot, scopeTargets } from './market-light-bridge-projection.mjs';
 
 const ROLE = String(workerData?.role || process.env.KAKA_ISOLATED_COLLECTOR_ROLE || '').trim();
 const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT || 0);
 process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
 process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
 if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
-const VERSION = '650.8.15.123';
+const VERSION = '650.8.15.124';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -38,25 +39,10 @@ if (ROLE === 'market-light') {
   internalState = (url) => {
     const scope = String(url?.searchParams?.get('scope') || 'parent');
     const providers = {};
-    const wanted = scope === 'deep-market'
-      ? [
-          ['contract', 'binance'], ['contract', 'okx'], ['contract', 'bybit'],
-          ['contract', 'bitget'], ['contract', 'gate'],
-        ]
-      : scope === 'slow-stats'
-        ? [
-            ['spot', 'bitget'],
-            ['contract', 'bitget'], ['contract', 'okx'], ['contract', 'bybit'],
-          ]
-        : [
-            ['spot', 'binance'], ['spot', 'coinbase'], ['spot', 'okx'],
-            ['spot', 'bybit'], ['spot', 'bitget'], ['spot', 'gate'],
-            ['contract', 'binance'], ['contract', 'okx'], ['contract', 'bybit'],
-            ['contract', 'bitget'], ['contract', 'gate'],
-          ];
-
+    const wanted = scopeTargets(scope);
     for (const [market, provider] of wanted) {
-      providers[`${market}:${provider}`] = module.getMarketLightInternalSnapshot({ market, provider });
+      const full = module.getMarketLightInternalSnapshot({ market, provider });
+      providers[`${market}:${provider}`] = projectMarketLightSnapshot(full, { scope, market, provider });
     }
     return {
       ok: true,
@@ -70,6 +56,10 @@ if (ROLE === 'market-light') {
       uptime_seconds: Math.round(process.uptime()),
       state_scope: scope,
       provider_snapshot_count: Object.keys(providers).length,
+      memory_usage: {
+        rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+        heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+      },
       provider_governor: getProviderGovernorHealth(),
       health: module.getMarketLightSnapshotHealth(),
       providers,
@@ -90,6 +80,10 @@ if (ROLE === 'market-light') {
     thread_id: null,
     ppid: process.ppid,
     uptime_seconds: Math.round(process.uptime()),
+    memory_usage: {
+      rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+      heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    },
     provider_governor: getProviderGovernorHealth(),
     liquidation_persistence: module.getContractLiquidationPersistenceHealth(),
     binance_liquidation_ws: module.getBinanceLiquidationWsHealth(),
@@ -141,6 +135,10 @@ if (ROLE === 'market-light') {
       thread_id: threadId,
       uptime_seconds: Math.round(process.uptime()),
       state_scope: scope,
+      memory_usage: {
+        rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+        heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+      },
       provider_governor: getProviderGovernorHealth(),
       market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
       focus_health: focusHealth,
@@ -186,6 +184,10 @@ if (ROLE === 'market-light') {
     pid: process.pid,
     thread_id: threadId,
     uptime_seconds: Math.round(process.uptime()),
+    memory_usage: {
+      rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+      heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    },
     provider_governor: getProviderGovernorHealth(),
     market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
     deep_market_bridge: deepBridge.getDeepMarketBridgeHealth(),

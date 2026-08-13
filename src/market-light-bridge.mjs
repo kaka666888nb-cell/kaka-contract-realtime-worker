@@ -1,10 +1,18 @@
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.123';
-const POLL_MS = Math.max(500, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_POLL_MS || 1_500));
-const STALE_MS = Math.max(5_000, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_STALE_MS || 10_000));
+const VERSION = '650.8.15.124';
 const CONSUMER_ROLE = String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || 'parent').trim() || 'parent';
 const STATE_SCOPE = CONSUMER_ROLE === 'deep-market' ? 'deep-market' : CONSUMER_ROLE === 'slow-stats' ? 'slow-stats' : 'parent';
+const DEFAULT_POLL_MS =
+  CONSUMER_ROLE === 'slow-stats' ? 8_000 :
+  CONSUMER_ROLE === 'deep-market' ? 5_000 :
+  2_500;
+const DEFAULT_STALE_MS =
+  CONSUMER_ROLE === 'slow-stats' ? 30_000 :
+  CONSUMER_ROLE === 'deep-market' ? 20_000 :
+  15_000;
+const POLL_MS = Math.max(750, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_POLL_MS || DEFAULT_POLL_MS));
+const STALE_MS = Math.max(5_000, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_STALE_MS || DEFAULT_STALE_MS));
 
 let timer = null;
 let running = false;
@@ -83,6 +91,8 @@ export function getMarketLightSnapshotHealth() {
     isolated_bridge_consumer_role: CONSUMER_ROLE,
     isolated_bridge_state_scope: STATE_SCOPE,
     isolated_bridge_provider_snapshot_count: providers.size,
+    isolated_bridge_projected_payloads: true,
+    isolated_bridge_full_row_copy_disabled: true,
     isolated_bridge_version: VERSION,
     isolated_bridge_poll_ms: POLL_MS,
     isolated_bridge_stale_ms: STALE_MS,

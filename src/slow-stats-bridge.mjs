@@ -1,8 +1,8 @@
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.123';
-const POLL_MS = Math.max(750, Number(process.env.KAKA_SLOW_STATS_BRIDGE_POLL_MS || 2_000));
-const STALE_MS = Math.max(6_000, Number(process.env.KAKA_SLOW_STATS_BRIDGE_STALE_MS || 12_000));
+const VERSION = '650.8.15.124';
+const POLL_MS = Math.max(1_000, Number(process.env.KAKA_SLOW_STATS_BRIDGE_POLL_MS || 5_000));
+const STALE_MS = Math.max(10_000, Number(process.env.KAKA_SLOW_STATS_BRIDGE_STALE_MS || 30_000));
 
 let timer = null;
 let running = false;

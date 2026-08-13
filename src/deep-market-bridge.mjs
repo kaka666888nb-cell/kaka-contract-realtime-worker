@@ -1,8 +1,8 @@
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.123';
-const POLL_MS = Math.max(750, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_POLL_MS || 2_000));
-const STALE_MS = Math.max(6_000, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_STALE_MS || 12_000));
+const VERSION = '650.8.15.124';
+const POLL_MS = Math.max(1_000, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_POLL_MS || 3_000));
+const STALE_MS = Math.max(8_000, Number(process.env.KAKA_DEEP_MARKET_BRIDGE_STALE_MS || 18_000));
 const CONSUMER_ROLE = String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || 'parent').trim() || 'parent';
 const STATE_SCOPE = CONSUMER_ROLE === 'slow-stats' ? 'slow-stats' : 'parent';
 
