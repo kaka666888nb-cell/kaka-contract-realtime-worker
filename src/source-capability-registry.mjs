@@ -6,6 +6,7 @@ import {
   getOkxAdvancedStatsHealth,
   getBybitAdvancedStatsHealth,
   getDerivativesPublicHealth,
+  getHistoryLifecycleHealth,
   getSlowStatsBridgeHealth,
 } from './slow-stats-bridge.mjs';
 import { getContractDepthHealth } from './contract-depth.mjs';
@@ -14,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.31';
+const VERSION = '650.8.15.32';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -149,6 +150,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const okxAdvanced = getOkxAdvancedStatsHealth();
   const bybitAdvanced = getBybitAdvancedStatsHealth();
   const derivativesPublic = getDerivativesPublicHealth();
+  const historyLifecycle = getHistoryLifecycleHealth();
   const contractDepth = getContractDepthHealth();
   const contractFocus = getContractFocusPoolHealth();
   const contractFlow = getContractFlowHealth();
@@ -831,6 +833,20 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       reads_scale_with_users: false,
     },
     capabilities: includeCapabilities ? CAPABILITIES : [],
+    step1000_history_lifecycle: {
+      ready: historyLifecycle?.ready === true && historyLifecycle?.step1000_ready === true,
+      version: historyLifecycle?.version || null,
+      lifecycle_matrix_declared: historyLifecycle?.lifecycle_matrix_declared === true,
+      one_day_persistence_present: historyLifecycle?.one_day_persistence_present === true,
+      one_day_storage_table: historyLifecycle?.one_day_storage_table || null,
+      one_day_retention_days: Number(historyLifecycle?.one_day_retention_days || 0),
+      one_day_rows: Number(historyLifecycle?.one_day_rows || 0),
+      one_day_provider_count: Number(historyLifecycle?.one_day_provider_count || 0),
+      user_reads_trigger_exchange_requests: historyLifecycle?.user_reads_trigger_exchange_requests === true,
+      user_reads_trigger_database_requests: historyLifecycle?.user_reads_trigger_database_requests === true,
+      reads_scale_with_users: historyLifecycle?.reads_scale_with_users === true,
+      raw_exchange_events_persisted: historyLifecycle?.raw_exchange_events_persisted === true,
+    },
     capability_count: CAPABILITIES.length,
     exchange_requests_started_by_user_read: 0,
     exchange_connections_started_by_user_read: 0,
@@ -869,7 +885,8 @@ export function getSourceCapabilityRegistryHealth() {
       payload.collector_isolation_second_batch.ready &&
       payload.step997_liquidation_history.ready &&
       payload.step998_liquidation_heatmap.ready &&
-      payload.step999_focus_hot_score.ready,
+      payload.step999_focus_hot_score.ready &&
+      payload.step1000_history_lifecycle.ready,
   };
 }
 

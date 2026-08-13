@@ -22,6 +22,7 @@ import {
   getOkxAdvancedStatsHealth,
   getBybitAdvancedStatsHealth,
   getDerivativesPublicHealth,
+  getHistoryLifecycleHealth,
   startSlowStatsBridge,
 } from './slow-stats-bridge.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
@@ -30,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.129';
+const STEP_VERSION = '650.8.15.130';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -323,6 +324,8 @@ const server = http.createServer(async (req, res) => {
       collector_isolation_first_batch: getCollectorIsolationHealth(),
       source_capabilities_current_snapshot: '/api/source-capabilities/current-snapshot',
       source_capabilities_health: '/api/source-capabilities/health',
+      history_lifecycle_current_snapshot: '/api/history-lifecycle/current-snapshot',
+      history_lifecycle_health: '/api/history-lifecycle/health',
       source_capabilities_state: getSourceCapabilityRegistryHealth(),
       derivatives_public_current_snapshot: '/api/derivatives-public/current-snapshot',
       derivatives_public_health: '/api/derivatives-public/health',
