@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.132",
+  "version": "650.8.15.133",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka worker 650.8.15.132 / Step1004.10 shared-read transport cache: coalesced localhost collector fetches plus reusable gzip response buffers for high-concurrency final pressure safety"
+  "description": "KakaWeb3 contract realtime worker Step1004.11 focus-hot membership hysteresis for slow-stat stability before final pressure gate"
 }
