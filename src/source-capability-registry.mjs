@@ -8,7 +8,7 @@ import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 import { getContractFlowHealth } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.13';
+const VERSION = '650.8.15.14';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -56,7 +56,8 @@ const CAPABILITIES = Object.freeze([
   { provider: 'bitget', market: 'contract', capability: 'ticker_mark_index_oi_funding_bbo', official_available: true, official_scope: 'product_batch', transport: 'REST/WS', batch_mode: 'USDT_FUTURES_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'selected_fields_bucketed_elsewhere', source_url: 'https://www.bitget.com/api-doc/uta/changelog' },
   { provider: 'bitget', market: 'contract', capability: 'next_funding_time_interval', official_available: true, official_scope: 'category_batch_symbol_optional', transport: 'REST', batch_mode: 'USDT-FUTURES_category_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step991', fallback_policy: 'last_verified_shared_snapshot_or_null', history_policy: 'none', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Current-Funding-Rate' },
   { provider: 'bitget', market: 'spot', capability: 'whale_fund_net_capital_flow', official_available: true, official_scope: 'per_symbol_focus_intersection', transport: 'REST', batch_mode: 'shared_focus15_slow_stats', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'funds_official', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: 'official_periods_plus_future_bucket_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/trading-data/Get-Spot-Whale-Net-Flow' },
-  { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short', official_available: true, official_scope: 'per_symbol_focus15', transport: 'REST', batch_mode: 'four_official_5m_focus_lanes', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: '5m_official_then_future_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
+  { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short', official_available: true, official_scope: 'per_symbol_focus15', transport: 'REST', batch_mode: 'four_official_5m_focus_lanes', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: 'official_5m_response_arrays_retained_step1001; 15m_1h_4h_1d_backend_rollups_explicitly_derived', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
+  { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short_history', official_available: true, official_scope: 'focus15_existing_5m_response_arrays', transport: 'reuse_existing_public_REST_responses', batch_mode: 'zero_additional_exchange_requests_capture_step991_response_arrays_plus_on_read_backend_rollups', rate_limit_class: 'zero_additional_upstream', collector: 'bitget-advanced-slow-stats', target_layer: 'contract_stats_history', current_integration: 'ready_step1001', fallback_policy: 'official_5m_missing_stays_missing; derived rollup missing stays missing; never cross-provider substitute', history_policy: 'official_5m_base_plus_explicitly_derived_15m_1h_4h_1d', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
   { provider: 'bitget', market: 'contract', capability: 'risk_reserve_position_tier_oi_limit_index_components', official_available: true, official_scope: 'batch_plus_focus15', transport: 'REST', batch_mode: 'risk_reserve_all_and_oi_limit_batch_plus_focus_tier_index', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step991', fallback_policy: 'missing', history_policy: 'risk_reserve_history_now_owned_by_step1000; current_reference_and_history_separate', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve-All' },
   { provider: 'bitget', market: 'contract', capability: 'risk_reserve_history', official_available: true, official_scope: 'focus15_mapped_to_current_official_reserve_pools', transport: 'public_REST', batch_mode: 'one_representative_focus_symbol_per_current_reserve_pool_for_daily_and_hourly_history', rate_limit_class: 'slow_shared_pool_dedup', collector: 'bitget-advanced-slow-stats', target_layer: 'risk_history', current_integration: 'ready_step1000', fallback_policy: 'last_shared_verified_until_stale_then_missing; official empty remains empty; no current-balance derivation', history_policy: 'native_official_daily_plus_native_official_hourly', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve' },
   { provider: 'bitget', market: 'contract', capability: 'liquidation_history', official_available: true, official_scope: 'category_wide_public_history_three_product_types', transport: 'public_REST', batch_mode: 'shared_background_delayed_closed_minute_reconcile_with_nonblocking_deferred_retry_after_public_ws_live_ingress', rate_limit_class: '5_per_sec_ip_bounded_350ms_gap', collector: 'liquidation-collector', target_layer: 'unified_history', current_integration: 'ready_v46_closure_step997_2_1', fallback_policy: 'live_ws_provisional_then_official_rest_reconcile; official empty/delayed/conflicting REST never overwrites; failed windows defer without blocking newer windows', history_policy: 'official_last_3_days_source_reconciles_nonzero_1m_buckets', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Liquidations' },
@@ -339,6 +340,27 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       user_reads_trigger_exchange_requests: bitgetAdvanced.risk_reserve_history?.user_reads_trigger_exchange_requests === true,
       reads_scale_with_users: bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === true,
     },
+    bitget_step1001: {
+      ready: bitgetAdvanced.contract_history?.ready === true &&
+        Number(bitgetAdvanced.contract_history?.focus_target || 0) === 15 &&
+        Number(bitgetAdvanced.contract_history?.official_lane_count || 0) === 4 &&
+        bitgetAdvanced.contract_history?.additional_exchange_requests === 0 &&
+        bitgetAdvanced.contract_history?.reused_existing_step991_response_arrays === true &&
+        bitgetAdvanced.contract_history?.shared_backend_memory === true &&
+        bitgetAdvanced.contract_history?.user_reads_trigger_exchange_requests === false &&
+        bitgetAdvanced.contract_history?.reads_scale_with_users === false &&
+        bitgetAdvanced.contract_history?.official_and_derived_kept_separate === true,
+      official_5m_history_ready: bitgetAdvanced.contract_history?.ready === true,
+      focus_target: Number(bitgetAdvanced.contract_history?.focus_target || 0),
+      official_lane_count: Number(bitgetAdvanced.contract_history?.official_lane_count || 0),
+      additional_exchange_requests: Number(bitgetAdvanced.contract_history?.additional_exchange_requests || 0),
+      reused_existing_step991_response_arrays: bitgetAdvanced.contract_history?.reused_existing_step991_response_arrays === true,
+      shared_backend_memory: bitgetAdvanced.contract_history?.shared_backend_memory === true,
+      user_reads_trigger_exchange_requests: bitgetAdvanced.contract_history?.user_reads_trigger_exchange_requests === true,
+      reads_scale_with_users: bitgetAdvanced.contract_history?.reads_scale_with_users === true,
+      derived_intervals: bitgetAdvanced.contract_history?.derived_intervals || [],
+      official_and_derived_kept_separate: bitgetAdvanced.contract_history?.official_and_derived_kept_separate === true,
+    },
     gate_step992: {
       ready: gateAdvanced.ready === true,
       version: gateAdvanced.version || null,
@@ -417,6 +439,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.coinbase_step995.ready &&
       payload.bitget_step991.ready &&
       payload.bitget_step1000.ready &&
+      payload.bitget_step1001.ready &&
       payload.gate_step992.ready &&
       payload.step997_liquidation_history.ready,
   };

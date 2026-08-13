@@ -1,9 +1,10 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.3';
+const VERSION = '650.8.15.4';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
+const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
 const BASE = 'https://api.bitget.com';
 
 const START_DELAY_MS = Math.max(2_000, Number(process.env.KAKA_BITGET_ADVANCED_START_DELAY_MS || 8_000));
@@ -19,6 +20,19 @@ const RISK_HISTORY_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BI
 const RISK_HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_STALE_MS || 12 * 60 * 60_000));
 const RISK_HISTORY_WATCH_MS = Math.max(20_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_WATCH_MS || 30_000));
 const RISK_HISTORY_REQUEST_GAP_MS = Math.max(300, Number(process.env.KAKA_BITGET_RISK_HISTORY_REQUEST_GAP_MS || 380));
+const OFFICIAL_5M_HISTORY_LIMIT = Math.max(36, Math.min(576, Number(process.env.KAKA_BITGET_OFFICIAL_5M_HISTORY_LIMIT || 288)));
+const DERIVED_HISTORY_INTERVALS = Object.freeze({
+  '15m': 15 * 60_000,
+  '1h': 60 * 60_000,
+  '4h': 4 * 60 * 60_000,
+  '1d': 24 * 60 * 60_000,
+});
+const OFFICIAL_HISTORY_LANES = Object.freeze([
+  'futures_active_buy_sell',
+  'futures_long_short',
+  'futures_position_long_short',
+  'futures_account_long_short',
+]);
 
 let started = false;
 let focusRunning = null;
@@ -60,6 +74,12 @@ let fundingRows = new Map();
 let riskReservePools = [];
 let oiLimitRows = new Map();
 let riskReserveHistoryByPool = new Map();
+const contractOfficial5mHistory = new Map(
+  OFFICIAL_HISTORY_LANES.map((lane) => [lane, new Map()]),
+);
+let official5mHistoryCaptures = 0;
+let official5mHistoryRowsCaptured = 0;
+let official5mHistoryLastUpdatedAt = null;
 
 const responseCache = new Map();
 const laneStats = new Map();
@@ -195,12 +215,284 @@ function bitgetSpotTargetSymbols(contractTargets) {
     .slice(0, FOCUS_TARGET);
 }
 
+function normalizedHistoryRowForLane(lane, raw, symbol) {
+  const ts = Number(raw?.ts || 0);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+
+  if (lane === 'futures_active_buy_sell') {
+    return {
+      symbol,
+      ts,
+      source_time: isoMs(ts),
+      buy_volume: finite(raw?.buyVolume),
+      sell_volume: finite(raw?.sellVolume),
+    };
+  }
+  if (lane === 'futures_long_short') {
+    return {
+      symbol,
+      ts,
+      source_time: isoMs(ts),
+      long_ratio: finite(raw?.longRatio),
+      short_ratio: finite(raw?.shortRatio),
+      long_short_ratio: finite(raw?.longShortRatio),
+    };
+  }
+  if (lane === 'futures_position_long_short') {
+    return {
+      symbol,
+      ts,
+      source_time: isoMs(ts),
+      long_position_ratio: finite(raw?.longPositionRatio),
+      short_position_ratio: finite(raw?.shortPositionRatio),
+      long_short_position_ratio: finite(raw?.longShortPositionRatio),
+    };
+  }
+  if (lane === 'futures_account_long_short') {
+    return {
+      symbol,
+      ts,
+      source_time: isoMs(ts),
+      long_account_ratio: finite(raw?.longAccountRatio),
+      short_account_ratio: finite(raw?.shortAccountRatio),
+      long_short_account_ratio: finite(raw?.longShortAccountRatio),
+    };
+  }
+  return null;
+}
+
+function captureOfficial5mHistory(lane, symbol, payload) {
+  const laneMap = contractOfficial5mHistory.get(lane);
+  if (!laneMap) return 0;
+  const rawRows = Array.isArray(payload?.data) ? payload.data : [];
+  const rows = rawRows
+    .map((raw) => normalizedHistoryRowForLane(lane, raw, symbol))
+    .filter(Boolean)
+    .sort((a, b) => a.ts - b.ts);
+
+  const dedup = [];
+  const seen = new Set();
+  for (const row of rows) {
+    if (seen.has(row.ts)) continue;
+    seen.add(row.ts);
+    dedup.push(row);
+  }
+  const limited = dedup.slice(-OFFICIAL_5M_HISTORY_LIMIT);
+  laneMap.set(symbol, {
+    provider: 'bitget',
+    market_type: 'contract',
+    symbol,
+    lane,
+    official: true,
+    period: '5m',
+    source: 'bitget_official_public_uta_advanced_statistics',
+    row_count: limited.length,
+    rows: limited,
+    captured_at: new Date().toISOString(),
+    additional_exchange_requests: 0,
+    reused_existing_step991_response: true,
+  });
+  official5mHistoryCaptures += 1;
+  official5mHistoryRowsCaptured += limited.length;
+  official5mHistoryLastUpdatedAt = new Date().toISOString();
+  return limited.length;
+}
+
+function averageFinite(rows, field) {
+  const values = rows.map((row) => finite(row?.[field])).filter((value) => value != null);
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+function sumFinite(rows, field) {
+  const values = rows.map((row) => finite(row?.[field])).filter((value) => value != null);
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0);
+}
+
+function derivedRollupRows(lane, baseRows, interval) {
+  const intervalMs = DERIVED_HISTORY_INTERVALS[interval];
+  if (!intervalMs) return [];
+  const expectedSamples = Math.max(1, Math.round(intervalMs / (5 * 60_000)));
+  const buckets = new Map();
+
+  for (const row of baseRows) {
+    const bucket = Math.floor(Number(row.ts || 0) / intervalMs) * intervalMs;
+    if (!Number.isFinite(bucket) || bucket <= 0) continue;
+    const group = buckets.get(bucket) || [];
+    group.push(row);
+    buckets.set(bucket, group);
+  }
+
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([bucketStart, rows]) => {
+      const base = {
+        ts: bucketStart,
+        source_time: isoMs(bucketStart),
+        interval,
+        official: false,
+        derived_from_official_5m: true,
+        sample_count: rows.length,
+        expected_samples: expectedSamples,
+        complete_bucket: rows.length >= expectedSamples,
+      };
+
+      if (lane === 'futures_active_buy_sell') {
+        const buy = sumFinite(rows, 'buy_volume');
+        const sell = sumFinite(rows, 'sell_volume');
+        return {
+          ...base,
+          aggregation: 'sum_official_5m_volumes',
+          buy_volume: buy,
+          sell_volume: sell,
+          buy_sell_ratio: buy != null && sell != null && sell !== 0 ? buy / sell : null,
+        };
+      }
+      if (lane === 'futures_long_short') {
+        return {
+          ...base,
+          aggregation: 'arithmetic_mean_official_5m_snapshots',
+          long_ratio: averageFinite(rows, 'long_ratio'),
+          short_ratio: averageFinite(rows, 'short_ratio'),
+          long_short_ratio: averageFinite(rows, 'long_short_ratio'),
+        };
+      }
+      if (lane === 'futures_position_long_short') {
+        return {
+          ...base,
+          aggregation: 'arithmetic_mean_official_5m_snapshots',
+          long_position_ratio: averageFinite(rows, 'long_position_ratio'),
+          short_position_ratio: averageFinite(rows, 'short_position_ratio'),
+          long_short_position_ratio: averageFinite(rows, 'long_short_position_ratio'),
+        };
+      }
+      if (lane === 'futures_account_long_short') {
+        return {
+          ...base,
+          aggregation: 'arithmetic_mean_official_5m_snapshots',
+          long_account_ratio: averageFinite(rows, 'long_account_ratio'),
+          short_account_ratio: averageFinite(rows, 'short_account_ratio'),
+          long_short_account_ratio: averageFinite(rows, 'long_short_account_ratio'),
+        };
+      }
+      return base;
+    });
+}
+
+function contractHistoryCoverage() {
+  const focus = bitgetFocusTargets();
+  const focusSymbols = focus.rows.map((row) => row.symbol);
+  const lanes = {};
+  let allOfficialCoverage = true;
+  for (const lane of OFFICIAL_HISTORY_LANES) {
+    const laneMap = contractOfficial5mHistory.get(lane);
+    const covered = focusSymbols.filter((symbol) => Number(laneMap?.get(symbol)?.row_count || 0) > 0).length;
+    lanes[lane] = {
+      focus_coverage: covered,
+      focus_target: FOCUS_TARGET,
+      official_5m_rows: focusSymbols.reduce((sum, symbol) => sum + Number(laneMap?.get(symbol)?.row_count || 0), 0),
+    };
+    if (covered !== FOCUS_TARGET) allOfficialCoverage = false;
+  }
+  return {
+    ready: focus.focus_ready && focusSymbols.length === FOCUS_TARGET && allOfficialCoverage,
+    focus_target: FOCUS_TARGET,
+    official_lane_count: OFFICIAL_HISTORY_LANES.length,
+    official_5m_history_limit: OFFICIAL_5M_HISTORY_LIMIT,
+    lanes,
+    captures: official5mHistoryCaptures,
+    rows_captured_total: official5mHistoryRowsCaptured,
+    last_updated_at: official5mHistoryLastUpdatedAt,
+    additional_exchange_requests: 0,
+    reused_existing_step991_response_arrays: true,
+    shared_backend_memory: true,
+    user_reads_trigger_exchange_requests: false,
+    reads_scale_with_users: false,
+    derived_intervals: Object.keys(DERIVED_HISTORY_INTERVALS),
+    official_and_derived_kept_separate: true,
+  };
+}
+
+function contractHistorySnapshot({ symbol, lane, interval = '5m' } = {}) {
+  const cleanSymbol = compact(symbol);
+  if (!cleanSymbol) return { ok: false, version: VERSION, error: 'symbol_required' };
+  if (!OFFICIAL_HISTORY_LANES.includes(lane)) {
+    return { ok: false, version: VERSION, error: 'unsupported_lane', supported_lanes: OFFICIAL_HISTORY_LANES };
+  }
+  const item = contractOfficial5mHistory.get(lane)?.get(cleanSymbol) || null;
+  if (!item) {
+    return {
+      ok: true,
+      version: VERSION,
+      provider: 'bitget',
+      market_type: 'contract',
+      symbol: cleanSymbol,
+      lane,
+      interval,
+      official: interval === '5m',
+      ready: false,
+      rows: [],
+      row_count: 0,
+      additional_exchange_requests: 0,
+      user_read_triggered_exchange_requests: false,
+      reads_scale_with_users: false,
+    };
+  }
+
+  if (interval === '5m') {
+    return {
+      ok: true,
+      version: VERSION,
+      ready: true,
+      ...clone(item),
+      interval: '5m',
+      official: true,
+      derived_from_official_5m: false,
+      additional_exchange_requests: 0,
+      user_read_triggered_exchange_requests: false,
+      reads_scale_with_users: false,
+    };
+  }
+
+  if (!DERIVED_HISTORY_INTERVALS[interval]) {
+    return {
+      ok: false,
+      version: VERSION,
+      error: 'unsupported_interval',
+      supported_intervals: ['5m', ...Object.keys(DERIVED_HISTORY_INTERVALS)],
+    };
+  }
+  const rows = derivedRollupRows(lane, item.rows, interval);
+  return {
+    ok: true,
+    version: VERSION,
+    ready: rows.length > 0,
+    provider: 'bitget',
+    market_type: 'contract',
+    symbol: cleanSymbol,
+    lane,
+    interval,
+    official: false,
+    source: 'derived_rollup_from_bitget_official_5m_history',
+    derived_from_official_5m: true,
+    official_base_period: '5m',
+    official_base_row_count: item.row_count,
+    row_count: rows.length,
+    rows,
+    additional_exchange_requests: 0,
+    user_read_triggered_exchange_requests: false,
+    reads_scale_with_users: false,
+  };
+}
+
+
 async function runPerSymbolLane(name, symbols, pathFor, parse) {
   const results = new Map();
   for (let i = 0; i < symbols.length; i += 1) {
     const symbol = symbols[i];
     try {
       const payload = await fetchJson(pathFor(symbol), { lane: name });
+      if (OFFICIAL_HISTORY_LANES.includes(name)) captureOfficial5mHistory(name, symbol, payload);
       const parsed = parse(payload, symbol);
       if (parsed) results.set(symbol, parsed);
     } catch (_) {}
@@ -989,6 +1281,7 @@ function snapshotPayload({ includeRows = true } = {}) {
   const hotOfficialRows = officialStatsRows.filter((row) => row.focus_role === 'hot').length;
   const riskFocusRows = freshContract.filter((row) => row.position_tier && row.index_components).length;
   const riskHistory = riskReserveHistorySnapshot();
+  const contractHistory = contractHistoryCoverage();
 
   const payload = {
     ok: true,
@@ -1029,6 +1322,14 @@ function snapshotPayload({ includeRows = true } = {}) {
     risk_reserve_history_full_cycle_symbol_naive_request_cap: riskHistory.full_cycle_symbol_naive_request_cap,
     risk_reserve_history_representative_symbol_per_pool: riskHistory.representative_symbol_per_pool,
     risk_reserve_history_current_pool_mapping_reused: riskHistory.current_risk_reserve_all_mapping_reused,
+    contract_official_5m_history_ready: contractHistory.ready,
+    contract_official_5m_history_lane_count: contractHistory.official_lane_count,
+    contract_official_5m_history_additional_exchange_requests: 0,
+    contract_official_5m_history_reuses_existing_step991_response_arrays: true,
+    contract_official_5m_history_shared_backend_memory: true,
+    contract_history_user_reads_trigger_exchange_requests: false,
+    contract_history_reads_scale_with_users: false,
+    contract_history_derived_intervals: contractHistory.derived_intervals,
     focus_refresh_seconds: Math.round(FOCUS_REFRESH_MS / 1000),
     batch_refresh_seconds: Math.round(BATCH_REFRESH_MS / 1000),
     one_per_second_lane_gap_ms: ONE_PER_SECOND_GAP_MS,
@@ -1056,6 +1357,8 @@ function snapshotPayload({ includeRows = true } = {}) {
       futures_long_short: 'Bitget official 5m long/short ratio',
       futures_position_long_short: 'Bitget official 5m active long/short position ratio',
       futures_account_long_short: 'Bitget official 5m active long/short account ratio',
+      futures_official_history: 'The existing Step991 5m response arrays are retained as official shared history with zero additional Bitget requests',
+      futures_history_rollups: '15m/1h/4h/1d are backend-derived from the retained official 5m rows and are explicitly marked derived, never relabeled official',
       position_tier: 'Bitget official position tier/leverage/MMR',
       index_components: 'Bitget official index price components and weights',
       risk_reserve_all: 'Bitget official current insurance-fund pools and symbol membership',
@@ -1086,6 +1389,7 @@ function snapshotPayload({ includeRows = true } = {}) {
     funding_rows: includeRows ? funding.map(clone) : [],
     risk_reserve_pools: includeRows ? clone(riskReservePools) : [],
     risk_reserve_history: includeRows ? clone(riskHistory) : { ...riskHistory, pools: [] },
+    contract_history_coverage: clone(contractHistory),
     oi_limit_rows: includeRows ? oiLimits.map(clone) : [],
     timestamp_ms: Date.now(),
   };
@@ -1122,6 +1426,13 @@ export function getBitgetAdvancedStatsHealth() {
     risk_reserve_history_focus_change_missing_only: true,
     risk_reserve_history_user_reads_trigger_exchange_requests: false,
     risk_reserve_history_reads_scale_with_users: false,
+    contract_history: contractHistoryCoverage(),
+    contract_history_route: HISTORY_ROUTE,
+    contract_history_additional_exchange_requests: 0,
+    contract_history_reuses_existing_step991_response_arrays: true,
+    contract_history_shared_backend_memory: true,
+    contract_history_user_reads_trigger_exchange_requests: false,
+    contract_history_reads_scale_with_users: false,
   };
 }
 
@@ -1139,7 +1450,7 @@ function sendJson(res, status, payload) {
 }
 
 export async function handleBitgetAdvancedStats(req, res, url) {
-  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE].includes(url.pathname)) return false;
+  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, HISTORY_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -1156,6 +1467,15 @@ export async function handleBitgetAdvancedStats(req, res, url) {
   totalReads += 1;
   if (url.pathname === HEALTH_ROUTE) {
     sendJson(res, 200, getBitgetAdvancedStatsHealth());
+    return true;
+  }
+  if (url.pathname === HISTORY_ROUTE) {
+    const payload = contractHistorySnapshot({
+      symbol: url.searchParams.get('symbol') || '',
+      lane: url.searchParams.get('lane') || '',
+      interval: url.searchParams.get('interval') || '5m',
+    });
+    sendJson(res, payload.ok === false ? 400 : 200, payload);
     return true;
   }
   sendJson(res, 200, snapshotPayload({ includeRows: true }));
@@ -1175,3 +1495,5 @@ export const __bitgetAdvancedTest = Object.freeze({
 });
 
 export const __bitgetStep1000Test = Object.freeze({ parseRiskReserveHistory, riskReservePoolKey });
+
+export const __bitgetStep1001Test = Object.freeze({ normalizedHistoryRowForLane, derivedRollupRows, contractHistorySnapshot });
