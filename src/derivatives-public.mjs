@@ -1,4 +1,4 @@
-const VERSION = '650.8.15.126';
+const VERSION = '650.8.15.127';
 const SNAPSHOT_ROUTE = '/api/derivatives-public/current-snapshot';
 const HEALTH_ROUTE = '/api/derivatives-public/health';
 
@@ -329,6 +329,13 @@ function parseGateRows(underlyings, tickerRows) {
   }).filter(Boolean);
 }
 
+
+function okxOptionFamilyFromInstId(value) {
+  const raw = upper(value);
+  const match = raw.match(/^([A-Z0-9]+-[A-Z0-9]+)-/);
+  return match ? match[1] : '';
+}
+
 function slimOkxOptionInstruments(payload) {
   const data = Array.isArray(payload?.data) ? payload.data.map((row) => ({
     instId: row?.instId,
@@ -361,24 +368,56 @@ function slimBybitOptionInstruments(rows) {
 }
 
 async function refreshOkx() {
-  const oldDirectory = directoryByProvider.get('okx');
-  let instrumentsPayload = oldDirectory?.payload || null;
-  if (!instrumentsPayload || !isFresh(oldDirectory?.updated_at, DIRECTORY_REFRESH_MS)) {
-    instrumentsPayload = slimOkxOptionInstruments(
-      await fetchOkx('/api/v5/public/instruments?instType=OPTION', 'option_instruments'),
-    );
-    directoryByProvider.set('okx', { payload: instrumentsPayload, updated_at: nowIso() });
-  }
-  const instruments = Array.isArray(instrumentsPayload?.data) ? instrumentsPayload.data : [];
-  const allFamilies = [...new Set(
-    instruments
-      .map((row) => upper(row?.instFamily || row?.uly))
-      .filter(Boolean),
-  )];
-  const families = allFamilies.slice(0, MAX_OKX_FAMILIES);
+  // OKX currently requires instFamily when Get instruments is called with instType=OPTION.
+  // The all-option Tickers endpoint does not require instFamily, so use its official instId set
+  // to discover the live option families first, then read Instruments + OI per official family.
   const tickerPayload = await fetchOkx('/api/v5/market/tickers?instType=OPTION', 'option_tickers');
-  const oiData = [];
+  const tickerRows = Array.isArray(tickerPayload?.data) ? tickerPayload.data : [];
+  const tickerSymbols = new Set(tickerRows.map((row) => upper(row?.instId)).filter(Boolean));
+  const allFamilies = [...new Set(tickerRows.map((row) => okxOptionFamilyFromInstId(row?.instId)).filter(Boolean))];
+  if (tickerRows.length === 0 || allFamilies.length === 0) throw new Error('okx_option_tickers_or_families_empty');
+
+  const families = allFamilies.slice(0, MAX_OKX_FAMILIES);
+  const oldDirectory = directoryByProvider.get('okx');
+  const oldPayload = oldDirectory?.payload || null;
+  const oldRows = Array.isArray(oldPayload?.data) ? oldPayload.data : [];
+  const oldFamilies = new Set(oldRows.map((row) => upper(row?.instFamily || row?.uly)).filter(Boolean));
+  const directoryNeedsRefresh =
+    oldRows.length === 0 ||
+    !isFresh(oldDirectory?.updated_at, DIRECTORY_REFRESH_MS) ||
+    families.some((family) => !oldFamilies.has(family));
+
+  let instrumentsPayload = oldPayload;
+  let directoryFamilySuccesses = 0;
   const partialErrors = [];
+  if (directoryNeedsRefresh) {
+    const instrumentRows = [];
+    for (const instFamily of families) {
+      try {
+        const payload = await fetchOkx(
+          `/api/v5/public/instruments?instType=OPTION&instFamily=${encodeURIComponent(instFamily)}`,
+          `option_instruments_${instFamily}`,
+        );
+        if (Array.isArray(payload?.data)) instrumentRows.push(...payload.data);
+        directoryFamilySuccesses += 1;
+      } catch (error) {
+        partialErrors.push(`directory:${instFamily}:${String(error?.message || error)}`);
+      }
+    }
+    if (instrumentRows.length === 0) throw new Error(`okx_option_instruments_empty:${partialErrors.join('|').slice(0, 300)}`);
+    instrumentsPayload = slimOkxOptionInstruments({ code: '0', data: instrumentRows });
+    directoryByProvider.set('okx', { payload: instrumentsPayload, updated_at: nowIso() });
+  } else {
+    directoryFamilySuccesses = families.length;
+  }
+
+  const instrumentsAll = Array.isArray(instrumentsPayload?.data) ? instrumentsPayload.data : [];
+  // Keep the current public market scope aligned with the official all-option ticker identity set.
+  // This avoids retaining an expired directory row during the directory TTL window.
+  const instruments = instrumentsAll.filter((row) => tickerSymbols.has(upper(row?.instId)));
+  const currentInstrumentsPayload = { code: '0', data: instruments };
+
+  const oiData = [];
   let oiFamilySuccesses = 0;
   for (const instFamily of families) {
     try {
@@ -392,17 +431,22 @@ async function refreshOkx() {
       partialErrors.push(`oi:${instFamily}:${String(error?.message || error)}`);
     }
   }
+
   const oiPayload = { code: '0', data: oiData };
-  const normalized = parseOkxRows(instrumentsPayload, tickerPayload, oiPayload);
+  const normalized = parseOkxRows(currentInstrumentsPayload, tickerPayload, oiPayload);
   const rowsTruncated = normalized.length > MAX_ROWS_PER_PROVIDER;
   const rows = boundedRows(normalized);
+  if (rows.length === 0) throw new Error('okx_option_normalized_rows_empty');
   rowsByProvider.set('okx', rows);
   patchProvider('okx', {
     official_response: true,
     directory_ready: instruments.length > 0,
     row_count: rows.length,
+    option_ticker_count: tickerRows.length,
     option_family_count: allFamilies.length,
     option_family_polled: families.length,
+    directory_family_successes: directoryFamilySuccesses,
+    directory_family_failures: families.length - directoryFamilySuccesses,
     scope_truncated: allFamilies.length > families.length,
     rows_truncated: rowsTruncated,
     oi_family_successes: oiFamilySuccesses,
@@ -606,7 +650,7 @@ export function getDerivativesPublicHealth() {
   return {
     ok: true,
     version: VERSION,
-    step: 'Step1004.5 closes original Step996 public options/more-complete derivatives gap',
+    step: 'Step1004.5.1 fixes OKX option family discovery and closes original Step996 public options/more-complete derivatives gap',
     snapshot_endpoint: SNAPSHOT_ROUTE,
     health_endpoint: HEALTH_ROUTE,
     collector_role: 'slow-stats',
@@ -699,4 +743,4 @@ export async function handleDerivativesPublic(req, res, url) {
   return true;
 }
 
-export const __testDerivativesPublic = Object.freeze({ parseOptionSymbol, parseOkxRows, parseBybitRows, parseGateRows });
+export const __testDerivativesPublic = Object.freeze({ parseOptionSymbol, okxOptionFamilyFromInstId, parseOkxRows, parseBybitRows, parseGateRows });

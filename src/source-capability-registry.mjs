@@ -14,7 +14,7 @@ import { getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridge
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.28';
+const VERSION = '650.8.15.29';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
