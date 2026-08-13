@@ -8,7 +8,7 @@ import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 import { getContractFlowHealth } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.19';
+const VERSION = '650.8.15.20';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -66,8 +66,9 @@ const CAPABILITIES = Object.freeze([
   // Gate
   { provider: 'gate', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'all_spot_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'ticker_mark_index_funding_bbo', official_available: true, official_scope: 'batch', transport: 'REST/WS', batch_mode: 'USDT_futures_tickers', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'selected_fields_bucketed_elsewhere', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
-  { provider: 'gate', market: 'contract', capability: 'open_interest', official_available: true, official_scope: 'per_contract_contract_stats', transport: 'REST', batch_mode: 'focus15_5m_contract_stats', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step992_focus15_contract_stats', fallback_policy: 'missing_not_provider_total_size', history_policy: '5m_1h_1d_future_rollup', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
-  { provider: 'gate', market: 'contract', capability: 'contract_stats_top_trader_taker_account', official_available: true, official_scope: 'per_contract_contract_stats', transport: 'REST', batch_mode: 'focus15_5m_contract_stats', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step992', fallback_policy: 'missing_keep_derived_separate', history_policy: '5m_1h_1d_future_rollup', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'open_interest', official_available: true, official_scope: 'per_contract_contract_stats', transport: 'REST', batch_mode: 'focus15_existing_5m_contract_stats_requests_limit100', rate_limit_class: 'slow_shared_zero_additional_request_count', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step1003', fallback_policy: 'missing_not_provider_total_size', history_policy: 'official_5m_retained_same_step992_requests_plus_explicit_1h_1d_backend_rollups', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'contract_stats_top_trader_taker_account', official_available: true, official_scope: 'per_contract_contract_stats', transport: 'REST', batch_mode: 'focus15_existing_5m_contract_stats_requests_limit100', rate_limit_class: 'slow_shared_zero_additional_request_count', collector: 'slow-stats-collector', target_layer: 'contract_stats_history', current_integration: 'ready_step1003', fallback_policy: 'official_5m_missing_stays_missing; derived missing stays missing; no cross-provider substitution', history_policy: 'official_5m_state_and_flow_fields_plus_explicit_1h_1d_semantic_rollups', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
+  { provider: 'gate', market: 'contract', capability: 'contract_stats_history', official_available: true, official_scope: 'focus15_existing_step992_requests', transport: 'reuse_existing_public_REST_response_arrays_plus_shared_persistence', batch_mode: 'same_15_requests_limit100_zero_additional_request_count', rate_limit_class: 'zero_additional_exchange_request_count', collector: 'gate-advanced-slow-stats', target_layer: 'contract_stats_history', current_integration: 'ready_step1003', fallback_policy: 'last_verified_shared_persisted_5m; no derived-as-official; no cross-provider substitution', history_policy: 'official_5m_plus_explicit_1h_1d_field_semantic_rollups', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'risk_limit_tiers', official_available: true, official_scope: 'public_per_contract_or_top100_market', transport: 'REST', batch_mode: 'focus15_per_contract', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step992', fallback_policy: 'missing', history_policy: 'reference_snapshot', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'insurance_fund', official_available: true, official_scope: 'public_settlement_history', transport: 'REST', batch_mode: 'one_shared_low_frequency_request', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step992', fallback_policy: 'last_verified_shared_snapshot_or_missing', history_policy: 'official_history', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'gate', market: 'contract', capability: 'liquidation_event_history', official_available: true, official_scope: 'public_all_usdt_closed_minute_liq_orders', transport: 'REST+existing_public_WS', batch_mode: 'one_closed_minute_liq_orders_request_per_60s_plus_shared_ws', rate_limit_class: 'bounded_background_event_history', collector: 'liquidation-collector', target_layer: 'liquidation_history', current_integration: 'ready_step997', fallback_policy: 'complete_liq_orders_minute_owns_gate_1m_history; truncated_window_never_overwrites; never_cross_provider_substitute', history_policy: '1m_base_plus_5m_15m_and_1h_base_plus_6h_24h', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
@@ -454,6 +455,40 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       liquidation_history_step997_ready: gateAdvanced.liquidation_history_step997_ready === true,
       user_reads_scale_with_users: false,
     },
+    gate_step1003: {
+      ready: gateAdvanced.contract_stats_history?.ready === true &&
+        Number(gateAdvanced.contract_stats_history?.focus_target || 0) === 15 &&
+        Number(gateAdvanced.contract_stats_history?.official_5m_coverage || 0) === 15 &&
+        Number(gateAdvanced.contract_stats_history?.total_official_5m_rows || 0) > 0 &&
+        Number(gateAdvanced.contract_stats_history?.additional_exchange_requests_vs_step992 || 0) === 0 &&
+        gateAdvanced.contract_stats_history?.reuses_existing_step992_contract_stats_requests === true &&
+        gateAdvanced.contract_stats_history?.same_request_current_and_history === true &&
+        gateAdvanced.contract_stats_history?.official_and_derived_separate === true &&
+        gateAdvanced.contract_stats_history?.user_reads_trigger_collector === false &&
+        gateAdvanced.contract_stats_history?.reads_scale_with_users === false,
+      version: gateAdvanced.version || null,
+      focus_target: Number(gateAdvanced.contract_stats_history?.focus_target || 0),
+      official_5m_coverage: Number(gateAdvanced.contract_stats_history?.official_5m_coverage || 0),
+      fresh_5m_coverage: Number(gateAdvanced.contract_stats_history?.fresh_5m_coverage || 0),
+      total_official_5m_rows: Number(gateAdvanced.contract_stats_history?.total_official_5m_rows || 0),
+      official_interval: gateAdvanced.contract_stats_history?.official_interval || null,
+      official_endpoint: gateAdvanced.contract_stats_history?.official_endpoint || null,
+      official_limit_per_existing_request: Number(gateAdvanced.contract_stats_history?.official_limit_per_existing_request || 0),
+      request_count_per_full_focus_cycle: Number(gateAdvanced.contract_stats_history?.request_count_per_full_focus_cycle || 0),
+      additional_exchange_requests_vs_step992: Number(gateAdvanced.contract_stats_history?.additional_exchange_requests_vs_step992 || 0),
+      reuses_existing_step992_contract_stats_requests: gateAdvanced.contract_stats_history?.reuses_existing_step992_contract_stats_requests === true,
+      same_request_current_and_history: gateAdvanced.contract_stats_history?.same_request_current_and_history === true,
+      derived_intervals: Array.isArray(gateAdvanced.contract_stats_history?.derived_intervals) ? [...gateAdvanced.contract_stats_history.derived_intervals] : [],
+      derived_method: gateAdvanced.contract_stats_history?.derived_method || null,
+      rollup_state_fields: Array.isArray(gateAdvanced.contract_stats_history?.rollup_state_fields) ? [...gateAdvanced.contract_stats_history.rollup_state_fields] : [],
+      rollup_sum_fields: Array.isArray(gateAdvanced.contract_stats_history?.rollup_sum_fields) ? [...gateAdvanced.contract_stats_history.rollup_sum_fields] : [],
+      persistence_enabled: gateAdvanced.contract_stats_history?.persistence_enabled === true,
+      persistence_table: gateAdvanced.contract_stats_history?.persistence_table || null,
+      persist_successes: Number(gateAdvanced.contract_stats_history?.persist_successes || 0),
+      restore_successes: Number(gateAdvanced.contract_stats_history?.restore_successes || 0),
+      user_reads_trigger_collector: gateAdvanced.contract_stats_history?.user_reads_trigger_collector === true,
+      reads_scale_with_users: gateAdvanced.contract_stats_history?.reads_scale_with_users === true,
+    },
     step997_liquidation_history: {
       ready: liquidationHistory.persistence_enabled === true &&
         liquidationHistory.step997_unified_history_ready === true &&
@@ -520,6 +555,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.bitget_step1000.ready &&
       payload.bitget_step1001.ready &&
       payload.gate_step992.ready &&
+      payload.gate_step1003.ready &&
       payload.step997_liquidation_history.ready,
   };
 }
