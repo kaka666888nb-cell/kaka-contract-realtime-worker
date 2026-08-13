@@ -1,8 +1,9 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getContractDepthSharedOrderbook } from './contract-depth.mjs';
 import { getContractFlowInternalFocusSnapshot, reconcileContractFlowFocusPool } from './contract-flow.mjs';
+import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.6';
+const VERSION = '650.8.15.7';
 const SNAPSHOT_ROUTE = '/api/contract-deep-shared/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-deep-shared/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -418,6 +419,20 @@ async function scan(reason = 'interval') {
   }
 }
 
+
+function deepBusinessFlowPolicy(provider, flowRow) {
+  const rule = getBusinessSourceRule(provider, 'contract', 'taker_quote_flow_5m');
+  const source = String(flowRow?.taker_source || flowRow?.source || '');
+  const gateOfficial = provider === 'gate' && source.startsWith('gate_contract_stats_');
+  const usable = rule?.available === true && (rule.resolution !== 'official_normalized' || gateOfficial);
+  return {
+    resolution: rule?.resolution || 'unavailable',
+    scope: rule?.scope || 'none',
+    usable,
+    official_current: gateOfficial,
+  };
+}
+
 function currentPayload() {
   if (responseCache && Date.now() - responseCache.at <= RESPONSE_CACHE_TTL_MS) {
     responseCacheHits += 1;
@@ -450,36 +465,60 @@ function currentPayload() {
       if (depthRetryNotBeforeMs(depth) > now) depthCooldown += 1;
       if (fresh) depthFresh += 1;
       const flowRow = flowByKey.get(key) || null;
-      if (flowRow) flowRows += 1;
+      const flowPolicy = deepBusinessFlowPolicy(provider, flowRow);
+      const depthRule = getBusinessSourceRule(provider, 'contract', 'depth20');
+      const largeRule = getBusinessSourceRule(provider, 'contract', 'large_trade_p95');
+      const flowUsable = Boolean(flowRow) &&
+        flowPolicy.usable === true &&
+        finite(flowRow?.taker_buy_quote) != null &&
+        finite(flowRow?.taker_sell_quote) != null;
+      const largeTradeUsable = Boolean(flowRow) && largeRule?.available === true;
+      if (flowUsable) flowRows += 1;
       rows.push({
         ...focusRow,
-        depth_ready: fresh,
+        depth_ready: fresh && depthRule?.available === true,
         depth_stale: depth != null && !fresh,
         depth_age_ms: ageMs,
         ...(depth || {}),
-        flow_ready: Boolean(flowRow),
-        flow_bucket_time: flowRow?.bucket_time || null,
-        flow_bucket_end_time: flowRow?.bucket_end_time || null,
-        flow_buy_quote: finite(flowRow?.buy_quote),
-        flow_sell_quote: finite(flowRow?.sell_quote),
-        flow_net_quote: finite(flowRow?.net_quote),
-        flow_trade_count: finite(flowRow?.trade_count),
-        flow_p70_quote: finite(flowRow?.p70_quote),
-        flow_p95_quote: finite(flowRow?.p95_quote),
-        flow_large_buy_quote: finite(flowRow?.large_buy_quote),
-        flow_large_sell_quote: finite(flowRow?.large_sell_quote),
-        flow_large_net_quote: finite(flowRow?.large_net_quote),
-        flow_medium_buy_quote: finite(flowRow?.medium_buy_quote),
-        flow_medium_sell_quote: finite(flowRow?.medium_sell_quote),
-        flow_small_buy_quote: finite(flowRow?.small_buy_quote),
-        flow_small_sell_quote: finite(flowRow?.small_sell_quote),
-        flow_large_buy_count: finite(flowRow?.large_buy_count),
-        flow_large_sell_count: finite(flowRow?.large_sell_count),
-        flow_medium_buy_count: finite(flowRow?.medium_buy_count),
-        flow_medium_sell_count: finite(flowRow?.medium_sell_count),
-        flow_small_buy_count: finite(flowRow?.small_buy_count),
-        flow_small_sell_count: finite(flowRow?.small_sell_count),
-        flow_source: flowRow?.source || null,
+        flow_ready: flowUsable,
+        large_trade_ready: largeTradeUsable,
+        large_trade_source: largeTradeUsable ? (flowRow?.source || null) : null,
+        large_trade_bucket_time: largeTradeUsable ? (flowRow?.bucket_time || null) : null,
+        large_trade_bucket_end_time: largeTradeUsable ? (flowRow?.bucket_end_time || null) : null,
+        flow_bucket_time: flowUsable ? (flowRow?.taker_bucket_time || flowRow?.bucket_time || null) : null,
+        flow_bucket_end_time: flowUsable ? (flowRow?.taker_bucket_end_time || flowRow?.bucket_end_time || null) : null,
+        flow_buy_quote: flowUsable ? finite(flowRow?.taker_buy_quote) : null,
+        flow_sell_quote: flowUsable ? finite(flowRow?.taker_sell_quote) : null,
+        flow_net_quote: flowUsable ? finite(flowRow?.taker_net_quote) : null,
+        flow_trade_count: largeTradeUsable ? finite(flowRow?.trade_count) : null,
+        flow_p70_quote: largeTradeUsable ? finite(flowRow?.p70_quote) : null,
+        flow_p95_quote: largeTradeUsable ? finite(flowRow?.p95_quote) : null,
+        flow_large_buy_quote: largeTradeUsable ? finite(flowRow?.large_buy_quote) : null,
+        flow_large_sell_quote: largeTradeUsable ? finite(flowRow?.large_sell_quote) : null,
+        flow_large_net_quote: largeTradeUsable ? finite(flowRow?.large_net_quote) : null,
+        flow_medium_buy_quote: largeTradeUsable ? finite(flowRow?.medium_buy_quote) : null,
+        flow_medium_sell_quote: largeTradeUsable ? finite(flowRow?.medium_sell_quote) : null,
+        flow_small_buy_quote: largeTradeUsable ? finite(flowRow?.small_buy_quote) : null,
+        flow_small_sell_quote: largeTradeUsable ? finite(flowRow?.small_sell_quote) : null,
+        flow_large_buy_count: largeTradeUsable ? finite(flowRow?.large_buy_count) : null,
+        flow_large_sell_count: largeTradeUsable ? finite(flowRow?.large_sell_count) : null,
+        flow_medium_buy_count: largeTradeUsable ? finite(flowRow?.medium_buy_count) : null,
+        flow_medium_sell_count: largeTradeUsable ? finite(flowRow?.medium_sell_count) : null,
+        flow_small_buy_count: largeTradeUsable ? finite(flowRow?.small_buy_count) : null,
+        flow_small_sell_count: largeTradeUsable ? finite(flowRow?.small_sell_count) : null,
+        flow_source: flowUsable ? (flowRow?.taker_source || flowRow?.source || null) : null,
+        business_policy_applied: true,
+        business_policy_version: BUSINESS_SOURCE_POLICY_VERSION,
+        business_policy_depth20: depthRule?.resolution || 'unavailable',
+        business_policy_depth20_scope: depthRule?.scope || 'none',
+        business_policy_taker_quote_flow_5m: flowPolicy.resolution,
+        business_policy_taker_quote_flow_5m_scope: flowPolicy.scope,
+        business_policy_taker_quote_flow_5m_current_usable: flowPolicy.usable,
+        business_policy_taker_quote_flow_5m_official_current: flowPolicy.official_current,
+        business_policy_large_trade_p95: largeRule?.resolution || 'unavailable',
+        business_policy_missing_stays_null: true,
+        business_policy_cross_provider_substitution: false,
+        business_policy_cross_quote_substitution: false,
       });
     }
     flowActive = Number(flow?.active_rows || 0); // aggregate is exposed separately below
@@ -499,14 +538,14 @@ function currentPayload() {
   const depthMissingRows = rows.filter((row) => !Number(row.depth_sampled_at_ms || 0)).length;
   const flowRows = rows.filter((row) => row.flow_ready === true).length;
   const largeTradeSchemaRows = rows.filter((row) =>
-    row.flow_ready === true &&
+    row.large_trade_ready === true &&
     row.flow_trade_count != null && row.flow_trade_count > 0 &&
     row.flow_p95_quote != null &&
     row.flow_large_buy_quote != null &&
     row.flow_large_sell_quote != null
   ).length;
   const largeTradeValueRows = rows.filter((row) =>
-    row.flow_ready === true &&
+    row.large_trade_ready === true &&
     ((row.flow_large_buy_quote ?? 0) + (row.flow_large_sell_quote ?? 0)) > 0
   ).length;
   const desiredFocusSignature = focusSignature(focus);
@@ -521,6 +560,12 @@ function currentPayload() {
     ok: true,
     version: VERSION,
     source: 'render_shared_focus_pool_depth20_plus_existing_contract_flow_websocket',
+    business_policy_applied: true,
+    business_policy_version: BUSINESS_SOURCE_POLICY_VERSION,
+    business_policy_official_first: true,
+    business_policy_missing_stays_null: true,
+    business_policy_cross_provider_substitution: false,
+    business_policy_cross_quote_substitution: false,
     ready: liveReady,
     live_ready: liveReady,
     focus_pool_ready: focus.ready,
@@ -640,6 +685,12 @@ export function getContractDeepSharedHealth() {
     snapshot_endpoint: SNAPSHOT_ROUTE,
     health_endpoint: HEALTH_ROUTE,
     ready: payload.ready,
+    business_policy_applied: payload.business_policy_applied === true,
+    business_policy_version: payload.business_policy_version,
+    business_policy_official_first: payload.business_policy_official_first === true,
+    business_policy_missing_stays_null: payload.business_policy_missing_stays_null === true,
+    business_policy_cross_provider_substitution: payload.business_policy_cross_provider_substitution === true,
+    business_policy_cross_quote_substitution: payload.business_policy_cross_quote_substitution === true,
     focus_pool_ready: payload.focus_pool_ready,
     row_count: payload.row_count,
     target_rows: TARGET_ROWS,

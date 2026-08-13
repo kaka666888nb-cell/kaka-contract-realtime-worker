@@ -3,8 +3,9 @@ import { fetchBinancePublicRestRelayJson, getBinanceContractKlineRelayHealth } f
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
+import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.96';
+const VERSION = '650.8.15.97';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -1718,6 +1719,20 @@ export function getContractFlowInternalFocusSnapshot() {
       ].filter(Boolean).sort((a, b) => Number(b.start || 0) - Number(a.start || 0));
       const latest = candidates[0] || null;
       if (!latest) continue;
+      const gateOfficialLatest = provider === 'gate'
+        ? gateOfficialFlowFallbackRows(state)
+            .filter((row) => row && Number(row.end || 0) >= Date.now() - 12 * 60 * 1000)
+            .at(-1) || null
+        : null;
+      const takerBuyQuote = provider === 'gate'
+        ? asNumber(gateOfficialLatest?.buy_quote)
+        : asNumber(latest.buy_quote);
+      const takerSellQuote = provider === 'gate'
+        ? asNumber(gateOfficialLatest?.sell_quote)
+        : asNumber(latest.sell_quote);
+      const takerSource = provider === 'gate'
+        ? (gateOfficialLatest?.source || null)
+        : (latest.source || 'render_exchange_websocket_histogram');
       rows.push({
         provider,
         symbol,
@@ -1726,6 +1741,22 @@ export function getContractFlowInternalFocusSnapshot() {
         buy_quote: asNumber(latest.buy_quote) ?? 0,
         sell_quote: asNumber(latest.sell_quote) ?? 0,
         net_quote: (asNumber(latest.buy_quote) ?? 0) - (asNumber(latest.sell_quote) ?? 0),
+        taker_buy_quote: takerBuyQuote,
+        taker_sell_quote: takerSellQuote,
+        taker_net_quote: takerBuyQuote != null && takerSellQuote != null
+          ? takerBuyQuote - takerSellQuote
+          : null,
+        taker_source: takerSource,
+        taker_bucket_time: provider === 'gate' && gateOfficialLatest
+          ? new Date(gateOfficialLatest.start).toISOString()
+          : latest.bucket_time,
+        taker_bucket_end_time: provider === 'gate' && gateOfficialLatest
+          ? new Date(gateOfficialLatest.end).toISOString()
+          : latest.bucket_end_time,
+        taker_official: provider === 'gate' ? Boolean(gateOfficialLatest) : false,
+        taker_policy_source: provider === 'gate'
+          ? 'gate_contract_stats_if_recent_else_missing'
+          : 'same_venue_public_trade_histogram',
         trade_count: asNumber(latest.trade_count) ?? 0,
         p70_quote: asNumber(latest.p70_quote),
         p95_quote: asNumber(latest.p95_quote),
@@ -3826,6 +3857,32 @@ function pruneSharedCurrentSnapshotCache(now = Date.now()) {
   }
 }
 
+
+function applyBusinessPolicyToSharedCurrentMetricRow(row) {
+  const provider = providerKey(row?.provider);
+  const attach = (field, fields) => {
+    const rule = getBusinessSourceRule(provider, 'contract', field);
+    row[`business_policy_${field}`] = rule?.resolution || 'unavailable';
+    row[`business_policy_${field}_scope`] = rule?.scope || 'none';
+    if (!rule || rule.available !== true) {
+      for (const key of fields) row[key] = null;
+    }
+  };
+  attach('open_interest', ['open_interest','open_interest_value','open_interest_unit','open_interest_value_unit','oi_source_time','open_interest_source_time']);
+  attach('funding_rate', ['last_funding_rate','funding_rate','last_funding_rate_percent','funding_rate_percent','funding_source_time','next_funding_time']);
+  attach('mark_price', ['mark_price']);
+  attach('index_price', ['index_price']);
+  attach('ratio_global', ['global_long_short_ratio','global_long_account','global_short_account']);
+  attach('ratio_top_account', ['top_account_long_short_ratio','top_account_long','top_account_short']);
+  attach('ratio_top_position', ['top_position_long_short_ratio','top_position_long','top_position_short']);
+  row.business_policy_applied = true;
+  row.business_policy_version = BUSINESS_SOURCE_POLICY_VERSION;
+  row.business_policy_cross_provider_substitution = false;
+  row.business_policy_cross_quote_substitution = false;
+  row.business_policy_missing_stays_null = true;
+  return row;
+}
+
 function normalizeSharedCurrentMetricRow(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const provider = providerKey(raw.provider);
@@ -3856,7 +3913,7 @@ function normalizeSharedCurrentMetricRow(raw) {
     const value = asNumber(row[field]);
     row[field] = value != null && Number.isFinite(value) ? value : null;
   }
-  return row;
+  return applyBusinessPolicyToSharedCurrentMetricRow(row);
 }
 
 async function getSharedCurrentContractSnapshot({ maxAgeMinutes = 30 } = {}) {
@@ -3896,6 +3953,12 @@ async function getSharedCurrentContractSnapshot({ maxAgeMinutes = 30 } = {}) {
         row_count: rows.length,
         max_age_minutes: safeMinutes,
         source: 'render_shared_supabase_current_contract_metric_snapshot',
+    business_policy_applied: true,
+    business_policy_version: BUSINESS_SOURCE_POLICY_VERSION,
+    business_policy_official_first: true,
+    business_policy_missing_stays_null: true,
+    business_policy_cross_provider_substitution: false,
+    business_policy_cross_quote_substitution: false,
         rpc: SHARED_CURRENT_SNAPSHOT_RPC,
         exchange_requests_started: 0,
         cache_hit: false,
@@ -4355,7 +4418,7 @@ export async function handleContractFlow(req,res,url){
     if(req.method!=='GET'){sendJson(res,405,{ok:false,version:VERSION,error:'method_not_allowed'});return true;}
     const maxAgeMinutes=Math.max(5,Math.min(180,Number(url.searchParams.get('max_age_minutes')||30)));
     if(!PERSISTENCE_ENABLED){
-      sendJson(res,200,{ok:true,version:VERSION,rows:[],row_count:0,provider_coverage:{},max_age_minutes:maxAgeMinutes,source:'persistence_disabled',warning:'shared_current_snapshot_persistence_disabled',exchange_requests_started:0,backend_cycle:flowScanState.cycle,full_universe_scan:flowScanStatusPayload(),generated_at:new Date().toISOString()});return true;
+      sendJson(res,200,{ok:true,version:VERSION,rows:[],row_count:0,provider_coverage:{},max_age_minutes:maxAgeMinutes,source:'persistence_disabled',business_policy_applied:true,business_policy_version:BUSINESS_SOURCE_POLICY_VERSION,business_policy_official_first:true,business_policy_missing_stays_null:true,business_policy_cross_provider_substitution:false,business_policy_cross_quote_substitution:false,warning:'shared_current_snapshot_persistence_disabled',exchange_requests_started:0,backend_cycle:flowScanState.cycle,full_universe_scan:flowScanStatusPayload(),generated_at:new Date().toISOString()});return true;
     }
     try{
       const snapshot=await getSharedCurrentContractSnapshot({maxAgeMinutes});
