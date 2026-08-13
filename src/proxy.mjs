@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.133';
+const STEP_VERSION = '650.8.15.134';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -291,6 +291,10 @@ function fetchChildJson(pathname, timeoutMs = 4_000) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  // Step1004.12: Render Edge Caching will be enabled with Cacheable file types = All files.
+  // Keep every route private/no-store by default; only explicitly approved shared snapshot
+  // responses attach CDN-Cache-Control, which Render gives precedence over Cache-Control.
+  if (!res.hasHeader('cache-control')) res.setHeader('cache-control', 'no-store');
   if (url.pathname === '/health') {
     const realtimeWsHealth = await fetchChildJson('/ws-health').catch((error) => ({
       ok: false,

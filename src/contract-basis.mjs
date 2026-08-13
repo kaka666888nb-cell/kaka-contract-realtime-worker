@@ -407,16 +407,21 @@ export function getContractBasisHealth() {
   };
 }
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, { cdnSMaxAgeSec = 0 } = {}) {
   if (res.headersSent) return;
   const body = Buffer.from(JSON.stringify(payload));
-  res.writeHead(status, {
+  const headers = {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, OPTIONS',
     'content-length': String(body.length),
-  });
+  };
+  if (status >= 200 && status < 300 && Number(cdnSMaxAgeSec || 0) > 0) {
+    headers['cdn-cache-control'] = `public, s-maxage=${Math.max(1, Number(cdnSMaxAgeSec))}, stale-while-revalidate=8, stale-if-error=30`;
+    headers['x-kaka-edge-cache-policy'] = 'render_edge_cache_shared_snapshot_v1';
+  }
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -440,6 +445,6 @@ export async function handleContractBasis(req, res, url) {
     return true;
   }
   totalSnapshotReads += 1;
-  sendJson(res, 200, cachedResponse());
+  sendJson(res, 200, cachedResponse(), { cdnSMaxAgeSec: 2 });
   return true;
 }

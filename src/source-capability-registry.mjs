@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.35';
+const VERSION = '650.8.15.36';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -880,6 +880,21 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       reads_scale_local_collector_serialization_with_users: false,
       gzip_shared_buffer_reused_across_users: true,
     },
+    step1004_render_edge_cache: {
+      ready: collectorIsolation?.shared_read_transport_cache?.ready === true &&
+        collectorIsolation?.shared_read_transport_cache?.render_edge_cache_header_enabled === true &&
+        collectorIsolation?.shared_read_transport_cache?.browser_cache_control_no_store === true &&
+        collectorIsolation?.shared_read_transport_cache?.cdn_cache_control_separate_from_browser_cache === true &&
+        Number(collectorIsolation?.shared_read_transport_cache?.gzip_level || 0) >= 6,
+      version: collectorIsolation?.version || null,
+      policy: collectorIsolation?.shared_read_transport_cache?.edge_cache_policy_version || null,
+      render_dashboard_requirement: 'Edge Caching -> Cacheable file types -> All files',
+      selected_shared_snapshot_routes_only: true,
+      browser_cache_control_no_store: collectorIsolation?.shared_read_transport_cache?.browser_cache_control_no_store === true,
+      cdn_cache_control_header_enabled: collectorIsolation?.shared_read_transport_cache?.render_edge_cache_header_enabled === true,
+      gzip_level: Number(collectorIsolation?.shared_read_transport_cache?.gzip_level || 0),
+      actual_edge_hit_must_be_verified_externally_by_cf_cache_status: true,
+    },
     step1000_history_lifecycle: {
       ready: historyLifecycle?.ready === true && historyLifecycle?.step1000_ready === true,
       version: historyLifecycle?.version || null,
@@ -936,20 +951,26 @@ export function getSourceCapabilityRegistryHealth() {
       payload.step1004_focus_membership_stability.ready &&
       payload.step1000_history_lifecycle.ready &&
       payload.step1004_pressure_shared_read_cache.ready &&
-      payload.step1004_pressure_transport_cache.ready,
+      payload.step1004_pressure_transport_cache.ready &&
+      payload.step1004_render_edge_cache.ready,
   };
 }
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, { cdnSMaxAgeSec = 0 } = {}) {
   if (res.headersSent) return;
   const body = Buffer.from(JSON.stringify(payload));
-  res.writeHead(status, {
+  const headers = {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, OPTIONS',
     'content-length': String(body.length),
-  });
+  };
+  if (status >= 200 && status < 300 && Number(cdnSMaxAgeSec || 0) > 0) {
+    headers['cdn-cache-control'] = `public, s-maxage=${Math.max(1, Number(cdnSMaxAgeSec))}, stale-while-revalidate=20, stale-if-error=60`;
+    headers['x-kaka-edge-cache-policy'] = 'render_edge_cache_shared_snapshot_v1';
+  }
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -973,6 +994,6 @@ export async function handleSourceCapabilityRegistry(req, res, url) {
     sendJson(res, 200, getSourceCapabilityRegistryHealth());
     return true;
   }
-  sendJson(res, 200, registrySnapshot({ includeCapabilities: true }));
+  sendJson(res, 200, registrySnapshot({ includeCapabilities: true }), { cdnSMaxAgeSec: 5 });
   return true;
 }

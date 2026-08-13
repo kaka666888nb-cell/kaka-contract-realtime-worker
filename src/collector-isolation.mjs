@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.132';
+const VERSION = '650.8.15.134';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -26,6 +26,8 @@ const ISOLATED_KEEP_ALIVE_AGENT = new http.Agent({ keepAlive: true, maxSockets: 
 const SHARED_RESPONSE_CACHE_MAX_ENTRIES = 32;
 const SHARED_RESPONSE_MAX_BODY_BYTES = 32 * 1024 * 1024;
 const SHARED_RESPONSE_GZIP_MIN_BYTES = 2 * 1024;
+const SHARED_RESPONSE_GZIP_LEVEL = Math.max(1, Math.min(9, Number(process.env.KAKA_SHARED_RESPONSE_GZIP_LEVEL || 6)));
+const SHARED_RESPONSE_EDGE_POLICY_VERSION = 'render_edge_cache_shared_snapshot_v1';
 const sharedResponseCache = new Map();
 const sharedResponseInflight = new Map();
 const sharedResponseStats = {
@@ -46,22 +48,29 @@ const sharedResponseStats = {
 
 function sharedResponsePolicy(pathname) {
   const path = String(pathname || '');
-  if (path === '/api/market-light/current-snapshot') return { freshMs: 2_000, staleMs: 10_000 };
-  if (path === '/api/contract-flow/market-snapshot') return { freshMs: 5_000, staleMs: 30_000 };
-  if (path === '/api/contract-liquidation/market-snapshot') return { freshMs: 1_500, staleMs: 8_000 };
-  if (path === '/api/contract-liquidation/heatmap') return { freshMs: 2_000, staleMs: 10_000 };
-  if (path === '/api/contract-focus-pool/current-snapshot') return { freshMs: 5_000, staleMs: 20_000 };
-  if (path === '/api/contract-deep-shared/current-snapshot') return { freshMs: 2_000, staleMs: 10_000 };
-  if (path === '/api/derivatives-public/current-snapshot') return { freshMs: 15_000, staleMs: 60_000 };
-  if (path === '/api/history-lifecycle/current-snapshot') return { freshMs: 30_000, staleMs: 120_000 };
+  if (path === '/api/market-light/current-snapshot') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
+  if (path === '/api/contract-flow/market-snapshot') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
+  if (path === '/api/contract-liquidation/market-snapshot') return { freshMs: 1_500, staleMs: 8_000, cdnSMaxAgeSec: 2 };
+  if (path === '/api/contract-liquidation/heatmap') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
+  if (path === '/api/contract-focus-pool/current-snapshot') return { freshMs: 5_000, staleMs: 20_000, cdnSMaxAgeSec: 5 };
+  if (path === '/api/contract-deep-shared/current-snapshot') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
+  if (path === '/api/derivatives-public/current-snapshot') return { freshMs: 15_000, staleMs: 60_000, cdnSMaxAgeSec: 15 };
+  if (path === '/api/history-lifecycle/current-snapshot') return { freshMs: 30_000, staleMs: 120_000, cdnSMaxAgeSec: 30 };
   return null;
+}
+
+function sharedResponseCdnCacheControl(policy) {
+  const sMaxAge = Math.max(1, Number(policy?.cdnSMaxAgeSec || 1));
+  const swr = Math.max(8, Math.ceil(sMaxAge * 4));
+  const sie = Math.max(30, Math.ceil(sMaxAge * 12));
+  return `public, s-maxage=${sMaxAge}, stale-while-revalidate=${swr}, stale-if-error=${sie}`;
 }
 
 function cleanSharedHeaders(headers = {}) {
   const result = {};
   for (const [name, value] of Object.entries(headers || {})) {
     const lower = String(name || '').toLowerCase();
-    if (lower === 'connection' || lower === 'keep-alive' || lower === 'transfer-encoding' || lower === 'content-length' || lower === 'content-encoding' || lower === 'vary') continue;
+    if (lower === 'connection' || lower === 'keep-alive' || lower === 'transfer-encoding' || lower === 'content-length' || lower === 'content-encoding' || lower === 'vary' || lower === 'cdn-cache-control') continue;
     if (value != null) result[name] = value;
   }
   result['cache-control'] = 'no-store';
@@ -125,7 +134,7 @@ async function buildSharedResponseEntry(role, path) {
   let gzipBody = null;
   if (result.statusCode >= 200 && result.statusCode < 300 && result.body.length >= SHARED_RESPONSE_GZIP_MIN_BYTES) {
     try {
-      gzipBody = await gzipAsync(result.body, { level: 1 });
+      gzipBody = await gzipAsync(result.body, { level: SHARED_RESPONSE_GZIP_LEVEL });
       sharedResponseStats.gzip_builds += 1;
       sharedResponseStats.gzip_bytes_built += gzipBody.length;
     } catch {
@@ -136,16 +145,23 @@ async function buildSharedResponseEntry(role, path) {
   return { ...result, gzipBody, storedAt: Date.now() };
 }
 
-function sendSharedResponse(req, res, entry, cacheState) {
+function sendSharedResponse(req, res, entry, cacheState, policy) {
   if (res.headersSent) return;
   const useGzip = Buffer.isBuffer(entry?.gzipBody) && acceptsGzip(req);
   const body = useGzip ? entry.gzipBody : entry.body;
+  const statusCode = entry?.statusCode || 502;
   const headers = {
     ...cleanSharedHeaders(entry?.headers || {}),
     'content-length': String(body?.length || 0),
     'x-kaka-shared-response-cache': cacheState,
     'x-kaka-shared-response-reused': cacheState === 'fresh' || cacheState === 'stale' || cacheState === 'coalesced' ? '1' : '0',
+    'x-kaka-edge-cache-policy': SHARED_RESPONSE_EDGE_POLICY_VERSION,
   };
+  // Browser/device storage stays disabled. Render's CDN gets a separate, short public TTL.
+  // CDN-Cache-Control takes precedence over Cache-Control on Render when edge caching is enabled.
+  if (statusCode >= 200 && statusCode < 300) {
+    headers['cdn-cache-control'] = sharedResponseCdnCacheControl(policy);
+  }
   if (useGzip) {
     headers['content-encoding'] = 'gzip';
     headers.vary = 'Accept-Encoding';
@@ -153,7 +169,7 @@ function sendSharedResponse(req, res, entry, cacheState) {
   } else {
     sharedResponseStats.raw_served_responses += 1;
   }
-  res.writeHead(entry?.statusCode || 502, headers);
+  res.writeHead(statusCode, headers);
   res.end(body || Buffer.alloc(0));
 }
 
@@ -186,14 +202,14 @@ function proxySharedCachedCollectorGet(req, res, url, role, policy) {
 
   if (cached && age <= policy.freshMs) {
     sharedResponseStats.fresh_hits += 1;
-    sendSharedResponse(req, res, cached, 'fresh');
+    sendSharedResponse(req, res, cached, 'fresh', policy);
     return;
   }
 
   if (cached && age <= policy.staleMs) {
     sharedResponseStats.stale_hits += 1;
     startSharedResponseRefresh(key, role, req.url).catch(() => {});
-    sendSharedResponse(req, res, cached, 'stale');
+    sendSharedResponse(req, res, cached, 'stale', policy);
     return;
   }
 
@@ -201,7 +217,7 @@ function proxySharedCachedCollectorGet(req, res, url, role, policy) {
   if (existing) sharedResponseStats.inflight_coalesced += 1;
   else sharedResponseStats.cold_misses += 1;
   const pending = existing || startSharedResponseRefresh(key, role, req.url);
-  pending.then((entry) => sendSharedResponse(req, res, entry, existing ? 'coalesced' : 'miss'))
+  pending.then((entry) => sendSharedResponse(req, res, entry, existing ? 'coalesced' : 'miss', policy))
     .catch((error) => {
       if (res.headersSent) {
         res.destroy(error);
@@ -595,9 +611,15 @@ export function getCollectorIsolationHealth() {
       inflight_coalescing_enabled: true,
       stale_while_refresh_enabled: true,
       gzip_shared_buffer_enabled: true,
+      gzip_level: SHARED_RESPONSE_GZIP_LEVEL,
       collector_keep_alive_enabled: true,
       collector_fetches_scale_with_users: false,
       one_refresh_per_key_window: true,
+      render_edge_cache_header_enabled: true,
+      render_edge_cache_requires_dashboard_all_files: true,
+      browser_cache_control_no_store: true,
+      cdn_cache_control_separate_from_browser_cache: true,
+      edge_cache_policy_version: SHARED_RESPONSE_EDGE_POLICY_VERSION,
       cache_entries: sharedResponseCache.size,
       inflight_keys: sharedResponseInflight.size,
       max_entries: SHARED_RESPONSE_CACHE_MAX_ENTRIES,
