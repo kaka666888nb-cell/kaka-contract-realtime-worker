@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.122",
+  "version": "650.8.15.123",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka worker 650.8.15.122 / Step1004.2 deep-market + slow-stats process-level collector isolation"
+  "description": "Kaka worker 650.8.15.123 / Step1004.2.1 memory-safe second-batch collector worker-isolate fault domains"
 }
