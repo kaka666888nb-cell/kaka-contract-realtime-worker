@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.133",
+  "version": "650.8.15.134",
   "private": true,
   "type": "module",
   "scripts": {
