@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.6';
+const VERSION = '650.8.15.7';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
@@ -975,32 +975,36 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
       riskReserveHistoryByPool.set(pool.pool_key,next);
     }
 
-    const activeKeys=new Set(targets.pools.map((pool)=>pool.pool_key));
-    for(const key of [...riskReserveHistoryByPool.keys()]) if(!activeKeys.has(key)) riskReserveHistoryByPool.delete(key);
+    const activeKeys = new Set(targets.pools.map((pool)=>pool.pool_key));
+    for (const key of [...riskReserveHistoryByPool.keys()]) {
+      if (!activeKeys.has(key)) riskReserveHistoryByPool.delete(key);
+    }
 
-    riskHistoryLastCompletedAt=new Date().toISOString();
+    riskHistoryLastCompletedAt = new Date().toISOString();
     responseCache.clear();
 
-    const incompletePools=riskHistoryIncompletePoolCount(targets);
-    if(incompletePools>0){
-      riskHistoryFailures+=1;
-      const recoveryDelay=scheduleRiskHistoryRecovery(
+    const incompletePools = riskHistoryIncompletePoolCount(targets);
+    if (incompletePools > 0) {
+      riskHistoryFailures += 1;
+      const recoveryDelay = scheduleRiskHistoryRecovery(
         requestErrors[0] || `${reason}:incomplete_pools:${incompletePools}/${targets.pools.length}`,
       );
-      riskHistoryLastError=requestErrors.length
+      riskHistoryLastError = requestErrors.length
         ? `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length}:${requestErrors.slice(0,3).join('|')}`
         : `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length};recovery_in=${Math.round(recoveryDelay/1000)}s`;
+      // Never commit an incomplete pool signature as complete.
       return false;
     }
 
-    riskHistoryLastSignature=riskHistorySignature(targets);
+    riskHistoryLastSignature = riskHistorySignature(targets);
     clearRiskHistoryRecoveryState();
-    riskHistoryLastError='';
+    riskHistoryLastError = '';
     return true;
   })();
 
-  riskHistoryRunning=task;
-  try{return await task;}finally{if(riskHistoryRunning===task)riskHistoryRunning=null;}
+  riskHistoryRunning = task;
+  try { return await task; }
+  finally { if (riskHistoryRunning === task) riskHistoryRunning = null; }
 }
 
 function riskReserveHistorySnapshot() {

@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.93';
+const STEP_VERSION = '650.8.15.94';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -43,6 +43,17 @@ const COINBASE_SUBSCRIBE_GAP_MS = Math.max(130, Number(process.env.KAKA_MARKET_L
 const COINBASE_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_COINBASE_RECONNECT_MIN_MS || 2_000));
 const COINBASE_RECONNECT_MAX_MS = Math.max(COINBASE_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_COINBASE_RECONNECT_MAX_MS || 30_000));
 const COINBASE_MAX_PRODUCT_IDS = Math.max(50, Math.min(2_000, Number(process.env.KAKA_MARKET_LIGHT_COINBASE_MAX_PRODUCT_IDS || 1_200)));
+
+// Step1001.6: Binance spot market-light is isolated from the authenticated
+// Binance REST Edge relay. A low-frequency official Spot WebSocket API
+// ticker.24hr all-symbol baseline provides exact currently-trading USDT
+// directory + 24h/BBO fields, while one market-data-only !miniTicker@arr
+// stream refreshes changed symbols between baselines.
+const BINANCE_SPOT_WS_API_URL = 'wss://ws-api.binance.com:443/ws-api/v3';
+const BINANCE_SPOT_MINI_TICKER_WS_URL = 'wss://data-stream.binance.vision:443/ws/!miniTicker@arr';
+const BINANCE_SPOT_BASELINE_TTL_MS = Math.max(60_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BASELINE_TTL_MS || 2 * 60_000));
+const BINANCE_SPOT_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_RECONNECT_MIN_MS || 2_000));
+const BINANCE_SPOT_RECONNECT_MAX_MS = Math.max(BINANCE_SPOT_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_RECONNECT_MAX_MS || 30_000));
 
 // Step990: Binance USDⓈ-M exposes one official all-symbol best bid/ask stream.
 // Keep it as exactly one shared backend WebSocket, independent of user count.
@@ -125,6 +136,32 @@ const coinbase = {
   subscribeMessages: 0,
   messages: 0,
   tickerUpdates: 0,
+};
+
+const binanceSpotTicker = {
+  socket: null,
+  connecting: null,
+  reconnectTimer: null,
+  reconnectAttempt: 0,
+  ready: false,
+  openedAt: 0,
+  lastMessageAt: 0,
+  lastError: '',
+  rows: new Map(),
+  connectAttempts: 0,
+  messages: 0,
+  acceptedUpdates: 0,
+  ignoredNonUsdtUpdates: 0,
+  ignoredUnknownSymbols: 0,
+  baselineConnecting: null,
+  baselineAt: 0,
+  baselineAttempts: 0,
+  baselineSuccesses: 0,
+  baselineFailures: 0,
+  baselineRows: 0,
+  baselineLastError: '',
+  baselineLastRateLimitCount: null,
+  baselineLastRateLimitLimit: null,
 };
 
 const binanceContractBookTicker = {
@@ -363,7 +400,7 @@ async function fetchJson(url, { timeoutMs = 15_000 } = {}) {
     const response = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.93 market-light',
+        'user-agent': 'KakaWeb3/650.8.15.94 market-light',
       },
       signal: controller.signal,
     });
@@ -710,6 +747,11 @@ async function ensureDirectory(provider, market) {
   // stale-identity prune becomes visible within ~30s instead of waiting for the
   // generic 10-minute external-directory cadence used by other providers.
   const localBinanceContractDirectory = provider === 'binance' && market === 'contract';
+  const localBinanceSpotDirectory = provider === 'binance' && market === 'spot';
+  if (localBinanceSpotDirectory) {
+    await refreshBinanceSpotTickerBaseline().catch(() => false);
+    return directoryRowsByKey.get(key) || [];
+  }
   if (!localBinanceContractDirectory && Array.isArray(rows) && rows.length) return rows;
   const quote = PRIMARY_QUOTE[market]?.[provider];
   if (!quote) return [];
@@ -727,6 +769,51 @@ async function ensureDirectory(provider, market) {
 
 async function buildProvider(provider, market, cycleRound) {
   totalBuilds += 1;
+  if (provider === 'binance' && market === 'spot') {
+    ensureBinanceSpotMiniTicker().catch(() => {});
+    await refreshBinanceSpotTickerBaseline().catch(() => false);
+    const rows = [...binanceSpotTicker.rows.values()]
+      .filter((row) => quoteAssetFor(row, 'USDT') === 'USDT')
+      .sort((a, b) => a.symbol.localeCompare(b.symbol));
+    const providerKey = keyFor(market, provider);
+    const current = metaByKey.get(providerKey) || {};
+    if (!rows.length) {
+      metaByKey.set(providerKey, {
+        ...current,
+        build_calls: Number(current.build_calls || 0) + 1,
+        failed_builds: Number(current.failed_builds || 0) + 1,
+        last_error: binanceSpotTicker.baselineLastError || binanceSpotTicker.lastError || 'binance_spot_shared_ws_rows_empty',
+      });
+      totalBuildFailures += 1;
+      return false;
+    }
+    const observedAt = new Date().toISOString();
+    try {
+      assertNoSeverePartialOverwrite(providerKey, rows);
+    } catch (error) {
+      metaByKey.set(providerKey, {
+        ...current,
+        build_calls: Number(current.build_calls || 0) + 1,
+        failed_builds: Number(current.failed_builds || 0) + 1,
+        last_error: String(error?.message || error).slice(0, 320),
+      });
+      totalBuildFailures += 1;
+      return false;
+    }
+    rowsByKey.set(providerKey, rows.map((row) => ({
+      ...row,
+      shared_round: cycleRound,
+      shared_observed_at: observedAt,
+    })));
+    metaByKey.set(providerKey, {
+      ...current,
+      updated_at: observedAt,
+      last_error: '',
+      build_calls: Number(current.build_calls || 0) + 1,
+      successful_builds: Number(current.successful_builds || 0) + 1,
+    });
+    return true;
+  }
   if (provider === 'coinbase' && market === 'spot') {
     const rows = [...coinbase.rows.values()]
       .filter((row) => quoteAssetFor(row, 'USD') === 'USD')
@@ -820,6 +907,10 @@ async function refreshDirectoryCounts() {
     await mapLimit(targets, 2, async ({ provider, market }) => {
       const quote = PRIMARY_QUOTE[market]?.[provider];
       if (!quote) return;
+      if (provider === 'binance' && market === 'spot') {
+        await refreshBinanceSpotTickerBaseline().catch(() => false);
+        return;
+      }
       try {
         const rows = await getMarketUniverseRows(provider, market, quote);
         if (Array.isArray(rows) && rows.length) {
@@ -1109,6 +1200,322 @@ async function ensureCoinbaseTickerBatch() {
   return await coinbase.connecting;
 }
 
+
+function binanceSpotTicker24hRow(raw, observedAt = new Date().toISOString()) {
+  if (!raw || typeof raw !== 'object') return null;
+  const symbol = compact(raw.symbol ?? raw.s);
+  if (!symbol || !symbol.endsWith('USDT') || symbol.length <= 4) return null;
+  const last = positive(raw.lastPrice ?? raw.c);
+  if (last == null) return null;
+  const bid = positive(raw.bidPrice ?? raw.b);
+  const ask = positive(raw.askPrice ?? raw.a);
+  const open = positive(raw.openPrice ?? raw.o);
+  const sourceTime = isoMs(raw.closeTime ?? raw.E) || observedAt;
+  const baseVolume = finite(raw.volume ?? raw.v);
+  const quoteVolume = finite(raw.quoteVolume ?? raw.q);
+  let changePercent = finite(raw.priceChangePercent);
+  if (changePercent == null && open != null && open > 0) changePercent = ((last - open) / open) * 100;
+  return {
+    provider: 'binance',
+    market_type: 'spot',
+    symbol,
+    raw_symbol: symbol,
+    native_symbol: symbol,
+    base_asset: symbol.slice(0, -4),
+    quote_asset: 'USDT',
+    quote_symbol: 'USDT',
+    trading_status: 'TRADING',
+    active: true,
+    last_price: last,
+    price: last,
+    price_change_percent_24h: changePercent,
+    price_change_percent_24h_source: raw.priceChangePercent != null
+      ? 'binance_spot_ws_api_ticker_24hr'
+      : 'derived_from_binance_official_open_close',
+    volume_24h: baseVolume,
+    base_volume_24h: baseVolume,
+    quote_volume_24h: quoteVolume,
+    high_24h: finite(raw.highPrice ?? raw.h),
+    low_24h: finite(raw.lowPrice ?? raw.l),
+    best_bid: bid,
+    best_ask: ask,
+    bid_price: bid,
+    ask_price: ask,
+    spread_percent: bid != null && ask != null && ask > 0 && ask >= bid ? ((ask - bid) / ask) * 100 : null,
+    source: 'binance_spot_official_ws_api_ticker_24hr_all_trading',
+    transport: 'websocket_api_all_symbols_baseline',
+    source_time: sourceTime,
+    cached_at: sourceTime,
+    backend_shared: true,
+    market_light_scope: 'primary_quote_full_directory',
+    bbo_available_in_source: bid != null && ask != null,
+  };
+}
+
+function binanceSpotMiniTickerPatch(raw, existing) {
+  if (!raw || typeof raw !== 'object' || !existing) return null;
+  const symbol = compact(raw.s ?? raw.symbol);
+  if (!symbol || symbol !== compact(existing.symbol) || !symbol.endsWith('USDT')) return null;
+  const last = positive(raw.c);
+  if (last == null) return null;
+  const open = positive(raw.o);
+  const sourceTime = isoMs(raw.E) || new Date().toISOString();
+  return {
+    ...existing,
+    last_price: last,
+    price: last,
+    price_change_percent_24h: open != null && open > 0 ? ((last - open) / open) * 100 : existing.price_change_percent_24h,
+    price_change_percent_24h_source: open != null
+      ? 'derived_from_binance_official_miniticker_close_open'
+      : existing.price_change_percent_24h_source,
+    volume_24h: finite(raw.v) ?? existing.volume_24h,
+    base_volume_24h: finite(raw.v) ?? existing.base_volume_24h,
+    quote_volume_24h: finite(raw.q) ?? existing.quote_volume_24h,
+    high_24h: finite(raw.h) ?? existing.high_24h,
+    low_24h: finite(raw.l) ?? existing.low_24h,
+    source: 'binance_spot_official_ws_api_baseline_plus_miniticker_stream',
+    transport: 'websocket_api_baseline_plus_shared_market_stream',
+    source_time: sourceTime,
+    cached_at: sourceTime,
+  };
+}
+
+function binanceSpotDirectoryFromRows(rows) {
+  return rows.map((row) => ({
+    provider: 'binance',
+    market_type: 'spot',
+    symbol: row.symbol,
+    raw_symbol: row.raw_symbol,
+    native_symbol: row.native_symbol,
+    base_asset: row.base_asset,
+    quote_asset: 'USDT',
+    status: 'TRADING',
+    trading_status: 'TRADING',
+    active: true,
+  }));
+}
+
+async function refreshBinanceSpotTickerBaseline({ force = false } = {}) {
+  if (!force && binanceSpotTicker.baselineAt > 0 && Date.now() - binanceSpotTicker.baselineAt <= BINANCE_SPOT_BASELINE_TTL_MS) {
+    return true;
+  }
+  if (binanceSpotTicker.baselineConnecting) return await binanceSpotTicker.baselineConnecting;
+  binanceSpotTicker.baselineConnecting = (async () => {
+    const WebSocketCtor = await resolveWebSocketCtor();
+    binanceSpotTicker.baselineAttempts += 1;
+    const socket = new WebSocketCtor(BINANCE_SPOT_WS_API_URL);
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const requestId = `kaka-binance-spot-ticker24h-${Date.now()}`;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        closeWs(socket);
+        reject(new Error('binance_spot_ws_api_ticker_24hr_timeout'));
+      }, 15_000);
+      timeout.unref?.();
+
+      wsListen(socket, 'open', () => {
+        if (!sendWs(socket, {
+          id: requestId,
+          method: 'ticker.24hr',
+          params: { type: 'FULL', symbolStatus: 'TRADING' },
+        })) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            closeWs(socket);
+            reject(new Error('binance_spot_ws_api_ticker_24hr_send_failed'));
+          }
+        }
+      });
+
+      wsListen(socket, 'message', async (event) => {
+        if (settled) return;
+        try {
+          const text = await wsMessageText(event);
+          const decoded = JSON.parse(text);
+          if (String(decoded?.id ?? '') !== requestId) return;
+          if (Number(decoded?.status || 0) !== 200) {
+            throw new Error(`binance_spot_ws_api_ticker_24hr_status_${decoded?.status || 0}:${decoded?.error?.msg || ''}`);
+          }
+          const sourceRows = Array.isArray(decoded?.result)
+            ? decoded.result
+            : decoded?.result && typeof decoded.result === 'object'
+              ? [decoded.result]
+              : [];
+          const observedAt = new Date().toISOString();
+          const rows = sourceRows.map((item) => binanceSpotTicker24hRow(item, observedAt)).filter(Boolean);
+          if (rows.length < 20) throw new Error(`binance_spot_ws_api_ticker_24hr_rows_too_small:${rows.length}`);
+
+          const next = new Map(rows.map((row) => [row.symbol, row]));
+          binanceSpotTicker.rows = next;
+          const directory = binanceSpotDirectoryFromRows(rows);
+          directoryRowsByKey.set(keyFor('spot', 'binance'), directory);
+          directoryCountByKey.set(keyFor('spot', 'binance'), directory.length);
+          directoryUpdatedAtByKey.set(keyFor('spot', 'binance'), observedAt);
+
+          const limit = Array.isArray(decoded?.rateLimits)
+            ? decoded.rateLimits.find((item) => String(item?.rateLimitType || '') === 'REQUEST_WEIGHT' && String(item?.interval || '') === 'MINUTE')
+            : null;
+          binanceSpotTicker.baselineLastRateLimitCount = finite(limit?.count);
+          binanceSpotTicker.baselineLastRateLimitLimit = finite(limit?.limit);
+          binanceSpotTicker.baselineAt = Date.now();
+          binanceSpotTicker.baselineRows = rows.length;
+          binanceSpotTicker.baselineSuccesses += 1;
+          binanceSpotTicker.baselineLastError = '';
+
+          settled = true;
+          clearTimeout(timeout);
+          closeWs(socket);
+          resolve(true);
+        } catch (error) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            closeWs(socket);
+            reject(error);
+          }
+        }
+      });
+
+      wsListen(socket, 'error', (error) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(error instanceof Error ? error : new Error('binance_spot_ws_api_ticker_24hr_error'));
+        }
+      });
+
+      wsListen(socket, 'close', () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(new Error('binance_spot_ws_api_ticker_24hr_closed_before_response'));
+        }
+      });
+    });
+  })()
+    .catch((error) => {
+      binanceSpotTicker.baselineFailures += 1;
+      binanceSpotTicker.baselineLastError = String(error?.message || error).slice(0, 320);
+      return false;
+    })
+    .finally(() => {
+      binanceSpotTicker.baselineConnecting = null;
+    });
+  return await binanceSpotTicker.baselineConnecting;
+}
+
+function scheduleBinanceSpotMiniTickerReconnect() {
+  if (binanceSpotTicker.reconnectTimer) return;
+  const delay = Math.min(
+    BINANCE_SPOT_RECONNECT_MAX_MS,
+    BINANCE_SPOT_RECONNECT_MIN_MS * (2 ** Math.min(binanceSpotTicker.reconnectAttempt, 5)),
+  );
+  binanceSpotTicker.reconnectAttempt += 1;
+  binanceSpotTicker.reconnectTimer = setTimeout(() => {
+    binanceSpotTicker.reconnectTimer = null;
+    ensureBinanceSpotMiniTicker().catch(() => {});
+  }, delay);
+  binanceSpotTicker.reconnectTimer.unref?.();
+}
+
+async function openBinanceSpotMiniTicker() {
+  const WebSocketCtor = await resolveWebSocketCtor();
+  binanceSpotTicker.connectAttempts += 1;
+  const socket = new WebSocketCtor(BINANCE_SPOT_MINI_TICKER_WS_URL);
+  binanceSpotTicker.socket = socket;
+  binanceSpotTicker.ready = false;
+  binanceSpotTicker.lastError = '';
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      closeWs(socket);
+      reject(new Error('binance_spot_miniticker_connect_timeout'));
+    }, 12_000);
+    timeout.unref?.();
+
+    wsListen(socket, 'open', () => {
+      if (settled) return;
+      binanceSpotTicker.openedAt = Date.now();
+      binanceSpotTicker.reconnectAttempt = 0;
+      binanceSpotTicker.ready = true;
+      refreshBinanceSpotTickerBaseline().catch(() => {});
+      settled = true;
+      clearTimeout(timeout);
+      resolve(true);
+    });
+
+    wsListen(socket, 'message', async (event) => {
+      try {
+        const text = await wsMessageText(event);
+        const decoded = JSON.parse(text);
+        const payload = decoded?.data ?? decoded;
+        const items = Array.isArray(payload) ? payload : [payload];
+        binanceSpotTicker.messages += 1;
+        binanceSpotTicker.lastMessageAt = Date.now();
+        for (const item of items) {
+          const symbol = compact(item?.s ?? item?.symbol);
+          if (!symbol || !symbol.endsWith('USDT')) {
+            binanceSpotTicker.ignoredNonUsdtUpdates += 1;
+            continue;
+          }
+          const existing = binanceSpotTicker.rows.get(symbol);
+          if (!existing) {
+            // Stream is changed-only, so never let it invent directory identity.
+            binanceSpotTicker.ignoredUnknownSymbols += 1;
+            continue;
+          }
+          const merged = binanceSpotMiniTickerPatch(item, existing);
+          if (!merged) continue;
+          binanceSpotTicker.rows.set(symbol, merged);
+          binanceSpotTicker.acceptedUpdates += 1;
+        }
+      } catch (error) {
+        binanceSpotTicker.lastError = String(error?.message || error).slice(0, 320);
+      }
+    });
+
+    wsListen(socket, 'error', (error) => {
+      binanceSpotTicker.lastError = String(error?.message || error || 'binance_spot_miniticker_socket_error').slice(0, 320);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error('binance_spot_miniticker_socket_error'));
+      }
+    });
+
+    wsListen(socket, 'close', () => {
+      binanceSpotTicker.ready = false;
+      if (binanceSpotTicker.socket === socket) binanceSpotTicker.socket = null;
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error('binance_spot_miniticker_closed_before_open'));
+      }
+      scheduleBinanceSpotMiniTickerReconnect();
+    });
+  });
+}
+
+async function ensureBinanceSpotMiniTicker() {
+  if (wsReady(binanceSpotTicker.socket) && binanceSpotTicker.ready) return true;
+  if (binanceSpotTicker.connecting) return await binanceSpotTicker.connecting;
+  binanceSpotTicker.connecting = openBinanceSpotMiniTicker()
+    .catch((error) => {
+      binanceSpotTicker.lastError = String(error?.message || error).slice(0, 320);
+      scheduleBinanceSpotMiniTickerReconnect();
+      return false;
+    })
+    .finally(() => {
+      binanceSpotTicker.connecting = null;
+    });
+  return await binanceSpotTicker.connecting;
+}
+
 function binanceContractBookTickerRow(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const symbolTypeRaw = raw.st;
@@ -1343,6 +1750,8 @@ export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {})
   const cycleRound = round + 1;
   try {
     ensureCoinbaseTickerBatch().catch(() => {});
+    ensureBinanceSpotMiniTicker().catch(() => {});
+    refreshBinanceSpotTickerBaseline().catch(() => {});
     ensureBinanceContractBookTicker().catch(() => {});
     const targets = [
       ...SPOT_PROVIDERS.map((provider) => ({ provider, market: 'spot' })),
@@ -1371,6 +1780,8 @@ export function startMarketLightSnapshotScanner() {
   if (started || process.env.KAKA_DISABLE_MARKET_LIGHT_SCANNER === '1') return;
   started = true;
   ensureCoinbaseTickerBatch().catch(() => {});
+  ensureBinanceSpotMiniTicker().catch(() => {});
+  refreshBinanceSpotTickerBaseline().catch(() => {});
   ensureBinanceContractBookTicker().catch(() => {});
   refreshDirectoryCounts().catch(() => {});
   scanTimer = setTimeout(() => {
@@ -1532,8 +1943,12 @@ export function getMarketLightSnapshotHealth() {
     directory_min_ratio_after_warm: DIRECTORY_MIN_RATIO_AFTER_WARM,
     designed_upstream_budget: {
       scan_interval_seconds: Math.round(SCAN_INTERVAL_MS / 1000),
-      approximate_batch_attempts_per_cycle: 11,
-      approximate_batch_attempts_per_minute_at_default_interval: Math.round((60_000 / SCAN_INTERVAL_MS) * 11 * 10) / 10,
+      approximate_batch_attempts_per_cycle: 10,
+      approximate_batch_attempts_per_minute_at_default_interval: Math.round((60_000 / SCAN_INTERVAL_MS) * 10 * 10) / 10,
+      binance_spot_shared_market_ws_connections: 1,
+      binance_spot_ws_api_baseline_requests_per_2m: 1,
+      binance_spot_rest_requests_from_market_light: 0,
+      binance_spot_edge_relay_requests_from_market_light: 0,
       coinbase_shared_market_ws_connections: 1,
       binance_contract_all_book_ticker_shared_ws_connections: 1,
       binance_contract_bbo_ws_api_baseline_requests_per_10m: 1,
@@ -1542,7 +1957,7 @@ export function getMarketLightSnapshotHealth() {
       note: 'collector budget only; shared caches/governors may reduce physical upstream calls further',
     },
     full_market_light_source_notes: {
-      binance_spot: 'official_all_24h_tickers_batch',
+      binance_spot: 'official Spot WebSocket API ticker.24hr all-currently-trading baseline + one data-stream.binance.vision !miniTicker@arr shared changed-symbol stream; no REST/Edge relay dependency',
       binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot + official USDⓈ-M !bookTicker one shared websocket for all-symbol BBO',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
@@ -1576,6 +1991,51 @@ export function getMarketLightSnapshotHealth() {
       mark_batch_mode: 'instType=SWAP',
       additional_user_scaled_requests: 0,
       additional_user_scaled_connections: 0,
+    },
+    binance_spot_ticker_shared_ws: {
+      ready: binanceSpotTicker.baselineRows > 0 &&
+        binanceSpotTicker.rows.size === binanceSpotTicker.baselineRows &&
+        Number(directoryCountByKey.get(keyFor('spot','binance')) || 0) === binanceSpotTicker.baselineRows,
+      source: 'binance_spot_official_ws_api_ticker_24hr_plus_miniticker',
+      ws_api_url: BINANCE_SPOT_WS_API_URL,
+      ws_api_baseline_method: 'ticker.24hr',
+      ws_api_baseline_symbol_omitted_returns_all_currently_trading: true,
+      ws_api_baseline_symbol_status: 'TRADING',
+      ws_api_baseline_type: 'FULL',
+      ws_api_baseline_ip_weight: 80,
+      ws_api_baseline_ttl_seconds: Math.round(BINANCE_SPOT_BASELINE_TTL_MS / 1000),
+      ws_api_baseline_attempts: binanceSpotTicker.baselineAttempts,
+      ws_api_baseline_successes: binanceSpotTicker.baselineSuccesses,
+      ws_api_baseline_failures: binanceSpotTicker.baselineFailures,
+      ws_api_baseline_rows: binanceSpotTicker.baselineRows,
+      ws_api_baseline_at: binanceSpotTicker.baselineAt ? new Date(binanceSpotTicker.baselineAt).toISOString() : null,
+      ws_api_baseline_last_error: binanceSpotTicker.baselineLastError,
+      ws_api_last_request_weight_count_1m: binanceSpotTicker.baselineLastRateLimitCount,
+      ws_api_last_request_weight_limit_1m: binanceSpotTicker.baselineLastRateLimitLimit,
+      market_stream_url: BINANCE_SPOT_MINI_TICKER_WS_URL,
+      market_stream: '!miniTicker@arr',
+      market_stream_changed_symbols_only: true,
+      stream_connected: wsReady(binanceSpotTicker.socket) && binanceSpotTicker.ready,
+      cached_rows: binanceSpotTicker.rows.size,
+      directory_rows: Number(directoryCountByKey.get(keyFor('spot','binance')) || 0),
+      connect_attempts: binanceSpotTicker.connectAttempts,
+      messages: binanceSpotTicker.messages,
+      accepted_updates: binanceSpotTicker.acceptedUpdates,
+      ignored_non_usdt_updates: binanceSpotTicker.ignoredNonUsdtUpdates,
+      ignored_unknown_symbols: binanceSpotTicker.ignoredUnknownSymbols,
+      opened_at: binanceSpotTicker.openedAt ? new Date(binanceSpotTicker.openedAt).toISOString() : null,
+      last_message_at: binanceSpotTicker.lastMessageAt ? new Date(binanceSpotTicker.lastMessageAt).toISOString() : null,
+      last_error: binanceSpotTicker.lastError,
+      direct_rest_used: false,
+      edge_relay_used: false,
+      directory_from_ws_api_baseline: true,
+      stream_cannot_invent_directory_identity: true,
+      one_shared_backend_stream: true,
+      shared_backend_connections: 1,
+      per_user_requests: 0,
+      per_user_connections: 0,
+      user_reads_start_connections: false,
+      reads_scale_with_users: false,
     },
     binance_contract_all_book_ticker: {
       source: 'binance_usdm_all_book_tickers_shared_websocket',
@@ -1681,3 +2141,5 @@ export async function handleMarketLightSnapshot(req, res, url) {
   sendJson(res, 200, snapshotPayload({ market, provider, includeRows, offset, limit }));
   return true;
 }
+
+export const __marketLightStep1001_6Test = Object.freeze({ binanceSpotTicker24hRow, binanceSpotMiniTickerPatch, binanceSpotDirectoryFromRows });
