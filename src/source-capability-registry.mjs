@@ -9,7 +9,7 @@ import { getContractLiquidationPersistenceHealth } from './liquidation-bridge.mj
 import { getContractFlowHealth } from './contract-flow.mjs';
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.22';
+const VERSION = '650.8.15.23';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -292,6 +292,9 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         contractFlow.binance_official_taker?.normalized_shared_snapshot_persisted === true &&
         contractFlow.binance_official_taker?.render_direct_binance_rest === false &&
         contractFlow.binance_official_taker?.custom_provider_governor_created === false &&
+        contractFlow.binance_official_taker?.focus_change_detection === 'symbol_signature_not_round_counter' &&
+        contractFlow.binance_official_taker?.focus_round_is_not_used_as_symbol_change_signal === true &&
+        contractFlow.binance_official_taker?.scheduled_same_signature_refresh_is_full_focus15 === true &&
         liquidationHistory.bitget_liquidations_history?.collector_ready === true &&
         liquidationHistory.bitget_liquidations_history?.official_endpoint_operational === true &&
         Number(liquidationHistory.bitget_liquidations_history?.official_response_cycles || 0) > 0 &&
@@ -326,6 +329,9 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       binance_official_taker_relay_guard_active: contractFlow.binance_official_taker?.relay_guard_active === true,
       binance_official_taker_relay_guard_next_allowed_at: contractFlow.binance_official_taker?.relay_guard_next_allowed_at || null,
       binance_official_taker_user_reads_trigger_exchange_requests: contractFlow.binance_official_taker?.user_reads_trigger_exchange_requests === true,
+      binance_official_taker_focus_change_detection: contractFlow.binance_official_taker?.focus_change_detection || null,
+      binance_official_taker_round_not_symbol_change_signal: contractFlow.binance_official_taker?.focus_round_is_not_used_as_symbol_change_signal === true,
+      binance_official_taker_same_signature_full_refresh: contractFlow.binance_official_taker?.scheduled_same_signature_refresh_is_full_focus15 === true,
       bitget_liquidation_history_ready: liquidationHistory.bitget_liquidations_history?.collector_ready === true && liquidationHistory.bitget_liquidations_history?.official_endpoint_operational === true,
       bitget_liquidation_history_collector_ready: liquidationHistory.bitget_liquidations_history?.collector_ready === true,
       bitget_liquidation_history_official_endpoint_operational: liquidationHistory.bitget_liquidations_history?.official_endpoint_operational === true,
@@ -352,7 +358,11 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       user_reads_scale_exchange_upstream: false,
     },
     binance_step993: {
-      ready: binanceAdvanced.ready === true,
+      ready: binanceAdvanced.ready === true &&
+        binanceAdvanced.adl_all_symbols_response_cache_retains_nonfocus_symbols === true &&
+        binanceAdvanced.adl_dynamic_hot_focus_reuses_cached_all_symbols_snapshot === true &&
+        binanceAdvanced.dynamic_focus_missing_only_recovery === true &&
+        binanceAdvanced.dynamic_focus_recovery_user_read_triggered === false,
       version: binanceAdvanced.version || null,
       focus_target: Number(binanceAdvanced.focus_target || 0),
       row_count: Number(binanceAdvanced.row_count || 0),
@@ -368,6 +378,11 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       adl_official_update_interval_minutes: Number(binanceAdvanced.adl_official_update_interval_minutes || 0),
       edge_relay_only: binanceAdvanced.edge_relay_only === true,
       render_direct_binance_rest: binanceAdvanced.render_direct_binance_rest === true,
+      adl_all_symbols_response_cache_retains_nonfocus_symbols: binanceAdvanced.adl_all_symbols_response_cache_retains_nonfocus_symbols === true,
+      adl_dynamic_hot_focus_reuses_cached_all_symbols_snapshot: binanceAdvanced.adl_dynamic_hot_focus_reuses_cached_all_symbols_snapshot === true,
+      dynamic_focus_watch_seconds: Number(binanceAdvanced.dynamic_focus_watch_seconds || 0),
+      dynamic_focus_missing_only_recovery: binanceAdvanced.dynamic_focus_missing_only_recovery === true,
+      dynamic_focus_recovery_user_read_triggered: binanceAdvanced.dynamic_focus_recovery_user_read_triggered === true,
       user_reads_scale_with_users: false,
     },
     bitget_step991: {

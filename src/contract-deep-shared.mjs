@@ -2,7 +2,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { getContractDepthSharedOrderbook } from './contract-depth.mjs';
 import { getContractFlowInternalFocusSnapshot, reconcileContractFlowFocusPool } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.4';
+const VERSION = '650.8.15.5';
 const SNAPSHOT_ROUTE = '/api/contract-deep-shared/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-deep-shared/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -10,6 +10,12 @@ const TARGET_PER_PROVIDER = 15;
 const TARGET_ROWS = PROVIDERS.length * TARGET_PER_PROVIDER;
 const DEPTH_LEVELS = 20;
 const DEPTH_SAMPLE_PER_PROVIDER_PER_CYCLE = 4;
+// Step1004.1.3: after a provider already has verified depth samples, a
+// persistently failing row may consume at most one of the four bounded slots.
+// The other three slots remain available to refresh healthy rows so one bad
+// Binance depth stream cannot age the rest of focus15 past the freshness gate.
+const DEPTH_FAILED_RECOVERY_MAX_PER_PROVIDER_PER_CYCLE = 1;
+const DEPTH_HEALTHY_REFRESH_RESERVED_PER_PROVIDER_PER_CYCLE = 3;
 const SCAN_INTERVAL_MS = 15_000;
 const STARTUP_DELAY_MS = 12_000;
 const DEPTH_STALE_MS = 95_000;
@@ -189,38 +195,85 @@ function depthRecoveryPriority(row, now) {
 function nextDepthTargets(focus) {
   const targets = [];
   const now = Date.now();
+
   for (const provider of PROVIDERS) {
     const rows = focus.byProvider[provider] || [];
     if (!rows.length) continue;
+
     const count = Math.min(DEPTH_SAMPLE_PER_PROVIDER_PER_CYCLE, rows.length);
     const selected = [];
     const selectedKeys = new Set();
 
-    // Step992.3: cold-start and refresh recovery always consume the same bounded
-    // four-per-provider budget first. Missing/failed rows are retried before
-    // already-healthy rows; this changes ordering only, never request volume.
-    const recoveryRows = rows
-      .map((row, index) => ({ row, index, priority: depthRecoveryPriority(row, now) }))
-      .filter((item) => item.priority < 9)
-      .sort((a, b) => a.priority - b.priority || a.index - b.index);
-    for (const item of recoveryRows) {
+    const classified = rows.map((row, index) => {
+      const key = `${provider}:${row.symbol}`;
+      const current = depthState.get(key) || null;
+      const hasVerifiedSample = Boolean(current && Number(current.depth_sampled_at_ms || 0) > 0);
+      const hasFailure = Boolean(
+        String(current?.depth_last_refresh_error || '').trim() ||
+        String(current?.depth_error || '').trim()
+      );
+      const cooling = depthRetryNotBeforeMs(current) > now;
+      return { row, index, key, current, hasVerifiedSample, hasFailure, cooling };
+    });
+
+    // Cold/new focus rows that have never failed get first priority so a hot5
+    // change can bootstrap quickly without changing the existing request cap.
+    const coldMissing = classified.filter(
+      (item) => !item.hasVerifiedSample && !item.hasFailure && !item.cooling,
+    );
+    for (const item of coldMissing) {
       if (selected.length >= count) break;
-      const key = `${provider}:${item.row.symbol}`;
-      if (selectedKeys.has(key)) continue;
       selected.push(item.row);
-      selectedKeys.add(key);
+      selectedKeys.add(item.key);
     }
 
-    // Preserve the existing round-robin refresh for the remaining budget so
-    // healthy rows keep refreshing and no provider can exceed the old cap.
+    // Failed rows used to consume all four provider slots every 15 seconds.
+    // Once any verified focus depth exists, cap failed recovery at one slot;
+    // this guarantees >=3 healthy round-robin refresh slots per cycle.
+    const verifiedCount = classified.filter((item) => item.hasVerifiedSample).length;
+    const failedBudget = verifiedCount > 0
+      ? Math.min(DEPTH_FAILED_RECOVERY_MAX_PER_PROVIDER_PER_CYCLE, count - selected.length)
+      : Math.min(2, count - selected.length);
+
+    if (failedBudget > 0) {
+      const failed = classified
+        .filter((item) => item.hasFailure && !item.cooling && !selectedKeys.has(item.key))
+        .sort((a, b) => {
+          const aVerified = a.hasVerifiedSample ? 1 : 0;
+          const bVerified = b.hasVerifiedSample ? 1 : 0;
+          if (aVerified !== bVerified) return aVerified - bVerified;
+          const aAge = Math.max(0, now - Number(a.current?.depth_sampled_at_ms || 0));
+          const bAge = Math.max(0, now - Number(b.current?.depth_sampled_at_ms || 0));
+          return bAge - aAge || a.index - b.index;
+        });
+      for (const item of failed.slice(0, failedBudget)) {
+        selected.push(item.row);
+        selectedKeys.add(item.key);
+      }
+    }
+
+    // Healthy rows always retain the remaining bounded budget. Rows currently
+    // in a failure state are intentionally not selected here; their retry is
+    // handled only by the bounded failed-recovery lane above.
     let cursor = Math.max(0, Number(cursors[provider] || 0)) % rows.length;
     let visited = 0;
     while (selected.length < count && visited < rows.length) {
       const row = rows[(cursor + visited) % rows.length];
       const key = `${provider}:${row.symbol}`;
       const current = depthState.get(key) || null;
-      if (depthRetryNotBeforeMs(current) > now) {
+      const cooling = depthRetryNotBeforeMs(current) > now;
+      const failed = Boolean(
+        String(current?.depth_last_refresh_error || '').trim() ||
+        String(current?.depth_error || '').trim()
+      );
+      const hasVerifiedSample = Boolean(current && Number(current.depth_sampled_at_ms || 0) > 0);
+
+      if (cooling) {
         depthCooldownSkips += 1;
+        visited += 1;
+        continue;
+      }
+      if (failed || !hasVerifiedSample) {
         visited += 1;
         continue;
       }
@@ -230,9 +283,11 @@ function nextDepthTargets(focus) {
       }
       visited += 1;
     }
+
     cursors[provider] = (cursor + Math.max(1, visited)) % rows.length;
     targets.push(...selected);
   }
+
   return targets;
 }
 
@@ -478,6 +533,10 @@ function currentPayload() {
     depth_retry_cooldown_rows_do_not_consume_cycle_budget: true,
     depth_refresh_failures_preserve_last_good_until_stale: true,
     depth_recovery_does_not_raise_per_cycle_request_cap: true,
+    failed_recovery_max_per_provider_per_cycle: DEPTH_FAILED_RECOVERY_MAX_PER_PROVIDER_PER_CYCLE,
+    healthy_refresh_reserved_per_provider_per_cycle: DEPTH_HEALTHY_REFRESH_RESERVED_PER_PROVIDER_PER_CYCLE,
+    failed_rows_cannot_monopolize_provider_cycle: true,
+    healthy_rows_refresh_budget_preserved_under_failures: true,
     flow_active_rows: Number(flow.active_rows || 0),
     flow_connected_rows: Number(flow.connected_rows || 0),
     flow_value_rows: flowRows,
@@ -525,6 +584,10 @@ export function getContractDeepSharedHealth() {
     depth_retry_cooldown_rows_do_not_consume_cycle_budget: true,
     depth_refresh_failures_preserve_last_good_until_stale: true,
     depth_recovery_does_not_raise_per_cycle_request_cap: true,
+    failed_recovery_max_per_provider_per_cycle: DEPTH_FAILED_RECOVERY_MAX_PER_PROVIDER_PER_CYCLE,
+    healthy_refresh_reserved_per_provider_per_cycle: DEPTH_HEALTHY_REFRESH_RESERVED_PER_PROVIDER_PER_CYCLE,
+    failed_rows_cannot_monopolize_provider_cycle: true,
+    healthy_rows_refresh_budget_preserved_under_failures: true,
     flow_active_rows: payload.flow_active_rows,
     flow_connected_rows: payload.flow_connected_rows,
     flow_value_rows: payload.flow_value_rows,

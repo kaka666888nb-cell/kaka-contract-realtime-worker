@@ -4,7 +4,7 @@ import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.95';
+const VERSION = '650.8.15.96';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -554,6 +554,7 @@ let binanceOfficialTakerLastRestoreError = '';
 let binanceOfficialTakerLastPersistError = '';
 let binanceOfficialTakerRecoveryTimer = null;
 let binanceOfficialTakerRound = 0;
+let binanceOfficialTakerLastSuccessfulFocusSignature = '';
 const binanceOfficialTakerStats = {
   attempts: 0,
   successes: 0,
@@ -2431,7 +2432,13 @@ async function persistBinanceOfficialTakerSharedSnapshot() {
 function binanceOfficialTakerFocusTargets() {
   const focus = focusPoolSymbolsByProvider();
   const rows = focus.byProvider?.binance || [];
-  return { ready: focus.ready === true && rows.length === 15, round: Number(focus.round || 0), symbols: rows.slice(0,15) };
+  const symbols = rows.slice(0, 15);
+  return {
+    ready: focus.ready === true && symbols.length === 15,
+    round: Number(focus.round || 0),
+    symbols,
+    signature: symbols.join('|'),
+  };
 }
 
 function binanceOfficialTakerEntryFresh(entry) {
@@ -2486,6 +2493,11 @@ function binanceOfficialTakerHealthPayload() {
     defer_when_busy: false,
     visible_kline_and_critical_priority_preserved_by_existing_relay_queue: true,
     focus_change_missing_only_recovery: true,
+    focus_change_detection: 'symbol_signature_not_round_counter',
+    focus_round_is_not_used_as_symbol_change_signal: true,
+    scheduled_same_signature_refresh_is_full_focus15: true,
+    last_successful_focus_signature: binanceOfficialTakerLastSuccessfulFocusSignature,
+    current_focus_signature: focus.signature,
     incomplete_focus_recovery_seconds: Math.round(BINANCE_OFFICIAL_TAKER_RETRY_MS/1000),
     incomplete_focus_recovery_uses_existing_edge_relay_deferral: true,
     existing_edge_relay_governor_reused: true,
@@ -2540,6 +2552,7 @@ async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnl
     const health=binanceOfficialTakerHealthPayload();
     if(health.ready) {
       binanceOfficialTakerStats.last_successful_focus_round=focus.round;
+      binanceOfficialTakerLastSuccessfulFocusSignature=focus.signature;
       await persistBinanceOfficialTakerSharedSnapshot().catch(()=>false);
     }
     binanceOfficialTakerStats.last_error=health.ready?'':errors.join(' | ').slice(0,700);
@@ -2568,8 +2581,19 @@ function startBinanceOfficialTakerCollector() {
   startup.unref?.();
   const interval=setInterval(async()=>{
     const focus=binanceOfficialTakerFocusTargets();
-    const focusChanged=focus.ready && Number(binanceOfficialTakerStats.last_successful_focus_round||0)!==Number(focus.round||0);
-    const ready=await refreshBinanceOfficialTakerFocus(focusChanged?'focus_change_missing_only':'interval',{missingOnly:focusChanged}).catch(()=>false);
+    const focusChanged=focus.ready &&
+      Boolean(binanceOfficialTakerLastSuccessfulFocusSignature) &&
+      focus.signature !== binanceOfficialTakerLastSuccessfulFocusSignature;
+    // Step1004.1.3: focus.round increments on every pool rebuild even when the
+    // same 15 symbols remain selected. Treating round changes as symbol changes
+    // incorrectly converted every scheduled refresh into missing-only mode and
+    // allowed old entries to cross the 12-minute stale gate. Only a real symbol
+    // signature change uses missing-only recovery; an unchanged focus performs
+    // the intended full focus15 refresh every five minutes.
+    const ready=await refreshBinanceOfficialTakerFocus(
+      focusChanged?'focus_change_missing_only':'interval_full_focus',
+      {missingOnly:focusChanged},
+    ).catch(()=>false);
     if(!ready) scheduleBinanceOfficialTakerRecovery();
   },BINANCE_OFFICIAL_TAKER_REFRESH_MS);
   interval.unref?.();

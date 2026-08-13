@@ -4,7 +4,7 @@ import {
   getBinanceContractKlineRelayHealth,
 } from './binance-contract-kline-relay.mjs';
 
-const VERSION = '650.8.15.4';
+const VERSION = '650.8.15.5';
 const SNAPSHOT_ROUTE = '/api/binance-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/binance-advanced/health';
 const FUTURES_BASE = 'https://fapi.binance.com';
@@ -20,6 +20,7 @@ const ADL_STALE_MS = Math.max(35 * 60_000, Number(process.env.KAKA_BINANCE_ADVAN
 const ADL_REFRESH_MS = Math.max(30 * 60_000, Number(process.env.KAKA_BINANCE_ADVANCED_ADL_REFRESH_MS || 30 * 60_000));
 const ADL_TARGET_RECOVERY_COOLDOWN_MS = Math.max(5 * 60_000, Number(process.env.KAKA_BINANCE_ADVANCED_ADL_TARGET_RECOVERY_COOLDOWN_MS || 5 * 60_000));
 const ADL_TARGET_RECOVERY_MAX_PER_CYCLE = 1;
+const DYNAMIC_FOCUS_WATCH_MS = Math.max(10_000, Number(process.env.KAKA_BINANCE_ADVANCED_FOCUS_WATCH_MS || 15_000));
 const RELAY_LANE = 'critical';
 const RELAY_PRIORITY = 18;
 
@@ -28,6 +29,7 @@ let running = null;
 let startTimer = null;
 let recoveryTimer = null;
 let refreshInterval = null;
+let focusWatchInterval = null;
 let round = 0;
 let totalReads = 0;
 let totalBuilds = 0;
@@ -244,15 +246,21 @@ async function refreshAdl(targets, reason) {
       const payload = await relayJson(`${FUTURES_BASE}/fapi/v1/symbolAdlRisk`, 'adl_risk_all_symbols');
       const parsed = parseAdlRows(payload);
       lastAdlAllSymbolsRowCount = parsed.size;
-      for (const target of targets) {
-        const row = parsed.get(target.symbol);
-        if (!row) continue;
-        adlRows.set(target.symbol, {
+
+      // Step1004.1.3: the endpoint is already one official all-symbol request.
+      // Retain every valid symbol from that same response instead of discarding
+      // non-focus rows. Dynamic hot5 changes can then reuse the already-fetched
+      // official 30-minute ADL snapshot with zero additional Binance requests.
+      for (const [symbol, row] of parsed.entries()) {
+        adlRows.set(symbol, {
           ...row,
-          base_asset: target.base_asset,
-          focus_role: target.role,
-          focus_slot: target.slot,
+          base_asset: symbol.endsWith('USDT') ? symbol.slice(0, -4) : null,
+          focus_role: null,
+          focus_slot: null,
         });
+      }
+      for (const target of targets) {
+        if (!parsed.has(target.symbol)) continue;
         adlOfficialUnavailable.delete(target.symbol);
         adlTargetProbeErrors.delete(target.symbol);
       }
@@ -437,6 +445,17 @@ export function startBinanceAdvancedStatsScanner() {
     if (!startupReady()) scheduleStartupRecovery();
   }, REFRESH_MS);
   refreshInterval.unref?.();
+
+  // A focus hot5 can change independently of the five-minute advanced-stat
+  // interval. Detect missing current-focus official fields quickly and recover
+  // only those rows through the existing relay/governor. This is backend-only
+  // and never triggered by a user read.
+  focusWatchInterval = setInterval(async () => {
+    if (startupReady()) return;
+    await refreshCycle('startup_recovery').catch(() => false);
+    if (!startupReady()) scheduleStartupRecovery();
+  }, DYNAMIC_FOCUS_WATCH_MS);
+  focusWatchInterval.unref?.();
 }
 
 function snapshotPayload({ includeRows = true } = {}) {
@@ -529,6 +548,11 @@ function snapshotPayload({ includeRows = true } = {}) {
     adl_target_requires_successful_all_symbols_snapshot: true,
     adl_target_queue_wait_enabled: true,
     adl_target_defer_when_busy: false,
+    adl_all_symbols_response_cache_retains_nonfocus_symbols: true,
+    adl_dynamic_hot_focus_reuses_cached_all_symbols_snapshot: true,
+    dynamic_focus_watch_seconds: Math.round(DYNAMIC_FOCUS_WATCH_MS / 1000),
+    dynamic_focus_missing_only_recovery: true,
+    dynamic_focus_recovery_user_read_triggered: false,
     adl_target_priority: RELAY_PRIORITY + 2,
     adl_target_recovery_per_cycle_max: ADL_TARGET_RECOVERY_MAX_PER_CYCLE,
     adl_target_probe_cooldown_seconds: Math.round(ADL_TARGET_RECOVERY_COOLDOWN_MS / 1000),
