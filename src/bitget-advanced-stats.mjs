@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.4';
+const VERSION = '650.8.15.5';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
@@ -20,6 +20,8 @@ const RISK_HISTORY_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BI
 const RISK_HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_STALE_MS || 12 * 60 * 60_000));
 const RISK_HISTORY_WATCH_MS = Math.max(20_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_WATCH_MS || 30_000));
 const RISK_HISTORY_REQUEST_GAP_MS = Math.max(300, Number(process.env.KAKA_BITGET_RISK_HISTORY_REQUEST_GAP_MS || 380));
+const RISK_HISTORY_RECOVERY_BASE_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_RECOVERY_BASE_MS || 60_000));
+const RISK_HISTORY_RECOVERY_MAX_MS = Math.max(RISK_HISTORY_RECOVERY_BASE_MS, Number(process.env.KAKA_BITGET_RISK_HISTORY_RECOVERY_MAX_MS || 15 * 60_000));
 const OFFICIAL_5M_HISTORY_LIMIT = Math.max(36, Math.min(576, Number(process.env.KAKA_BITGET_OFFICIAL_5M_HISTORY_LIMIT || 288)));
 const DERIVED_HISTORY_INTERVALS = Object.freeze({
   '15m': 15 * 60_000,
@@ -53,6 +55,10 @@ let riskHistoryLastCompletedAt = null;
 let riskHistoryLastError = '';
 let riskHistoryBuilds = 0;
 let riskHistoryFailures = 0;
+let riskHistoryRecoveryAttempts = 0;
+let riskHistoryRecoveryFailures = 0;
+let riskHistoryNextRecoveryAt = 0;
+let riskHistoryLastRecoveryReason = '';
 let round = 0;
 let totalReads = 0;
 let responseCacheHits = 0;
@@ -831,6 +837,30 @@ function riskHistorySignature(targets) {
     .join('|');
 }
 
+function riskHistoryRecoveryDelayMs(failures) {
+  const safe = Math.max(1, Number(failures || 1));
+  const factor = 2 ** Math.min(4, safe - 1);
+  return Math.min(RISK_HISTORY_RECOVERY_MAX_MS, RISK_HISTORY_RECOVERY_BASE_MS * factor);
+}
+
+function riskHistoryIncompletePoolCount(targets = riskReserveHistoryTargets()) {
+  return targets.pools.filter((pool) => !riskHistoryPoolReady(pool.pool_key)).length;
+}
+
+function scheduleRiskHistoryRecovery(reason = 'incomplete') {
+  riskHistoryRecoveryFailures += 1;
+  const delayMs = riskHistoryRecoveryDelayMs(riskHistoryRecoveryFailures);
+  riskHistoryNextRecoveryAt = Date.now() + delayMs;
+  riskHistoryLastRecoveryReason = String(reason || 'incomplete').slice(0, 240);
+  return delayMs;
+}
+
+function clearRiskHistoryRecoveryState() {
+  riskHistoryRecoveryFailures = 0;
+  riskHistoryNextRecoveryAt = 0;
+  riskHistoryLastRecoveryReason = '';
+}
+
 function parseRiskReserveHistory(payload, { lane, pool, granularity }) {
   const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
   const coin = compact(data?.coin);
@@ -884,20 +914,23 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
   const task = (async () => {
     riskHistoryLastStartedAt = new Date().toISOString();
     riskHistoryBuilds += 1;
+    if (reason.includes('recovery') || reason.includes('watch') || missingOnly) riskHistoryRecoveryAttempts += 1;
 
     const targets = riskReserveHistoryTargets();
     if (!targets.focus_ready || targets.mapped_focus_rows.length !== FOCUS_TARGET) {
       riskHistoryLastError = `${reason}:focus_not_ready:${targets.mapped_focus_rows.length}/${FOCUS_TARGET}`;
-      riskHistoryFailures += 1;
-      return false;
-    }
-    const unmapped = targets.mapped_focus_rows.filter((row) => !row.pool_found);
-    if (unmapped.length > 0 || targets.pools.length === 0) {
-      riskHistoryLastError = `${reason}:risk_reserve_pool_mapping_missing:${unmapped.map((row) => row.symbol).join(',')}`;
-      riskHistoryFailures += 1;
+      riskHistoryNextRecoveryAt = 0;
       return false;
     }
 
+    const unmapped = targets.mapped_focus_rows.filter((row) => !row.pool_found);
+    if (unmapped.length > 0 || targets.pools.length === 0) {
+      riskHistoryLastError = `${reason}:risk_reserve_pool_mapping_missing:${unmapped.map((row) => row.symbol).join(',')}`;
+      riskHistoryNextRecoveryAt = 0;
+      return false;
+    }
+
+    const requestErrors = [];
     for (const pool of targets.pools) {
       if (missingOnly && riskHistoryPoolReady(pool.pool_key)) continue;
       const previous = riskReserveHistoryByPool.get(pool.pool_key) || {};
@@ -915,6 +948,7 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
             granularity: 'daily',
           });
         } catch (error) {
+          requestErrors.push(`daily:${pool.representative_symbol}:${String(error?.message || error)}`);
           if (!previous.daily?.official_response) {
             next.daily = {
               official_response: false,
@@ -945,6 +979,7 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
             granularity: 'hourly',
           });
         } catch (error) {
+          requestErrors.push(`hourly:${pool.representative_symbol}:${String(error?.message || error)}`);
           if (!previous.hourly?.official_response) {
             next.hourly = {
               official_response: false,
@@ -966,22 +1001,30 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
       riskReserveHistoryByPool.set(pool.pool_key, next);
     }
 
-    // Prune histories for pools no longer intersecting focus15.
     const activeKeys = new Set(targets.pools.map((pool) => pool.pool_key));
     for (const key of [...riskReserveHistoryByPool.keys()]) {
       if (!activeKeys.has(key)) riskReserveHistoryByPool.delete(key);
     }
 
-    riskHistoryLastSignature = riskHistorySignature(targets);
     riskHistoryLastCompletedAt = new Date().toISOString();
     responseCache.clear();
 
-    const ready = targets.pools.every((pool) => riskHistoryPoolReady(pool.pool_key));
-    if (!ready) {
-      riskHistoryLastError = `${reason}:risk_reserve_history_incomplete`;
+    const incompletePools = riskHistoryIncompletePoolCount(targets);
+    if (incompletePools > 0) {
       riskHistoryFailures += 1;
+      const recoveryDelayMs = scheduleRiskHistoryRecovery(
+        requestErrors[0] || `${reason}:incomplete_pools:${incompletePools}/${targets.pools.length}`,
+      );
+      riskHistoryLastError = requestErrors.length
+        ? `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length}:${requestErrors.slice(0, 3).join('|')}`
+        : `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length};recovery_in=${Math.round(recoveryDelayMs / 1000)}s`;
+      // Do NOT mark this pool signature complete. Keeping an incomplete signature
+      // uncommitted is what allows the backend watch to retry missing pools.
       return false;
     }
+
+    riskHistoryLastSignature = riskHistorySignature(targets);
+    clearRiskHistoryRecoveryState();
     riskHistoryLastError = '';
     return true;
   })();
@@ -1046,6 +1089,16 @@ function riskReserveHistorySnapshot() {
     last_error: riskHistoryLastError,
     builds: riskHistoryBuilds,
     failures: riskHistoryFailures,
+    incomplete_pool_count: riskHistoryIncompletePoolCount(targets),
+    incomplete_pool_recovery_enabled: true,
+    incomplete_pool_recovery_missing_only: true,
+    incomplete_signature_never_marked_complete: true,
+    recovery_base_seconds: Math.round(RISK_HISTORY_RECOVERY_BASE_MS / 1000),
+    recovery_max_seconds: Math.round(RISK_HISTORY_RECOVERY_MAX_MS / 1000),
+    recovery_attempts: riskHistoryRecoveryAttempts,
+    recovery_failures: riskHistoryRecoveryFailures,
+    next_recovery_at: riskHistoryNextRecoveryAt > 0 ? isoMs(riskHistoryNextRecoveryAt) : null,
+    last_recovery_reason: riskHistoryLastRecoveryReason,
     pools,
   };
 }
@@ -1233,8 +1286,14 @@ export function startBitgetAdvancedStatsScanner() {
     const targets = riskReserveHistoryTargets();
     if (!targets.focus_ready || targets.mapped_focus_rows.length !== FOCUS_TARGET || targets.pools.length === 0) return;
     const signature = riskHistorySignature(targets);
-    if (signature !== riskHistoryLastSignature) {
-      await refreshRiskReserveHistory('focus_or_pool_change_missing_only', { missingOnly: true }).catch(() => false);
+    const incompletePools = riskHistoryIncompletePoolCount(targets);
+    const signatureChanged = signature !== riskHistoryLastSignature;
+    const recoveryDue = riskHistoryNextRecoveryAt <= 0 || Date.now() >= riskHistoryNextRecoveryAt;
+    if ((signatureChanged || incompletePools > 0) && recoveryDue) {
+      await refreshRiskReserveHistory(
+        signatureChanged ? 'focus_or_pool_change_recovery' : 'incomplete_pool_recovery',
+        { missingOnly: true },
+      ).catch(() => false);
     }
   }, RISK_HISTORY_WATCH_MS);
   riskHistoryWatchInterval.unref?.();
@@ -1424,6 +1483,9 @@ export function getBitgetAdvancedStatsHealth() {
     risk_reserve_history_running: Boolean(riskHistoryRunning),
     risk_reserve_history_startup_background_only: true,
     risk_reserve_history_focus_change_missing_only: true,
+    risk_reserve_history_incomplete_pool_recovery_enabled: true,
+    risk_reserve_history_incomplete_pool_recovery_missing_only: true,
+    risk_reserve_history_incomplete_signature_never_marked_complete: true,
     risk_reserve_history_user_reads_trigger_exchange_requests: false,
     risk_reserve_history_reads_scale_with_users: false,
     contract_history: contractHistoryCoverage(),
@@ -1494,6 +1556,6 @@ export const __bitgetAdvancedTest = Object.freeze({
   parseSpotNet,
 });
 
-export const __bitgetStep1000Test = Object.freeze({ parseRiskReserveHistory, riskReservePoolKey });
+export const __bitgetStep1000Test = Object.freeze({ parseRiskReserveHistory, riskReservePoolKey, riskHistoryRecoveryDelayMs });
 
 export const __bitgetStep1001Test = Object.freeze({ normalizedHistoryRowForLane, derivedRollupRows, contractHistorySnapshot });

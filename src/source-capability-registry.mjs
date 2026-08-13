@@ -8,7 +8,7 @@ import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 import { getContractFlowHealth } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.14';
+const VERSION = '650.8.15.15';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -319,6 +319,9 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         bitgetAdvanced.risk_reserve_history?.current_risk_reserve_all_mapping_reused === true &&
         Number(bitgetAdvanced.risk_reserve_history?.full_cycle_request_cap || 0) <= 30 &&
         bitgetAdvanced.risk_reserve_history?.shared_background_collector === true &&
+        bitgetAdvanced.risk_reserve_history?.incomplete_pool_recovery_enabled === true &&
+        bitgetAdvanced.risk_reserve_history?.incomplete_pool_recovery_missing_only === true &&
+        bitgetAdvanced.risk_reserve_history?.incomplete_signature_never_marked_complete === true &&
         bitgetAdvanced.risk_reserve_history?.user_reads_trigger_exchange_requests === false &&
         bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === false,
       ready_from_bitget_advanced: bitgetAdvanced.risk_reserve_history?.ready === true,
@@ -336,6 +339,12 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       official_daily_endpoint: bitgetAdvanced.risk_reserve_history?.official_daily_endpoint || null,
       official_hourly_endpoint: bitgetAdvanced.risk_reserve_history?.official_hourly_endpoint || null,
       shared_background_collector: bitgetAdvanced.risk_reserve_history?.shared_background_collector === true,
+      incomplete_pool_recovery_enabled: bitgetAdvanced.risk_reserve_history?.incomplete_pool_recovery_enabled === true,
+      incomplete_pool_recovery_missing_only: bitgetAdvanced.risk_reserve_history?.incomplete_pool_recovery_missing_only === true,
+      incomplete_signature_never_marked_complete: bitgetAdvanced.risk_reserve_history?.incomplete_signature_never_marked_complete === true,
+      incomplete_pool_count: Number(bitgetAdvanced.risk_reserve_history?.incomplete_pool_count || 0),
+      recovery_attempts: Number(bitgetAdvanced.risk_reserve_history?.recovery_attempts || 0),
+      next_recovery_at: bitgetAdvanced.risk_reserve_history?.next_recovery_at || null,
       provider_request_governor_reused: bitgetAdvanced.risk_reserve_history?.provider_request_governor_reused === true,
       user_reads_trigger_exchange_requests: bitgetAdvanced.risk_reserve_history?.user_reads_trigger_exchange_requests === true,
       reads_scale_with_users: bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === true,
