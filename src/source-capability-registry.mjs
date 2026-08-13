@@ -8,7 +8,7 @@ import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 import { getContractFlowHealth } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.12';
+const VERSION = '650.8.15.13';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -57,7 +57,8 @@ const CAPABILITIES = Object.freeze([
   { provider: 'bitget', market: 'contract', capability: 'next_funding_time_interval', official_available: true, official_scope: 'category_batch_symbol_optional', transport: 'REST', batch_mode: 'USDT-FUTURES_category_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step991', fallback_policy: 'last_verified_shared_snapshot_or_null', history_policy: 'none', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Current-Funding-Rate' },
   { provider: 'bitget', market: 'spot', capability: 'whale_fund_net_capital_flow', official_available: true, official_scope: 'per_symbol_focus_intersection', transport: 'REST', batch_mode: 'shared_focus15_slow_stats', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'funds_official', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: 'official_periods_plus_future_bucket_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/trading-data/Get-Spot-Whale-Net-Flow' },
   { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short', official_available: true, official_scope: 'per_symbol_focus15', transport: 'REST', batch_mode: 'four_official_5m_focus_lanes', rate_limit_class: '1_per_sec_per_endpoint', collector: 'slow-stats-collector', target_layer: 'contract_stats', current_integration: 'ready_step991', fallback_policy: 'keep_derived_separate_never_relabel', history_policy: '5m_official_then_future_rollup', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
-  { provider: 'bitget', market: 'contract', capability: 'risk_reserve_position_tier_oi_limit_index_components', official_available: true, official_scope: 'batch_plus_focus15', transport: 'REST', batch_mode: 'risk_reserve_all_and_oi_limit_batch_plus_focus_tier_index', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step991', fallback_policy: 'missing', history_policy: 'risk_reserve_future_history_step1000; current_reference_now', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve-All' },
+  { provider: 'bitget', market: 'contract', capability: 'risk_reserve_position_tier_oi_limit_index_components', official_available: true, official_scope: 'batch_plus_focus15', transport: 'REST', batch_mode: 'risk_reserve_all_and_oi_limit_batch_plus_focus_tier_index', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step991', fallback_policy: 'missing', history_policy: 'risk_reserve_history_now_owned_by_step1000; current_reference_and_history_separate', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve-All' },
+  { provider: 'bitget', market: 'contract', capability: 'risk_reserve_history', official_available: true, official_scope: 'focus15_mapped_to_current_official_reserve_pools', transport: 'public_REST', batch_mode: 'one_representative_focus_symbol_per_current_reserve_pool_for_daily_and_hourly_history', rate_limit_class: 'slow_shared_pool_dedup', collector: 'bitget-advanced-slow-stats', target_layer: 'risk_history', current_integration: 'ready_step1000', fallback_policy: 'last_shared_verified_until_stale_then_missing; official empty remains empty; no current-balance derivation', history_policy: 'native_official_daily_plus_native_official_hourly', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve' },
   { provider: 'bitget', market: 'contract', capability: 'liquidation_history', official_available: true, official_scope: 'category_wide_public_history_three_product_types', transport: 'public_REST', batch_mode: 'shared_background_delayed_closed_minute_reconcile_with_nonblocking_deferred_retry_after_public_ws_live_ingress', rate_limit_class: '5_per_sec_ip_bounded_350ms_gap', collector: 'liquidation-collector', target_layer: 'unified_history', current_integration: 'ready_v46_closure_step997_2_1', fallback_policy: 'live_ws_provisional_then_official_rest_reconcile; official empty/delayed/conflicting REST never overwrites; failed windows defer without blocking newer windows', history_policy: 'official_last_3_days_source_reconciles_nonzero_1m_buckets', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Liquidations' },
 
   // Gate
@@ -307,6 +308,37 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       oi_limit_row_count: Number(bitgetAdvanced.oi_limit_row_count || 0),
       user_reads_scale_with_users: false,
     },
+    bitget_step1000: {
+      ready: bitgetAdvanced.risk_reserve_history?.ready === true &&
+        Number(bitgetAdvanced.risk_reserve_history?.mapped_focus_rows || 0) === 15 &&
+        Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0) > 0 &&
+        Number(bitgetAdvanced.risk_reserve_history?.daily_official_pool_coverage || 0) === Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0) &&
+        Number(bitgetAdvanced.risk_reserve_history?.hourly_official_pool_coverage || 0) === Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0) &&
+        bitgetAdvanced.risk_reserve_history?.representative_symbol_per_pool === true &&
+        bitgetAdvanced.risk_reserve_history?.current_risk_reserve_all_mapping_reused === true &&
+        Number(bitgetAdvanced.risk_reserve_history?.full_cycle_request_cap || 0) <= 30 &&
+        bitgetAdvanced.risk_reserve_history?.shared_background_collector === true &&
+        bitgetAdvanced.risk_reserve_history?.user_reads_trigger_exchange_requests === false &&
+        bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === false,
+      ready_from_bitget_advanced: bitgetAdvanced.risk_reserve_history?.ready === true,
+      mapped_focus_rows: Number(bitgetAdvanced.risk_reserve_history?.mapped_focus_rows || 0),
+      pool_target_count: Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0),
+      pool_dedup_saved_symbol_queries: Number(bitgetAdvanced.risk_reserve_history?.pool_dedup_saved_symbol_queries || 0),
+      daily_official_pool_coverage: Number(bitgetAdvanced.risk_reserve_history?.daily_official_pool_coverage || 0),
+      hourly_official_pool_coverage: Number(bitgetAdvanced.risk_reserve_history?.hourly_official_pool_coverage || 0),
+      daily_nonempty_pools: Number(bitgetAdvanced.risk_reserve_history?.daily_nonempty_pools || 0),
+      hourly_nonempty_pools: Number(bitgetAdvanced.risk_reserve_history?.hourly_nonempty_pools || 0),
+      full_cycle_request_cap: Number(bitgetAdvanced.risk_reserve_history?.full_cycle_request_cap || 0),
+      symbol_naive_request_cap: Number(bitgetAdvanced.risk_reserve_history?.full_cycle_symbol_naive_request_cap || 0),
+      representative_symbol_per_pool: bitgetAdvanced.risk_reserve_history?.representative_symbol_per_pool === true,
+      current_pool_mapping_reused: bitgetAdvanced.risk_reserve_history?.current_risk_reserve_all_mapping_reused === true,
+      official_daily_endpoint: bitgetAdvanced.risk_reserve_history?.official_daily_endpoint || null,
+      official_hourly_endpoint: bitgetAdvanced.risk_reserve_history?.official_hourly_endpoint || null,
+      shared_background_collector: bitgetAdvanced.risk_reserve_history?.shared_background_collector === true,
+      provider_request_governor_reused: bitgetAdvanced.risk_reserve_history?.provider_request_governor_reused === true,
+      user_reads_trigger_exchange_requests: bitgetAdvanced.risk_reserve_history?.user_reads_trigger_exchange_requests === true,
+      reads_scale_with_users: bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === true,
+    },
     gate_step992: {
       ready: gateAdvanced.ready === true,
       version: gateAdvanced.version || null,
@@ -384,6 +416,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.bybit_step995.ready &&
       payload.coinbase_step995.ready &&
       payload.bitget_step991.ready &&
+      payload.bitget_step1000.ready &&
       payload.gate_step992.ready &&
       payload.step997_liquidation_history.ready,
   };
