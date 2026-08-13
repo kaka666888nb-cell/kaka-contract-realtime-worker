@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.119",
+  "version": "650.8.15.120",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.119 / Step1004.1 catch-up: market-light and liquidation process-level fault-domain isolation"
+  "description": "Kaka worker 650.8.15.120 / Step1004.1.3 isolation stabilization: deep fairness + Binance taker signature refresh + dynamic focus recovery"
 }
