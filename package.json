@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.126",
+  "version": "650.8.15.127",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka worker 650.8.15.126 / Step1004.5 closes original Step996 with shared official public crypto-options layer while preserving Binance safety isolation"
+  "description": "Kaka worker 650.8.15.127 / Step1004.5.1 fixes OKX option family discovery and audit isolation while preserving Step996 shared official public crypto-options scope"
 }
