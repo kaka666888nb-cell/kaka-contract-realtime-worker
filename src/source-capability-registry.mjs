@@ -8,7 +8,7 @@ import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './contract-liquidation.mjs';
 import { getContractFlowHealth } from './contract-flow.mjs';
 
-const VERSION = '650.8.15.18';
+const VERSION = '650.8.15.19';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -41,7 +41,8 @@ const CAPABILITIES = Object.freeze([
   // OKX
   { provider: 'okx', market: 'spot', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SPOT_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
   { provider: 'okx', market: 'contract', capability: 'ticker_bbo_24h', official_available: true, official_scope: 'instType_batch', transport: 'REST/WS', batch_mode: 'SWAP_batch', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://www.okx.com/docs-v5/en/' },
-  { provider: 'okx', market: 'contract', capability: 'mark_index_open_interest', official_available: true, official_scope: 'batch', transport: 'REST', batch_mode: 'SWAP_plus_USDT_index_plus_OI', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'oi_history_deferred', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'mark_index_open_interest', official_available: true, official_scope: 'batch', transport: 'REST', batch_mode: 'SWAP_plus_USDT_index_plus_OI', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'open_interest_history_owned_by_step1002', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'okx', market: 'contract', capability: 'open_interest_history', official_available: true, official_scope: 'per_symbol_focus15', transport: 'public_REST_plus_shared_backend_persistence', batch_mode: 'one_official_5m_request_per_stale_focus_symbol_then_backend_rollup', rate_limit_class: '10_requests_per_2s_IP_plus_instrument_but_project_uses_low_frequency_shared', collector: 'okx-advanced-slow-stats', target_layer: 'history', current_integration: 'ready_step1002', fallback_policy: 'last_verified_shared_persisted_5m_history; no cross-provider substitution; stale remains stale', history_policy: 'official_5m_plus_explicit_derived_15m_1h_4h_last_observation', source_url: 'https://www.okx.com/docs-v5/en/' },
   { provider: 'okx', market: 'contract', capability: 'funding_rate', official_available: true, official_scope: 'per_symbol_focus15', transport: 'public_REST', batch_mode: 'shared_focus15_5m', rate_limit_class: 'medium_shared', collector: 'okx-advanced-slow-stats', target_layer: 'slow_stats', current_integration: 'ready_step994', fallback_policy: 'last_verified_until_stale_then_missing; empty nextFundingRate stays null', history_policy: 'current_shared_5m; existing_history_endpoint_separate', source_url: 'https://www.okx.com/docs-v5/en/' },
   { provider: 'okx', market: 'contract', capability: 'price_limit_security_fund_adl', official_available: true, official_scope: 'focus15_price_limit_plus_focus15_family_security_fund_plus_public_adl_warning_channel', transport: 'public_REST_plus_public_WS', batch_mode: 'price_limit_focus15_5m; security_fund_focus_family_6h_missing_only_recovery; one_shared_adl_ws', rate_limit_class: 'slow_shared', collector: 'okx-advanced-slow-stats', target_layer: 'risk', current_integration: 'ready_step994', fallback_policy: 'last_verified_until_stale_then_missing; ADL normal silence remains null and is never fabricated', history_policy: 'slow_snapshot_or_event; active_ADL_event_memory_only', source_url: 'https://www.okx.com/docs-v5/en/' },
 
@@ -192,6 +193,38 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       provider_request_governor_reused: okxAdvanced.provider_request_governor_reused === true,
       custom_provider_governor_created: okxAdvanced.custom_provider_governor_created === true,
       user_reads_scale_with_users: false,
+    },
+    okx_step1002: {
+      ready: okxAdvanced.open_interest_history?.ready === true &&
+        Number(okxAdvanced.open_interest_history?.focus_target || 0) === 15 &&
+        Number(okxAdvanced.open_interest_history?.official_5m_coverage || 0) === 15 &&
+        Number(okxAdvanced.open_interest_history?.total_official_5m_rows || 0) > 0 &&
+        Number(okxAdvanced.open_interest_history?.full_cycle_request_cap || 0) === 15 &&
+        okxAdvanced.open_interest_history?.official_endpoint === '/api/v5/rubik/stat/contracts/open-interest-history' &&
+        okxAdvanced.open_interest_history?.official_period === '5m' &&
+        okxAdvanced.open_interest_history?.official_and_derived_separate === true &&
+        okxAdvanced.open_interest_history?.shared_background_collector === true &&
+        okxAdvanced.open_interest_history?.user_reads_trigger_collector === false &&
+        okxAdvanced.open_interest_history?.reads_scale_with_users === false,
+      version: okxAdvanced.version || null,
+      focus_target: Number(okxAdvanced.open_interest_history?.focus_target || 0),
+      official_5m_coverage: Number(okxAdvanced.open_interest_history?.official_5m_coverage || 0),
+      fresh_5m_coverage: Number(okxAdvanced.open_interest_history?.fresh_5m_coverage || 0),
+      total_official_5m_rows: Number(okxAdvanced.open_interest_history?.total_official_5m_rows || 0),
+      official_endpoint: okxAdvanced.open_interest_history?.official_endpoint || null,
+      official_period: okxAdvanced.open_interest_history?.official_period || null,
+      derived_intervals: Array.isArray(okxAdvanced.open_interest_history?.derived_intervals) ? [...okxAdvanced.open_interest_history.derived_intervals] : [],
+      derived_method: okxAdvanced.open_interest_history?.derived_method || null,
+      full_cycle_request_cap: Number(okxAdvanced.open_interest_history?.full_cycle_request_cap || 0),
+      refresh_seconds: Number(okxAdvanced.open_interest_history?.refresh_seconds || 0),
+      per_request_gap_ms: Number(okxAdvanced.open_interest_history?.per_request_gap_ms || 0),
+      persistence_enabled: okxAdvanced.open_interest_history?.persistence_enabled === true,
+      persistence_table: okxAdvanced.open_interest_history?.persistence_table || null,
+      persist_successes: Number(okxAdvanced.open_interest_history?.persist_successes || 0),
+      restore_successes: Number(okxAdvanced.open_interest_history?.restore_successes || 0),
+      official_and_derived_separate: okxAdvanced.open_interest_history?.official_and_derived_separate === true,
+      user_reads_trigger_collector: okxAdvanced.open_interest_history?.user_reads_trigger_collector === true,
+      reads_scale_with_users: okxAdvanced.open_interest_history?.reads_scale_with_users === true,
     },
     bybit_step995: {
       ready: bybitAdvanced.ready === true,
@@ -480,6 +513,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.v46_closure.ready &&
       payload.binance_step993.ready &&
       payload.okx_step994.ready &&
+      payload.okx_step1002.ready &&
       payload.bybit_step995.ready &&
       payload.coinbase_step995.ready &&
       payload.bitget_step991.ready &&

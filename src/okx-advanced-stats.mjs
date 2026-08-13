@@ -2,9 +2,10 @@ import WebSocket from 'ws';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.3';
 const SNAPSHOT_ROUTE = '/api/okx-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/okx-advanced/health';
+const OI_HISTORY_ROUTE = '/api/okx-advanced/open-interest-history';
 const BASE = 'https://www.okx.com';
 const WS_URL = 'wss://ws.okx.com:8443/ws/v5/public';
 
@@ -22,6 +23,21 @@ const ADL_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_OKX_ADVANCE
 const ADL_RECONNECT_MAX_MS = Math.max(10_000, Number(process.env.KAKA_OKX_ADVANCED_ADL_RECONNECT_MAX_MS || 60_000));
 const ADL_SUBSCRIPTION_REFRESH_MS = Math.max(10_000, Number(process.env.KAKA_OKX_ADVANCED_ADL_SUBSCRIPTION_REFRESH_MS || 30_000));
 const FOCUS_TARGET = 15;
+
+const OI_HISTORY_NATIVE_PERIOD = '5m';
+const OI_HISTORY_OFFICIAL_LIMIT = 100;
+const OI_HISTORY_START_DELAY_MS = Math.max(30_000, Number(process.env.KAKA_OKX_OI_HISTORY_START_DELAY_MS || 45_000));
+const OI_HISTORY_REFRESH_MS = Math.max(10 * 60_000, Number(process.env.KAKA_OKX_OI_HISTORY_REFRESH_MS || 10 * 60_000));
+const OI_HISTORY_STALE_MS = Math.max(10 * 60_000, Number(process.env.KAKA_OKX_OI_HISTORY_STALE_MS || 20 * 60_000));
+const OI_HISTORY_RECOVERY_BASE_MS = Math.max(60_000, Number(process.env.KAKA_OKX_OI_HISTORY_RECOVERY_BASE_MS || 60_000));
+const OI_HISTORY_RECOVERY_MAX_MS = Math.max(OI_HISTORY_RECOVERY_BASE_MS, Number(process.env.KAKA_OKX_OI_HISTORY_RECOVERY_MAX_MS || 15 * 60_000));
+const OI_HISTORY_MAX_5M_ROWS = Math.max(288, Math.min(2_016, Number(process.env.KAKA_OKX_OI_HISTORY_MAX_5M_ROWS || 576)));
+const OI_HISTORY_PERSIST_INTERVAL_MS = Math.max(15 * 60_000, Number(process.env.KAKA_OKX_OI_HISTORY_PERSIST_INTERVAL_MS || 30 * 60_000));
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+const OI_HISTORY_SNAPSHOT_TABLE = 'app_market_backend_snapshots';
+const OI_HISTORY_SNAPSHOT_TYPE = 'position_stats';
+const OI_HISTORY_SNAPSHOT_PREFIX = 'OKX_OI_HISTORY:';
 
 let started = false;
 let focusRunning = null;
@@ -63,11 +79,36 @@ let lastSecurityFundCompletedAt = null;
 let lastSecurityFundError = '';
 let round = 0;
 
+let oiHistoryRunning = null;
+let oiHistoryTimer = null;
+let oiHistoryInterval = null;
+let oiHistoryRecoveryTimer = null;
+let oiHistoryRestorePromise = null;
+let oiHistoryRestored = false;
+let oiHistoryLastStartedAt = null;
+let oiHistoryLastCompletedAt = null;
+let oiHistoryLastError = '';
+let oiHistoryBuilds = 0;
+let oiHistoryFailures = 0;
+let oiHistoryRecoveryFailures = 0;
+let oiHistoryRecoveryAttempts = 0;
+let oiHistoryNextRecoveryAt = 0;
+let oiHistoryLastPersistAt = 0;
+let oiHistoryPersistAttempts = 0;
+let oiHistoryPersistSuccesses = 0;
+let oiHistoryPersistErrors = 0;
+let oiHistoryRestoreAttempts = 0;
+let oiHistoryRestoreSuccesses = 0;
+let oiHistoryRestoreErrors = 0;
+let oiHistoryLastPersistError = '';
+let oiHistoryLastRestoreError = '';
+
 const fundingRows = new Map();
 const priceLimitRows = new Map();
 const securityFundRows = new Map();
 const adlWarningRows = new Map();
 const adlSubscribedFamilies = new Set();
+const oiHistoryBySymbol = new Map();
 const laneStats = new Map();
 const responseCache = new Map();
 
@@ -184,6 +225,516 @@ function okxOpenInterestMap() {
   };
 }
 
+
+function persistenceEnabled() {
+  return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+}
+
+function oiHistorySnapshotKey(symbol) {
+  return `${OI_HISTORY_SNAPSHOT_PREFIX}${compact(symbol)}`;
+}
+
+function normalizeOiHistoryInterval(raw) {
+  const value = String(raw || OI_HISTORY_NATIVE_PERIOD).trim().toLowerCase();
+  if (value === '5m') return '5m';
+  if (value === '15m') return '15m';
+  if (value === '1h' || value === '60m') return '1h';
+  if (value === '4h' || value === '240m') return '4h';
+  return null;
+}
+
+function oiHistoryIntervalMs(interval) {
+  if (interval === '15m') return 15 * 60_000;
+  if (interval === '1h') return 60 * 60_000;
+  if (interval === '4h') return 4 * 60 * 60_000;
+  return 5 * 60_000;
+}
+
+function parseOiHistoryRow(raw, target) {
+  if (!raw) return null;
+  let ts = null;
+  let oi = null;
+  let oiCcy = null;
+  let oiUsd = null;
+  let responseShape = 'unknown';
+
+  if (Array.isArray(raw)) {
+    responseShape = 'array';
+    ts = Number(raw[0] || 0) || null;
+    oi = finite(raw[1]);
+    oiCcy = finite(raw[2]);
+    oiUsd = finite(raw[3]);
+  } else if (typeof raw === 'object') {
+    responseShape = 'object';
+    ts = Number(raw.ts ?? raw.timestamp ?? raw.time ?? 0) || null;
+    oi = finite(raw.oi ?? raw.openInterest ?? raw.open_interest);
+    oiCcy = finite(raw.oiCcy ?? raw.openInterestCcy ?? raw.open_interest_ccy ?? raw.open_interest_base);
+    oiUsd = finite(raw.oiUsd ?? raw.openInterestUsd ?? raw.open_interest_usd ?? raw.open_interest_value);
+  }
+
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  if (ts < 10_000_000_000) ts *= 1000;
+  if (oi == null && oiCcy == null && oiUsd == null) return null;
+
+  return {
+    provider: 'okx',
+    market_type: 'contract',
+    quote_asset: 'USDT',
+    symbol: target.symbol,
+    native_symbol: target.native_symbol,
+    base_asset: target.base_asset,
+    interval: OI_HISTORY_NATIVE_PERIOD,
+    bucket_time_ms: ts,
+    bucket_time: isoMs(ts),
+    source_time_ms: ts,
+    source_time: isoMs(ts),
+    open_interest_contracts: oi,
+    open_interest_base: oiCcy,
+    open_interest_usd: oiUsd,
+    open_interest_contracts_unit: oi != null ? 'contracts' : null,
+    open_interest_base_unit: oiCcy != null ? target.base_asset : null,
+    open_interest_usd_unit: oiUsd != null ? 'USD' : null,
+    official: true,
+    derived: false,
+    derived_from_official_5m: false,
+    official_period: OI_HISTORY_NATIVE_PERIOD,
+    official_endpoint: '/api/v5/rubik/stat/contracts/open-interest-history',
+    response_shape: responseShape,
+    source: 'okx_official_contract_open_interest_history_5m',
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function parseOiHistoryPayload(payload, target) {
+  const source = Array.isArray(payload?.data) ? payload.data : [];
+  const byTime = new Map();
+  const shapes = new Set();
+  for (const raw of source) {
+    const row = parseOiHistoryRow(raw, target);
+    if (!row) continue;
+    byTime.set(row.bucket_time_ms, row);
+    shapes.add(row.response_shape);
+  }
+  const rows = [...byTime.values()].sort((a, b) => a.bucket_time_ms - b.bucket_time_ms);
+  return {
+    rows,
+    response_shape: shapes.size === 1 ? [...shapes][0] : shapes.size > 1 ? 'mixed' : 'unknown',
+  };
+}
+
+function mergeOiHistoryRows(existing, incoming) {
+  const byTime = new Map();
+  for (const row of [...(existing || []), ...(incoming || [])]) {
+    const ts = Number(row?.bucket_time_ms || row?.source_time_ms || 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    byTime.set(ts, { ...row, bucket_time_ms: ts, bucket_time: isoMs(ts) });
+  }
+  return [...byTime.values()]
+    .sort((a, b) => a.bucket_time_ms - b.bucket_time_ms)
+    .slice(-OI_HISTORY_MAX_5M_ROWS);
+}
+
+function oiHistoryEntryFresh(entry) {
+  const latest = entry?.rows?.at(-1);
+  const ts = Number(latest?.source_time_ms || 0);
+  return Number.isFinite(ts) && ts > 0 && Date.now() - ts <= OI_HISTORY_STALE_MS;
+}
+
+function deriveOiHistoryRows(rows, interval) {
+  if (interval === '5m') return (rows || []).map((row) => ({ ...row }));
+  const span = oiHistoryIntervalMs(interval);
+  const buckets = new Map();
+  for (const row of rows || []) {
+    const ts = Number(row?.source_time_ms || row?.bucket_time_ms || 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    const bucketStart = Math.floor(ts / span) * span;
+    const current = buckets.get(bucketStart);
+    if (!current || ts >= Number(current.source_time_ms || 0)) {
+      buckets.set(bucketStart, {
+        ...row,
+        interval,
+        bucket_time_ms: bucketStart,
+        bucket_time: isoMs(bucketStart),
+        official: false,
+        derived: true,
+        derived_from_official_5m: true,
+        official_period: OI_HISTORY_NATIVE_PERIOD,
+        derived_method: 'last_official_5m_observation_in_bucket',
+        source: `okx_derived_${interval}_from_official_5m_open_interest_history`,
+      });
+    }
+  }
+  return [...buckets.values()].sort((a, b) => a.bucket_time_ms - b.bucket_time_ms);
+}
+
+function oiHistoryRecoveryDelayMs(failures) {
+  const safe = Math.max(1, Number(failures || 1));
+  const factor = 2 ** Math.min(4, safe - 1);
+  return Math.min(OI_HISTORY_RECOVERY_MAX_MS, OI_HISTORY_RECOVERY_BASE_MS * factor);
+}
+
+function oiHistoryTargets() {
+  const focus = okxFocusTargets();
+  return {
+    focus_ready: focus.focus_ready,
+    focus_round: focus.focus_round,
+    rows: focus.rows,
+  };
+}
+
+function oiHistoryCoverage(targets = oiHistoryTargets()) {
+  const covered = targets.rows.filter((target) => {
+    const entry = oiHistoryBySymbol.get(target.symbol);
+    return Array.isArray(entry?.rows) && entry.rows.length > 0;
+  });
+  const fresh = targets.rows.filter((target) => oiHistoryEntryFresh(oiHistoryBySymbol.get(target.symbol)));
+  return {
+    target_count: targets.rows.length,
+    covered_count: covered.length,
+    fresh_count: fresh.length,
+    missing_symbols: targets.rows.filter((target) => !oiHistoryBySymbol.get(target.symbol)?.rows?.length).map((target) => target.symbol),
+    stale_symbols: targets.rows.filter((target) => {
+      const entry = oiHistoryBySymbol.get(target.symbol);
+      return entry?.rows?.length && !oiHistoryEntryFresh(entry);
+    }).map((target) => target.symbol),
+  };
+}
+
+async function restoreOiHistorySnapshots() {
+  if (oiHistoryRestored) return true;
+  if (!persistenceEnabled()) {
+    oiHistoryRestored = true;
+    return false;
+  }
+  if (oiHistoryRestorePromise) return await oiHistoryRestorePromise;
+  oiHistoryRestorePromise = (async () => {
+    oiHistoryRestoreAttempts += 1;
+    try {
+      const query = [
+        'select=quote_asset,payload,updated_at',
+        'provider=eq.okx',
+        'market_type=eq.contract',
+        `snapshot_type=eq.${encodeURIComponent(OI_HISTORY_SNAPSHOT_TYPE)}`,
+        'source=eq.okx_official_open_interest_history_focus15_shared',
+        'limit=30',
+      ].join('&');
+      const response = await fetch(`${SUPABASE_URL}/rest/v1/${OI_HISTORY_SNAPSHOT_TABLE}?${query}`, {
+        headers: {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!response.ok) throw new Error(`okx_oi_history_restore_http_${response.status}`);
+      const records = await response.json();
+      let restored = 0;
+      for (const record of Array.isArray(records) ? records : []) {
+        const symbol = compact(record?.payload?.symbol || String(record?.quote_asset || '').replace(OI_HISTORY_SNAPSHOT_PREFIX, ''));
+        if (!symbol || !symbol.endsWith('USDT')) continue;
+        const target = {
+          symbol,
+          native_symbol: nativeSymbol(symbol),
+          base_asset: splitSymbol(symbol).base,
+        };
+        const normalized = [];
+        for (const raw of Array.isArray(record?.payload?.rows) ? record.payload.rows : []) {
+          const row = parseOiHistoryRow(raw, target);
+          if (row) normalized.push(row);
+        }
+        if (!normalized.length) continue;
+        oiHistoryBySymbol.set(symbol, {
+          symbol,
+          native_symbol: target.native_symbol,
+          base_asset: target.base_asset,
+          rows: mergeOiHistoryRows([], normalized),
+          response_shape: String(record?.payload?.response_shape || 'persisted_normalized'),
+          updated_at: record?.updated_at || new Date().toISOString(),
+          restored: true,
+        });
+        restored += 1;
+      }
+      oiHistoryRestoreSuccesses += restored > 0 ? 1 : 0;
+      oiHistoryLastRestoreError = '';
+      return restored > 0;
+    } catch (error) {
+      oiHistoryRestoreErrors += 1;
+      oiHistoryLastRestoreError = String(error?.message || error).slice(0, 320);
+      return false;
+    } finally {
+      oiHistoryRestored = true;
+    }
+  })().finally(() => {
+    oiHistoryRestorePromise = null;
+  });
+  return await oiHistoryRestorePromise;
+}
+
+async function persistOiHistorySnapshots({ force = false } = {}) {
+  if (!persistenceEnabled()) return false;
+  if (!force && oiHistoryLastPersistAt > 0 && Date.now() - oiHistoryLastPersistAt < OI_HISTORY_PERSIST_INTERVAL_MS) return true;
+  const targets = oiHistoryTargets();
+  const body = targets.rows.map((target) => {
+    const entry = oiHistoryBySymbol.get(target.symbol);
+    if (!entry?.rows?.length) return null;
+    const now = new Date().toISOString();
+    return {
+      provider: 'okx',
+      market_type: 'contract',
+      snapshot_type: OI_HISTORY_SNAPSHOT_TYPE,
+      quote_asset: oiHistorySnapshotKey(target.symbol),
+      payload: {
+        schema_version: '650.8.15.116',
+        symbol: target.symbol,
+        native_symbol: target.native_symbol,
+        base_asset: target.base_asset,
+        official_period: OI_HISTORY_NATIVE_PERIOD,
+        official_endpoint: '/api/v5/rubik/stat/contracts/open-interest-history',
+        response_shape: entry.response_shape || 'unknown',
+        rows: entry.rows.slice(-OI_HISTORY_MAX_5M_ROWS),
+      },
+      row_count: entry.rows.length,
+      source: 'okx_official_open_interest_history_focus15_shared',
+      source_time: entry.rows.at(-1)?.source_time || now,
+      updated_at: now,
+    };
+  }).filter(Boolean);
+  if (!body.length) return false;
+
+  oiHistoryPersistAttempts += 1;
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/${OI_HISTORY_SNAPSHOT_TABLE}?on_conflict=provider,market_type,snapshot_type,quote_asset`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'content-type': 'application/json',
+          prefer: 'resolution=merge-duplicates,return=minimal',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(12_000),
+      },
+    );
+    if (!response.ok) throw new Error(`okx_oi_history_persist_http_${response.status}`);
+    oiHistoryLastPersistAt = Date.now();
+    oiHistoryPersistSuccesses += 1;
+    oiHistoryLastPersistError = '';
+    return true;
+  } catch (error) {
+    oiHistoryPersistErrors += 1;
+    oiHistoryLastPersistError = String(error?.message || error).slice(0, 320);
+    return false;
+  }
+}
+
+function scheduleOiHistoryRecovery() {
+  const coverage = oiHistoryCoverage();
+  if (coverage.target_count === FOCUS_TARGET && coverage.fresh_count === FOCUS_TARGET) {
+    oiHistoryRecoveryFailures = 0;
+    oiHistoryNextRecoveryAt = 0;
+    if (oiHistoryRecoveryTimer) clearTimeout(oiHistoryRecoveryTimer);
+    oiHistoryRecoveryTimer = null;
+    return;
+  }
+  if (oiHistoryRecoveryTimer) return;
+  oiHistoryRecoveryFailures += 1;
+  const delay = oiHistoryRecoveryDelayMs(oiHistoryRecoveryFailures);
+  oiHistoryNextRecoveryAt = Date.now() + delay;
+  oiHistoryRecoveryTimer = setTimeout(async () => {
+    oiHistoryRecoveryTimer = null;
+    oiHistoryRecoveryAttempts += 1;
+    await refreshOiHistory('recovery_missing_only', { missingOnly: true }).catch(() => false);
+    const next = oiHistoryCoverage();
+    if (next.target_count !== FOCUS_TARGET || next.fresh_count !== FOCUS_TARGET) scheduleOiHistoryRecovery();
+  }, delay);
+  oiHistoryRecoveryTimer.unref?.();
+}
+
+async function refreshOiHistory(reason = 'scheduled', { missingOnly = true } = {}) {
+  if (oiHistoryRunning) return await oiHistoryRunning;
+  const task = (async () => {
+    oiHistoryLastStartedAt = new Date().toISOString();
+    oiHistoryBuilds += 1;
+    await restoreOiHistorySnapshots().catch(() => false);
+
+    const targets = oiHistoryTargets();
+    if (!targets.focus_ready || targets.rows.length !== FOCUS_TARGET) {
+      oiHistoryFailures += 1;
+      oiHistoryLastError = `${reason}:okx_oi_history_focus_not_ready:${targets.rows.length}/${FOCUS_TARGET}`;
+      scheduleOiHistoryRecovery();
+      return false;
+    }
+
+    const requestTargets = missingOnly
+      ? targets.rows.filter((target) => !oiHistoryEntryFresh(oiHistoryBySymbol.get(target.symbol)))
+      : targets.rows;
+
+    let successes = 0;
+    const errors = [];
+    for (const target of requestTargets) {
+      try {
+        const path = `/api/v5/rubik/stat/contracts/open-interest-history?instId=${encodeURIComponent(target.native_symbol)}&period=${encodeURIComponent(OI_HISTORY_NATIVE_PERIOD)}&limit=${OI_HISTORY_OFFICIAL_LIMIT}`;
+        const payload = await fetchJson(path, { lane: 'open_interest_history_5m', timeoutMs: 20_000 });
+        const parsed = parseOiHistoryPayload(payload, target);
+        if (!parsed.rows.length) throw new Error(`okx_oi_history_payload_empty:${target.symbol}`);
+        const previous = oiHistoryBySymbol.get(target.symbol);
+        oiHistoryBySymbol.set(target.symbol, {
+          symbol: target.symbol,
+          native_symbol: target.native_symbol,
+          base_asset: target.base_asset,
+          rows: mergeOiHistoryRows(previous?.rows || [], parsed.rows),
+          response_shape: parsed.response_shape,
+          updated_at: new Date().toISOString(),
+          restored: previous?.restored === true,
+        });
+        successes += 1;
+      } catch (error) {
+        errors.push(`${target.symbol}:${String(error?.message || error)}`);
+      }
+      await sleep(PER_REQUEST_GAP_MS);
+    }
+
+    const coverage = oiHistoryCoverage(targets);
+    setLane('open_interest_history_5m', {
+      last_rows: coverage.covered_count,
+      last_error: errors.join(' | ').slice(0, 700),
+    });
+
+    oiHistoryLastCompletedAt = new Date().toISOString();
+    oiHistoryLastError = errors.join(' | ').slice(0, 700);
+    if (errors.length > 0 && successes === 0 && requestTargets.length > 0) oiHistoryFailures += 1;
+    if (coverage.covered_count === FOCUS_TARGET) {
+      await persistOiHistorySnapshots({ force: oiHistoryLastPersistAt === 0 }).catch(() => false);
+    }
+    responseCache.clear();
+
+    if (coverage.fresh_count !== FOCUS_TARGET) scheduleOiHistoryRecovery();
+    else {
+      oiHistoryRecoveryFailures = 0;
+      oiHistoryNextRecoveryAt = 0;
+    }
+    return coverage.covered_count === FOCUS_TARGET;
+  })();
+  oiHistoryRunning = task;
+  try {
+    return await task;
+  } finally {
+    if (oiHistoryRunning === task) oiHistoryRunning = null;
+  }
+}
+
+function oiHistoryHealthPayload() {
+  const targets = oiHistoryTargets();
+  const coverage = oiHistoryCoverage(targets);
+  const entries = targets.rows.map((target) => {
+    const entry = oiHistoryBySymbol.get(target.symbol);
+    const rows = entry?.rows || [];
+    const latest = rows.at(-1) || null;
+    return {
+      symbol: target.symbol,
+      native_symbol: target.native_symbol,
+      row_count: rows.length,
+      fresh: oiHistoryEntryFresh(entry),
+      response_shape: entry?.response_shape || null,
+      latest_source_time: latest?.source_time || null,
+      latest_open_interest_contracts: latest?.open_interest_contracts ?? null,
+      latest_open_interest_base: latest?.open_interest_base ?? null,
+      latest_open_interest_usd: latest?.open_interest_usd ?? null,
+      restored: entry?.restored === true,
+    };
+  });
+  const totalRows = entries.reduce((sum, entry) => sum + Number(entry.row_count || 0), 0);
+  return {
+    ready: targets.focus_ready && targets.rows.length === FOCUS_TARGET && coverage.covered_count === FOCUS_TARGET,
+    focus_target: FOCUS_TARGET,
+    focus_ready: targets.focus_ready,
+    focus_round: targets.focus_round,
+    focus_symbols: targets.rows.map((target) => target.symbol),
+    official_5m_coverage: coverage.covered_count,
+    fresh_5m_coverage: coverage.fresh_count,
+    total_official_5m_rows: totalRows,
+    official_endpoint: '/api/v5/rubik/stat/contracts/open-interest-history',
+    official_period: OI_HISTORY_NATIVE_PERIOD,
+    official_limit_per_request: OI_HISTORY_OFFICIAL_LIMIT,
+    official_rate_limit: '10 requests per 2 seconds / IP + Instrument ID',
+    full_cycle_request_cap: FOCUS_TARGET,
+    request_model: 'one official 5m request per stale focus symbol; higher intervals are backend rollups',
+    derived_intervals: ['15m', '1h', '4h'],
+    derived_method: 'last_official_5m_observation_in_bucket',
+    official_and_derived_separate: true,
+    refresh_seconds: Math.round(OI_HISTORY_REFRESH_MS / 1000),
+    stale_seconds: Math.round(OI_HISTORY_STALE_MS / 1000),
+    per_request_gap_ms: PER_REQUEST_GAP_MS,
+    startup_delay_seconds: Math.round(OI_HISTORY_START_DELAY_MS / 1000),
+    recovery_base_seconds: Math.round(OI_HISTORY_RECOVERY_BASE_MS / 1000),
+    recovery_max_seconds: Math.round(OI_HISTORY_RECOVERY_MAX_MS / 1000),
+    recovery_attempts: oiHistoryRecoveryAttempts,
+    recovery_failures: oiHistoryRecoveryFailures,
+    next_recovery_at: oiHistoryNextRecoveryAt > 0 ? new Date(oiHistoryNextRecoveryAt).toISOString() : null,
+    missing_symbols: coverage.missing_symbols,
+    stale_symbols: coverage.stale_symbols,
+    shared_background_collector: true,
+    shared_process_memory: true,
+    persistence_enabled: persistenceEnabled(),
+    persistence_table: OI_HISTORY_SNAPSHOT_TABLE,
+    persistence_snapshot_type: OI_HISTORY_SNAPSHOT_TYPE,
+    persistence_one_batch_write_per_interval: true,
+    persist_interval_seconds: Math.round(OI_HISTORY_PERSIST_INTERVAL_MS / 1000),
+    persist_attempts: oiHistoryPersistAttempts,
+    persist_successes: oiHistoryPersistSuccesses,
+    persist_errors: oiHistoryPersistErrors,
+    last_persist_error: oiHistoryLastPersistError,
+    restore_attempts: oiHistoryRestoreAttempts,
+    restore_successes: oiHistoryRestoreSuccesses,
+    restore_errors: oiHistoryRestoreErrors,
+    last_restore_error: oiHistoryLastRestoreError,
+    exchange_requests_started_by_user_read: 0,
+    exchange_connections_started_by_user_read: 0,
+    user_reads_trigger_collector: false,
+    reads_scale_with_users: false,
+    last_started_at: oiHistoryLastStartedAt,
+    last_completed_at: oiHistoryLastCompletedAt,
+    last_error: oiHistoryLastError,
+    builds: oiHistoryBuilds,
+    failures: oiHistoryFailures,
+    symbols: entries,
+  };
+}
+
+function oiHistoryReadPayload(symbol, interval = '5m', limit = 200) {
+  const normalized = compact(symbol);
+  const normalizedInterval = normalizeOiHistoryInterval(interval);
+  const cappedLimit = Math.max(1, Math.min(OI_HISTORY_MAX_5M_ROWS, Number(limit || 200)));
+  const target = okxFocusTargets().rows.find((row) => row.symbol === normalized);
+  const entry = oiHistoryBySymbol.get(normalized);
+  const baseRows = entry?.rows || [];
+  const rows = normalizedInterval ? deriveOiHistoryRows(baseRows, normalizedInterval).slice(-cappedLimit) : [];
+  return {
+    ok: true,
+    version: VERSION,
+    provider: 'okx',
+    market_type: 'contract',
+    symbol: normalized,
+    native_symbol: target?.native_symbol || nativeSymbol(normalized),
+    interval: normalizedInterval,
+    ready: Boolean(target && normalizedInterval && rows.length > 0),
+    official: normalizedInterval === '5m',
+    derived: normalizedInterval !== '5m',
+    derived_from_official_5m: normalizedInterval !== '5m',
+    official_base_period: OI_HISTORY_NATIVE_PERIOD,
+    official_endpoint: '/api/v5/rubik/stat/contracts/open-interest-history',
+    row_count: rows.length,
+    rows: rows.map(clone),
+    shared_backend_read: true,
+    user_read_triggered_exchange_requests: false,
+    user_read_triggered_exchange_connections: false,
+    reads_scale_with_users: false,
+    timestamp_ms: Date.now(),
+  };
+}
+
 async function fetchJson(path, { lane = 'unknown', timeoutMs = 18_000 } = {}) {
   const startedAt = Date.now();
   setLane(lane, {
@@ -197,7 +748,7 @@ async function fetchJson(path, { lane = 'unknown', timeoutMs = 18_000 } = {}) {
     const response = await fetch(`${BASE}${path}`, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.104 okx-advanced-shared',
+        'user-agent': 'KakaWeb3/650.8.15.116 okx-advanced-shared',
       },
       signal: controller.signal,
     });
@@ -685,6 +1236,19 @@ export function startOkxAdvancedStatsScanner() {
   securityFundInterval = setInterval(() => refreshSecurityFund('interval').catch(() => {}), SECURITY_FUND_REFRESH_MS);
   securityFundInterval.unref?.();
 
+  oiHistoryTimer = setTimeout(async () => {
+    await refreshOiHistory('startup_missing_only', { missingOnly: true }).catch(() => false);
+    const coverage = oiHistoryCoverage();
+    if (coverage.target_count !== FOCUS_TARGET || coverage.fresh_count !== FOCUS_TARGET) scheduleOiHistoryRecovery();
+  }, OI_HISTORY_START_DELAY_MS);
+  oiHistoryTimer.unref?.();
+
+  oiHistoryInterval = setInterval(async () => {
+    await refreshOiHistory('interval_missing_only', { missingOnly: true }).catch(() => false);
+    await persistOiHistorySnapshots().catch(() => false);
+  }, OI_HISTORY_REFRESH_MS);
+  oiHistoryInterval.unref?.();
+
   const adlStart = setTimeout(() => connectAdlWarningWs(), START_DELAY_MS + 2_500);
   adlStart.unref?.();
   adlSubscriptionTimer = setInterval(() => {
@@ -824,6 +1388,8 @@ function snapshotPayload({ includeRows = true } = {}) {
     adl_warning_normal_state_not_fabricated: true,
     adl_warning_public_no_auth: true,
     adl_warning_one_shared_connection: true,
+    open_interest_history: oiHistoryHealthPayload(),
+    open_interest_history_route: OI_HISTORY_ROUTE,
     last_focus_started_at: lastFocusStartedAt,
     last_focus_completed_at: lastFocusCompletedAt,
     last_focus_error: lastFocusError,
@@ -886,6 +1452,12 @@ export function getOkxAdvancedStatsHealth() {
     security_fund_uly_parameter_required: true,
     security_fund_all_swap_query_disabled: true,
     security_fund_requests_per_full_cycle_max: FOCUS_TARGET,
+    open_interest_history_ready: snapshot.open_interest_history?.ready === true,
+    open_interest_history_official_5m_coverage: Number(snapshot.open_interest_history?.official_5m_coverage || 0),
+    open_interest_history_total_official_5m_rows: Number(snapshot.open_interest_history?.total_official_5m_rows || 0),
+    open_interest_history_full_cycle_request_cap: Number(snapshot.open_interest_history?.full_cycle_request_cap || 0),
+    open_interest_history_user_reads_trigger_collector: snapshot.open_interest_history?.user_reads_trigger_collector === true,
+    open_interest_history_reads_scale_with_users: snapshot.open_interest_history?.reads_scale_with_users === true,
   };
 }
 
@@ -903,7 +1475,7 @@ function sendJson(res, status, payload) {
 }
 
 export async function handleOkxAdvancedStats(req, res, url) {
-  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE].includes(url.pathname)) return false;
+  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, OI_HISTORY_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -922,6 +1494,17 @@ export async function handleOkxAdvancedStats(req, res, url) {
     sendJson(res, 200, getOkxAdvancedStatsHealth());
     return true;
   }
+  if (url.pathname === OI_HISTORY_ROUTE) {
+    const symbol = compact(url.searchParams.get('symbol') || '');
+    const interval = normalizeOiHistoryInterval(url.searchParams.get('interval') || '5m');
+    const limit = Number(url.searchParams.get('limit') || 200);
+    if (!symbol || !interval) {
+      sendJson(res, 400, { ok: false, version: VERSION, error: 'symbol_and_supported_interval_required' });
+      return true;
+    }
+    sendJson(res, 200, oiHistoryReadPayload(symbol, interval, limit));
+    return true;
+  }
   sendJson(res, 200, snapshotPayload({ includeRows: true }));
   return true;
 }
@@ -932,6 +1515,12 @@ export const __okxAdvancedTest = Object.freeze({
   parseSecurityFund,
   securityFundFocusState,
   parseAdlWarningPush,
+  parseOiHistoryRow,
+  parseOiHistoryPayload,
+  mergeOiHistoryRows,
+  deriveOiHistoryRows,
+  normalizeOiHistoryInterval,
+  oiHistoryRecoveryDelayMs,
   nativeSymbol,
   instFamily,
 });
