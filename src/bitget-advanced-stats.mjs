@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-snapshot.mjs';
 
-const VERSION = '650.8.15.5';
+const VERSION = '650.8.15.6';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
@@ -15,11 +15,11 @@ const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_BITGET_ADV
 const STALE_MS = Math.max(5 * 60_000, Number(process.env.KAKA_BITGET_ADVANCED_STALE_MS || 12 * 60_000));
 const ONE_PER_SECOND_GAP_MS = Math.max(1_020, Number(process.env.KAKA_BITGET_ADVANCED_1S_GAP_MS || 1_080));
 const FOCUS_TARGET = 15;
-const RISK_HISTORY_START_DELAY_MS = Math.max(12_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_START_DELAY_MS || 18_000));
+const RISK_HISTORY_START_DELAY_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_START_DELAY_MS || 90_000));
 const RISK_HISTORY_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_REFRESH_MS || 6 * 60 * 60_000));
 const RISK_HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_STALE_MS || 12 * 60 * 60_000));
 const RISK_HISTORY_WATCH_MS = Math.max(20_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_WATCH_MS || 30_000));
-const RISK_HISTORY_REQUEST_GAP_MS = Math.max(300, Number(process.env.KAKA_BITGET_RISK_HISTORY_REQUEST_GAP_MS || 380));
+const RISK_HISTORY_REQUEST_GAP_MS = Math.max(600, Number(process.env.KAKA_BITGET_RISK_HISTORY_REQUEST_GAP_MS || 850));
 const RISK_HISTORY_RECOVERY_BASE_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_RECOVERY_BASE_MS || 60_000));
 const RISK_HISTORY_RECOVERY_MAX_MS = Math.max(RISK_HISTORY_RECOVERY_BASE_MS, Number(process.env.KAKA_BITGET_RISK_HISTORY_RECOVERY_MAX_MS || 15 * 60_000));
 const OFFICIAL_5M_HISTORY_LIMIT = Math.max(36, Math.min(576, Number(process.env.KAKA_BITGET_OFFICIAL_5M_HISTORY_LIMIT || 288)));
@@ -914,7 +914,7 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
   const task = (async () => {
     riskHistoryLastStartedAt = new Date().toISOString();
     riskHistoryBuilds += 1;
-    if (reason.includes('recovery') || reason.includes('watch') || missingOnly) riskHistoryRecoveryAttempts += 1;
+    if (reason.includes('recovery') || missingOnly) riskHistoryRecoveryAttempts += 1;
 
     const targets = riskReserveHistoryTargets();
     if (!targets.focus_ready || targets.mapped_focus_rows.length !== FOCUS_TARGET) {
@@ -922,10 +922,9 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
       riskHistoryNextRecoveryAt = 0;
       return false;
     }
-
     const unmapped = targets.mapped_focus_rows.filter((row) => !row.pool_found);
     if (unmapped.length > 0 || targets.pools.length === 0) {
-      riskHistoryLastError = `${reason}:risk_reserve_pool_mapping_missing:${unmapped.map((row) => row.symbol).join(',')}`;
+      riskHistoryLastError = `${reason}:risk_reserve_pool_mapping_missing:${unmapped.map((row)=>row.symbol).join(',')}`;
       riskHistoryNextRecoveryAt = 0;
       return false;
     }
@@ -942,27 +941,15 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
             `/api/v3/market/risk-reserve?category=USDT-FUTURES&symbol=${encodeURIComponent(pool.representative_symbol)}`,
             { lane: 'risk_reserve_daily_history' },
           );
-          next.daily = parseRiskReserveHistory(payload, {
-            lane: 'risk_reserve_daily_history',
-            pool,
-            granularity: 'daily',
-          });
+          next.daily = parseRiskReserveHistory(payload, {lane:'risk_reserve_daily_history',pool,granularity:'daily'});
         } catch (error) {
-          requestErrors.push(`daily:${pool.representative_symbol}:${String(error?.message || error)}`);
-          if (!previous.daily?.official_response) {
-            next.daily = {
-              official_response: false,
-              official_empty: false,
-              granularity: 'daily',
-              representative_symbol: pool.representative_symbol,
-              pool_key: pool.pool_key,
-              mapped_focus_symbols: [...pool.mapped_focus_symbols],
-              row_count: 0,
-              rows: [],
-              updated_at: null,
-              error: String(error?.message || error).slice(0, 240),
-            };
-          }
+          requestErrors.push(`daily:${pool.representative_symbol}:${String(error?.message||error)}`);
+          if (!previous.daily?.official_response) next.daily = {
+            official_response:false, official_empty:false, granularity:'daily',
+            representative_symbol:pool.representative_symbol, pool_key:pool.pool_key,
+            mapped_focus_symbols:[...pool.mapped_focus_symbols], row_count:0, rows:[],
+            updated_at:null, error:String(error?.message||error).slice(0,240),
+          };
         }
         await sleep(RISK_HISTORY_REQUEST_GAP_MS);
       }
@@ -973,68 +960,47 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
             `/api/v3/market/risk-reserve-hour?category=USDT-FUTURES&symbol=${encodeURIComponent(pool.representative_symbol)}`,
             { lane: 'risk_reserve_hourly_history' },
           );
-          next.hourly = parseRiskReserveHistory(payload, {
-            lane: 'risk_reserve_hourly_history',
-            pool,
-            granularity: 'hourly',
-          });
+          next.hourly = parseRiskReserveHistory(payload, {lane:'risk_reserve_hourly_history',pool,granularity:'hourly'});
         } catch (error) {
-          requestErrors.push(`hourly:${pool.representative_symbol}:${String(error?.message || error)}`);
-          if (!previous.hourly?.official_response) {
-            next.hourly = {
-              official_response: false,
-              official_empty: false,
-              granularity: 'hourly',
-              representative_symbol: pool.representative_symbol,
-              pool_key: pool.pool_key,
-              mapped_focus_symbols: [...pool.mapped_focus_symbols],
-              row_count: 0,
-              rows: [],
-              updated_at: null,
-              error: String(error?.message || error).slice(0, 240),
-            };
-          }
+          requestErrors.push(`hourly:${pool.representative_symbol}:${String(error?.message||error)}`);
+          if (!previous.hourly?.official_response) next.hourly = {
+            official_response:false, official_empty:false, granularity:'hourly',
+            representative_symbol:pool.representative_symbol, pool_key:pool.pool_key,
+            mapped_focus_symbols:[...pool.mapped_focus_symbols], row_count:0, rows:[],
+            updated_at:null, error:String(error?.message||error).slice(0,240),
+          };
         }
         await sleep(RISK_HISTORY_REQUEST_GAP_MS);
       }
-
-      riskReserveHistoryByPool.set(pool.pool_key, next);
+      riskReserveHistoryByPool.set(pool.pool_key,next);
     }
 
-    const activeKeys = new Set(targets.pools.map((pool) => pool.pool_key));
-    for (const key of [...riskReserveHistoryByPool.keys()]) {
-      if (!activeKeys.has(key)) riskReserveHistoryByPool.delete(key);
-    }
+    const activeKeys=new Set(targets.pools.map((pool)=>pool.pool_key));
+    for(const key of [...riskReserveHistoryByPool.keys()]) if(!activeKeys.has(key)) riskReserveHistoryByPool.delete(key);
 
-    riskHistoryLastCompletedAt = new Date().toISOString();
+    riskHistoryLastCompletedAt=new Date().toISOString();
     responseCache.clear();
 
-    const incompletePools = riskHistoryIncompletePoolCount(targets);
-    if (incompletePools > 0) {
-      riskHistoryFailures += 1;
-      const recoveryDelayMs = scheduleRiskHistoryRecovery(
+    const incompletePools=riskHistoryIncompletePoolCount(targets);
+    if(incompletePools>0){
+      riskHistoryFailures+=1;
+      const recoveryDelay=scheduleRiskHistoryRecovery(
         requestErrors[0] || `${reason}:incomplete_pools:${incompletePools}/${targets.pools.length}`,
       );
-      riskHistoryLastError = requestErrors.length
-        ? `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length}:${requestErrors.slice(0, 3).join('|')}`
-        : `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length};recovery_in=${Math.round(recoveryDelayMs / 1000)}s`;
-      // Do NOT mark this pool signature complete. Keeping an incomplete signature
-      // uncommitted is what allows the backend watch to retry missing pools.
+      riskHistoryLastError=requestErrors.length
+        ? `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length}:${requestErrors.slice(0,3).join('|')}`
+        : `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length};recovery_in=${Math.round(recoveryDelay/1000)}s`;
       return false;
     }
 
-    riskHistoryLastSignature = riskHistorySignature(targets);
+    riskHistoryLastSignature=riskHistorySignature(targets);
     clearRiskHistoryRecoveryState();
-    riskHistoryLastError = '';
+    riskHistoryLastError='';
     return true;
   })();
 
-  riskHistoryRunning = task;
-  try {
-    return await task;
-  } finally {
-    if (riskHistoryRunning === task) riskHistoryRunning = null;
-  }
+  riskHistoryRunning=task;
+  try{return await task;}finally{if(riskHistoryRunning===task)riskHistoryRunning=null;}
 }
 
 function riskReserveHistorySnapshot() {
@@ -1093,6 +1059,8 @@ function riskReserveHistorySnapshot() {
     incomplete_pool_recovery_enabled: true,
     incomplete_pool_recovery_missing_only: true,
     incomplete_signature_never_marked_complete: true,
+    startup_deconflicted_seconds: Math.round(RISK_HISTORY_START_DELAY_MS / 1000),
+    request_gap_ms: RISK_HISTORY_REQUEST_GAP_MS,
     recovery_base_seconds: Math.round(RISK_HISTORY_RECOVERY_BASE_MS / 1000),
     recovery_max_seconds: Math.round(RISK_HISTORY_RECOVERY_MAX_MS / 1000),
     recovery_attempts: riskHistoryRecoveryAttempts,
@@ -1486,6 +1454,7 @@ export function getBitgetAdvancedStatsHealth() {
     risk_reserve_history_incomplete_pool_recovery_enabled: true,
     risk_reserve_history_incomplete_pool_recovery_missing_only: true,
     risk_reserve_history_incomplete_signature_never_marked_complete: true,
+    risk_reserve_history_startup_deconflicted: true,
     risk_reserve_history_user_reads_trigger_exchange_requests: false,
     risk_reserve_history_reads_scale_with_users: false,
     contract_history: contractHistoryCoverage(),

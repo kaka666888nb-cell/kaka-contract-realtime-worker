@@ -4,7 +4,7 @@ import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getMarketUniverseRows } from './market-rest.mjs';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 
-const VERSION = '650.8.15.93';
+const VERSION = '650.8.15.94';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -537,6 +537,8 @@ const BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT = Math.max(3, Math.min(500, Number(pr
 const BINANCE_OFFICIAL_TAKER_START_DELAY_MS = Math.max(20_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_START_DELAY_MS || 45_000));
 const BINANCE_OFFICIAL_TAKER_RETRY_MS = Math.max(30_000, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_RETRY_MS || 30_000));
 const binanceOfficialTakerBySymbol = new Map();
+const binanceOfficialTakerDeferralsBySymbol = new Map();
+const BINANCE_OFFICIAL_TAKER_STARVATION_ESCAPE_AFTER = Math.max(3, Number(process.env.KAKA_BINANCE_OFFICIAL_TAKER_STARVATION_ESCAPE_AFTER || 4));
 let binanceOfficialTakerInflight = null;
 let binanceOfficialTakerRecoveryTimer = null;
 let binanceOfficialTakerRound = 0;
@@ -2297,6 +2299,8 @@ function binanceOfficialTakerHealthPayload() {
     official_coverage_rows: coverage,
     total_history_rows: totalRows,
     missing_symbols: missing,
+    missing_symbol_deferrals: Object.fromEntries(missing.map((symbol)=>[symbol,Number(binanceOfficialTakerDeferralsBySymbol.get(symbol)||0)])),
+    max_missing_symbol_deferrals: missing.reduce((max,symbol)=>Math.max(max,Number(binanceOfficialTakerDeferralsBySymbol.get(symbol)||0)),0),
     official_endpoint: '/futures/data/takerlongshortRatio',
     official_period: '5m',
     official_history_limit: BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT,
@@ -2312,6 +2316,10 @@ function binanceOfficialTakerHealthPayload() {
     incomplete_focus_recovery_seconds: Math.round(BINANCE_OFFICIAL_TAKER_RETRY_MS/1000),
     incomplete_focus_recovery_uses_existing_edge_relay_deferral: true,
     existing_edge_relay_governor_reused: true,
+    starvation_escape_enabled: true,
+    starvation_escape_after_consecutive_deferrals: BINANCE_OFFICIAL_TAKER_STARVATION_ESCAPE_AFTER,
+    starvation_escape_lane: 'auxiliary_low_priority_queueable_one_at_a_time',
+    visible_kline_and_critical_priority_preserved: true,
     custom_provider_governor_created: false,
     user_reads_trigger_exchange_requests: false,
     reads_scale_with_users: false,
@@ -2338,21 +2346,33 @@ async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnl
       binanceOfficialTakerStats.attempts+=1;
       try{
         const native=nativeContractSymbol('binance',symbol);
+        const consecutiveDeferrals=Number(binanceOfficialTakerDeferralsBySymbol.get(symbol)||0);
+        const starvationEscape=consecutiveDeferrals>=BINANCE_OFFICIAL_TAKER_STARVATION_ESCAPE_AFTER;
         const payload=await fetchBinanceJson(
           `https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${encodeURIComponent(native)}&period=5m&limit=${BINANCE_OFFICIAL_TAKER_HISTORY_LIMIT}`,
-          { source:'position_metrics:official_taker_focus15', lane:'auxiliary', priority:-15, deferWhenBusy:true },
+          {
+            source:'position_metrics:official_taker_focus15',
+            lane:'auxiliary',
+            priority: starvationEscape ? -30 : -15,
+            deferWhenBusy: !starvationEscape,
+          },
         );
         const parsed=parseBinanceOfficialTakerRows(payload,symbol);
         if(!parsed || parsed.row_count<=0) throw new Error('binance_official_taker_empty');
         binanceOfficialTakerBySymbol.set(symbol,parsed);
+        binanceOfficialTakerDeferralsBySymbol.delete(symbol);
         binanceOfficialTakerStats.successes+=1;
         anySuccess=true;
       }catch(error){
         binanceOfficialTakerStats.failures+=1;
         const message=String(error?.message||error).slice(0,220);
         errors.push(`${symbol}:${message}`);
-        if(error?.backgroundDeferred||error?.auxiliaryDeferred){
+        if(error?.backgroundDeferred||error?.auxiliaryDeferred||message.includes('binance_kline_relay_queue_')){
           binanceOfficialTakerStats.background_deferrals+=1;
+          binanceOfficialTakerDeferralsBySymbol.set(
+            symbol,
+            Math.min(1000,Number(binanceOfficialTakerDeferralsBySymbol.get(symbol)||0)+1),
+          );
           break;
         }
         if(error?.internalBinanceRestGuard||error?.internalBinanceRelayGuard||[403,418,429,451].includes(Number(error?.status||0))) break;
