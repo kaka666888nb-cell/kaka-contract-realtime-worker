@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.117",
+  "version": "650.8.15.118",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka contract realtime worker 650.8.15.117 / Step1003 Gate official 5m contract-stat history reuse + semantic 1h/1d rollups"
+  "description": "Kaka contract realtime worker 650.8.15.118 / Step1004 Bitget spot whale + 24h net-capital official timestamped history reuse"
 }
