@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.32';
+const VERSION = '650.8.15.33';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -833,6 +833,18 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       reads_scale_with_users: false,
     },
     capabilities: includeCapabilities ? CAPABILITIES : [],
+    step1004_pressure_shared_read_cache: {
+      ready: contractFlow?.market_snapshot_shared_cache?.ready === true &&
+        contractFlow?.market_snapshot_shared_cache?.user_reads_trigger_database_requests === false &&
+        contractFlow?.market_snapshot_shared_cache?.user_reads_trigger_exchange_requests === false &&
+        contractFlow?.market_snapshot_shared_cache?.database_reads_scale_with_users === false &&
+        Number(contractFlow?.market_snapshot_shared_cache?.provider_count || 0) === 5,
+      version: contractFlow?.version || null,
+      market_snapshot_shared_cache: { ...(contractFlow?.market_snapshot_shared_cache || {}) },
+      user_reads_trigger_database_requests: contractFlow?.market_snapshot_shared_cache?.user_reads_trigger_database_requests === true,
+      user_reads_trigger_exchange_requests: contractFlow?.market_snapshot_shared_cache?.user_reads_trigger_exchange_requests === true,
+      database_reads_scale_with_users: contractFlow?.market_snapshot_shared_cache?.database_reads_scale_with_users === true,
+    },
     step1000_history_lifecycle: {
       ready: historyLifecycle?.ready === true && historyLifecycle?.step1000_ready === true,
       version: historyLifecycle?.version || null,
@@ -886,7 +898,8 @@ export function getSourceCapabilityRegistryHealth() {
       payload.step997_liquidation_history.ready &&
       payload.step998_liquidation_heatmap.ready &&
       payload.step999_focus_hot_score.ready &&
-      payload.step1000_history_lifecycle.ready,
+      payload.step1000_history_lifecycle.ready &&
+      payload.step1004_pressure_shared_read_cache.ready,
   };
 }
 
