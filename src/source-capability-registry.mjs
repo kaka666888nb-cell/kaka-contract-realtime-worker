@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.36';
+const VERSION = '650.8.15.37';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -466,6 +466,13 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         bitgetAdvanced.risk_reserve_history?.incomplete_pool_recovery_missing_only === true &&
         bitgetAdvanced.risk_reserve_history?.incomplete_signature_never_marked_complete === true &&
         Number(bitgetAdvanced.risk_reserve_history?.startup_deconflicted_seconds || 0) >= 60 &&
+        Number(bitgetAdvanced.risk_reserve_history?.request_gap_ms || 0) >= 1500 &&
+        bitgetAdvanced.risk_reserve_history?.pool_cache_retained_across_focus_changes === true &&
+        bitgetAdvanced.risk_reserve_history?.same_pool_symbol_fallback_enabled === true &&
+        Number(bitgetAdvanced.risk_reserve_history?.same_pool_symbol_fallback_limit || 0) >= 2 &&
+        bitgetAdvanced.risk_reserve_history?.rate_limit_abort_enabled === true &&
+        Number(bitgetAdvanced.risk_reserve_history?.rate_limit_cooldown_seconds || 0) >= 60 &&
+        bitgetAdvanced.risk_reserve_history?.shared_upstream_lane_serialization === true &&
         bitgetAdvanced.risk_reserve_history?.user_reads_trigger_exchange_requests === false &&
         bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === false,
       ready_from_bitget_advanced: bitgetAdvanced.risk_reserve_history?.ready === true,
@@ -488,6 +495,18 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       incomplete_signature_never_marked_complete: bitgetAdvanced.risk_reserve_history?.incomplete_signature_never_marked_complete === true,
       startup_deconflicted_seconds: Number(bitgetAdvanced.risk_reserve_history?.startup_deconflicted_seconds || 0),
       request_gap_ms: Number(bitgetAdvanced.risk_reserve_history?.request_gap_ms || 0),
+      pool_cache_retained_across_focus_changes: bitgetAdvanced.risk_reserve_history?.pool_cache_retained_across_focus_changes === true,
+      retained_pool_cache_count: Number(bitgetAdvanced.risk_reserve_history?.retained_pool_cache_count || 0),
+      inactive_retained_pool_count: Number(bitgetAdvanced.risk_reserve_history?.inactive_retained_pool_count || 0),
+      same_pool_symbol_fallback_enabled: bitgetAdvanced.risk_reserve_history?.same_pool_symbol_fallback_enabled === true,
+      same_pool_symbol_fallback_limit: Number(bitgetAdvanced.risk_reserve_history?.same_pool_symbol_fallback_limit || 0),
+      same_pool_symbol_fallback_successes: Number(bitgetAdvanced.risk_reserve_history?.same_pool_symbol_fallback_successes || 0),
+      rate_limit_abort_enabled: bitgetAdvanced.risk_reserve_history?.rate_limit_abort_enabled === true,
+      rate_limit_cooldown_seconds: Number(bitgetAdvanced.risk_reserve_history?.rate_limit_cooldown_seconds || 0),
+      rate_limit_cooldown_until: bitgetAdvanced.risk_reserve_history?.rate_limit_cooldown_until || null,
+      last_rate_limit_at: bitgetAdvanced.risk_reserve_history?.last_rate_limit_at || null,
+      rate_limit_aborts: Number(bitgetAdvanced.risk_reserve_history?.rate_limit_aborts || 0),
+      shared_upstream_lane_serialization: bitgetAdvanced.risk_reserve_history?.shared_upstream_lane_serialization === true,
       provider_request_governor_reused: bitgetAdvanced.risk_reserve_history?.provider_request_governor_reused === true,
       user_reads_trigger_exchange_requests: bitgetAdvanced.risk_reserve_history?.user_reads_trigger_exchange_requests === true,
       reads_scale_with_users: bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === true,

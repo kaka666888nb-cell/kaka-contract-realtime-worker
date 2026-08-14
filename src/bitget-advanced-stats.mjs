@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.8';
+const VERSION = '650.8.15.9';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
@@ -20,7 +20,9 @@ const RISK_HISTORY_START_DELAY_MS = Math.max(60_000, Number(process.env.KAKA_BIT
 const RISK_HISTORY_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_REFRESH_MS || 6 * 60 * 60_000));
 const RISK_HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_STALE_MS || 12 * 60 * 60_000));
 const RISK_HISTORY_WATCH_MS = Math.max(20_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_WATCH_MS || 30_000));
-const RISK_HISTORY_REQUEST_GAP_MS = Math.max(600, Number(process.env.KAKA_BITGET_RISK_HISTORY_REQUEST_GAP_MS || 850));
+const RISK_HISTORY_REQUEST_GAP_MS = Math.max(1_500, Number(process.env.KAKA_BITGET_RISK_HISTORY_REQUEST_GAP_MS || 2_500));
+const RISK_HISTORY_RATE_LIMIT_COOLDOWN_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_RATE_LIMIT_COOLDOWN_MS || 75_000));
+const RISK_HISTORY_SYMBOL_FALLBACK_LIMIT = Math.max(1, Math.min(4, Number(process.env.KAKA_BITGET_RISK_HISTORY_SYMBOL_FALLBACK_LIMIT || 3)));
 const RISK_HISTORY_RECOVERY_BASE_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_RECOVERY_BASE_MS || 60_000));
 const RISK_HISTORY_RECOVERY_MAX_MS = Math.max(RISK_HISTORY_RECOVERY_BASE_MS, Number(process.env.KAKA_BITGET_RISK_HISTORY_RECOVERY_MAX_MS || 15 * 60_000));
 const OFFICIAL_5M_HISTORY_LIMIT = Math.max(36, Math.min(576, Number(process.env.KAKA_BITGET_OFFICIAL_5M_HISTORY_LIMIT || 288)));
@@ -68,6 +70,19 @@ let riskHistoryRecoveryAttempts = 0;
 let riskHistoryRecoveryFailures = 0;
 let riskHistoryNextRecoveryAt = 0;
 let riskHistoryLastRecoveryReason = '';
+let riskHistoryRateLimitUntil = 0;
+let riskHistoryLastRateLimitAt = null;
+let riskHistoryRateLimitAborts = 0;
+let riskHistoryAlternateSymbolSuccesses = 0;
+let riskHistoryInactivePoolRetentions = 0;
+const riskReserveHistoryPreferredSymbolByPool = new Map();
+
+let advancedUpstreamTail = Promise.resolve();
+let advancedUpstreamActiveLane = '';
+let advancedUpstreamQueued = 0;
+let advancedUpstreamRuns = 0;
+let advancedUpstreamWaits = 0;
+let advancedUpstreamMaxQueue = 0;
 let round = 0;
 let totalReads = 0;
 let responseCacheHits = 0;
@@ -127,6 +142,27 @@ function sleep(ms) {
     t.unref?.();
   });
 }
+
+async function runAdvancedUpstreamLane(name, task) {
+  const previous = advancedUpstreamTail.catch(() => {});
+  let release = null;
+  const gate = new Promise((resolve) => { release = resolve; });
+  advancedUpstreamTail = previous.then(() => gate);
+  advancedUpstreamQueued += 1;
+  advancedUpstreamMaxQueue = Math.max(advancedUpstreamMaxQueue, advancedUpstreamQueued);
+  const waitStartedAt = Date.now();
+  await previous;
+  advancedUpstreamQueued = Math.max(0, advancedUpstreamQueued - 1);
+  if (Date.now() - waitStartedAt >= 250) advancedUpstreamWaits += 1;
+  advancedUpstreamActiveLane = String(name || 'unknown');
+  advancedUpstreamRuns += 1;
+  try {
+    return await task();
+  } finally {
+    advancedUpstreamActiveLane = '';
+    release?.();
+  }
+}
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
 }
@@ -173,7 +209,7 @@ async function fetchJson(path, { timeoutMs = 18_000, lane = 'unknown' } = {}) {
     const response = await fetch(`${BASE}${path}`, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.118 bitget-advanced-shared',
+        'user-agent': 'KakaWeb3/650.8.15.135 bitget-advanced-shared',
       },
       signal: controller.signal,
     });
@@ -867,7 +903,7 @@ function mergeSpotStats(symbols, lanes) {
 
 async function refreshFocusStats(reason = 'interval') {
   if (focusRunning) return await focusRunning;
-  const task = (async () => {
+  const task = (async () => runAdvancedUpstreamLane('focus_stats', async () => {
     lastFocusStartedAt = new Date().toISOString();
     totalFocusBuilds += 1;
     const targetState = bitgetFocusTargets();
@@ -958,7 +994,7 @@ async function refreshFocusStats(reason = 'interval') {
     lastFocusError = '';
     responseCache.clear();
     return true;
-  })();
+  }))();
 
   focusRunning = task;
   try {
@@ -1054,7 +1090,7 @@ function clearRiskHistoryRecoveryState() {
   riskHistoryLastRecoveryReason = '';
 }
 
-function parseRiskReserveHistory(payload, { lane, pool, granularity }) {
+function parseRiskReserveHistory(payload, { lane, pool, granularity, requestSymbol = '' }) {
   const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
   const coin = compact(data?.coin);
   const list = Array.isArray(data?.riskReserveRecords) ? data.riskReserveRecords : [];
@@ -1074,7 +1110,7 @@ function parseRiskReserveHistory(payload, { lane, pool, granularity }) {
     official_empty: rows.length === 0,
     granularity,
     coin: coin || pool.coin,
-    representative_symbol: pool.representative_symbol,
+    representative_symbol: compact(requestSymbol) || pool.representative_symbol,
     pool_key: pool.pool_key,
     mapped_focus_symbols: [...pool.mapped_focus_symbols],
     row_count: rows.length,
@@ -1102,12 +1138,93 @@ function riskHistoryPoolReady(poolKey) {
   return riskHistoryFresh(state?.daily) && riskHistoryFresh(state?.hourly);
 }
 
+function riskHistoryCandidateSymbols(pool) {
+  const out = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const symbol = compact(raw);
+    if (!symbol || seen.has(symbol)) return;
+    seen.add(symbol);
+    out.push(symbol);
+  };
+  add(riskReserveHistoryPreferredSymbolByPool.get(pool?.pool_key));
+  add(pool?.representative_symbol);
+  for (const symbol of Array.isArray(pool?.mapped_focus_symbols) ? pool.mapped_focus_symbols : []) add(symbol);
+  for (const symbol of Array.isArray(pool?.symbols) ? pool.symbols : []) add(symbol);
+  return out.slice(0, RISK_HISTORY_SYMBOL_FALLBACK_LIMIT);
+}
+
+function riskHistoryIsRateLimited(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return message.includes('bitget_http_429') ||
+    message.includes('provider_governor_cooldown') ||
+    message.includes('too many requests');
+}
+
+async function fetchRiskHistoryPoolGranularity(pool, granularity) {
+  const daily = granularity === 'daily';
+  const lane = daily ? 'risk_reserve_daily_history' : 'risk_reserve_hourly_history';
+  const endpoint = daily ? '/api/v3/market/risk-reserve' : '/api/v3/market/risk-reserve-hour';
+  const candidates = riskHistoryCandidateSymbols(pool);
+  const errors = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const symbol = candidates[index];
+    try {
+      const payload = await fetchJson(
+        `${endpoint}?category=USDT-FUTURES&symbol=${encodeURIComponent(symbol)}`,
+        { lane },
+      );
+      const parsed = parseRiskReserveHistory(payload, { lane, pool, granularity, requestSymbol: symbol });
+      riskReserveHistoryPreferredSymbolByPool.set(pool.pool_key, symbol);
+      if (index > 0 || symbol !== compact(pool.representative_symbol)) riskHistoryAlternateSymbolSuccesses += 1;
+      return { ok: true, value: parsed, symbol, errors, rate_limited: false };
+    } catch (error) {
+      const message = String(error?.message || error);
+      errors.push(`${granularity}:${symbol}:${message}`);
+      if (riskHistoryIsRateLimited(error)) {
+        riskHistoryRateLimitAborts += 1;
+        riskHistoryLastRateLimitAt = new Date().toISOString();
+        riskHistoryRateLimitUntil = Date.now() + RISK_HISTORY_RATE_LIMIT_COOLDOWN_MS;
+        return { ok: false, value: null, symbol, errors, rate_limited: true, error: message };
+      }
+      if (index < candidates.length - 1) await sleep(RISK_HISTORY_REQUEST_GAP_MS);
+    }
+  }
+  return {
+    ok: false,
+    value: null,
+    symbol: candidates[0] || compact(pool?.representative_symbol),
+    errors,
+    rate_limited: false,
+    error: errors[errors.length - 1] || `${granularity}:no_candidate_symbol`,
+  };
+}
+
+function pruneRiskHistoryPoolCache() {
+  const officialKeys = new Set(riskReservePools.map((pool) => riskReservePoolKey(pool)).filter(Boolean));
+  if (officialKeys.size === 0) return 0;
+  let removed = 0;
+  for (const key of [...riskReserveHistoryByPool.keys()]) {
+    if (officialKeys.has(key)) continue;
+    riskReserveHistoryByPool.delete(key);
+    riskReserveHistoryPreferredSymbolByPool.delete(key);
+    removed += 1;
+  }
+  return removed;
+}
+
 async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = false } = {}) {
   if (riskHistoryRunning) return await riskHistoryRunning;
-  const task = (async () => {
+  const task = (async () => runAdvancedUpstreamLane('risk_reserve_history', async () => {
     riskHistoryLastStartedAt = new Date().toISOString();
     riskHistoryBuilds += 1;
     if (reason.includes('recovery') || missingOnly) riskHistoryRecoveryAttempts += 1;
+
+    if (riskHistoryRateLimitUntil > Date.now()) {
+      riskHistoryNextRecoveryAt = Math.max(riskHistoryNextRecoveryAt, riskHistoryRateLimitUntil);
+      riskHistoryLastError = `${reason}:risk_reserve_rate_limit_cooldown_until:${isoMs(riskHistoryRateLimitUntil)}`;
+      return false;
+    }
 
     const targets = riskReserveHistoryTargets();
     if (!targets.focus_ready || targets.mapped_focus_rows.length !== FOCUS_TARGET) {
@@ -1123,55 +1240,53 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
     }
 
     const requestErrors = [];
+    let rateLimitedAbort = false;
     for (const pool of targets.pools) {
       if (missingOnly && riskHistoryPoolReady(pool.pool_key)) continue;
       const previous = riskReserveHistoryByPool.get(pool.pool_key) || {};
       const next = { ...previous, pool: clone(pool) };
 
       if (!missingOnly || !riskHistoryFresh(previous.daily)) {
-        try {
-          const payload = await fetchJson(
-            `/api/v3/market/risk-reserve?category=USDT-FUTURES&symbol=${encodeURIComponent(pool.representative_symbol)}`,
-            { lane: 'risk_reserve_daily_history' },
-          );
-          next.daily = parseRiskReserveHistory(payload, {lane:'risk_reserve_daily_history',pool,granularity:'daily'});
-        } catch (error) {
-          requestErrors.push(`daily:${pool.representative_symbol}:${String(error?.message||error)}`);
-          if (!previous.daily?.official_response) next.daily = {
+        const result = await fetchRiskHistoryPoolGranularity(pool, 'daily');
+        requestErrors.push(...result.errors);
+        if (result.ok) {
+          next.daily = result.value;
+        } else if (!previous.daily?.official_response) {
+          next.daily = {
             official_response:false, official_empty:false, granularity:'daily',
-            representative_symbol:pool.representative_symbol, pool_key:pool.pool_key,
+            representative_symbol:result.symbol || pool.representative_symbol, pool_key:pool.pool_key,
             mapped_focus_symbols:[...pool.mapped_focus_symbols], row_count:0, rows:[],
-            updated_at:null, error:String(error?.message||error).slice(0,240),
+            updated_at:null, error:String(result.error || 'risk_reserve_daily_failed').slice(0,240),
           };
         }
+        riskReserveHistoryByPool.set(pool.pool_key, next);
+        if (result.rate_limited) { rateLimitedAbort = true; break; }
         await sleep(RISK_HISTORY_REQUEST_GAP_MS);
       }
 
       if (!missingOnly || !riskHistoryFresh(previous.hourly)) {
-        try {
-          const payload = await fetchJson(
-            `/api/v3/market/risk-reserve-hour?category=USDT-FUTURES&symbol=${encodeURIComponent(pool.representative_symbol)}`,
-            { lane: 'risk_reserve_hourly_history' },
-          );
-          next.hourly = parseRiskReserveHistory(payload, {lane:'risk_reserve_hourly_history',pool,granularity:'hourly'});
-        } catch (error) {
-          requestErrors.push(`hourly:${pool.representative_symbol}:${String(error?.message||error)}`);
-          if (!previous.hourly?.official_response) next.hourly = {
+        const result = await fetchRiskHistoryPoolGranularity(pool, 'hourly');
+        requestErrors.push(...result.errors);
+        if (result.ok) {
+          next.hourly = result.value;
+        } else if (!previous.hourly?.official_response) {
+          next.hourly = {
             official_response:false, official_empty:false, granularity:'hourly',
-            representative_symbol:pool.representative_symbol, pool_key:pool.pool_key,
+            representative_symbol:result.symbol || pool.representative_symbol, pool_key:pool.pool_key,
             mapped_focus_symbols:[...pool.mapped_focus_symbols], row_count:0, rows:[],
-            updated_at:null, error:String(error?.message||error).slice(0,240),
+            updated_at:null, error:String(result.error || 'risk_reserve_hourly_failed').slice(0,240),
           };
         }
+        riskReserveHistoryByPool.set(pool.pool_key, next);
+        if (result.rate_limited) { rateLimitedAbort = true; break; }
         await sleep(RISK_HISTORY_REQUEST_GAP_MS);
       }
-      riskReserveHistoryByPool.set(pool.pool_key,next);
+      riskReserveHistoryByPool.set(pool.pool_key, next);
     }
 
-    const activeKeys = new Set(targets.pools.map((pool)=>pool.pool_key));
-    for (const key of [...riskReserveHistoryByPool.keys()]) {
-      if (!activeKeys.has(key)) riskReserveHistoryByPool.delete(key);
-    }
+    pruneRiskHistoryPoolCache();
+    const activeKeys = new Set(targets.pools.map((pool) => pool.pool_key));
+    riskHistoryInactivePoolRetentions = [...riskReserveHistoryByPool.keys()].filter((key) => !activeKeys.has(key)).length;
 
     riskHistoryLastCompletedAt = new Date().toISOString();
     responseCache.clear();
@@ -1179,21 +1294,29 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
     const incompletePools = riskHistoryIncompletePoolCount(targets);
     if (incompletePools > 0) {
       riskHistoryFailures += 1;
-      const recoveryDelay = scheduleRiskHistoryRecovery(
-        requestErrors[0] || `${reason}:incomplete_pools:${incompletePools}/${targets.pools.length}`,
-      );
+      let recoveryDelay = 0;
+      if (rateLimitedAbort) {
+        recoveryDelay = Math.max(1_000, riskHistoryRateLimitUntil - Date.now());
+        riskHistoryNextRecoveryAt = riskHistoryRateLimitUntil;
+        riskHistoryLastRecoveryReason = requestErrors[requestErrors.length - 1] || `${reason}:rate_limited`;
+      } else {
+        recoveryDelay = scheduleRiskHistoryRecovery(
+          requestErrors[0] || `${reason}:incomplete_pools:${incompletePools}/${targets.pools.length}`,
+        );
+      }
       riskHistoryLastError = requestErrors.length
-        ? `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length}:${requestErrors.slice(0,3).join('|')}`
+        ? `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length}:${requestErrors.slice(-3).join('|')}`
         : `${reason}:risk_reserve_history_incomplete:${incompletePools}/${targets.pools.length};recovery_in=${Math.round(recoveryDelay/1000)}s`;
       // Never commit an incomplete pool signature as complete.
       return false;
     }
 
     riskHistoryLastSignature = riskHistorySignature(targets);
+    riskHistoryRateLimitUntil = 0;
     clearRiskHistoryRecoveryState();
     riskHistoryLastError = '';
     return true;
-  })();
+  }))();
 
   riskHistoryRunning = task;
   try { return await task; }
@@ -1236,6 +1359,18 @@ function riskReserveHistorySnapshot() {
     full_cycle_symbol_naive_request_cap: FOCUS_TARGET * 2,
     representative_symbol_per_pool: true,
     current_risk_reserve_all_mapping_reused: true,
+    pool_cache_retained_across_focus_changes: true,
+    retained_pool_cache_count: riskReserveHistoryByPool.size,
+    inactive_retained_pool_count: riskHistoryInactivePoolRetentions,
+    same_pool_symbol_fallback_enabled: true,
+    same_pool_symbol_fallback_limit: RISK_HISTORY_SYMBOL_FALLBACK_LIMIT,
+    same_pool_symbol_fallback_successes: riskHistoryAlternateSymbolSuccesses,
+    rate_limit_abort_enabled: true,
+    rate_limit_cooldown_seconds: Math.round(RISK_HISTORY_RATE_LIMIT_COOLDOWN_MS / 1000),
+    rate_limit_cooldown_until: riskHistoryRateLimitUntil > Date.now() ? isoMs(riskHistoryRateLimitUntil) : null,
+    last_rate_limit_at: riskHistoryLastRateLimitAt,
+    rate_limit_aborts: riskHistoryRateLimitAborts,
+    shared_upstream_lane_serialization: true,
     official_daily_endpoint: '/api/v3/market/risk-reserve',
     official_hourly_endpoint: '/api/v3/market/risk-reserve-hour',
     shared_background_collector: true,
@@ -1303,7 +1438,7 @@ function refreshFundingRowsFromMarketLight() {
 
 async function refreshBatchStats(reason = 'interval') {
   if (batchRunning) return await batchRunning;
-  const task = (async () => {
+  const task = (async () => runAdvancedUpstreamLane('batch_stats', async () => {
     lastBatchStartedAt = new Date().toISOString();
     totalBatchBuilds += 1;
     refreshFundingRowsFromMarketLight();
@@ -1347,7 +1482,7 @@ async function refreshBatchStats(reason = 'interval') {
     if (riskReservePools.length === 0 && oiLimitRows.size === 0 && fundingRows.size === 0) throw new Error(lastBatchError || 'bitget_batch_stats_empty');
     responseCache.clear();
     return errors.length === 0;
-  })();
+  }))();
 
   batchRunning = task;
   try {
@@ -1574,8 +1709,8 @@ function snapshotPayload({ includeRows = true } = {}) {
       index_components: '10/sec/IP but collector keeps shared bounded schedule',
       current_funding: 'owned by market-light official category batch; slow-stats reuses shared rows and opens no duplicate funding request',
       risk_reserve_all: '3/sec/IP category batch',
-      risk_reserve_daily_history: '20/sec/IP official per-symbol endpoint; shared collector deduplicates by current risk-reserve pool and uses one representative focus symbol per pool',
-      risk_reserve_hourly_history: '20/sec/IP official per-symbol endpoint; shared collector deduplicates by current risk-reserve pool and uses one representative focus symbol per pool',
+      risk_reserve_daily_history: '20/sec/IP official per-symbol endpoint; shared collector deduplicates by current risk-reserve pool, spaces history calls at a low shared cadence, aborts on 429 cooldown, and may retry another official symbol from the same pool only',
+      risk_reserve_hourly_history: '20/sec/IP official per-symbol endpoint; shared collector deduplicates by current risk-reserve pool, spaces history calls at a low shared cadence, aborts on 429 cooldown, and may retry another official symbol from the same pool only',
       oi_limit: '10/sec/IP category batch',
     },
     official_semantics: {
@@ -1594,7 +1729,7 @@ function snapshotPayload({ includeRows = true } = {}) {
       index_components: 'Bitget official index price components and weights',
       risk_reserve_all: 'Bitget official current insurance-fund pools and symbol membership',
       risk_reserve_history: 'Bitget official daily and hourly risk-reserve records; records are kept under their native endpoint granularity and are never derived from current balance',
-      risk_reserve_history_pool_dedup: 'Current risk-reserve-all pool membership is reused to avoid repeated history calls for focus symbols that share the same reserve pool; one focus representative symbol is queried per pool',
+      risk_reserve_history_pool_dedup: 'Current risk-reserve-all pool membership is reused to avoid repeated history calls for focus symbols that share the same reserve pool; verified pool history is retained across focus rotation, and symbol fallback never leaves the same official pool',
       oi_limit: 'Bitget official individual and main/sub-account notional limits',
       funding: 'Bitget official current funding; market-light owns the optional-symbol category batch and slow-stats reuses it without duplicate upstream',
     },
@@ -1661,6 +1796,12 @@ export function getBitgetAdvancedStatsHealth() {
     risk_reserve_history_startup_deconflicted: true,
     risk_reserve_history_user_reads_trigger_exchange_requests: false,
     risk_reserve_history_reads_scale_with_users: false,
+    shared_upstream_lane_serialization: true,
+    shared_upstream_lane_active: advancedUpstreamActiveLane || null,
+    shared_upstream_lane_queued: advancedUpstreamQueued,
+    shared_upstream_lane_runs: advancedUpstreamRuns,
+    shared_upstream_lane_waits: advancedUpstreamWaits,
+    shared_upstream_lane_max_queue: advancedUpstreamMaxQueue,
     contract_history: contractHistoryCoverage(),
     contract_history_route: HISTORY_ROUTE,
     contract_history_additional_exchange_requests: 0,
@@ -1737,7 +1878,14 @@ export const __bitgetAdvancedTest = Object.freeze({
   parseSpotNet,
 });
 
-export const __bitgetStep1000Test = Object.freeze({ parseRiskReserveHistory, riskReservePoolKey, riskHistoryRecoveryDelayMs });
+export const __bitgetStep1000Test = Object.freeze({
+  parseRiskReserveHistory,
+  riskReservePoolKey,
+  riskHistoryRecoveryDelayMs,
+  riskHistoryCandidateSymbols,
+  riskHistoryIsRateLimited,
+  runAdvancedUpstreamLane,
+});
 
 export const __bitgetStep1001Test = Object.freeze({ normalizedHistoryRowForLane, derivedRollupRows, contractHistorySnapshot });
 export const __bitgetStep1004Test = Object.freeze({
