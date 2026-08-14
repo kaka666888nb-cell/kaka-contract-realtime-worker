@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.37';
+const VERSION = '650.8.15.38';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -90,7 +90,7 @@ const CAPABILITIES = Object.freeze([
   { provider: 'bitget', market: 'contract', capability: 'active_buy_sell_long_short_history', official_available: true, official_scope: 'focus15_existing_5m_response_arrays', transport: 'reuse_existing_public_REST_responses', batch_mode: 'zero_additional_exchange_requests_capture_step991_response_arrays_plus_on_read_backend_rollups', rate_limit_class: 'zero_additional_upstream', collector: 'bitget-advanced-slow-stats', target_layer: 'contract_stats_history', current_integration: 'ready_step1001', fallback_policy: 'official_5m_missing_stays_missing; derived rollup missing stays missing; never cross-provider substitute', history_policy: 'official_5m_base_plus_explicitly_derived_15m_1h_4h_1d', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Futures-Active-Buy-Sell' },
   { provider: 'bitget', market: 'contract', capability: 'long_short_ratio_families', official_available: true, official_scope: 'per_symbol_5m_global_account_position_families', transport: 'REST', batch_mode: 'futures_long_short_plus_account_long_short_plus_position_long_short', rate_limit_class: 'shared_bounded', collector: 'contract-flow-metric-history', target_layer: 'current_and_history', current_integration: 'ready_existing_contract_flow', fallback_policy: 'each ratio family stays separate; no family substitution', history_policy: '5m_metric_rows', source_url: 'https://api.bitget.com/api/v3/market/futures-long-short' },
   { provider: 'bitget', market: 'contract', capability: 'risk_reserve_position_tier_oi_limit_index_components', official_available: true, official_scope: 'batch_plus_focus15', transport: 'REST', batch_mode: 'risk_reserve_all_and_oi_limit_batch_plus_focus_tier_index', rate_limit_class: 'slow_shared', collector: 'slow-stats-collector', target_layer: 'risk_reference', current_integration: 'ready_step991', fallback_policy: 'missing', history_policy: 'risk_reserve_history_now_owned_by_step1000; current_reference_and_history_separate', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve-All' },
-  { provider: 'bitget', market: 'contract', capability: 'risk_reserve_history', official_available: true, official_scope: 'focus15_mapped_to_current_official_reserve_pools', transport: 'public_REST', batch_mode: 'one_representative_focus_symbol_per_current_reserve_pool_for_daily_and_hourly_history', rate_limit_class: 'slow_shared_pool_dedup', collector: 'bitget-advanced-slow-stats', target_layer: 'risk_history', current_integration: 'ready_step1000', fallback_policy: 'last_shared_verified_until_stale_then_missing; official empty remains empty; no current-balance derivation', history_policy: 'native_official_daily_plus_native_official_hourly', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve' },
+  { provider: 'bitget', market: 'contract', capability: 'risk_reserve_history', official_available: true, official_scope: 'focus15_mapped_to_current_official_reserve_pools', transport: 'public_REST', batch_mode: 'one_representative_focus_symbol_per_current_reserve_pool_for_daily_and_hourly_history', rate_limit_class: 'slow_shared_pool_dedup', collector: 'bitget-advanced-slow-stats', target_layer: 'risk_history', current_integration: 'ready_step1000', fallback_policy: 'last_shared_verified_until_stale_then_missing; focus symbols absent from current official risk-reserve-all remain unsupported/null; no cross-pool substitution or current-balance derivation', history_policy: 'native_official_daily_plus_native_official_hourly', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Risk-Reserve' },
   { provider: 'bitget', market: 'contract', capability: 'liquidation_history', official_available: true, official_scope: 'category_wide_public_history_three_product_types', transport: 'public_REST', batch_mode: 'shared_background_delayed_closed_minute_reconcile_with_nonblocking_deferred_retry_after_public_ws_live_ingress', rate_limit_class: '5_per_sec_ip_bounded_350ms_gap', collector: 'liquidation-collector', target_layer: 'unified_history', current_integration: 'ready_v46_closure_step997_2_1', fallback_policy: 'live_ws_provisional_then_official_rest_reconcile; official empty/delayed/conflicting REST never overwrites; failed windows defer without blocking newer windows', history_policy: 'official_last_3_days_source_reconciles_nonzero_1m_buckets', source_url: 'https://www.bitget.com/api-doc/uta/public/Get-Liquidations' },
   { provider: 'bitget', market: 'contract', capability: 'depth20_current_focus', official_available: true, official_scope: 'focus15_current', transport: 'public_orderbook_shared_backend', batch_mode: 'bounded_focus15_depth20', rate_limit_class: 'shared_bounded', collector: 'deep-market-collector', target_layer: 'depth', current_integration: 'ready_step1004_1_5', fallback_policy: 'last verified until stale then null; no cross-provider substitution', history_policy: 'current_only', source_url: 'https://www.bitget.com/api-doc/contract/websocket/public/Order-Book-Channel' },
   { provider: 'bitget', market: 'contract', capability: 'liquidation_current', official_available: true, official_scope: 'public_event_stream_current', transport: 'public_WS_or_public_event_endpoint', batch_mode: 'shared_backend_event_collection', rate_limit_class: 'shared_bounded', collector: 'liquidation-collector', target_layer: 'liquidation_current', current_integration: 'ready_step997', fallback_policy: 'verified zero distinct from missing; no cross-provider substitution', history_policy: 'shared_event_buckets_and_history', source_url: 'https://www.bitget.com/api-doc/contract/websocket/public/Order-Book-Channel' },
@@ -454,7 +454,11 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
     },
     bitget_step1000: {
       ready: bitgetAdvanced.risk_reserve_history?.ready === true &&
-        Number(bitgetAdvanced.risk_reserve_history?.mapped_focus_rows || 0) === 15 &&
+        Number(bitgetAdvanced.risk_reserve_history?.focus_scope_resolved_rows || 0) === 15 &&
+        Number(bitgetAdvanced.risk_reserve_history?.mapped_focus_rows || 0) + Number(bitgetAdvanced.risk_reserve_history?.officially_unsupported_focus_rows || 0) === 15 &&
+        bitgetAdvanced.risk_reserve_history?.unsupported_focus_is_valid_missing === true &&
+        bitgetAdvanced.risk_reserve_history?.unsupported_focus_triggers_history_request === false &&
+        bitgetAdvanced.risk_reserve_history?.current_risk_reserve_all_is_support_authority === true &&
         Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0) > 0 &&
         Number(bitgetAdvanced.risk_reserve_history?.daily_official_pool_coverage || 0) === Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0) &&
         Number(bitgetAdvanced.risk_reserve_history?.hourly_official_pool_coverage || 0) === Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0) &&
@@ -477,14 +481,22 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         bitgetAdvanced.risk_reserve_history?.reads_scale_with_users === false,
       ready_from_bitget_advanced: bitgetAdvanced.risk_reserve_history?.ready === true,
       mapped_focus_rows: Number(bitgetAdvanced.risk_reserve_history?.mapped_focus_rows || 0),
+      officially_unsupported_focus_rows: Number(bitgetAdvanced.risk_reserve_history?.officially_unsupported_focus_rows || 0),
+      officially_unsupported_focus_symbols: Array.isArray(bitgetAdvanced.risk_reserve_history?.officially_unsupported_focus_symbols) ? [...bitgetAdvanced.risk_reserve_history.officially_unsupported_focus_symbols] : [],
+      focus_scope_resolved_rows: Number(bitgetAdvanced.risk_reserve_history?.focus_scope_resolved_rows || 0),
+      unsupported_focus_is_valid_missing: bitgetAdvanced.risk_reserve_history?.unsupported_focus_is_valid_missing === true,
+      unsupported_focus_triggers_history_request: bitgetAdvanced.risk_reserve_history?.unsupported_focus_triggers_history_request === true,
+      current_risk_reserve_all_is_support_authority: bitgetAdvanced.risk_reserve_history?.current_risk_reserve_all_is_support_authority === true,
       pool_target_count: Number(bitgetAdvanced.risk_reserve_history?.pool_target_count || 0),
       pool_dedup_saved_symbol_queries: Number(bitgetAdvanced.risk_reserve_history?.pool_dedup_saved_symbol_queries || 0),
+      unsupported_focus_avoided_symbol_queries: Number(bitgetAdvanced.risk_reserve_history?.unsupported_focus_avoided_symbol_queries || 0),
       daily_official_pool_coverage: Number(bitgetAdvanced.risk_reserve_history?.daily_official_pool_coverage || 0),
       hourly_official_pool_coverage: Number(bitgetAdvanced.risk_reserve_history?.hourly_official_pool_coverage || 0),
       daily_nonempty_pools: Number(bitgetAdvanced.risk_reserve_history?.daily_nonempty_pools || 0),
       hourly_nonempty_pools: Number(bitgetAdvanced.risk_reserve_history?.hourly_nonempty_pools || 0),
       full_cycle_request_cap: Number(bitgetAdvanced.risk_reserve_history?.full_cycle_request_cap || 0),
       symbol_naive_request_cap: Number(bitgetAdvanced.risk_reserve_history?.full_cycle_symbol_naive_request_cap || 0),
+      supported_symbol_naive_request_cap: Number(bitgetAdvanced.risk_reserve_history?.supported_symbol_naive_request_cap || 0),
       representative_symbol_per_pool: bitgetAdvanced.risk_reserve_history?.representative_symbol_per_pool === true,
       current_pool_mapping_reused: bitgetAdvanced.risk_reserve_history?.current_risk_reserve_all_mapping_reused === true,
       official_daily_endpoint: bitgetAdvanced.risk_reserve_history?.official_daily_endpoint || null,

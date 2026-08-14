@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.9';
+const VERSION = '650.8.15.10';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
@@ -16,7 +16,7 @@ const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_BITGET_ADV
 const STALE_MS = Math.max(5 * 60_000, Number(process.env.KAKA_BITGET_ADVANCED_STALE_MS || 12 * 60_000));
 const ONE_PER_SECOND_GAP_MS = Math.max(1_020, Number(process.env.KAKA_BITGET_ADVANCED_1S_GAP_MS || 1_080));
 const FOCUS_TARGET = 15;
-const RISK_HISTORY_START_DELAY_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_START_DELAY_MS || 90_000));
+const RISK_HISTORY_START_DELAY_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_START_DELAY_MS || 60_000));
 const RISK_HISTORY_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_REFRESH_MS || 6 * 60 * 60_000));
 const RISK_HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_STALE_MS || 12 * 60 * 60_000));
 const RISK_HISTORY_WATCH_MS = Math.max(20_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_WATCH_MS || 30_000));
@@ -209,7 +209,7 @@ async function fetchJson(path, { timeoutMs = 18_000, lane = 'unknown' } = {}) {
     const response = await fetch(`${BASE}${path}`, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/650.8.15.135 bitget-advanced-shared',
+        'user-agent': 'KakaWeb3/650.8.15.136 bitget-advanced-shared',
       },
       signal: controller.signal,
     });
@@ -1016,15 +1016,25 @@ function riskReservePoolKey(pool) {
   return `${coin}:${symbols.join(',')}`;
 }
 
-function riskReserveHistoryTargets() {
-  const focus = bitgetFocusTargets();
+function buildRiskReserveHistoryTargets(focus, reservePools) {
   const mapped = [];
   const pools = new Map();
+  const unsupported = [];
+  const officialPools = Array.isArray(reservePools) ? reservePools : [];
 
-  for (const target of focus.rows) {
-    const pool = riskReservePools.find((item) => Array.isArray(item?.symbols) && item.symbols.includes(target.symbol));
+  for (const target of Array.isArray(focus?.rows) ? focus.rows : []) {
+    const pool = officialPools.find((item) => Array.isArray(item?.symbols) && item.symbols.includes(target.symbol));
     if (!pool) {
-      mapped.push({ ...target, pool_key: '', representative_symbol: '', pool_found: false });
+      const row = {
+        ...target,
+        pool_key: '',
+        representative_symbol: '',
+        pool_found: false,
+        official_risk_reserve_support: false,
+        unsupported_reason: 'not_listed_by_current_risk_reserve_all',
+      };
+      mapped.push(row);
+      unsupported.push(row);
       continue;
     }
     const key = riskReservePoolKey(pool);
@@ -1045,18 +1055,26 @@ function riskReserveHistoryTargets() {
       pool_key: key,
       representative_symbol: group.representative_symbol,
       pool_found: true,
+      official_risk_reserve_support: true,
+      unsupported_reason: '',
     });
   }
 
   return {
-    focus_ready: focus.focus_ready,
-    focus_round: focus.focus_round,
+    focus_ready: focus?.focus_ready === true,
+    focus_round: Number(focus?.focus_round || 0),
     mapped_focus_rows: mapped,
+    unsupported_focus_rows: unsupported,
+    unsupported_focus_symbols: unsupported.map((row) => row.symbol),
     pools: [...pools.values()].map((group) => ({
       ...group,
       mapped_focus_symbols: [...new Set(group.mapped_focus_symbols)].sort(),
     })),
   };
+}
+
+function riskReserveHistoryTargets() {
+  return buildRiskReserveHistoryTargets(bitgetFocusTargets(), riskReservePools);
 }
 
 function riskHistorySignature(targets) {
@@ -1232,11 +1250,18 @@ async function refreshRiskReserveHistory(reason = 'scheduled', { missingOnly = f
       riskHistoryNextRecoveryAt = 0;
       return false;
     }
-    const unmapped = targets.mapped_focus_rows.filter((row) => !row.pool_found);
-    if (unmapped.length > 0 || targets.pools.length === 0) {
-      riskHistoryLastError = `${reason}:risk_reserve_pool_mapping_missing:${unmapped.map((row)=>row.symbol).join(',')}`;
+    const unsupported = targets.unsupported_focus_rows || [];
+    if (targets.pools.length === 0) {
+      riskHistoryLastError = `${reason}:no_current_official_risk_reserve_pool_for_focus`;
       riskHistoryNextRecoveryAt = 0;
       return false;
+    }
+    // A focus symbol that is absent from the current official risk-reserve-all list has no
+    // current official insurance-pool mapping. Keep that symbol explicitly unsupported/null,
+    // but continue collecting every mapped official pool. One unsupported hot symbol must never
+    // block the other supported pools or trigger fabricated cross-pool history.
+    if (unsupported.length > 0) {
+      riskHistoryLastRecoveryReason = `${reason}:officially_unsupported_focus:${unsupported.map((row)=>row.symbol).join(',')}`.slice(0, 240);
     }
 
     const requestErrors = [];
@@ -1336,6 +1361,9 @@ function riskReserveHistorySnapshot() {
   const dailyCoverage = pools.filter((pool) => pool.daily != null).length;
   const hourlyCoverage = pools.filter((pool) => pool.hourly != null).length;
   const mappedFocusCount = targets.mapped_focus_rows.filter((row) => row.pool_found).length;
+  const unsupportedFocusSymbols = [...new Set((targets.unsupported_focus_symbols || []).map(compact).filter(Boolean))].sort();
+  const unsupportedFocusCount = unsupportedFocusSymbols.length;
+  const focusScopeResolvedRows = mappedFocusCount + unsupportedFocusCount;
   const dailyNonempty = pools.filter((pool) => Number(pool.daily?.row_count || 0) > 0).length;
   const hourlyNonempty = pools.filter((pool) => Number(pool.hourly?.row_count || 0) > 0).length;
   const requestCap = Math.max(0, targets.pools.length * 2);
@@ -1343,20 +1371,28 @@ function riskReserveHistorySnapshot() {
   return {
     ready: targets.focus_ready &&
       targets.mapped_focus_rows.length === FOCUS_TARGET &&
-      mappedFocusCount === FOCUS_TARGET &&
+      focusScopeResolvedRows === FOCUS_TARGET &&
       targets.pools.length > 0 &&
       dailyCoverage === targets.pools.length &&
       hourlyCoverage === targets.pools.length,
     focus_target: FOCUS_TARGET,
     mapped_focus_rows: mappedFocusCount,
+    officially_unsupported_focus_rows: unsupportedFocusCount,
+    officially_unsupported_focus_symbols: unsupportedFocusSymbols,
+    focus_scope_resolved_rows: focusScopeResolvedRows,
+    unsupported_focus_is_valid_missing: true,
+    unsupported_focus_triggers_history_request: false,
+    current_risk_reserve_all_is_support_authority: true,
     pool_target_count: targets.pools.length,
-    pool_dedup_saved_symbol_queries: Math.max(0, FOCUS_TARGET - targets.pools.length),
+    pool_dedup_saved_symbol_queries: Math.max(0, mappedFocusCount - targets.pools.length),
+    unsupported_focus_avoided_symbol_queries: unsupportedFocusCount,
     daily_official_pool_coverage: dailyCoverage,
     hourly_official_pool_coverage: hourlyCoverage,
     daily_nonempty_pools: dailyNonempty,
     hourly_nonempty_pools: hourlyNonempty,
     full_cycle_request_cap: requestCap,
     full_cycle_symbol_naive_request_cap: FOCUS_TARGET * 2,
+    supported_symbol_naive_request_cap: mappedFocusCount * 2,
     representative_symbol_per_pool: true,
     current_risk_reserve_all_mapping_reused: true,
     pool_cache_retained_across_focus_changes: true,
@@ -1881,6 +1917,7 @@ export const __bitgetAdvancedTest = Object.freeze({
 export const __bitgetStep1000Test = Object.freeze({
   parseRiskReserveHistory,
   riskReservePoolKey,
+  buildRiskReserveHistoryTargets,
   riskHistoryRecoveryDelayMs,
   riskHistoryCandidateSymbols,
   riskHistoryIsRateLimited,
