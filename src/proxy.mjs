@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.151';
+const STEP_VERSION = '650.8.15.152';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -785,20 +785,16 @@ const server = http.createServer(async (req, res) => {
         step1026_gate_cash_equity_kline_second_source_locked: true,
         step1026_coinbase_equity_kline_second_source_locked: true,
         step1026_3_coinbase_equity_v50_capability_policy_restored: true,
-        step1026_3_coinbase_equity_shared_products_catalog: true,
         step1026_3_coinbase_equity_per_asset_book_trades_not_assumed: true,
         step1026_3_coinbase_equity_realtime_price_not_proven: true,
         step1026_3_coinbase_equity_rules_status_session_official: true,
         step1026_3_coinbase_equity_canonical_product_id_preserved: true,
-        step1026_3_coinbase_equity_user_reads_scale_upstream: false,
-        step1026_4_coinbase_equity_cursor_pagination_complete_required: true,
-        step1026_4_coinbase_equity_fixed_10_page_truncation_removed: true,
-        step1026_4_coinbase_equity_missing_exact_identity_returns_partial_200: true,
-        step1026_4_coinbase_equity_incomplete_catalog_rejected: true,
-        step1026_5_coinbase_equity_existing_provider_governor_reused: true,
-        step1026_5_coinbase_equity_429_waits_for_governor_cooldown: true,
-        step1026_5_coinbase_equity_page_gap_ms: 900,
-        step1026_5_coinbase_equity_catalog_fresh_ttl_ms: 300000,
+        step1026_6_coinbase_equity_full_market_catalog_scan_removed: true,
+        step1026_6_coinbase_equity_exact_product_shared_metadata: true,
+        step1026_6_coinbase_equity_metadata_fresh_ttl_ms: 1800000,
+        step1026_6_coinbase_equity_metadata_stale_ttl_ms: 86400000,
+        step1026_6_coinbase_equity_batch_realtime_upstream_requests: 0,
+        step1026_6_coinbase_equity_missing_exact_metadata_returns_partial_200: true,
         step1024_cross_provider_substitution: false,
         step1024_cross_quote_substitution: false,
         coinbase_step995_ticker_batch_existing_shared: true,
