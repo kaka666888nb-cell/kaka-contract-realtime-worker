@@ -9,6 +9,7 @@ import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed
 import { getBinanceContractKlineRelayHealth } from './binance-contract-kline-relay.mjs';
 import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
 import { getAssetKlineHealth, handleAssetKline } from './exchange-asset-kline.mjs';
+import { getAssetMarketHealth, handleAssetMarket } from './exchange-asset-market.mjs';
 import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurrentSnapshotScanner } from './spot-current-snapshot.mjs';
 import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ticker.mjs';
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
@@ -32,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.145';
+const STEP_VERSION = '650.8.15.146';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -369,6 +370,11 @@ const server = http.createServer(async (req, res) => {
       asset_klines_health: '/api/asset-klines/health',
       asset_klines_self_test: '/api/asset-klines/self-test',
       asset_klines_state: getAssetKlineHealth(),
+      asset_market: '/api/asset-market',
+      asset_market_tickers: '/api/asset-market/tickers',
+      asset_market_health: '/api/asset-market/health',
+      asset_market_self_test: '/api/asset-market/self-test',
+      asset_market_state: getAssetMarketHealth(),
       all_market_second_history_end_time_pagination: true,
       all_market_second_history_latest_audit_cases: 11,
       all_market_second_history_older_target_cases: 11,
@@ -763,6 +769,21 @@ const server = http.createServer(async (req, res) => {
         step1026_cross_provider_substitution: false,
         step1026_cross_product_substitution: false,
         step1026_cross_ticker_substitution: false,
+        step1026_asset_market_route: '/api/asset-market',
+        step1026_asset_market_batch_tickers_route: '/api/asset-market/tickers',
+        step1026_asset_market_exact_identity_required: true,
+        step1026_asset_market_batch_shared_reads: true,
+        step1026_asset_market_app_direct_exchange_requests: 0,
+        step1026_asset_market_cross_provider_substitution: false,
+        step1026_asset_market_cross_product_substitution: false,
+        step1026_asset_market_cross_ticker_substitution: false,
+        step1026_asset_market_binance_supported: false,
+        step1026_bitget_reality_dedicated_depth_requires_bd_whitelist: true,
+        step1026_bitget_reality_dedicated_fills_requires_bd_whitelist: true,
+        step1026_bybit_mt5_requires_tradfi_qualification: true,
+        step1026_gate_cash_stock_public_market_trades_unavailable: true,
+        step1026_gate_cash_equity_kline_second_source_locked: true,
+        step1026_coinbase_equity_kline_second_source_locked: true,
         step1024_cross_provider_substitution: false,
         step1024_cross_quote_substitution: false,
         coinbase_step995_ticker_batch_existing_shared: true,
@@ -950,6 +971,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowHistory(req, res, url)) return true;
       if (await handleAssetKline(req, res, url, requestAbortController.signal)) return true;
+      if (await handleAssetMarket(req, res, url, requestAbortController.signal)) return true;
       if (await handleMarketApi(req, res, url)) return true;
       if (await handleContractDepth(req, res, url)) return true;
       if (await handleContractFunding(req, res, url)) return true;
@@ -1017,5 +1039,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1026 exact-identity official all-asset Kline shared cache/singleflight + Step1024.2 Bybit historical-volatility official result-array and exact option-quote alignment + Step1024 six-capability official batch (OKX dynamic limits/options, Bybit index/HV/depth1000, Coinbase product rules) + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + pre-landed all-asset Kline + Step1024.2 Bybit historical-volatility official result-array and exact option-quote alignment + Step1024 six-capability official batch (OKX dynamic limits/options, Bybit index/HV/depth1000, Coinbase product rules) + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
