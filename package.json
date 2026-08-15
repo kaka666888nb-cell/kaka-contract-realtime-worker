@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.151",
+  "version": "650.8.15.152",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Step1026.5 Coinbase EQUITY complete cursor catalog reuses provider-governor cooldown + low-pressure paging"
+  "description": "KakaWeb3 Step1026.6 Coinbase EQUITY exact canonical product shared metadata; no full-market catalog scan"
 }
