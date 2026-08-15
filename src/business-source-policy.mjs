@@ -1,4 +1,4 @@
-export const BUSINESS_SOURCE_POLICY_VERSION = '650.8.15.128';
+export const BUSINESS_SOURCE_POLICY_VERSION = '650.8.15.142';
 
 const RULES = [];
 function add(provider, market, field, {
@@ -226,11 +226,15 @@ add('binance','contract','insurance_fund',{resolution:'unavailable',scope:'none'
 add('okx','contract','risk_adl',{resolution:'official_shared',capability:'price_limit_security_fund_adl',scope:'official_public_available_scope',layers:['slow_stats']});
 add('okx','contract','risk_limit',{resolution:'official_shared_limited',capability:'price_limit_security_fund_adl',scope:'official_public_available_scope',layers:['slow_stats']});
 add('okx','contract','insurance_fund',{resolution:'official_shared',capability:'price_limit_security_fund_adl',scope:'official_public_available_scope',layers:['slow_stats']});
+add('okx','contract','current_price_limit',{resolution:'official_shared',capability:'price_limit_security_fund_adl',scope:'focus15_current',layers:['slow_stats'],limitation:'Official highest buy limit and lowest sell limit are returned only when OKX enables the current instrument price limit; disabled or empty official fields stay null.'});
 
 add('bybit','contract','risk_adl',{resolution:'unavailable',scope:'none',layers:['slow_stats']});
 add('bybit','contract','risk_limit',{resolution:'official_shared',capability:'risk_limit_insurance_pool',scope:'official_public_available_scope',layers:['slow_stats']});
 add('bybit','contract','insurance_fund',{resolution:'official_shared',capability:'risk_limit_insurance_pool',scope:'official_public_available_scope',layers:['slow_stats']});
 add('bybit','contract','order_price_limit',{resolution:'official_shared',capability:'order_price_limit_current_focus',scope:'focus15_current',layers:['slow_stats'],limitation:'Official buyLmt and sellLmt are exposed as highest bid order price and lowest ask order price. Values outside the current focus15 or beyond the verified stale window remain missing; no local formula is substituted.'});
+add('bybit','contract','index_price_components',{resolution:'official_shared',capability:'index_price_components_current_focus',scope:'focus15_current',layers:['slow_stats'],limitation:'Official index component rows preserve exchange, spot pair, equivalent price, multiplier, component price and weight. Empty components stay null.'});
+add('bybit','spot','ultra_deep_orderbook',{resolution:'official_shared_limited',capability:'spot_orderbook_depth1000_exact',scope:'exact_active_symbol_up_to_1000_levels',layers:['user_exact'],limitation:'One exact active spot symbol can request the official 1000-level snapshot. The visible table remains compact; any full-book totals are explicitly same-venue derived values.'});
+add('coinbase','spot','product_status_restrictions_session',{resolution:'official_shared',capability:'product_status_restrictions_session',scope:'bounded_active_level2_products',layers:['user_exact'],limitation:'Authenticated Get Product official fields are collected in the backend for bounded active Level2 product slots. Secret keys never reach the App; absent session objects stay null.'});
 
 add('bitget','contract','risk_adl',{resolution:'unavailable',scope:'none',layers:['slow_stats']});
 add('bitget','contract','risk_limit',{resolution:'official_shared',capability:'risk_reserve_position_tier_oi_limit_index_components',scope:'official_public_available_scope',layers:['slow_stats']});
@@ -282,19 +286,25 @@ for (const provider of ['binance','okx','bybit','bitget','gate']) {
     layers: shared ? ['derivatives_public'] : [],
     limitation: unavailableReason || 'If an official option row does not return open interest, the field stays null.',
   });
-  const greeksShared = provider === 'bybit' || provider === 'gate';
+  const greeksShared = provider === 'okx' || provider === 'bybit' || provider === 'gate';
   add(provider,'option','iv_greeks',{
     resolution: greeksShared ? 'official_shared' : 'unavailable',
-    capability:'option_public_market',
+    capability:provider === 'okx' && greeksShared ? 'option_iv_greeks_summary' : 'option_public_market',
     scope: greeksShared ? 'current_public_crypto_options_where_officially_returned' : 'none_current_shared_field',
     layers: greeksShared ? ['derivatives_public'] : [],
     limitation: greeksShared
       ? 'Only source-native public option IV/Greeks are exposed; absent individual Greeks remain null.'
-      : provider === 'okx'
-        ? 'The Step1004.5 OKX public layer consumes instruments, tickers and official option-family open interest only; IV/Greeks are not fabricated from price inputs.'
-        : unavailableReason,
+      : unavailableReason,
   });
 }
+
+add('bybit','option','historical_volatility',{
+  resolution:'official_shared',
+  capability:'option_historical_volatility',
+  scope:'official_baseCoin_hourly_period_7',
+  layers:['derivatives_public'],
+  limitation:'The official hourly historical volatility series is preserved at its source period. It is not converted into an implied-volatility substitute.',
+});
 
 export const BUSINESS_SOURCE_RULES = Object.freeze(RULES);
 const RULE_BY_KEY = new Map(

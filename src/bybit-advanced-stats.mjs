@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.2';
+const VERSION = '650.8.15.142';
 const SNAPSHOT_ROUTE = '/api/bybit-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bybit-advanced/health';
 
@@ -18,6 +18,9 @@ const FOCUS_WATCH_MS = Math.max(15_000, Number(process.env.KAKA_BYBIT_ADVANCED_F
 const PRICE_LIMIT_START_DELAY_MS = Math.max(5_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_START_DELAY_MS || 7_000));
 const PRICE_LIMIT_REFRESH_MS = Math.max(10_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_REFRESH_MS || 15_000));
 const PRICE_LIMIT_STALE_MS = Math.max(30_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_STALE_MS || 60_000));
+const INDEX_COMPONENT_START_DELAY_MS = Math.max(5_000, Number(process.env.KAKA_BYBIT_INDEX_COMPONENT_START_DELAY_MS || 9_000));
+const INDEX_COMPONENT_REFRESH_MS = Math.max(30_000, Number(process.env.KAKA_BYBIT_INDEX_COMPONENT_REFRESH_MS || 60_000));
+const INDEX_COMPONENT_STALE_MS = Math.max(60_000, Number(process.env.KAKA_BYBIT_INDEX_COMPONENT_STALE_MS || 180_000));
 const HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_HISTORY_STALE_MS || 12 * 60 * 60_000));
 const RISK_STALE_MS = Math.max(12 * 60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_RISK_STALE_MS || 24 * 60 * 60_000));
 const INSURANCE_STALE_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_INSURANCE_STALE_MS || 2 * 60 * 60_000));
@@ -34,8 +37,12 @@ let focusWatchInterval = null;
 let priceLimitStartupTimer = null;
 let priceLimitInterval = null;
 let priceLimitRunning = null;
+let indexComponentStartupTimer = null;
+let indexComponentInterval = null;
+let indexComponentRunning = null;
 let lastFocusSignature = '';
 let lastPriceLimitFocusSignature = '';
+let lastIndexComponentFocusSignature = '';
 let totalReads = 0;
 let totalBuilds = 0;
 let totalBuildFailures = 0;
@@ -50,10 +57,15 @@ let priceLimitRound = 0;
 let priceLimitLastStartedAt = null;
 let priceLimitLastCompletedAt = null;
 let priceLimitLastError = '';
+let indexComponentRound = 0;
+let indexComponentLastStartedAt = null;
+let indexComponentLastCompletedAt = null;
+let indexComponentLastError = '';
 
 const historyBySymbol = new Map();
 const riskBySymbol = new Map();
 const priceLimitBySymbol = new Map();
+const indexComponentsBySymbol = new Map();
 let insuranceState = {
   official_response: false,
   updated_at: null,
@@ -296,6 +308,39 @@ function parseOrderPriceLimit(payload, symbol) {
   };
 }
 
+function parseIndexPriceComponents(payload, symbol) {
+  const result = payload?.result;
+  const indexName = compact(result?.indexName);
+  const components = (Array.isArray(result?.components) ? result.components : [])
+    .map((item) => ({
+      exchange: String(item?.exchange || '').trim() || null,
+      spot_pair: String(item?.spotPair || '').trim() || null,
+      equivalent_price: finite(item?.equivalentPrice),
+      multiplier: finite(item?.multiplier),
+      price: finite(item?.price),
+      weight: finite(item?.weight),
+    }))
+    .filter((item) => item.exchange && item.spot_pair);
+  const sourceTimeMs = Number(result?.updateTime || payload?.time || 0);
+  const identityMatches = indexName === symbol;
+  return {
+    symbol,
+    index_name: identityMatches ? indexName : null,
+    official_response: true,
+    official_empty: !identityMatches || finite(result?.lastPrice) == null || components.length === 0,
+    last_price: identityMatches ? finite(result?.lastPrice) : null,
+    component_count: identityMatches ? components.length : 0,
+    components: identityMatches ? components : [],
+    timestamp_ms: identityMatches && Number.isFinite(sourceTimeMs) && sourceTimeMs > 0
+      ? sourceTimeMs
+      : null,
+    source_time: identityMatches ? isoMs(sourceTimeMs) : null,
+    updated_at: new Date().toISOString(),
+    source: 'bybit_official_public_index_price_components',
+    endpoint: '/v5/market/index-price-components',
+  };
+}
+
 function historyStateFresh(symbol) {
   const state = historyBySymbol.get(symbol);
   if (!state) return false;
@@ -314,6 +359,12 @@ function insuranceFresh() {
 function priceLimitStateFresh(symbol) {
   const item = priceLimitBySymbol.get(symbol);
   return item?.official_response === true && isFresh(item.updated_at, PRICE_LIMIT_STALE_MS);
+}
+function indexComponentStateFresh(symbol) {
+  const item = indexComponentsBySymbol.get(symbol);
+  return item?.official_response === true &&
+    item?.official_empty !== true &&
+    isFresh(item.updated_at, INDEX_COMPONENT_STALE_MS);
 }
 function insuranceForSymbol(symbol) {
   if (!insuranceFresh()) {
@@ -498,6 +549,71 @@ async function refreshOrderPriceLimits(reason = 'scheduled', { missingOnly = fal
   }
 }
 
+async function refreshIndexComponents(reason = 'scheduled', { missingOnly = false } = {}) {
+  if (indexComponentRunning) return await indexComponentRunning;
+  const task = (async () => {
+    indexComponentLastStartedAt = new Date().toISOString();
+    const focus = focusTargets();
+    if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) {
+      indexComponentLastError = `${reason}:bybit_focus_not_ready:${focus.rows.length}/${FOCUS_TARGET}`;
+      return false;
+    }
+
+    let failures = 0;
+    for (const target of focus.rows) {
+      const symbol = target.symbol;
+      const previous = indexComponentsBySymbol.get(symbol);
+      if (missingOnly && indexComponentStateFresh(symbol)) continue;
+      try {
+        const payload = await fetchJson(
+          `/v5/market/index-price-components?indexName=${encodeURIComponent(symbol)}`,
+          'index_price_components',
+        );
+        const parsed = parseIndexPriceComponents(payload, symbol);
+        if (parsed.official_empty) throw new Error(`bybit_index_components_empty:${symbol}`);
+        indexComponentsBySymbol.set(symbol, parsed);
+      } catch (error) {
+        failures += 1;
+        if (!previous?.official_response) {
+          indexComponentsBySymbol.set(symbol, {
+            symbol,
+            index_name: null,
+            official_response: false,
+            official_empty: false,
+            last_price: null,
+            component_count: 0,
+            components: [],
+            timestamp_ms: null,
+            source_time: null,
+            updated_at: null,
+            error: String(error?.message || error).slice(0, 240),
+          });
+        }
+      }
+      await sleep(PER_REQUEST_GAP_MS);
+    }
+
+    lastIndexComponentFocusSignature = focusSignature(focus.rows);
+    indexComponentRound += 1;
+    indexComponentLastCompletedAt = new Date().toISOString();
+    responseCache.clear();
+    const coverage = focus.rows.filter((row) => indexComponentStateFresh(row.symbol)).length;
+    if (coverage !== FOCUS_TARGET) {
+      indexComponentLastError = `${reason}:bybit_index_component_coverage:${coverage}/${FOCUS_TARGET}:failures=${failures}`;
+      return false;
+    }
+    indexComponentLastError = '';
+    return true;
+  })();
+
+  indexComponentRunning = task;
+  try {
+    return await task;
+  } finally {
+    if (indexComponentRunning === task) indexComponentRunning = null;
+  }
+}
+
 function scheduleRetry() {
   if (!started || retryTimer) return;
   retryTimer = setTimeout(async () => {
@@ -525,6 +641,11 @@ export function startBybitAdvancedStatsScanner() {
   }, PRICE_LIMIT_START_DELAY_MS);
   priceLimitStartupTimer.unref?.();
 
+  indexComponentStartupTimer = setTimeout(async () => {
+    await refreshIndexComponents('startup', { missingOnly: false }).catch(() => false);
+  }, INDEX_COMPONENT_START_DELAY_MS);
+  indexComponentStartupTimer.unref?.();
+
   fullInterval = setInterval(async () => {
     await refreshHistoryAndRisk('interval', { missingOnly: false }).catch(() => false);
   }, FULL_REFRESH_MS);
@@ -538,6 +659,11 @@ export function startBybitAdvancedStatsScanner() {
   }, PRICE_LIMIT_REFRESH_MS);
   priceLimitInterval.unref?.();
 
+  indexComponentInterval = setInterval(() => {
+    refreshIndexComponents('interval', { missingOnly: false }).catch(() => false);
+  }, INDEX_COMPONENT_REFRESH_MS);
+  indexComponentInterval.unref?.();
+
   focusWatchInterval = setInterval(async () => {
     const focus = focusTargets();
     if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) return;
@@ -548,6 +674,9 @@ export function startBybitAdvancedStatsScanner() {
     }
     if (signature !== lastPriceLimitFocusSignature) {
       await refreshOrderPriceLimits('focus_change_missing_only', { missingOnly: true }).catch(() => false);
+    }
+    if (signature !== lastIndexComponentFocusSignature) {
+      await refreshIndexComponents('focus_change_missing_only', { missingOnly: true }).catch(() => false);
     }
   }, FOCUS_WATCH_MS);
   focusWatchInterval.unref?.();
@@ -566,6 +695,7 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     const histories = historyBySymbol.get(target.symbol) || {};
     const risk = riskBySymbol.get(target.symbol) || null;
     const orderPriceLimit = priceLimitBySymbol.get(target.symbol) || null;
+    const indexComponents = indexComponentsBySymbol.get(target.symbol) || null;
     const insurance = insuranceForSymbol(target.symbol);
     const oi = currentOi.map.get(target.symbol) || null;
     return {
@@ -588,6 +718,11 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
       order_price_limit: orderPriceLimit?.official_response === true &&
               isFresh(orderPriceLimit.updated_at, PRICE_LIMIT_STALE_MS)
           ? clone(orderPriceLimit)
+          : null,
+      index_price_components: indexComponents?.official_response === true &&
+              indexComponents?.official_empty !== true &&
+              isFresh(indexComponents.updated_at, INDEX_COMPONENT_STALE_MS)
+          ? clone(indexComponents)
           : null,
       insurance_official_checked: insurance.official_checked,
       insurance_mapped: insurance.mapped,
@@ -613,6 +748,11 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     finite(row.order_price_limit?.highest_bid_price) != null &&
     finite(row.order_price_limit?.lowest_ask_price) != null
   ).length;
+  const indexComponentCoverage = rows.filter((row) => row.index_price_components != null).length;
+  const indexComponentNonempty = rows.filter((row) =>
+    Number(row.index_price_components?.component_count || 0) > 0 &&
+    finite(row.index_price_components?.last_price) != null
+  ).length;
   const insuranceCoverage = rows.filter((row) => row.insurance_official_checked).length;
   const insuranceMapped = rows.filter((row) => row.insurance_mapped).length;
   const currentOiCoverage = rows.filter((row) => row.current_open_interest != null || row.current_open_interest_value != null).length;
@@ -625,8 +765,13 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     rows.length === FOCUS_TARGET &&
     priceLimitCoverage === FOCUS_TARGET &&
     priceLimitNonempty === FOCUS_TARGET;
+  const indexComponentReady = focus.focus_ready &&
+    rows.length === FOCUS_TARGET &&
+    indexComponentCoverage === FOCUS_TARGET &&
+    indexComponentNonempty === FOCUS_TARGET;
   const ready = historyRiskReady &&
     priceLimitReady &&
+    indexComponentReady &&
     insuranceFresh() &&
     insuranceCoverage === FOCUS_TARGET &&
     currentOi.ready &&
@@ -658,6 +803,12 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     order_price_limit_refresh_seconds: Math.round(PRICE_LIMIT_REFRESH_MS / 1000),
     order_price_limit_stale_seconds: Math.round(PRICE_LIMIT_STALE_MS / 1000),
     order_price_limit_cycle_request_cap: FOCUS_TARGET,
+    index_price_components_ready: indexComponentReady,
+    index_price_components_official_coverage_rows: indexComponentCoverage,
+    index_price_components_nonempty_rows: indexComponentNonempty,
+    index_price_components_refresh_seconds: Math.round(INDEX_COMPONENT_REFRESH_MS / 1000),
+    index_price_components_stale_seconds: Math.round(INDEX_COMPONENT_STALE_MS / 1000),
+    index_price_components_cycle_request_cap: FOCUS_TARGET,
     insurance_official_coverage_rows: insuranceCoverage,
     insurance_mapped_rows: insuranceMapped,
     insurance_pool_count: insuranceFresh() ? insuranceState.pools.length : 0,
@@ -668,7 +819,7 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     full_cycle_history_request_cap: FOCUS_TARGET * HISTORY_INTERVALS.length,
     full_cycle_risk_request_cap: FOCUS_TARGET,
     full_cycle_insurance_request_cap: 1,
-    full_cycle_total_request_cap: FOCUS_TARGET * HISTORY_INTERVALS.length + FOCUS_TARGET + FOCUS_TARGET + 1,
+    full_cycle_total_request_cap: FOCUS_TARGET * HISTORY_INTERVALS.length + FOCUS_TARGET + FOCUS_TARGET + FOCUS_TARGET + 1,
     focus_change_missing_only: true,
     official_empty_history_counts_as_official_coverage_without_fabricating_rows: true,
     official_empty_risk_counts_as_official_coverage_without_fabricating_tiers: true,
@@ -686,6 +837,10 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     order_price_limit_last_started_at: priceLimitLastStartedAt,
     order_price_limit_last_completed_at: priceLimitLastCompletedAt,
     order_price_limit_last_error: priceLimitLastError,
+    index_price_components_round: indexComponentRound,
+    index_price_components_last_started_at: indexComponentLastStartedAt,
+    index_price_components_last_completed_at: indexComponentLastCompletedAt,
+    index_price_components_last_error: indexComponentLastError,
     lanes: Object.fromEntries([...laneStats.entries()].map(([key, value]) => [key, { ...value }])),
     rows: includeRows ? rows : undefined,
   };
@@ -699,7 +854,7 @@ export function getBybitAdvancedStatsHealth() {
   return {
     ...snapshot,
     enabled: started || process.env.KAKA_DISABLE_BYBIT_ADVANCED_STATS !== '1',
-    mode: 'shared_bybit_focus15_oi_history_risk_limit_order_price_limit_plus_usdt_insurance_pool',
+    mode: 'shared_bybit_focus15_oi_history_risk_limit_order_price_limit_index_components_plus_usdt_insurance_pool',
     snapshot_endpoint: SNAPSHOT_ROUTE,
     health_endpoint: HEALTH_ROUTE,
     total_reads: totalReads,
@@ -710,6 +865,7 @@ export function getBybitAdvancedStatsHealth() {
     total_exchange_failures: totalExchangeFailures,
     running: Boolean(running),
     order_price_limit_running: Boolean(priceLimitRunning),
+    index_price_components_running: Boolean(indexComponentRunning),
     startup_recovery_missing_only: true,
     history_direct_official_intervals_no_derived_relabel: true,
     risk_limit_per_focus_symbol: true,
@@ -717,6 +873,10 @@ export function getBybitAdvancedStatsHealth() {
     order_price_limit_official_field_mapping: 'buyLmt=highest_bid_price;sellLmt=lowest_ask_price',
     order_price_limit_user_reads_trigger_exchange_requests: false,
     order_price_limit_reads_scale_with_users: false,
+    index_price_components_per_focus_symbol: true,
+    index_price_components_official_fields: ['indexName', 'lastPrice', 'updateTime', 'exchange', 'spotPair', 'equivalentPrice', 'multiplier', 'price', 'weight'],
+    index_price_components_user_reads_trigger_exchange_requests: false,
+    index_price_components_reads_scale_with_users: false,
     insurance_one_shared_usdt_request: true,
   };
 }
@@ -771,4 +931,5 @@ export const __bybitAdvancedTest = Object.freeze({
   parseRisk,
   parseInsurance,
   parseOrderPriceLimit,
+  parseIndexPriceComponents,
 });

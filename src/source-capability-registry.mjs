@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.42';
+const VERSION = '650.8.15.142';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -32,6 +32,11 @@ const DECISION_POLICY = Object.freeze({
 });
 
 const CAPABILITIES = Object.freeze([
+  { provider: 'okx', market: 'option', capability: 'option_iv_greeks_summary', official_available: true, official_scope: 'current_public_option_summary_per_instrument_family', transport: 'official_public_REST_shared_background', batch_mode: 'bounded_official_instFamily_opt_summary', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1024', fallback_policy: 'official empty fields stay null; no derived Greeks', history_policy: 'current_only', source_url: 'https://www.okx.com/docs-v5/en/' },
+  { provider: 'bybit', market: 'contract', capability: 'index_price_components_current_focus', official_available: true, official_scope: 'focus15_current_index_components', transport: 'official_public_REST_shared_background', batch_mode: 'one_index_component_request_per_focus_symbol_per_minute', rate_limit_class: 'slow_shared_governed', collector: 'bybit-advanced-slow-stats', target_layer: 'slow_stats', current_integration: 'ready_step1024', fallback_policy: 'last verified until stale then null', history_policy: 'current_only', source_url: 'https://bybit-exchange.github.io/docs/v5/market/index-components' },
+  { provider: 'bybit', market: 'option', capability: 'option_historical_volatility', official_available: true, official_scope: 'official_baseCoin_hourly_period_7', transport: 'official_public_REST_shared_background', batch_mode: 'one_hourly_cached_request_per_supported_baseCoin', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1024', fallback_policy: 'last verified official series until stale; no IV substitution', history_policy: 'source_native_hourly_rows', source_url: 'https://bybit-exchange.github.io/docs/v5/market/iv' },
+  { provider: 'bybit', market: 'spot', capability: 'spot_orderbook_depth1000_exact', official_available: true, official_scope: 'exact_active_symbol_up_to_1000_levels', transport: 'official_public_REST_backend_cache', batch_mode: 'one_exact_snapshot_per_active_request_cache_key', rate_limit_class: 'bounded_exact_5s_cache', collector: 'contract-depth-exact', target_layer: 'user_exact', current_integration: 'ready_step1024', fallback_policy: 'stale verified snapshot within bounded error window; no cross-symbol substitution', history_policy: 'current_only', source_url: 'https://bybit-exchange.github.io/docs/v5/market/orderbook' },
+  { provider: 'coinbase', market: 'spot', capability: 'product_status_restrictions_session', official_available: true, official_scope: 'bounded_active_level2_products', transport: 'authenticated_official_REST_shared_backend_background', batch_mode: 'active_Level2_slots_only', rate_limit_class: 'bounded_background_60s', collector: 'contract-depth-exact', target_layer: 'user_exact', current_integration: 'ready_step1024', fallback_policy: 'last verified until stale; missing official fields stay null; no cross-product substitution', history_policy: 'current_only', source_url: 'https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/products/get-product' },
   { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_first_batch', official_available: true, official_scope: 'backend_architecture', transport: 'separate_node_child_processes_plus_localhost_bridge', batch_mode: 'market_light_and_liquidation_distinct_process_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_1_catchup', fallback_policy: 'role_scoped_restart; sibling collector stays alive', history_policy: 'none', source_url: 'internal_architecture' },
   { provider: 'kaka_backend', market: 'shared', capability: 'collector_isolation_second_batch', official_available: true, official_scope: 'backend_architecture', transport: 'resource_limited_node_worker_isolates_plus_localhost_bridges', batch_mode: 'deep_market_and_slow_stats_distinct_worker_fault_domains', rate_limit_class: 'local_internal_only', collector: 'collector-isolation-supervisor', target_layer: 'backend_runtime', current_integration: 'ready_step1004_2_2_projected_bridge_memory_safe', fallback_policy: 'role_scoped worker restart; sibling worker and parent remain alive', history_policy: 'none', source_url: 'internal_architecture' },
   { provider: 'binance', market: 'option', capability: 'option_public_market', official_available: true, official_scope: 'official_public_crypto_options_market', transport: 'official_REST_and_market_WebSocket_exist_but_not_collected_by_current_Kaka_Render', batch_mode: 'none_in_step1004_5', rate_limit_class: 'blocked_by_existing_Kaka_Binance_safety_boundary', collector: 'none', target_layer: 'derivatives_public', current_integration: 'not_collected_step996_existing_binance_safety_policy_preserved', fallback_policy: 'missing; no cross-provider substitution', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-options/api/ws-streams/market' },
@@ -332,6 +337,33 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       official_field_mapping: bybitAdvanced.order_price_limit_official_field_mapping || null,
       user_reads_trigger_exchange_requests: bybitAdvanced.order_price_limit_user_reads_trigger_exchange_requests === true,
       reads_scale_with_users: bybitAdvanced.order_price_limit_reads_scale_with_users === true,
+    },
+    step1024_official_capability_batch: {
+      ready: Number(okxAdvanced.price_limit_coverage_rows || 0) === 15 &&
+        bybitAdvanced.index_price_components_ready === true &&
+        Number(bybitAdvanced.index_price_components_official_coverage_rows || 0) === 15 &&
+        Number(bybitAdvanced.index_price_components_nonempty_rows || 0) === 15 &&
+        derivativesPublic.providers?.okx?.option_summary_ready === true &&
+        derivativesPublic.providers?.bybit?.historical_volatility_ready === true &&
+        contractDepth.bybit_spot_orderbook_official_max_depth === 1000 &&
+        contractDepth.bybit_spot_ultra_deep_only_exact_active_symbol === true &&
+        contractDepth.coinbase_product_facts_endpoint === '/api/v3/brokerage/products/{product_id}' &&
+        contractDepth.coinbase_product_facts_user_read_starts_rest_request === false &&
+        contractDepth.coinbase_product_facts_secret_exposed_to_app === false &&
+        contractDepth.coinbase_product_facts_cross_product_substitution === false,
+      okx_current_price_limit_coverage_rows: Number(okxAdvanced.price_limit_coverage_rows || 0),
+      okx_option_summary_ready: derivativesPublic.providers?.okx?.option_summary_ready === true,
+      bybit_index_components_ready: bybitAdvanced.index_price_components_ready === true,
+      bybit_index_components_coverage_rows: Number(bybitAdvanced.index_price_components_official_coverage_rows || 0),
+      bybit_option_historical_volatility_ready: derivativesPublic.providers?.bybit?.historical_volatility_ready === true,
+      bybit_spot_orderbook_official_max_depth: Number(contractDepth.bybit_spot_orderbook_official_max_depth || 0),
+      coinbase_product_facts_endpoint: contractDepth.coinbase_product_facts_endpoint || null,
+      coinbase_product_facts_credentials_configured: contractDepth.coinbase_product_book_credentials_configured === true,
+      user_reads_trigger_exchange_requests: false,
+      reads_scale_with_users: false,
+      missing_stays_null: true,
+      cross_provider_substitution: false,
+      cross_quote_substitution: false,
     },
     coinbase_step995: {
       ready: health.coinbase_ticker_batch?.connected === true &&
@@ -1026,6 +1058,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.okx_step1002.ready &&
       payload.bybit_step995.ready &&
       payload.bybit_step1023.ready &&
+      payload.step1024_official_capability_batch.ready &&
       payload.coinbase_step995.ready &&
       payload.bitget_step991.ready &&
       payload.bitget_step1000.ready &&

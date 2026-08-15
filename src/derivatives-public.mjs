@@ -1,4 +1,4 @@
-const VERSION = '650.8.15.127';
+const VERSION = '650.8.15.142';
 const SNAPSHOT_ROUTE = '/api/derivatives-public/current-snapshot';
 const HEALTH_ROUTE = '/api/derivatives-public/health';
 
@@ -12,6 +12,8 @@ const MAX_BYBIT_PAGES = Math.max(1, Math.min(8, Number(process.env.KAKA_DERIVATI
 const MAX_BYBIT_BASES = Math.max(1, Math.min(24, Number(process.env.KAKA_DERIVATIVES_PUBLIC_BYBIT_MAX_BASES || 12)));
 const MAX_GATE_UNDERLYINGS = Math.max(1, Math.min(24, Number(process.env.KAKA_DERIVATIVES_PUBLIC_GATE_MAX_UNDERLYINGS || 12)));
 const MAX_OKX_FAMILIES = Math.max(1, Math.min(24, Number(process.env.KAKA_DERIVATIVES_PUBLIC_OKX_MAX_FAMILIES || 12)));
+const BYBIT_HV_REFRESH_MS = Math.max(30 * 60_000, Number(process.env.KAKA_DERIVATIVES_PUBLIC_BYBIT_HV_REFRESH_MS || 60 * 60_000));
+const BYBIT_HV_STALE_MS = Math.max(BYBIT_HV_REFRESH_MS, Number(process.env.KAKA_DERIVATIVES_PUBLIC_BYBIT_HV_STALE_MS || 2 * 60 * 60_000));
 
 const OKX_BASE = 'https://www.okx.com';
 const BYBIT_HOSTS = Object.freeze(['https://api.bybit.com', 'https://api.bytick.com']);
@@ -68,6 +70,7 @@ let lastError = '';
 const rowsByProvider = new Map();
 const directoryByProvider = new Map();
 const providerState = new Map();
+const bybitHistoricalVolatilityByBase = new Map();
 
 function nowIso() { return new Date().toISOString(); }
 function clone(value) { return value == null ? value : JSON.parse(JSON.stringify(value)); }
@@ -229,20 +232,22 @@ async function fetchOkx(path, lane) {
   return payload;
 }
 
-function parseOkxRows(instrumentsPayload, tickerPayload, oiPayload) {
+function parseOkxRows(instrumentsPayload, tickerPayload, oiPayload, optionSummaryPayload = null) {
   const instruments = Array.isArray(instrumentsPayload?.data) ? instrumentsPayload.data : [];
   const tickers = new Map((Array.isArray(tickerPayload?.data) ? tickerPayload.data : []).map((row) => [upper(row?.instId), row]));
   const oiRows = new Map((Array.isArray(oiPayload?.data) ? oiPayload.data : []).map((row) => [upper(row?.instId), row]));
+  const summaryRows = new Map((Array.isArray(optionSummaryPayload?.data) ? optionSummaryPayload.data : []).map((row) => [upper(row?.instId), row]));
   const updatedAt = nowIso();
   return instruments.map((item) => {
     const symbol = upper(item?.instId);
     if (!symbol) return null;
     const ticker = tickers.get(symbol) || {};
     const oi = oiRows.get(symbol) || {};
+    const summary = summaryRows.get(symbol) || {};
     const parsed = parseOptionSymbol(symbol);
     const underlying = upper(item?.uly || item?.instFamily || '');
     const split = splitUnderlying(underlying);
-    const ts = ticker?.ts || oi?.ts || null;
+    const ts = summary?.ts || ticker?.ts || oi?.ts || null;
     return {
       provider: 'okx', market_type: 'option', product_type: 'option', symbol, native_symbol: symbol,
       underlying: underlying || null,
@@ -254,17 +259,49 @@ function parseOkxRows(instrumentsPayload, tickerPayload, oiPayload) {
       expiry_at: isoMs(item?.expTime) || parsed.expiry_at,
       listing_at: isoMs(item?.listTime),
       trading_status: text(item?.state) || null,
-      last_price: finite(ticker?.last), mark_price: null, index_price: null, underlying_price: null,
+      last_price: finite(ticker?.last), mark_price: null, index_price: null, underlying_price: finite(summary?.fwdPx),
       best_bid: finite(ticker?.bidPx), best_ask: finite(ticker?.askPx), best_bid_size: finite(ticker?.bidSz), best_ask_size: finite(ticker?.askSz),
       open_interest: finite(oi?.oi), open_interest_value: finite(oi?.oiUsd),
       volume_24h: finite(ticker?.vol24h), turnover_24h: finite(ticker?.volCcy24h),
-      bid_iv: null, ask_iv: null, mark_iv: null, delta: null, gamma: null, vega: null, theta: null, rho: null,
+      bid_iv: finite(summary?.bidVol), ask_iv: finite(summary?.askVol), mark_iv: finite(summary?.markVol),
+      delta: finite(summary?.delta), gamma: finite(summary?.gamma), vega: finite(summary?.vega), theta: finite(summary?.theta), rho: null,
+      delta_bs: finite(summary?.deltaBS), gamma_bs: finite(summary?.gammaBS), vega_bs: finite(summary?.vegaBS), theta_bs: finite(summary?.thetaBS),
+      leverage: finite(summary?.lever), realized_volatility: finite(summary?.realVol), volatility_level: finite(summary?.volLv), forward_price: finite(summary?.fwdPx),
       official: true, derived: false, identity_derived_from_official_symbol: parsed.option_type != null || parsed.strike_price != null,
-      source: 'okx_official_public_option_instruments_tickers_open_interest',
+      source: 'okx_official_public_option_instruments_tickers_open_interest_opt_summary',
       source_url: PROVIDER_POLICY.okx.source_url,
       source_time: isoMs(ts), updated_at: updatedAt,
     };
   }).filter(Boolean);
+}
+
+function parseBybitHistoricalVolatility(payload, baseCoin) {
+  const rows = (Array.isArray(payload?.result?.list) ? payload.result.list : [])
+    .map((item) => {
+      const timestampMs = Number(item?.time || 0);
+      return {
+        period: Number(item?.period || 0) || null,
+        value: finite(item?.value),
+        timestamp_ms: Number.isFinite(timestampMs) && timestampMs > 0 ? timestampMs : null,
+        source_time: isoMs(timestampMs),
+      };
+    })
+    .filter((item) => item.period != null && item.value != null && item.timestamp_ms != null)
+    .sort((a, b) => Number(b.timestamp_ms || 0) - Number(a.timestamp_ms || 0));
+  return {
+    provider: 'bybit',
+    market_type: 'option',
+    base_asset: upper(baseCoin),
+    quote_asset: 'USD',
+    official_response: true,
+    official_empty: rows.length === 0,
+    latest: rows[0] || null,
+    rows,
+    row_count: rows.length,
+    updated_at: nowIso(),
+    source: 'bybit_official_public_option_historical_volatility',
+    endpoint: '/v5/market/historical-volatility',
+  };
 }
 
 function parseBybitRows(instrumentRows, tickerRows) {
@@ -418,7 +455,9 @@ async function refreshOkx() {
   const currentInstrumentsPayload = { code: '0', data: instruments };
 
   const oiData = [];
+  const optionSummaryData = [];
   let oiFamilySuccesses = 0;
+  let optionSummaryFamilySuccesses = 0;
   for (const instFamily of families) {
     try {
       const payload = await fetchOkx(
@@ -430,10 +469,21 @@ async function refreshOkx() {
     } catch (error) {
       partialErrors.push(`oi:${instFamily}:${String(error?.message || error)}`);
     }
+    try {
+      const payload = await fetchOkx(
+        `/api/v5/public/opt-summary?instFamily=${encodeURIComponent(instFamily)}`,
+        `option_summary_${instFamily}`,
+      );
+      if (Array.isArray(payload?.data)) optionSummaryData.push(...payload.data);
+      optionSummaryFamilySuccesses += 1;
+    } catch (error) {
+      partialErrors.push(`opt-summary:${instFamily}:${String(error?.message || error)}`);
+    }
   }
 
   const oiPayload = { code: '0', data: oiData };
-  const normalized = parseOkxRows(currentInstrumentsPayload, tickerPayload, oiPayload);
+  const optionSummaryPayload = { code: '0', data: optionSummaryData };
+  const normalized = parseOkxRows(currentInstrumentsPayload, tickerPayload, oiPayload, optionSummaryPayload);
   const rowsTruncated = normalized.length > MAX_ROWS_PER_PROVIDER;
   const rows = boundedRows(normalized);
   if (rows.length === 0) throw new Error('okx_option_normalized_rows_empty');
@@ -451,6 +501,10 @@ async function refreshOkx() {
     rows_truncated: rowsTruncated,
     oi_family_successes: oiFamilySuccesses,
     oi_family_failures: families.length - oiFamilySuccesses,
+    option_summary_family_successes: optionSummaryFamilySuccesses,
+    option_summary_family_failures: families.length - optionSummaryFamilySuccesses,
+    option_summary_rows: optionSummaryData.length,
+    option_summary_ready: optionSummaryFamilySuccesses === families.length && optionSummaryData.length > 0,
     partial_error: partialErrors.join(' | ').slice(0, 800),
     directory_updated_at: directoryByProvider.get('okx')?.updated_at || null,
     snapshot_updated_at: nowIso(),
@@ -495,6 +549,7 @@ async function refreshBybit() {
   const tickerRows = [];
   const partialErrors = [];
   let tickerBaseSuccesses = 0;
+  let historicalVolatilityBaseSuccesses = 0;
   for (const baseCoin of bases) {
     try {
       const payload = await fetchBybit(`/v5/market/tickers?category=option&baseCoin=${encodeURIComponent(baseCoin)}`, `option_tickers_${baseCoin}`);
@@ -502,6 +557,23 @@ async function refreshBybit() {
       tickerBaseSuccesses += 1;
     } catch (error) {
       partialErrors.push(`ticker:${baseCoin}:${String(error?.message || error)}`);
+    }
+    const previousHv = bybitHistoricalVolatilityByBase.get(baseCoin);
+    if (previousHv?.official_response === true && isFresh(previousHv.updated_at, BYBIT_HV_REFRESH_MS)) {
+      historicalVolatilityBaseSuccesses += 1;
+    } else {
+      try {
+        const payload = await fetchBybit(
+          `/v5/market/historical-volatility?category=option&baseCoin=${encodeURIComponent(baseCoin)}&quoteCoin=USD&period=7`,
+          `option_historical_volatility_${baseCoin}`,
+        );
+        const parsed = parseBybitHistoricalVolatility(payload, baseCoin);
+        if (parsed.official_empty) throw new Error(`bybit_option_historical_volatility_empty:${baseCoin}`);
+        bybitHistoricalVolatilityByBase.set(baseCoin, parsed);
+        historicalVolatilityBaseSuccesses += 1;
+      } catch (error) {
+        partialErrors.push(`historical-volatility:${baseCoin}:${String(error?.message || error)}`);
+      }
     }
   }
   const normalized = parseBybitRows(instruments, tickerRows);
@@ -519,6 +591,11 @@ async function refreshBybit() {
     rows_truncated: rowsTruncated,
     ticker_base_successes: tickerBaseSuccesses,
     ticker_base_failures: bases.length - tickerBaseSuccesses,
+    historical_volatility_base_successes: historicalVolatilityBaseSuccesses,
+    historical_volatility_base_failures: bases.length - historicalVolatilityBaseSuccesses,
+    historical_volatility_ready: bases.length > 0 && historicalVolatilityBaseSuccesses === bases.length,
+    historical_volatility_refresh_seconds: Math.round(BYBIT_HV_REFRESH_MS / 1000),
+    historical_volatility_stale_seconds: Math.round(BYBIT_HV_STALE_MS / 1000),
     partial_error: partialErrors.join(' | ').slice(0, 800),
     directory_updated_at: directoryByProvider.get('bybit')?.updated_at || null,
     snapshot_updated_at: nowIso(),
@@ -637,7 +714,9 @@ function providerHealth(provider) {
     ...state,
     official_available: true,
     current_integration: PROVIDER_POLICY[provider].current_integration,
-    ready: state.official_response === true && state.directory_ready === true && state.row_count > 0 && state.scope_truncated !== true && state.rows_truncated !== true && !state.last_error,
+    ready: state.official_response === true && state.directory_ready === true && state.row_count > 0 && state.scope_truncated !== true && state.rows_truncated !== true && !state.last_error &&
+      (provider !== 'okx' || state.option_summary_ready === true) &&
+      (provider !== 'bybit' || state.historical_volatility_ready === true),
   };
 }
 
@@ -678,6 +757,8 @@ export function getDerivativesPublicHealth() {
     current_scope_not_truncated: [okx, bybit, gate].every((item) => item.scope_truncated !== true && item.rows_truncated !== true),
     providers: { binance, okx, bybit, gate, bitget },
     supported_crypto_option_providers: ['okx', 'bybit', 'gate'],
+    okx_option_summary_official_fields: ['bidVol', 'askVol', 'markVol', 'delta', 'gamma', 'vega', 'theta', 'deltaBS', 'gammaBS', 'vegaBS', 'thetaBS', 'lever', 'realVol', 'volLv', 'fwdPx'],
+    bybit_option_historical_volatility_official_fields: ['period', 'value', 'time'],
     explicit_non_collected_or_unsupported: ['binance', 'bitget'],
     binance_direct_rest_added: false,
     binance_option_ws_added: false,
@@ -704,6 +785,15 @@ function snapshotRows(url) {
   const offset = Math.max(0, Math.min(100_000, Number(url.searchParams.get('offset') || 0) || 0));
   const limit = Math.max(1, Math.min(1_000, Number(url.searchParams.get('limit') || 200) || 200));
   return { total: rows.length, offset, limit, rows: rows.slice(offset, offset + limit).map((row) => ({ ...row })) };
+}
+
+function snapshotBybitHistoricalVolatility(url) {
+  const base = compact(url.searchParams.get('base_asset') || '');
+  const rows = [...bybitHistoricalVolatilityByBase.values()]
+    .filter((item) => item?.official_response === true && isFresh(item.updated_at, BYBIT_HV_STALE_MS))
+    .filter((item) => !base || compact(item.base_asset) === base)
+    .map(clone);
+  return rows;
 }
 
 function sendJson(res, status, payload) {
@@ -735,6 +825,7 @@ export async function handleDerivativesPublic(req, res, url) {
     offset: page.offset,
     limit: page.limit,
     rows: page.rows,
+    option_historical_volatility: snapshotBybitHistoricalVolatility(url),
     provider_policy: PROVIDER_POLICY,
     user_read_triggered_exchange_requests: 0,
     reads_scale_with_users: false,
@@ -743,4 +834,4 @@ export async function handleDerivativesPublic(req, res, url) {
   return true;
 }
 
-export const __testDerivativesPublic = Object.freeze({ parseOptionSymbol, okxOptionFamilyFromInstId, parseOkxRows, parseBybitRows, parseGateRows });
+export const __testDerivativesPublic = Object.freeze({ parseOptionSymbol, okxOptionFamilyFromInstId, parseOkxRows, parseBybitRows, parseGateRows, parseBybitHistoricalVolatility });

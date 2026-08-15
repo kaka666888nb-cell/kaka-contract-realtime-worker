@@ -1,7 +1,7 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.93';
+const STEP_VERSION = '650.8.15.142';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -60,6 +60,7 @@ const COINBASE_L2_START_TIMEOUT_MS = 8_000;
 const COINBASE_L2_MAX_SYMBOLS = 12;
 const COINBASE_PRODUCT_BOOK_HOST = 'api.coinbase.com';
 const COINBASE_PRODUCT_BOOK_PATH = '/api/v3/brokerage/market/product_book';
+const COINBASE_PRODUCT_PATH_PREFIX = '/api/v3/brokerage/products/';
 const COINBASE_PRODUCT_BOOK_REFRESH_MS = Math.max(
   8_000,
   Number(process.env.KAKA_COINBASE_PRODUCT_BOOK_REFRESH_MS || 10_000),
@@ -75,6 +76,18 @@ const COINBASE_PRODUCT_BOOK_STALE_MS = Math.max(
 const COINBASE_PRODUCT_BOOK_RETRY_MS = Math.max(
   30_000,
   Number(process.env.KAKA_COINBASE_PRODUCT_BOOK_RETRY_MS || 60_000),
+);
+const COINBASE_PRODUCT_FACTS_REFRESH_MS = Math.max(
+  30_000,
+  Number(process.env.KAKA_COINBASE_PRODUCT_FACTS_REFRESH_MS || 60_000),
+);
+const COINBASE_PRODUCT_FACTS_FRESH_MS = Math.max(
+  COINBASE_PRODUCT_FACTS_REFRESH_MS,
+  Number(process.env.KAKA_COINBASE_PRODUCT_FACTS_FRESH_MS || 90_000),
+);
+const COINBASE_PRODUCT_FACTS_STALE_MS = Math.max(
+  COINBASE_PRODUCT_FACTS_FRESH_MS,
+  Number(process.env.KAKA_COINBASE_PRODUCT_FACTS_STALE_MS || 10 * 60_000),
 );
 const COINBASE_CDP_KEY_NAME = String(
   process.env.KAKA_COINBASE_CDP_KEY_NAME ||
@@ -112,6 +125,16 @@ const COINBASE_PRODUCT_BOOK_STATS = {
   last_success_at: null,
   last_error: '',
 };
+const COINBASE_PRODUCT_FACTS_STATS = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  fresh_cache_skips: 0,
+  retry_cooldown_skips: 0,
+  missing_credentials_skips: 0,
+  last_success_at: null,
+  last_error: '',
+};
 
 function coinbaseLevel2Route(native) {
   const requestedNative = String(native || '').trim().toUpperCase();
@@ -129,7 +152,7 @@ function base64Url(value) {
   return Buffer.from(value).toString('base64url');
 }
 
-function coinbaseProductBookJwt() {
+function coinbaseCdpJwt(path) {
   if (!COINBASE_PRODUCT_BOOK_CREDENTIALS_CONFIGURED) {
     throw new Error('coinbase_product_book_credentials_not_configured');
   }
@@ -148,7 +171,7 @@ function coinbaseProductBookJwt() {
     nbf: nowSeconds,
     exp: nowSeconds + 120,
     sub: COINBASE_CDP_KEY_NAME,
-    uri: `GET ${COINBASE_PRODUCT_BOOK_HOST}${COINBASE_PRODUCT_BOOK_PATH}`,
+    uri: `GET ${COINBASE_PRODUCT_BOOK_HOST}${path}`,
   };
   const signingInput = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
   const signature = cryptoSign(
@@ -157,6 +180,57 @@ function coinbaseProductBookJwt() {
     { key: coinbaseCdpPrivateKey, dsaEncoding: 'ieee-p1363' },
   );
   return `${signingInput}.${base64Url(signature)}`;
+}
+
+function coinbaseProductBookJwt() {
+  return coinbaseCdpJwt(COINBASE_PRODUCT_BOOK_PATH);
+}
+
+function nullableBoolean(value) {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function parseCoinbaseProductFacts(decoded, acceptedProductIds) {
+  const productId = String(decoded?.product_id || '').trim().toUpperCase();
+  if (!productId || !acceptedProductIds.has(productId)) {
+    throw new Error('coinbase_product_identity_mismatch');
+  }
+  const session = decoded?.fcm_trading_session_details;
+  const futuresSession = decoded?.future_product_details;
+  const equitySession = decoded?.equity_product_details;
+  return {
+    product_id: productId,
+    status: decoded?.status == null ? null : String(decoded.status),
+    product_type: decoded?.product_type == null ? null : String(decoded.product_type),
+    product_venue: decoded?.product_venue == null ? null : String(decoded.product_venue),
+    base_currency_id: decoded?.base_currency_id == null ? null : String(decoded.base_currency_id),
+    quote_currency_id: decoded?.quote_currency_id == null ? null : String(decoded.quote_currency_id),
+    is_disabled: nullableBoolean(decoded?.is_disabled),
+    view_only: nullableBoolean(decoded?.view_only),
+    cancel_only: nullableBoolean(decoded?.cancel_only),
+    limit_only: nullableBoolean(decoded?.limit_only),
+    post_only: nullableBoolean(decoded?.post_only),
+    trading_disabled: nullableBoolean(decoded?.trading_disabled),
+    auction_mode: nullableBoolean(decoded?.auction_mode),
+    fcm_trading_session_details: session && typeof session === 'object' ? {
+      is_session_open: nullableBoolean(session.is_session_open),
+      open_time: session.open_time == null ? null : String(session.open_time),
+      close_time: session.close_time == null ? null : String(session.close_time),
+    } : null,
+    future_product_details: futuresSession && typeof futuresSession === 'object' ? {
+      contract_expiry: futuresSession.contract_expiry == null ? null : String(futuresSession.contract_expiry),
+      contract_size: numberValue(futuresSession.contract_size),
+      contract_root_unit: futuresSession.contract_root_unit == null ? null : String(futuresSession.contract_root_unit),
+      group_description: futuresSession.group_description == null ? null : String(futuresSession.group_description),
+    } : null,
+    equity_product_details: equitySession && typeof equitySession === 'object' ? {
+      is_24_hour: nullableBoolean(equitySession.is_24_hour),
+      is_early_close: nullableBoolean(equitySession.is_early_close),
+      early_close_time: equitySession.early_close_time == null ? null : String(equitySession.early_close_time),
+    } : null,
+    official_endpoint: '/api/v3/brokerage/products/{product_id}',
+    source: 'coinbase_advanced_trade_authenticated_get_product_official_fields',
+  };
 }
 
 function coinbaseBookMetricsFromBbo(bids, asks) {
@@ -822,9 +896,12 @@ function integerValue(value) {
   return parsed == null ? 0 : Math.trunc(parsed);
 }
 
-function clampLimit(view, value) {
+function clampLimit(view, value, provider = '', marketType = 'contract') {
   const parsed = integerValue(value);
   if (view === 'trades') return Math.max(1, Math.min(parsed || 80, 100));
+  if (provider === 'bybit' && marketType === 'spot') {
+    return Math.max(1, Math.min(parsed || 20, 1_000));
+  }
   return Math.max(1, Math.min(parsed || 20, 20));
 }
 
@@ -1591,9 +1668,24 @@ async function loadSpotBybit(view, symbol, limit) {
     }).filter(Boolean);
     return { items, timestamp_ms: items[0]?.time_ms || integerValue(data?.time) || Date.now(), upstream_host: 'api.bybit.com', native_symbol: native };
   }
-  const data = await fetchJson(`https://api.bybit.com/v5/market/orderbook?category=spot&symbol=${encodeURIComponent(native)}&limit=${Math.max(1, Math.min(limit, 50))}`);
+  const officialLimit = Math.max(1, Math.min(limit, 1_000));
+  const data = await fetchJson(`https://api.bybit.com/v5/market/orderbook?category=spot&symbol=${encodeURIComponent(native)}&limit=${officialLimit}`);
   if (integerValue(data?.retCode) !== 0 || !data?.result) throw new Error(`bybit_spot_orderbook_${data?.retCode ?? 'invalid'}`);
-  return { bids: normalizeLevels(data.result.b, { side: 'bid' }), asks: normalizeLevels(data.result.a, { side: 'ask' }), timestamp_ms: integerValue(data.result.cts) || integerValue(data.result.ts) || integerValue(data?.time) || Date.now(), upstream_host: 'api.bybit.com', native_symbol: native };
+  const bids = normalizeLevels(data.result.b, { side: 'bid' }).slice(0, officialLimit);
+  const asks = normalizeLevels(data.result.a, { side: 'ask' }).slice(0, officialLimit);
+  return {
+    bids,
+    asks,
+    timestamp_ms: integerValue(data.result.cts) || integerValue(data.result.ts) || integerValue(data?.time) || Date.now(),
+    upstream_host: 'api.bybit.com',
+    native_symbol: native,
+    official_max_depth: 1_000,
+    requested_depth: officialLimit,
+    actual_bid_levels: bids.length,
+    actual_ask_levels: asks.length,
+    ultra_deep: officialLimit > 50,
+    transport: 'rest_public_spot_orderbook',
+  };
 }
 
 async function loadSpotBitget(view, symbol, limit) {
@@ -1675,6 +1767,11 @@ function coinbaseL2State(requestedNative) {
     officialBookMetricsInFlight: null,
     officialBookMetricsNextAttemptAt: 0,
     officialBookMetricsLastError: '',
+    officialProductFacts: null,
+    officialProductFactsAt: 0,
+    officialProductFactsInFlight: null,
+    officialProductFactsNextAttemptAt: 0,
+    officialProductFactsLastError: '',
   };
   COINBASE_L2_STATES.set(route.requestedNative, state);
   return state;
@@ -1874,6 +1971,56 @@ async function refreshCoinbaseOfficialBookMetrics(state) {
   return state.officialBookMetricsInFlight;
 }
 
+async function refreshCoinbaseOfficialProductFacts(state) {
+  if (!COINBASE_PRODUCT_BOOK_CREDENTIALS_CONFIGURED) {
+    COINBASE_PRODUCT_FACTS_STATS.missing_credentials_skips += 1;
+    return null;
+  }
+  const now = Date.now();
+  if (state.officialProductFacts &&
+      now - state.officialProductFactsAt <= COINBASE_PRODUCT_FACTS_FRESH_MS) {
+    COINBASE_PRODUCT_FACTS_STATS.fresh_cache_skips += 1;
+    return state.officialProductFacts;
+  }
+  if (state.officialProductFactsNextAttemptAt > now) {
+    COINBASE_PRODUCT_FACTS_STATS.retry_cooldown_skips += 1;
+    return state.officialProductFacts;
+  }
+  if (state.officialProductFactsInFlight) return state.officialProductFactsInFlight;
+  const productId = String(
+    state.lastProductId || state.subscribeNative || state.requestedNative || '',
+  ).trim().toUpperCase();
+  if (!productId || !state.acceptedProductIds.has(productId)) return null;
+  const path = `${COINBASE_PRODUCT_PATH_PREFIX}${encodeURIComponent(productId)}`;
+  COINBASE_PRODUCT_FACTS_STATS.attempts += 1;
+  state.officialProductFactsInFlight = (async () => {
+    const decoded = await fetchJson(
+      `https://${COINBASE_PRODUCT_BOOK_HOST}${path}`,
+      6_500,
+      { authorization: `Bearer ${coinbaseCdpJwt(path)}` },
+    );
+    const facts = parseCoinbaseProductFacts(decoded, state.acceptedProductIds);
+    state.officialProductFacts = facts;
+    state.officialProductFactsAt = Date.now();
+    state.officialProductFactsNextAttemptAt = 0;
+    state.officialProductFactsLastError = '';
+    COINBASE_PRODUCT_FACTS_STATS.successes += 1;
+    COINBASE_PRODUCT_FACTS_STATS.last_success_at = new Date().toISOString();
+    COINBASE_PRODUCT_FACTS_STATS.last_error = '';
+    return facts;
+  })().catch((error) => {
+    const message = String(error?.message || error || 'coinbase_product_facts_refresh_failed').slice(0, 220);
+    state.officialProductFactsLastError = message;
+    state.officialProductFactsNextAttemptAt = Date.now() + COINBASE_PRODUCT_BOOK_RETRY_MS;
+    COINBASE_PRODUCT_FACTS_STATS.failures += 1;
+    COINBASE_PRODUCT_FACTS_STATS.last_error = message;
+    return state.officialProductFacts;
+  }).finally(() => {
+    state.officialProductFactsInFlight = null;
+  });
+  return state.officialProductFactsInFlight;
+}
+
 async function loadCoinbaseLevel2Book(requestedNative, limit) {
   const state = coinbaseL2State(requestedNative);
   state.lastAccessAt = Date.now();
@@ -1916,6 +2063,12 @@ async function loadCoinbaseLevel2Book(requestedNative, limit) {
     .sort((a, b) => a.price - b.price)
     .slice(0, limit);
   const bookMetrics = resolveCoinbaseBookMetrics(state, bids, asks);
+  const productFactsAgeMs = state.officialProductFactsAt > 0
+    ? Date.now() - state.officialProductFactsAt
+    : null;
+  const productFacts = productFactsAgeMs != null && productFactsAgeMs <= COINBASE_PRODUCT_FACTS_STALE_MS
+    ? state.officialProductFacts
+    : null;
   return {
     bids,
     asks,
@@ -1927,6 +2080,8 @@ async function loadCoinbaseLevel2Book(requestedNative, limit) {
     alias_mode: state.aliasMode,
     transport: 'public_level2_websocket',
     connected: wsReady(state.socket),
+    product_facts: productFacts,
+    product_facts_age_ms: productFacts ? productFactsAgeMs : null,
   };
 }
 
@@ -1938,6 +2093,7 @@ const coinbaseL2CleanupTimer = setInterval(() => {
     if (now - state.lastAccessAt <= COINBASE_L2_IDLE_MS) {
       COINBASE_PRODUCT_BOOK_STATS.eligible_active_symbols += 1;
       refreshCoinbaseOfficialBookMetrics(state).catch(() => {});
+      refreshCoinbaseOfficialProductFacts(state).catch(() => {});
       continue;
     }
     closeWsQuietly(state.socket);
@@ -2137,6 +2293,20 @@ function buildPayload(provider, marketType, view, requestedSymbol, limit, data, 
       officialMetricsAgeMs != null && officialMetricsAgeMs >= 0
         ? Math.floor(officialMetricsAgeMs)
         : null;
+    payload.product_facts = data.product_facts && typeof data.product_facts === 'object'
+      ? data.product_facts
+      : null;
+    const productFactsAgeMs = numberValue(data.product_facts_age_ms);
+    payload.product_facts_age_ms = productFactsAgeMs != null && productFactsAgeMs >= 0
+      ? Math.floor(productFactsAgeMs)
+      : null;
+  }
+  if (provider === 'bybit' && marketType === 'spot') {
+    payload.official_max_depth = integerValue(data.official_max_depth) || 1_000;
+    payload.requested_depth = integerValue(data.requested_depth) || limit;
+    payload.actual_bid_levels = integerValue(data.actual_bid_levels) || bids.length;
+    payload.actual_ask_levels = integerValue(data.actual_ask_levels) || asks.length;
+    payload.ultra_deep = data.ultra_deep === true;
   }
   return payload;
 }
@@ -2144,7 +2314,11 @@ function buildPayload(provider, marketType, view, requestedSymbol, limit, data, 
 async function resolveCached(provider, marketType, view, symbol, limit) {
   const key = `${provider}|${marketType}|${view}|${compactSymbol(symbol)}|${limit}`;
   const circuitKey = `${provider}|${marketType}|${view}|${compactSymbol(symbol)}`;
-  const freshMs = view === 'trades' ? TRADES_FRESH_MS : ORDERBOOK_FRESH_MS;
+  const freshMs = view === 'trades'
+    ? TRADES_FRESH_MS
+    : provider === 'bybit' && marketType === 'spot' && limit > 50
+      ? 5_000
+      : ORDERBOOK_FRESH_MS;
   const now = Date.now();
   const cached = RESPONSE_CACHE.get(key);
   if (cached && now - cached.storedAt <= freshMs) {
@@ -2200,7 +2374,7 @@ async function resolveCached(provider, marketType, view, symbol, limit) {
 export async function getContractDepthSharedOrderbook(providerRaw, symbolRaw, limitRaw = 20) {
   const provider = normalizeProvider(providerRaw);
   const symbol = compactSymbol(symbolRaw);
-  const limit = clampLimit('orderbook', limitRaw);
+  const limit = clampLimit('orderbook', limitRaw, provider, 'contract');
   if (!SUPPORTED_PROVIDERS.has(provider) || provider === 'coinbase') {
     throw new Error('unsupported_contract_provider');
   }
@@ -2290,6 +2464,24 @@ export function getContractDepthHealth() {
     coinbase_product_book_cross_product_substitution: false,
     coinbase_product_book_self_test: coinbaseBookMetricsSelfTest(),
     coinbase_product_book_stats: { ...COINBASE_PRODUCT_BOOK_STATS },
+    coinbase_product_facts_endpoint: '/api/v3/brokerage/products/{product_id}',
+    coinbase_product_facts_official_fields: [
+      'status', 'is_disabled', 'view_only', 'cancel_only', 'limit_only',
+      'post_only', 'trading_disabled', 'auction_mode',
+      'fcm_trading_session_details', 'future_product_details', 'equity_product_details',
+    ],
+    coinbase_product_facts_refresh_ms: COINBASE_PRODUCT_FACTS_REFRESH_MS,
+    coinbase_product_facts_fresh_ms: COINBASE_PRODUCT_FACTS_FRESH_MS,
+    coinbase_product_facts_stale_ms: COINBASE_PRODUCT_FACTS_STALE_MS,
+    coinbase_product_facts_background_active_symbols_only: true,
+    coinbase_product_facts_user_read_starts_rest_request: false,
+    coinbase_product_facts_secret_exposed_to_app: false,
+    coinbase_product_facts_cross_product_substitution: false,
+    coinbase_product_facts_stats: { ...COINBASE_PRODUCT_FACTS_STATS },
+    bybit_spot_orderbook_official_max_depth: 1_000,
+    bybit_spot_ultra_deep_only_exact_active_symbol: true,
+    bybit_spot_ultra_deep_user_count_scales_request_types: false,
+    bybit_spot_ultra_deep_cache_fresh_ms: 5_000,
     gate_btc_usd_inverse_depth_enabled: true,
     gate_btc_usd_quote_value_per_contract:
       GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,
@@ -2319,6 +2511,15 @@ export function getContractDepthHealth() {
         ? Date.now() - state.officialBookMetricsAt
         : null,
       official_metrics_last_error: state.officialBookMetricsLastError,
+      product_facts_ready: Boolean(
+        state.officialProductFacts &&
+        Date.now() - state.officialProductFactsAt <= COINBASE_PRODUCT_FACTS_STALE_MS,
+      ),
+      product_facts_product_id: state.officialProductFacts?.product_id || null,
+      product_facts_age_ms: state.officialProductFactsAt > 0
+        ? Date.now() - state.officialProductFactsAt
+        : null,
+      product_facts_last_error: state.officialProductFactsLastError,
     })),
     ...COINBASE_L2_STATS,
     ...BINANCE_WS_STATS,
@@ -2367,7 +2568,7 @@ export async function handleContractDepth(req, res, url) {
   const marketType = String(url.searchParams.get('market_type') || 'contract').trim().toLowerCase() === 'spot' ? 'spot' : 'contract';
   const view = String(url.searchParams.get('view') || 'orderbook').trim().toLowerCase() === 'trades' ? 'trades' : 'orderbook';
   const symbol = compactSymbol(url.searchParams.get('symbol'));
-  const limit = clampLimit(view, url.searchParams.get('limit'));
+  const limit = clampLimit(view, url.searchParams.get('limit'), provider, marketType);
   if (!SUPPORTED_PROVIDERS.has(provider) || (marketType === 'contract' && provider === 'coinbase')) {
     sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider });
     return true;
@@ -2398,3 +2599,8 @@ export async function handleContractDepth(req, res, url) {
   }
   return true;
 }
+
+export const __contractDepthStep1024Test = Object.freeze({
+  clampLimit,
+  parseCoinbaseProductFacts,
+});

@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.3';
+const VERSION = '650.8.15.142';
 const SNAPSHOT_ROUTE = '/api/okx-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/okx-advanced/health';
 const OI_HISTORY_ROUTE = '/api/okx-advanced/open-interest-history';
@@ -1505,7 +1505,23 @@ export async function handleOkxAdvancedStats(req, res, url) {
     sendJson(res, 200, oiHistoryReadPayload(symbol, interval, limit));
     return true;
   }
-  sendJson(res, 200, snapshotPayload({ includeRows: true }));
+  const symbol = compact(url.searchParams.get('symbol') || '');
+  const payload = snapshotPayload({ includeRows: true });
+  if (!symbol) {
+    sendJson(res, 200, payload);
+    return true;
+  }
+  const rows = payload.rows.filter((row) => compact(row?.symbol) === symbol);
+  sendJson(res, 200, {
+    ...payload,
+    rows,
+    row_count: rows.length,
+    filter_provider: 'okx',
+    filter_market_type: 'contract',
+    filter_symbol: symbol,
+    exact_filter_match: rows.length === 1,
+    filter_does_not_trigger_collector: true,
+  });
   return true;
 }
 

@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.141';
+const STEP_VERSION = '650.8.15.142';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -739,6 +739,17 @@ const server = http.createServer(async (req, res) => {
         bybit_advanced_official_stats_ready: getBybitAdvancedStatsHealth().ready,
         bybit_advanced_current_oi_reuses_market_light: true,
         bybit_advanced_user_reads_scale_exchange_upstream: false,
+        step1024_okx_current_dynamic_price_limit: true,
+        step1024_okx_option_official_iv_greeks: true,
+        step1024_bybit_index_price_components_shared: true,
+        step1024_bybit_option_historical_volatility_shared: true,
+        step1024_bybit_spot_official_depth_limit: 1000,
+        step1024_coinbase_product_status_restrictions_session: true,
+        step1024_coinbase_product_facts_backend_secret_only: true,
+        step1024_user_reads_scale_shared_collectors: false,
+        step1024_missing_stays_null: true,
+        step1024_cross_provider_substitution: false,
+        step1024_cross_quote_substitution: false,
         coinbase_step995_ticker_batch_existing_shared: true,
         coinbase_step995_level2_existing_bounded_exact: true,
         coinbase_step995_market_trades_existing_public_exact: true,
@@ -990,5 +1001,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + Coinbase official product-book metrics with bounded Level2 fallback + shared Bybit official order price limit + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + three-platform official RPI overlay + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1024 six-capability official batch (OKX dynamic limits/options, Bybit index/HV/depth1000, Coinbase product rules) + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

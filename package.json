@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.141",
+  "version": "650.8.15.142",
   "private": true,
   "type": "module",
   "scripts": {
@@ -23,10 +23,11 @@
     "test:step788.1.2.1": "node tests/step788_1_2_1_selftest.mjs",
     "test:step980.6.3": "node tests/step980_6_3_selftest.mjs",
     "test:step980.6.3.4": "node tests/step980_6_3_4_selftest.mjs",
-    "test:step1023": "node tests/step1023_selftest.mjs"
+    "test:step1023": "node tests/step1023_selftest.mjs",
+    "test:step1024": "node tests/step1024_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 contract realtime worker Step1023 shared Bybit official order price limits"
+  "description": "KakaWeb3 Step1024 six-group official exchange capability batch"
 }
