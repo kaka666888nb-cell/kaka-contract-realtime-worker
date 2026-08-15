@@ -66,6 +66,7 @@ const klineIdentityStats = {
   builds_failed: 0,
   evictions: 0,
 };
+
 const coinbaseTickerCache = new Map();
 const coinbaseStatsCache = new Map();
 // Step781.2.8: current price follows the official last-trade ticker snapshot;
@@ -408,6 +409,27 @@ function num(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
+function officialNum(value) {
+  if (value == null || (typeof value === 'string' && value.trim() === '')) {
+    return null;
+  }
+  return num(value);
+}
+function officialBool(value) {
+  if (value == null || (typeof value === 'string' && value.trim() === '')) {
+    return null;
+  }
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'enabled'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'disabled'].includes(normalized)) return false;
+  return null;
+}
 function clamp(value, min, max, fallback) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
@@ -646,6 +668,20 @@ function marketRow(provider, market, symbol, base, quote, raw, extra = {}) {
     contract_multiplier: num(extra.contract_multiplier),
     contract_value_currency: String(extra.contract_value_currency || '').toUpperCase() || null,
     quantity_semantics: extra.quantity_semantics || (market === 'contract' ? 'base_asset' : 'base_asset'),
+    // Step1019: pass through official instrument-directory product facts
+    // already present in the same shared batch. Empty official values remain
+    // null; no extra exchange request and no derived replacement is added.
+    ...(market === 'contract' && provider === 'gate' ? {
+      funding_interval: officialNum(extra.funding_interval),
+      funding_next_apply: officialNum(extra.funding_next_apply),
+      market_order_slip_ratio: officialNum(extra.market_order_slip_ratio),
+      enable_circuit_breaker: officialBool(extra.enable_circuit_breaker),
+    } : {}),
+    ...(market === 'contract' && provider === 'okx' ? {
+      init_px_lmt_pct: officialNum(extra.init_px_lmt_pct),
+      float_px_lmt_pct: officialNum(extra.float_px_lmt_pct),
+      max_px_lmt_pct: officialNum(extra.max_px_lmt_pct),
+    } : {}),
     status: 'TRADING',
     active: true,
     source: `${provider}_official_public_market_render`,
@@ -773,6 +809,9 @@ async function fetchUniverse(
                 : contractValue !== null && valueCurrency === quote
                     ? 'contract_count_convertible_to_quote'
                     : 'contract_count',
+            init_px_lmt_pct: item.initPxLmtPct,
+            float_px_lmt_pct: item.floatPxLmtPct,
+            max_px_lmt_pct: item.maxPxLmtPct,
           },
         ));
       } else {
@@ -829,6 +868,10 @@ async function fetchUniverse(
                 : multiplier && multiplier > 0
                     ? 'contract_count_convertible_to_base'
                     : 'contract_count',
+            funding_interval: item.funding_interval,
+            funding_next_apply: item.funding_next_apply,
+            market_order_slip_ratio: item.market_order_slip_ratio,
+            enable_circuit_breaker: item.enable_circuit_breaker,
           },
         ));
       }
@@ -1220,8 +1263,12 @@ function tickerVolumeSemantics(provider, market, item, last, quote = 'USDT') {
 function tickerOpenInterestSemantics(provider, market, quote, item, last) {
   let amount = num(item.openInterest ?? item.holdingAmount ?? item.open_interest);
   let value = num(item.openInterestValue ?? item.open_interest_value);
+  let singleAmount = null;
+  let singleValue = null;
   let amountUnit = item.open_interest_unit || null;
   let valueUnit = item.open_interest_value_unit || null;
+  let singleAmountUnit = null;
+  let singleValueUnit = null;
   const safeQuote = normalizedQuote(quote, 'USDT');
 
   if (market !== 'contract') {
@@ -1230,21 +1277,35 @@ function tickerOpenInterestSemantics(provider, market, quote, item, last) {
       open_interest_value: value,
       open_interest_unit: amountUnit,
       open_interest_value_unit: valueUnit,
+      single_open_interest: null,
+      single_open_interest_value: null,
+      single_open_interest_unit: null,
+      single_open_interest_value_unit: null,
     };
   }
 
   if (provider === 'bybit') {
+    singleAmount = officialNum(
+      item.singleOpenInterest ?? item.single_open_interest,
+    );
+    singleValue = officialNum(
+      item.singleOpenInterestValue ?? item.single_open_interest_value,
+    );
     if (safeQuote === 'USD') {
       // Bybit inverse: openInterest is USD/quote amount and
       // openInterestValue is the converted base-coin amount.
       amountUnit = 'quote_asset';
       valueUnit = 'base_asset';
+      singleAmountUnit = 'quote_asset';
+      singleValueUnit = 'base_asset';
       if (value === null && amount !== null && last !== null && last > 0) {
         value = amount / last;
       }
     } else {
       amountUnit = 'base_asset';
       valueUnit = 'quote_asset';
+      singleAmountUnit = 'base_asset';
+      singleValueUnit = 'quote_asset';
       if (value === null && amount !== null && last !== null && last > 0) {
         value = amount * last;
       }
@@ -1268,6 +1329,12 @@ function tickerOpenInterestSemantics(provider, market, quote, item, last) {
     open_interest_value: value,
     open_interest_unit: amount === null ? null : amountUnit,
     open_interest_value_unit: value === null ? null : valueUnit,
+    single_open_interest: singleAmount,
+    single_open_interest_value: singleValue,
+    single_open_interest_unit:
+      singleAmount === null ? null : singleAmountUnit,
+    single_open_interest_value_unit:
+      singleValue === null ? null : singleValueUnit,
   };
 }
 
@@ -1389,6 +1456,17 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
     open_interest_value: openInterest.open_interest_value,
     open_interest_unit: openInterest.open_interest_unit,
     open_interest_value_unit: openInterest.open_interest_value_unit,
+    single_open_interest: openInterest.single_open_interest,
+    single_open_interest_value: openInterest.single_open_interest_value,
+    single_open_interest_unit: openInterest.single_open_interest_unit,
+    single_open_interest_value_unit:
+      openInterest.single_open_interest_value_unit,
+    single_open_interest_source:
+      provider === 'bybit' &&
+      (openInterest.single_open_interest !== null ||
+       openInterest.single_open_interest_value !== null)
+        ? 'bybit_official_public_ticker_single_side'
+        : null,
     source: `${provider}_official_public_ticker_render`,
     cached_at: new Date().toISOString(),
   };
@@ -3647,6 +3725,89 @@ function marketUnitSelfTest() {
       bybitInverseOi.open_interest_unit === 'quote_asset' &&
       bybitInverseOi.open_interest_value_unit === 'base_asset',
     bybitInverseOi,
+  );
+
+  const bybitSingleSideOi = tickerOpenInterestSemantics(
+    'bybit',
+    'contract',
+    'USDT',
+    {
+      openInterest: '2',
+      openInterestValue: '200',
+      singleOpenInterest: '1',
+      singleOpenInterestValue: '100',
+    },
+    100,
+  );
+  add(
+    'bybit_official_single_side_open_interest_preserved',
+    bybitSingleSideOi.single_open_interest === 1 &&
+      bybitSingleSideOi.single_open_interest_value === 100 &&
+      bybitSingleSideOi.single_open_interest_unit === 'base_asset' &&
+      bybitSingleSideOi.single_open_interest_value_unit === 'quote_asset',
+    bybitSingleSideOi,
+  );
+  const bybitSingleSideNull = tickerOpenInterestSemantics(
+    'bybit',
+    'contract',
+    'USDT',
+    { openInterest: '2', openInterestValue: '200' },
+    100,
+  );
+  add(
+    'bybit_missing_single_side_open_interest_stays_null',
+    bybitSingleSideNull.single_open_interest === null &&
+      bybitSingleSideNull.single_open_interest_value === null,
+    bybitSingleSideNull,
+  );
+
+  const gateRules = marketRow(
+    'gate', 'contract', 'BTC_USDT', 'BTC', 'USDT', 'BTC_USDT',
+    {
+      funding_interval: '28800',
+      funding_next_apply: '1786708800',
+      market_order_slip_ratio: '0.03',
+      enable_circuit_breaker: false,
+    },
+  );
+  add(
+    'gate_official_contract_rules_preserved',
+    gateRules.funding_interval === 28800 &&
+      gateRules.funding_next_apply === 1786708800 &&
+      gateRules.market_order_slip_ratio === 0.03 &&
+      gateRules.enable_circuit_breaker === false,
+    gateRules,
+  );
+
+  const okxPriceLimits = marketRow(
+    'okx', 'contract', 'BTCUSDT', 'BTC', 'USDT', 'BTC-USDT-SWAP',
+    {
+      init_px_lmt_pct: '0.05',
+      float_px_lmt_pct: '0.10',
+      max_px_lmt_pct: '0.20',
+    },
+  );
+  add(
+    'okx_official_price_limit_ratios_preserved',
+    okxPriceLimits.init_px_lmt_pct === 0.05 &&
+      okxPriceLimits.float_px_lmt_pct === 0.10 &&
+      okxPriceLimits.max_px_lmt_pct === 0.20,
+    okxPriceLimits,
+  );
+  const officialEmptyRules = marketRow(
+    'gate', 'contract', 'ETH_USDT', 'ETH', 'USDT', 'ETH_USDT',
+    {
+      funding_interval: '',
+      market_order_slip_ratio: '',
+      enable_circuit_breaker: '',
+    },
+  );
+  add(
+    'official_empty_product_facts_stay_null',
+    officialEmptyRules.funding_interval === null &&
+      officialEmptyRules.market_order_slip_ratio === null &&
+      officialEmptyRules.enable_circuit_breaker === null,
+    officialEmptyRules,
   );
 
   const bitget = tickerVolumeSemantics(

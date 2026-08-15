@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.95';
+const STEP_VERSION = '650.8.15.96';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 
@@ -23,6 +23,7 @@ const PRIMARY_QUOTE = Object.freeze({
     gate: 'USDT',
   }),
 });
+
 
 const SCAN_INTERVAL_MS = Math.max(15_000, Number(process.env.KAKA_MARKET_LIGHT_SCAN_INTERVAL_MS || 30_000));
 const START_DELAY_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_START_DELAY_MS || 7_000));
@@ -304,6 +305,29 @@ function normalizeRow(provider, market, raw, observedAt, primaryQuote, identitie
     quote_symbol: quote,
     settle_asset: identity?.settle_asset ?? raw.settle_asset ?? null,
     contract_type: identity?.contract_type ?? raw.contract_type ?? null,
+    // Step1019: directory-backed official product facts use the exact same
+    // provider/market/symbol identity merge as the ticker. Nullish coalescing
+    // intentionally preserves the valid boolean value false.
+    ...(market === 'contract' && provider === 'gate' ? {
+      funding_interval:
+        identity?.funding_interval ?? raw.funding_interval ?? null,
+      funding_next_apply:
+        identity?.funding_next_apply ?? raw.funding_next_apply ?? null,
+      market_order_slip_ratio:
+        identity?.market_order_slip_ratio ??
+        raw.market_order_slip_ratio ?? null,
+      enable_circuit_breaker:
+        identity?.enable_circuit_breaker ??
+        raw.enable_circuit_breaker ?? null,
+    } : {}),
+    ...(market === 'contract' && provider === 'okx' ? {
+      init_px_lmt_pct:
+        identity?.init_px_lmt_pct ?? raw.init_px_lmt_pct ?? null,
+      float_px_lmt_pct:
+        identity?.float_px_lmt_pct ?? raw.float_px_lmt_pct ?? null,
+      max_px_lmt_pct:
+        identity?.max_px_lmt_pct ?? raw.max_px_lmt_pct ?? null,
+    } : {}),
     trading_status: String(identity?.status ?? raw.trading_status ?? raw.status ?? 'TRADING').trim().toUpperCase() || 'TRADING',
     active: identity?.active !== false && raw.active !== false,
     last_price: lastPrice,
@@ -342,6 +366,15 @@ function fieldCoverage(rows) {
     funding_interval_hours: 'funding_interval_hours',
     open_interest: 'open_interest',
     open_interest_value: 'open_interest_value',
+    single_open_interest: 'single_open_interest',
+    single_open_interest_value: 'single_open_interest_value',
+    funding_interval: 'funding_interval',
+    funding_next_apply: 'funding_next_apply',
+    market_order_slip_ratio: 'market_order_slip_ratio',
+    enable_circuit_breaker: 'enable_circuit_breaker',
+    init_px_lmt_pct: 'init_px_lmt_pct',
+    float_px_lmt_pct: 'float_px_lmt_pct',
+    max_px_lmt_pct: 'max_px_lmt_pct',
     basis_rate: 'basis_rate',
     high_24h: 'high_24h',
     low_24h: 'low_24h',
@@ -2126,4 +2159,10 @@ export async function handleMarketLightSnapshot(req, res, url) {
   return true;
 }
 
-export const __marketLightStep1001_6Test = Object.freeze({ binanceSpotTicker24hRow, binanceSpotMiniTickerPatch, binanceSpotDirectoryFromRows });
+export const __marketLightStep1001_6Test = Object.freeze({
+  binanceSpotTicker24hRow,
+  binanceSpotMiniTickerPatch,
+  binanceSpotDirectoryFromRows,
+  normalizeRow,
+  fieldCoverage,
+});
