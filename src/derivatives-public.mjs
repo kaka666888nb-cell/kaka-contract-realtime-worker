@@ -1,4 +1,4 @@
-const VERSION = '650.8.15.142';
+const VERSION = '650.8.15.143';
 const SNAPSHOT_ROUTE = '/api/derivatives-public/current-snapshot';
 const HEALTH_ROUTE = '/api/derivatives-public/health';
 
@@ -276,7 +276,13 @@ function parseOkxRows(instrumentsPayload, tickerPayload, oiPayload, optionSummar
 }
 
 function parseBybitHistoricalVolatility(payload, baseCoin) {
-  const rows = (Array.isArray(payload?.result?.list) ? payload.result.list : [])
+  // Bybit's official V5 historical-volatility response returns `result` as
+  // the row array. Keep the older nested-list shape as a defensive fallback,
+  // but always prefer the current official array contract.
+  const sourceRows = Array.isArray(payload?.result)
+    ? payload.result
+    : (Array.isArray(payload?.result?.list) ? payload.result.list : []);
+  const rows = sourceRows
     .map((item) => {
       const timestampMs = Number(item?.time || 0);
       return {

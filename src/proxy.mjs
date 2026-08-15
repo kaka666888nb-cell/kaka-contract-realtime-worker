@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.142';
+const STEP_VERSION = '650.8.15.143';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -1001,5 +1001,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1024 six-capability official batch (OKX dynamic limits/options, Bybit index/HV/depth1000, Coinbase product rules) + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1024.1 Bybit historical-volatility official result-array fix + Step1024 six-capability official batch (OKX dynamic limits/options, Bybit index/HV/depth1000, Coinbase product rules) + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

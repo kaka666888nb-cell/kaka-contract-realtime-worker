@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.142",
+  "version": "650.8.15.143",
   "private": true,
   "type": "module",
   "scripts": {
@@ -29,5 +29,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Step1024 six-group official exchange capability batch"
+  "description": "KakaWeb3 Step1024.1 Bybit historical-volatility official response-shape fix"
 }
