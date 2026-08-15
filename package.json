@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.143",
+  "version": "650.8.15.144",
   "private": true,
   "type": "module",
   "scripts": {
@@ -29,5 +29,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Step1024.1 Bybit historical-volatility official response-shape fix"
+  "description": "KakaWeb3 Step1024.2 Bybit historical-volatility exact option-quote alignment"
 }

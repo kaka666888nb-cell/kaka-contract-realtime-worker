@@ -35,18 +35,26 @@ const hv = __testDerivativesPublic.parseBybitHistoricalVolatility({
     { period: '7', value: '0.6123', time: '1755000000000' },
     { period: '7', value: '0.6000', time: '1754996400000' },
   ],
-}, 'BTC');
+}, 'BTC', 'USDT');
 assert.equal(hv.official_empty, false);
 assert.equal(hv.latest.value, 0.6123);
 assert.equal(hv.rows.length, 2);
 assert.equal(hv.provider, 'bybit');
 assert.equal(hv.source, 'bybit_official_public_option_historical_volatility');
+assert.equal(hv.quote_asset, 'USDT');
 
 const legacyHv = __testDerivativesPublic.parseBybitHistoricalVolatility({
   result: { list: [{ period: '30', value: '0.5000', time: '1755000000000' }] },
 }, 'ETH');
 assert.equal(legacyHv.official_empty, false);
 assert.equal(legacyHv.latest.period, 30);
+
+assert.deepEqual(__testDerivativesPublic.bybitOptionQuoteCoinsForBase([
+  { baseCoin: 'BTC', quoteCoin: 'USDT' },
+  { baseCoin: 'BTC', quoteCoin: 'USDT' },
+  { baseCoin: 'BTC', quoteCoin: 'USD' },
+  { baseCoin: 'ETH', quoteCoin: 'USDT' },
+], 'BTC'), ['USDT', 'USD']);
 
 const okxRows = __testDerivativesPublic.parseOkxRows(
   { data: [{ instId: 'BTC-USD-260101-100000-C', uly: 'BTC-USD', baseCcy: 'BTC', quoteCcy: 'USD', optType: 'C', stk: '100000', state: 'live' }] },
@@ -103,4 +111,4 @@ const validation = validateBusinessSourceRules(capabilities);
 assert.equal(validation.ready, true, JSON.stringify(validation));
 assert.match(registrySource, /step1024_official_capability_batch/);
 
-console.log('Step1024.1 self-test passed');
+console.log('Step1024.2 self-test passed');

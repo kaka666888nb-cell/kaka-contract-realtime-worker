@@ -1,4 +1,4 @@
-const VERSION = '650.8.15.143';
+const VERSION = '650.8.15.144';
 const SNAPSHOT_ROUTE = '/api/derivatives-public/current-snapshot';
 const HEALTH_ROUTE = '/api/derivatives-public/health';
 
@@ -275,7 +275,7 @@ function parseOkxRows(instrumentsPayload, tickerPayload, oiPayload, optionSummar
   }).filter(Boolean);
 }
 
-function parseBybitHistoricalVolatility(payload, baseCoin) {
+function parseBybitHistoricalVolatility(payload, baseCoin, quoteCoin = 'USD') {
   // Bybit's official V5 historical-volatility response returns `result` as
   // the row array. Keep the older nested-list shape as a defensive fallback,
   // but always prefer the current official array contract.
@@ -298,7 +298,7 @@ function parseBybitHistoricalVolatility(payload, baseCoin) {
     provider: 'bybit',
     market_type: 'option',
     base_asset: upper(baseCoin),
-    quote_asset: 'USD',
+    quote_asset: upper(quoteCoin) || null,
     official_response: true,
     official_empty: rows.length === 0,
     latest: rows[0] || null,
@@ -308,6 +308,14 @@ function parseBybitHistoricalVolatility(payload, baseCoin) {
     source: 'bybit_official_public_option_historical_volatility',
     endpoint: '/v5/market/historical-volatility',
   };
+}
+
+function bybitOptionQuoteCoinsForBase(instruments, baseCoin) {
+  const exactBase = upper(baseCoin);
+  return [...new Set((Array.isArray(instruments) ? instruments : [])
+    .filter((row) => upper(row?.baseCoin) === exactBase)
+    .map((row) => upper(row?.quoteCoin))
+    .filter(Boolean))];
 }
 
 function parseBybitRows(instrumentRows, tickerRows) {
@@ -564,21 +572,33 @@ async function refreshBybit() {
     } catch (error) {
       partialErrors.push(`ticker:${baseCoin}:${String(error?.message || error)}`);
     }
+    const quoteCoins = bybitOptionQuoteCoinsForBase(instruments, baseCoin);
     const previousHv = bybitHistoricalVolatilityByBase.get(baseCoin);
-    if (previousHv?.official_response === true && isFresh(previousHv.updated_at, BYBIT_HV_REFRESH_MS)) {
+    if (previousHv?.official_response === true && quoteCoins.includes(upper(previousHv.quote_asset)) && isFresh(previousHv.updated_at, BYBIT_HV_REFRESH_MS)) {
       historicalVolatilityBaseSuccesses += 1;
     } else {
-      try {
-        const payload = await fetchBybit(
-          `/v5/market/historical-volatility?category=option&baseCoin=${encodeURIComponent(baseCoin)}&quoteCoin=USD&period=7`,
-          `option_historical_volatility_${baseCoin}`,
-        );
-        const parsed = parseBybitHistoricalVolatility(payload, baseCoin);
-        if (parsed.official_empty) throw new Error(`bybit_option_historical_volatility_empty:${baseCoin}`);
-        bybitHistoricalVolatilityByBase.set(baseCoin, parsed);
+      let verified = null;
+      const quoteErrors = [];
+      for (const quoteCoin of quoteCoins) {
+        try {
+          const payload = await fetchBybit(
+            `/v5/market/historical-volatility?category=option&baseCoin=${encodeURIComponent(baseCoin)}&quoteCoin=${encodeURIComponent(quoteCoin)}&period=7`,
+            `option_historical_volatility_${baseCoin}_${quoteCoin}`,
+          );
+          const parsed = parseBybitHistoricalVolatility(payload, baseCoin, quoteCoin);
+          if (parsed.official_empty) throw new Error(`bybit_option_historical_volatility_empty:${baseCoin}:${quoteCoin}`);
+          verified = parsed;
+          break;
+        } catch (error) {
+          quoteErrors.push(`${quoteCoin}:${String(error?.message || error)}`);
+        }
+      }
+      if (verified != null) {
+        bybitHistoricalVolatilityByBase.set(baseCoin, verified);
         historicalVolatilityBaseSuccesses += 1;
-      } catch (error) {
-        partialErrors.push(`historical-volatility:${baseCoin}:${String(error?.message || error)}`);
+      } else {
+        const reason = quoteCoins.length === 0 ? 'official_option_directory_quote_empty' : quoteErrors.join(',');
+        partialErrors.push(`historical-volatility:${baseCoin}:${reason}`);
       }
     }
   }
@@ -840,4 +860,4 @@ export async function handleDerivativesPublic(req, res, url) {
   return true;
 }
 
-export const __testDerivativesPublic = Object.freeze({ parseOptionSymbol, okxOptionFamilyFromInstId, parseOkxRows, parseBybitRows, parseGateRows, parseBybitHistoricalVolatility });
+export const __testDerivativesPublic = Object.freeze({ parseOptionSymbol, okxOptionFamilyFromInstId, parseOkxRows, parseBybitRows, parseGateRows, parseBybitHistoricalVolatility, bybitOptionQuoteCoinsForBase });
