@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.149';
+const STEP_VERSION = '650.8.15.150';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -791,6 +791,10 @@ const server = http.createServer(async (req, res) => {
         step1026_3_coinbase_equity_rules_status_session_official: true,
         step1026_3_coinbase_equity_canonical_product_id_preserved: true,
         step1026_3_coinbase_equity_user_reads_scale_upstream: false,
+        step1026_4_coinbase_equity_cursor_pagination_complete_required: true,
+        step1026_4_coinbase_equity_fixed_10_page_truncation_removed: true,
+        step1026_4_coinbase_equity_missing_exact_identity_returns_partial_200: true,
+        step1026_4_coinbase_equity_incomplete_catalog_rejected: true,
         step1024_cross_provider_substitution: false,
         step1024_cross_quote_substitution: false,
         coinbase_step995_ticker_batch_existing_shared: true,
