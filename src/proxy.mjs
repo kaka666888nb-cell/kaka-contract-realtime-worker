@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.146';
+const STEP_VERSION = '650.8.15.147';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -784,6 +784,8 @@ const server = http.createServer(async (req, res) => {
         step1026_gate_cash_stock_public_market_trades_unavailable: true,
         step1026_gate_cash_equity_kline_second_source_locked: true,
         step1026_coinbase_equity_kline_second_source_locked: true,
+        step1026_1_coinbase_equity_canonical_product_authenticated: true,
+        step1026_1_coinbase_equity_display_ticker_not_used_as_product_id: true,
         step1024_cross_provider_substitution: false,
         step1024_cross_quote_substitution: false,
         coinbase_step995_ticker_batch_existing_shared: true,
@@ -1039,5 +1041,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + pre-landed all-asset Kline + Step1024.2 Bybit historical-volatility official result-array and exact option-quote alignment + Step1024 six-capability official batch (OKX dynamic limits/options, Bybit index/HV/depth1000, Coinbase product rules) + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1026.1 Coinbase EQUITY canonical-product authenticated market fix + Step1026 all-asset shared market cache + pre-landed all-asset Kline + Step1024.2 Bybit historical-volatility official result-array and exact option-quote alignment + Step1024 six-capability official batch (OKX dynamic limits/options, Bybit index/HV/depth1000, Coinbase product rules) + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
