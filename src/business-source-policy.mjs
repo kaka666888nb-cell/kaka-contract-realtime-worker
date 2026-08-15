@@ -230,6 +230,7 @@ add('okx','contract','insurance_fund',{resolution:'official_shared',capability:'
 add('bybit','contract','risk_adl',{resolution:'unavailable',scope:'none',layers:['slow_stats']});
 add('bybit','contract','risk_limit',{resolution:'official_shared',capability:'risk_limit_insurance_pool',scope:'official_public_available_scope',layers:['slow_stats']});
 add('bybit','contract','insurance_fund',{resolution:'official_shared',capability:'risk_limit_insurance_pool',scope:'official_public_available_scope',layers:['slow_stats']});
+add('bybit','contract','order_price_limit',{resolution:'official_shared',capability:'order_price_limit_current_focus',scope:'focus15_current',layers:['slow_stats'],limitation:'Official buyLmt and sellLmt are exposed as highest bid order price and lowest ask order price. Values outside the current focus15 or beyond the verified stale window remain missing; no local formula is substituted.'});
 
 add('bitget','contract','risk_adl',{resolution:'unavailable',scope:'none',layers:['slow_stats']});
 add('bitget','contract','risk_limit',{resolution:'official_shared',capability:'risk_reserve_position_tier_oi_limit_index_components',scope:'official_public_available_scope',layers:['slow_stats']});

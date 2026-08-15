@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.140';
+const STEP_VERSION = '650.8.15.141';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -344,6 +344,9 @@ const server = http.createServer(async (req, res) => {
       bybit_advanced_current_snapshot: '/api/bybit-advanced/current-snapshot',
       bybit_advanced_health: '/api/bybit-advanced/health',
       bybit_advanced_state: getBybitAdvancedStatsHealth(),
+      bybit_order_price_limit_current_snapshot: '/api/bybit-advanced/current-snapshot?symbol=BTCUSDT',
+      bybit_order_price_limit_official_field_mapping: 'buyLmt=highest_bid_price;sellLmt=lowest_ask_price',
+      bybit_order_price_limit_user_reads_scale_exchange_upstream: false,
       contract_basis_current_snapshot: '/api/contract-basis/current-snapshot',
       contract_basis_health: '/api/contract-basis/health',
       contract_basis_state: getContractBasisHealth(),
@@ -987,5 +990,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + Coinbase official product-book metrics with bounded Level2 fallback + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + three-platform official RPI overlay + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + Coinbase official product-book metrics with bounded Level2 fallback + shared Bybit official order price limit + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + three-platform official RPI overlay + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

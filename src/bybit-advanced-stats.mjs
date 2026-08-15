@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.1';
+const VERSION = '650.8.15.2';
 const SNAPSHOT_ROUTE = '/api/bybit-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bybit-advanced/health';
 
@@ -15,6 +15,9 @@ const STARTUP_RETRY_MS = Math.max(15_000, Number(process.env.KAKA_BYBIT_ADVANCED
 const FULL_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_FULL_REFRESH_MS || 6 * 60 * 60_000));
 const INSURANCE_REFRESH_MS = Math.max(10 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_INSURANCE_REFRESH_MS || 30 * 60_000));
 const FOCUS_WATCH_MS = Math.max(15_000, Number(process.env.KAKA_BYBIT_ADVANCED_FOCUS_WATCH_MS || 30_000));
+const PRICE_LIMIT_START_DELAY_MS = Math.max(5_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_START_DELAY_MS || 7_000));
+const PRICE_LIMIT_REFRESH_MS = Math.max(10_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_REFRESH_MS || 15_000));
+const PRICE_LIMIT_STALE_MS = Math.max(30_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_STALE_MS || 60_000));
 const HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_HISTORY_STALE_MS || 12 * 60 * 60_000));
 const RISK_STALE_MS = Math.max(12 * 60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_RISK_STALE_MS || 24 * 60 * 60_000));
 const INSURANCE_STALE_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_INSURANCE_STALE_MS || 2 * 60 * 60_000));
@@ -28,7 +31,11 @@ let retryTimer = null;
 let fullInterval = null;
 let insuranceInterval = null;
 let focusWatchInterval = null;
+let priceLimitStartupTimer = null;
+let priceLimitInterval = null;
+let priceLimitRunning = null;
 let lastFocusSignature = '';
+let lastPriceLimitFocusSignature = '';
 let totalReads = 0;
 let totalBuilds = 0;
 let totalBuildFailures = 0;
@@ -39,9 +46,14 @@ let lastStartedAt = null;
 let lastCompletedAt = null;
 let lastError = '';
 let round = 0;
+let priceLimitRound = 0;
+let priceLimitLastStartedAt = null;
+let priceLimitLastCompletedAt = null;
+let priceLimitLastError = '';
 
 const historyBySymbol = new Map();
 const riskBySymbol = new Map();
+const priceLimitBySymbol = new Map();
 let insuranceState = {
   official_response: false,
   updated_at: null,
@@ -252,6 +264,38 @@ function parseInsurance(payload) {
   };
 }
 
+function parseOrderPriceLimit(payload, symbol) {
+  const result = payload?.result;
+  const list = Array.isArray(result?.list) ? result.list : [];
+  const direct = result && typeof result === 'object' && !Array.isArray(result)
+    ? result
+    : null;
+  const item = compact(direct?.symbol) === symbol
+    ? direct
+    : list.find((row) => compact(row?.symbol) === symbol) || null;
+  const highestBidPrice = finite(item?.buyLmt);
+  const lowestAskPrice = finite(item?.sellLmt);
+  const sourceTimeMs = Number(payload?.time || payload?.timeNow || 0);
+  const resultTimeMs = Number(item?.ts || 0);
+  const timestampMs = Number.isFinite(resultTimeMs) && resultTimeMs > 0
+    ? resultTimeMs
+    : Number.isFinite(sourceTimeMs) && sourceTimeMs > 0
+      ? sourceTimeMs
+      : null;
+  return {
+    symbol,
+    official_response: true,
+    official_empty: highestBidPrice == null || lowestAskPrice == null,
+    highest_bid_price: highestBidPrice,
+    lowest_ask_price: lowestAskPrice,
+    timestamp_ms: timestampMs,
+    source_time: isoMs(timestampMs),
+    updated_at: new Date().toISOString(),
+    source: 'bybit_official_public_order_price_limit',
+    endpoint: '/v5/market/price-limit',
+  };
+}
+
 function historyStateFresh(symbol) {
   const state = historyBySymbol.get(symbol);
   if (!state) return false;
@@ -266,6 +310,10 @@ function riskStateFresh(symbol) {
 }
 function insuranceFresh() {
   return insuranceState.official_response === true && isFresh(insuranceState.updated_at, INSURANCE_STALE_MS);
+}
+function priceLimitStateFresh(symbol) {
+  const item = priceLimitBySymbol.get(symbol);
+  return item?.official_response === true && isFresh(item.updated_at, PRICE_LIMIT_STALE_MS);
 }
 function insuranceForSymbol(symbol) {
   if (!insuranceFresh()) {
@@ -389,6 +437,67 @@ async function refreshInsurance(reason = 'scheduled') {
   }
 }
 
+async function refreshOrderPriceLimits(reason = 'scheduled', { missingOnly = false } = {}) {
+  if (priceLimitRunning) return await priceLimitRunning;
+  const task = (async () => {
+    priceLimitLastStartedAt = new Date().toISOString();
+    const focus = focusTargets();
+    if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) {
+      priceLimitLastError = `${reason}:bybit_focus_not_ready:${focus.rows.length}/${FOCUS_TARGET}`;
+      return false;
+    }
+
+    let failures = 0;
+    for (const target of focus.rows) {
+      const symbol = target.symbol;
+      const previous = priceLimitBySymbol.get(symbol);
+      if (missingOnly && priceLimitStateFresh(symbol)) continue;
+      try {
+        const payload = await fetchJson(
+          `/v5/market/price-limit?category=linear&symbol=${encodeURIComponent(symbol)}`,
+          'order_price_limit',
+        );
+        priceLimitBySymbol.set(symbol, parseOrderPriceLimit(payload, symbol));
+      } catch (error) {
+        failures += 1;
+        if (!previous?.official_response) {
+          priceLimitBySymbol.set(symbol, {
+            symbol,
+            official_response: false,
+            official_empty: false,
+            highest_bid_price: null,
+            lowest_ask_price: null,
+            timestamp_ms: null,
+            source_time: null,
+            updated_at: null,
+            error: String(error?.message || error).slice(0, 240),
+          });
+        }
+      }
+      await sleep(PER_REQUEST_GAP_MS);
+    }
+
+    lastPriceLimitFocusSignature = focusSignature(focus.rows);
+    priceLimitRound += 1;
+    priceLimitLastCompletedAt = new Date().toISOString();
+    responseCache.clear();
+    const coverage = focus.rows.filter((row) => priceLimitStateFresh(row.symbol)).length;
+    if (coverage !== FOCUS_TARGET) {
+      priceLimitLastError = `${reason}:bybit_order_price_limit_coverage:${coverage}/${FOCUS_TARGET}:failures=${failures}`;
+      return false;
+    }
+    priceLimitLastError = '';
+    return true;
+  })();
+
+  priceLimitRunning = task;
+  try {
+    return await task;
+  } finally {
+    if (priceLimitRunning === task) priceLimitRunning = null;
+  }
+}
+
 function scheduleRetry() {
   if (!started || retryTimer) return;
   retryTimer = setTimeout(async () => {
@@ -411,6 +520,11 @@ export function startBybitAdvancedStatsScanner() {
   }, START_DELAY_MS);
   startupTimer.unref?.();
 
+  priceLimitStartupTimer = setTimeout(async () => {
+    await refreshOrderPriceLimits('startup', { missingOnly: false }).catch(() => false);
+  }, PRICE_LIMIT_START_DELAY_MS);
+  priceLimitStartupTimer.unref?.();
+
   fullInterval = setInterval(async () => {
     await refreshHistoryAndRisk('interval', { missingOnly: false }).catch(() => false);
   }, FULL_REFRESH_MS);
@@ -419,6 +533,11 @@ export function startBybitAdvancedStatsScanner() {
   insuranceInterval = setInterval(() => refreshInsurance('interval').catch(() => false), INSURANCE_REFRESH_MS);
   insuranceInterval.unref?.();
 
+  priceLimitInterval = setInterval(() => {
+    refreshOrderPriceLimits('interval', { missingOnly: false }).catch(() => false);
+  }, PRICE_LIMIT_REFRESH_MS);
+  priceLimitInterval.unref?.();
+
   focusWatchInterval = setInterval(async () => {
     const focus = focusTargets();
     if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) return;
@@ -426,6 +545,9 @@ export function startBybitAdvancedStatsScanner() {
     if (signature !== lastFocusSignature) {
       await refreshHistoryAndRisk('focus_change_missing_only', { missingOnly: true }).catch(() => false);
       if (!getBybitAdvancedStatsHealth().ready) scheduleRetry();
+    }
+    if (signature !== lastPriceLimitFocusSignature) {
+      await refreshOrderPriceLimits('focus_change_missing_only', { missingOnly: true }).catch(() => false);
     }
   }, FOCUS_WATCH_MS);
   focusWatchInterval.unref?.();
@@ -443,6 +565,7 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
   const rows = focus.rows.map((target) => {
     const histories = historyBySymbol.get(target.symbol) || {};
     const risk = riskBySymbol.get(target.symbol) || null;
+    const orderPriceLimit = priceLimitBySymbol.get(target.symbol) || null;
     const insurance = insuranceForSymbol(target.symbol);
     const oi = currentOi.map.get(target.symbol) || null;
     return {
@@ -462,6 +585,10 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
         histories[interval]?.official_response === true ? clone(histories[interval]) : null,
       ])),
       risk_limit: risk?.official_response === true ? clone(risk) : null,
+      order_price_limit: orderPriceLimit?.official_response === true &&
+              isFresh(orderPriceLimit.updated_at, PRICE_LIMIT_STALE_MS)
+          ? clone(orderPriceLimit)
+          : null,
       insurance_official_checked: insurance.official_checked,
       insurance_mapped: insurance.mapped,
       insurance_pool: insurance.pool,
@@ -481,6 +608,11 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
   ).length;
   const riskCoverage = rows.filter((row) => row.risk_limit != null).length;
   const riskNonempty = rows.filter((row) => Number(row.risk_limit?.tier_count || 0) > 0).length;
+  const priceLimitCoverage = rows.filter((row) => row.order_price_limit != null).length;
+  const priceLimitNonempty = rows.filter((row) =>
+    finite(row.order_price_limit?.highest_bid_price) != null &&
+    finite(row.order_price_limit?.lowest_ask_price) != null
+  ).length;
   const insuranceCoverage = rows.filter((row) => row.insurance_official_checked).length;
   const insuranceMapped = rows.filter((row) => row.insurance_mapped).length;
   const currentOiCoverage = rows.filter((row) => row.current_open_interest != null || row.current_open_interest_value != null).length;
@@ -489,7 +621,12 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     rows.length === FOCUS_TARGET &&
     historyCompleteSymbols === FOCUS_TARGET &&
     riskCoverage === FOCUS_TARGET;
+  const priceLimitReady = focus.focus_ready &&
+    rows.length === FOCUS_TARGET &&
+    priceLimitCoverage === FOCUS_TARGET &&
+    priceLimitNonempty === FOCUS_TARGET;
   const ready = historyRiskReady &&
+    priceLimitReady &&
     insuranceFresh() &&
     insuranceCoverage === FOCUS_TARGET &&
     currentOi.ready &&
@@ -515,6 +652,12 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     history_complete_symbols: historyCompleteSymbols,
     risk_official_coverage_rows: riskCoverage,
     risk_nonempty_rows: riskNonempty,
+    order_price_limit_ready: priceLimitReady,
+    order_price_limit_official_coverage_rows: priceLimitCoverage,
+    order_price_limit_nonempty_rows: priceLimitNonempty,
+    order_price_limit_refresh_seconds: Math.round(PRICE_LIMIT_REFRESH_MS / 1000),
+    order_price_limit_stale_seconds: Math.round(PRICE_LIMIT_STALE_MS / 1000),
+    order_price_limit_cycle_request_cap: FOCUS_TARGET,
     insurance_official_coverage_rows: insuranceCoverage,
     insurance_mapped_rows: insuranceMapped,
     insurance_pool_count: insuranceFresh() ? insuranceState.pools.length : 0,
@@ -525,7 +668,7 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     full_cycle_history_request_cap: FOCUS_TARGET * HISTORY_INTERVALS.length,
     full_cycle_risk_request_cap: FOCUS_TARGET,
     full_cycle_insurance_request_cap: 1,
-    full_cycle_total_request_cap: FOCUS_TARGET * HISTORY_INTERVALS.length + FOCUS_TARGET + 1,
+    full_cycle_total_request_cap: FOCUS_TARGET * HISTORY_INTERVALS.length + FOCUS_TARGET + FOCUS_TARGET + 1,
     focus_change_missing_only: true,
     official_empty_history_counts_as_official_coverage_without_fabricating_rows: true,
     official_empty_risk_counts_as_official_coverage_without_fabricating_tiers: true,
@@ -539,6 +682,10 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     last_completed_at: lastCompletedAt,
     last_error: lastError,
     round,
+    order_price_limit_round: priceLimitRound,
+    order_price_limit_last_started_at: priceLimitLastStartedAt,
+    order_price_limit_last_completed_at: priceLimitLastCompletedAt,
+    order_price_limit_last_error: priceLimitLastError,
     lanes: Object.fromEntries([...laneStats.entries()].map(([key, value]) => [key, { ...value }])),
     rows: includeRows ? rows : undefined,
   };
@@ -552,7 +699,7 @@ export function getBybitAdvancedStatsHealth() {
   return {
     ...snapshot,
     enabled: started || process.env.KAKA_DISABLE_BYBIT_ADVANCED_STATS !== '1',
-    mode: 'shared_bybit_focus15_oi_history_risk_limit_plus_usdt_insurance_pool',
+    mode: 'shared_bybit_focus15_oi_history_risk_limit_order_price_limit_plus_usdt_insurance_pool',
     snapshot_endpoint: SNAPSHOT_ROUTE,
     health_endpoint: HEALTH_ROUTE,
     total_reads: totalReads,
@@ -562,9 +709,14 @@ export function getBybitAdvancedStatsHealth() {
     total_exchange_successes: totalExchangeSuccesses,
     total_exchange_failures: totalExchangeFailures,
     running: Boolean(running),
+    order_price_limit_running: Boolean(priceLimitRunning),
     startup_recovery_missing_only: true,
     history_direct_official_intervals_no_derived_relabel: true,
     risk_limit_per_focus_symbol: true,
+    order_price_limit_per_focus_symbol: true,
+    order_price_limit_official_field_mapping: 'buyLmt=highest_bid_price;sellLmt=lowest_ask_price',
+    order_price_limit_user_reads_trigger_exchange_requests: false,
+    order_price_limit_reads_scale_with_users: false,
     insurance_one_shared_usdt_request: true,
   };
 }
@@ -602,7 +754,15 @@ export async function handleBybitAdvancedStats(req, res, url) {
     sendJson(res, 200, getBybitAdvancedStatsHealth());
     return true;
   }
-  sendJson(res, 200, buildSnapshot({ includeRows: true }));
+  const payload = buildSnapshot({ includeRows: true });
+  const filterSymbol = compact(url.searchParams.get('symbol'));
+  if (filterSymbol) {
+    payload.filter_provider = 'bybit';
+    payload.filter_symbol = filterSymbol;
+    payload.rows = (Array.isArray(payload.rows) ? payload.rows : [])
+      .filter((row) => compact(row?.symbol) === filterSymbol);
+  }
+  sendJson(res, 200, payload);
   return true;
 }
 
@@ -610,4 +770,5 @@ export const __bybitAdvancedTest = Object.freeze({
   parseHistory,
   parseRisk,
   parseInsurance,
+  parseOrderPriceLimit,
 });

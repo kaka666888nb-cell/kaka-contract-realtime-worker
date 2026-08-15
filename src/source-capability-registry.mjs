@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.41';
+const VERSION = '650.8.15.42';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -78,6 +78,7 @@ const CAPABILITIES = Object.freeze([
   { provider: 'bybit', market: 'contract', capability: 'open_interest_history', official_available: true, official_scope: 'per_symbol_focus15', transport: 'public_REST', batch_mode: 'focus15_direct_5min_1h_1d_shared_6h_missing_only_rotation_recovery', rate_limit_class: 'medium_shared', collector: 'bybit-advanced-slow-stats', target_layer: 'history', current_integration: 'ready_step995', fallback_policy: 'last_verified_until_stale_then_missing; official empty stays empty', history_policy: 'direct_official_5min_1h_1d_no_derived_relabel', source_url: 'https://bybit-exchange.github.io/docs/v5/market/open-interest' },
   { provider: 'bybit', market: 'contract', capability: 'global_long_short_ratio', official_available: true, official_scope: 'USDT_linear_per_symbol_5m', transport: 'REST', batch_mode: 'account_ratio_5m_shared_rotation', rate_limit_class: 'shared_bounded', collector: 'contract-flow-metric-history', target_layer: 'current_and_history', current_integration: 'ready_existing_contract_flow', fallback_policy: 'USDC/USD account ratio stays unavailable; no USDT substitution', history_policy: '5m_metric_rows', source_url: 'https://api.bybit.com/v5/market/account-ratio' },
   { provider: 'bybit', market: 'contract', capability: 'risk_limit_insurance_pool', official_available: true, official_scope: 'risk_per_focus15_plus_one_shared_USDT_insurance_request', transport: 'public_REST', batch_mode: 'risk_focus15_6h_plus_insurance_USDT_30m', rate_limit_class: 'slow_shared', collector: 'bybit-advanced-slow-stats', target_layer: 'risk_reference', current_integration: 'ready_step995', fallback_policy: 'last_verified_until_stale_then_missing; insurance unmapped stays null', history_policy: 'reference_snapshot', source_url: 'https://bybit-exchange.github.io/docs/v5/market/risk-limit' },
+  { provider: 'bybit', market: 'contract', capability: 'order_price_limit_current_focus', official_available: true, official_scope: 'focus15_USDT_linear_current_highest_bid_and_lowest_ask_order_prices', transport: 'official_public_REST_shared_background', batch_mode: 'fixed_15_symbols_per_15s_cycle', rate_limit_class: 'shared_bounded_governed', collector: 'bybit-advanced-slow-stats', target_layer: 'product_facts_and_depth_reference', current_integration: 'ready_step1023', fallback_policy: 'last_verified_until_60s_stale_then_missing; no local formula or cross-symbol/provider substitution', history_policy: 'current_only', source_url: 'https://bybit-exchange.github.io/docs/v5/market/order-price-limit' },
   { provider: 'bybit', market: 'contract', capability: 'depth20_current_focus', official_available: true, official_scope: 'focus15_current', transport: 'public_orderbook_shared_backend', batch_mode: 'bounded_focus15_depth20', rate_limit_class: 'shared_bounded', collector: 'deep-market-collector', target_layer: 'depth', current_integration: 'ready_step1004_1_5', fallback_policy: 'last verified until stale then null; no cross-provider substitution', history_policy: 'current_only', source_url: 'https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook' },
   { provider: 'bybit', market: 'contract', capability: 'rpi_orderbook_current_focus', official_available: true, official_scope: 'focus15_USDT_perpetual_current_20_of_official_50_levels', transport: 'official_rpi_orderbook_REST_shared_background', batch_mode: 'bounded_4_symbols_per_15s_rotation', rate_limit_class: 'shared_bounded_governed', collector: 'contract-rpi-shared-deep-market', target_layer: 'official_rpi_overlay', current_integration: 'ready_step1021', fallback_policy: 'last verified until stale then missing; use official non-RPI and RPI quantities separately; never infer from standard book', history_policy: 'current_only', source_url: 'https://bybit-exchange.github.io/docs/v5/market/rpi-orderbook' },
   { provider: 'bybit', market: 'contract', capability: 'liquidation_current', official_available: true, official_scope: 'public_event_stream_current', transport: 'public_WS_or_public_event_endpoint', batch_mode: 'shared_backend_event_collection', rate_limit_class: 'shared_bounded', collector: 'liquidation-collector', target_layer: 'liquidation_current', current_integration: 'ready_step997', fallback_policy: 'verified zero distinct from missing; no cross-provider substitution', history_policy: 'shared_event_buckets_and_history', source_url: 'https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook' },
@@ -194,7 +195,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
     business_rule_missing_capability_refs: businessValidation.missing_capability_refs,
     business_rule_duplicate_keys: businessValidation.duplicate_rule_keys,
     business_rules: includeCapabilities ? BUSINESS_SOURCE_RULES : [],
-    collector_targets: ['market-light-collector', 'liquidation-collector', 'deep-market-collector', 'contract-rpi-shared-deep-market', 'slow-stats-collector', 'binance-advanced-slow-stats', 'okx-advanced-slow-stats', 'derivatives-public-slow-stats'],
+    collector_targets: ['market-light-collector', 'liquidation-collector', 'deep-market-collector', 'contract-rpi-shared-deep-market', 'slow-stats-collector', 'binance-advanced-slow-stats', 'okx-advanced-slow-stats', 'bybit-advanced-slow-stats', 'derivatives-public-slow-stats'],
     runtime_market_light_version: health?.version || null,
     runtime_market_light_11_exact: allMarketExact,
     runtime_market_light_coverage: coverage,
@@ -314,6 +315,23 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       provider_request_governor_reused: bybitAdvanced.provider_request_governor_reused === true,
       custom_provider_governor_created: bybitAdvanced.custom_provider_governor_created === true,
       user_reads_scale_with_users: false,
+    },
+    bybit_step1023: {
+      ready: bybitAdvanced.order_price_limit_ready === true &&
+        Number(bybitAdvanced.order_price_limit_official_coverage_rows || 0) === 15 &&
+        Number(bybitAdvanced.order_price_limit_nonempty_rows || 0) === 15 &&
+        bybitAdvanced.order_price_limit_user_reads_trigger_exchange_requests === false &&
+        bybitAdvanced.order_price_limit_reads_scale_with_users === false,
+      version: bybitAdvanced.version || null,
+      focus_target: Number(bybitAdvanced.focus_target || 0),
+      official_coverage_rows: Number(bybitAdvanced.order_price_limit_official_coverage_rows || 0),
+      nonempty_rows: Number(bybitAdvanced.order_price_limit_nonempty_rows || 0),
+      refresh_seconds: Number(bybitAdvanced.order_price_limit_refresh_seconds || 0),
+      stale_seconds: Number(bybitAdvanced.order_price_limit_stale_seconds || 0),
+      cycle_request_cap: Number(bybitAdvanced.order_price_limit_cycle_request_cap || 0),
+      official_field_mapping: bybitAdvanced.order_price_limit_official_field_mapping || null,
+      user_reads_trigger_exchange_requests: bybitAdvanced.order_price_limit_user_reads_trigger_exchange_requests === true,
+      reads_scale_with_users: bybitAdvanced.order_price_limit_reads_scale_with_users === true,
     },
     coinbase_step995: {
       ready: health.coinbase_ticker_batch?.connected === true &&
@@ -1007,6 +1025,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.okx_step994.ready &&
       payload.okx_step1002.ready &&
       payload.bybit_step995.ready &&
+      payload.bybit_step1023.ready &&
       payload.coinbase_step995.ready &&
       payload.bitget_step991.ready &&
       payload.bitget_step1000.ready &&
