@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.146",
+  "version": "650.8.15.147",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Step1026 all-asset official market ticker/orderbook/trades/rules/status/trading-hours shared layer + all-asset Kline"
+  "description": "KakaWeb3 Step1026.1 Coinbase EQUITY canonical product fix + Step1026 all-asset shared market layer + all-asset Kline"
 }
