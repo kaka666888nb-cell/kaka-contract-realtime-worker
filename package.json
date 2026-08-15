@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.136",
+  "version": "650.8.15.137",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 contract realtime worker Step1004.14 Bitget risk-reserve unsupported-focus honest-null recovery before final pressure gate"
+  "description": "KakaWeb3 contract realtime worker Step1019 official nine-field product-facts pass-through with zero additional exchange requests"
 }
