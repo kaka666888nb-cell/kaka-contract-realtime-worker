@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.134';
+const VERSION = '650.8.15.135';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -54,6 +54,7 @@ function sharedResponsePolicy(pathname) {
   if (path === '/api/contract-liquidation/heatmap') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
   if (path === '/api/contract-focus-pool/current-snapshot') return { freshMs: 5_000, staleMs: 20_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/contract-deep-shared/current-snapshot') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
+  if (path === '/api/contract-rpi-shared/current-snapshot') return { freshMs: 2_000, staleMs: 12_000, cdnSMaxAgeSec: 2 };
   if (path === '/api/derivatives-public/current-snapshot') return { freshMs: 15_000, staleMs: 60_000, cdnSMaxAgeSec: 15 };
   if (path === '/api/history-lifecycle/current-snapshot') return { freshMs: 30_000, staleMs: 120_000, cdnSMaxAgeSec: 30 };
   return null;
@@ -411,6 +412,7 @@ export function collectorRoleForPath(pathname) {
     path.startsWith('/api/contract-focus-pool') ||
     path.startsWith('/api/contract-flow') ||
     path.startsWith('/api/contract-deep-shared') ||
+    path.startsWith('/api/contract-rpi-shared') ||
     path === '/api/contract-meta' ||
     path === '/api/gate-usd-flow-self-test' ||
     path === '/api/gate-contract-stats-live-test'
@@ -599,6 +601,7 @@ export function getCollectorIsolationHealth() {
     deep_market_owns_focus_pool: true,
     deep_market_owns_contract_flow: true,
     deep_market_owns_deep_shared: true,
+    deep_market_owns_rpi_shared: true,
     slow_stats_owns_advanced_modules: true,
     parent_routes_second_batch_to_workers: true,
 
@@ -637,7 +640,7 @@ export function getCollectorIsolationHealth() {
       raw_served_responses: sharedResponseStats.raw_served_responses,
       raw_bytes_fetched: sharedResponseStats.raw_bytes_fetched,
       gzip_bytes_built: sharedResponseStats.gzip_bytes_built,
-      cacheable_routes: 8,
+      cacheable_routes: 9,
     },
     timestamp_ms: Date.now(),
   };

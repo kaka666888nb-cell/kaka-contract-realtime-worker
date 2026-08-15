@@ -8,7 +8,7 @@ const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT
 process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
 process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
 if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
-const VERSION = '650.8.15.130';
+const VERSION = '650.8.15.131';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -94,16 +94,19 @@ if (ROLE === 'market-light') {
   const focusModule = await import('./contract-focus-pool.mjs');
   const flowModule = await import('./contract-flow.mjs');
   const deepModule = await import('./contract-deep-shared.mjs');
+  const rpiModule = await import('./contract-rpi-shared.mjs');
 
   marketBridge.startMarketLightBridge();
   focusModule.startContractFocusPoolScanner();
   flowModule.startContractFlowUniverseScanner();
   deepModule.startContractDeepSharedScanner();
+  rpiModule.startContractRpiSharedScanner();
 
   roleVersion = deepModule.getContractDeepSharedHealth().version || null;
   handleRoleRoute = async (req, res, url) => {
     if (await focusModule.handleContractFocusPool(req, res, url)) return true;
     if (await deepModule.handleContractDeepShared(req, res, url)) return true;
+    if (await rpiModule.handleContractRpiShared(req, res, url)) return true;
     if (await flowModule.handleContractFlow(req, res, url)) return true;
     return false;
   };
@@ -145,6 +148,7 @@ if (ROLE === 'market-light') {
       focus_snapshot: focusSnapshot,
       flow_health: flowModule.getContractFlowHealth(),
       deep_health: deepModule.getContractDeepSharedHealth(),
+      rpi_health: rpiModule.getContractRpiSharedHealth(),
       timestamp_ms: Date.now(),
     };
   };

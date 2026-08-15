@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.138';
+const STEP_VERSION = '650.8.15.139';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -353,6 +353,11 @@ const server = http.createServer(async (req, res) => {
       contract_deep_shared_current_snapshot: '/api/contract-deep-shared/current-snapshot',
       contract_deep_shared_health: '/api/contract-deep-shared/health',
       contract_deep_shared_state: getContractDeepSharedHealth(),
+      contract_rpi_shared_current_snapshot: '/api/contract-rpi-shared/current-snapshot',
+      contract_rpi_shared_health: '/api/contract-rpi-shared/health',
+      contract_rpi_shared_providers: ['okx', 'bybit', 'bitget'],
+      contract_rpi_shared_standard_depth_kept_separate: true,
+      contract_rpi_shared_user_reads_scale_exchange_upstream: false,
       spot_exact_ticker: '/api/spot-market/exact-ticker',
       spot_exact_ticker_health: '/api/spot-market/exact-ticker-health',
       spot_exact_ticker_state: getSpotExactTickerHealth(),
@@ -975,5 +980,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + three-platform official RPI overlay + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
