@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.139",
+  "version": "650.8.15.140",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 contract realtime worker Step1021 shared official OKX Bybit Bitget RPI overlay"
+  "description": "KakaWeb3 contract realtime worker Step1022 Coinbase official product-book metrics with Level2 fallback"
 }

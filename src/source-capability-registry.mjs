@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.40';
+const VERSION = '650.8.15.41';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -126,6 +126,7 @@ const CAPABILITIES = Object.freeze([
   // Coinbase is project spot-only.
   { provider: 'coinbase', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'multi_product_public_ws', transport: 'WS', batch_mode: 'ticker_batch_5s', rate_limit_class: 'one_shared_connection', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
   { provider: 'coinbase', market: 'spot', capability: 'bbo', official_available: true, official_scope: 'ticker_or_level2_not_ticker_batch', transport: 'WS', batch_mode: 'no_light_batch_bbo', rate_limit_class: 'higher_bandwidth', collector: 'deep-market-collector', target_layer: 'focus_or_user_exact', current_integration: 'intentionally_not_market_light', fallback_policy: 'missing_in_full_market_light', history_policy: 'none', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
+  { provider: 'coinbase', market: 'spot', capability: 'product_book_mid_spread_metrics', official_available: true, official_scope: 'active_exact_product_mid_market_spread_bps_spread_absolute', transport: 'authenticated_Advanced_Trade_product_book_REST_plus_existing_public_Level2_WS_fallback', batch_mode: 'background_active_symbols_only_bounded_by_12_existing_Level2_slots', rate_limit_class: 'shared_governed_10s_refresh', collector: 'contract-depth-parent', target_layer: 'spot_orderbook_metrics', current_integration: 'ready_step1022_optional_Render_ECDSA_credentials_enable_official_primary', fallback_policy: 'official fields take precedence; existing same-product official Level2 WS BBO derivation only when official fields unavailable; no cross-product or cross-provider substitution', history_policy: 'current_only', source_url: 'https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product-book' },
   { provider: 'coinbase', market: 'spot', capability: 'market_trades_level2_candles', official_available: true, official_scope: 'per_product_public_exact', transport: 'public_WS_plus_public_REST', batch_mode: 'ticker_batch_full_market_plus_level2_exact_on_demand_plus_market_trades_exact', rate_limit_class: 'bounded_exact', collector: 'existing_market_light_plus_contract_depth_exact', target_layer: 'market_light_plus_user_exact', current_integration: 'ready_step995_existing_paths_formalized', fallback_policy: 'cache_inflight_circuit; no cross-product substitution', history_policy: 'existing_trade_pagination_and_candles_on_demand', source_url: 'https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels' },
 ]);
 
@@ -339,6 +340,38 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       market_trades_side_field_is_maker: contractDepth.coinbase_market_trades_side_field_is_maker === true,
       market_trades_output_side_is_taker: contractDepth.coinbase_market_trades_output_side_is_taker === true,
       user_reads_scale_full_market_upstream: false,
+    },
+    coinbase_step1022: {
+      ready: contractDepth.coinbase_product_book_credentials_configured === true &&
+        Number(contractDepth.coinbase_product_book_stats?.successes || 0) > 0 &&
+        contractDepth.coinbase_product_book_self_test?.ok === true,
+      integration_ready: contractDepth.coinbase_product_book_auth_required === true &&
+        contractDepth.coinbase_product_book_official_fields_take_precedence === true &&
+        contractDepth.coinbase_product_book_ws_bbo_fallback_only_when_official_missing === true &&
+        contractDepth.coinbase_product_book_user_read_starts_rest_request === false &&
+        contractDepth.coinbase_product_book_user_count_scales_rest_requests === false &&
+        contractDepth.coinbase_product_book_bounded_by_level2_symbol_slots === true &&
+        contractDepth.coinbase_product_book_self_test?.ok === true,
+      official_credentials_configured:
+        contractDepth.coinbase_product_book_credentials_configured === true,
+      official_primary_successes:
+        Number(contractDepth.coinbase_product_book_stats?.successes || 0),
+      official_primary_failures:
+        Number(contractDepth.coinbase_product_book_stats?.failures || 0),
+      official_primary_last_error:
+        String(contractDepth.coinbase_product_book_stats?.last_error || ''),
+      official_fields: Array.isArray(contractDepth.coinbase_product_book_official_fields)
+        ? [...contractDepth.coinbase_product_book_official_fields]
+        : [],
+      active_symbol_slot_cap: Number(contractDepth.coinbase_level2_max_symbols || 0),
+      user_read_starts_rest_request:
+        contractDepth.coinbase_product_book_user_read_starts_rest_request === true,
+      user_count_scales_rest_requests:
+        contractDepth.coinbase_product_book_user_count_scales_rest_requests === true,
+      fallback_source: 'same_product_official_Level2_WS_BBO_only',
+      blocked_reason: contractDepth.coinbase_product_book_credentials_configured === true
+        ? ''
+        : 'render_coinbase_cdp_ecdsa_credentials_not_configured',
     },
     v46_closure: {
       ready: binanceAdvanced.focus_target === 15 &&

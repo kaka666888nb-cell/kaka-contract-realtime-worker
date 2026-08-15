@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.139';
+const STEP_VERSION = '650.8.15.140';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -739,6 +739,13 @@ const server = http.createServer(async (req, res) => {
         coinbase_step995_ticker_batch_existing_shared: true,
         coinbase_step995_level2_existing_bounded_exact: true,
         coinbase_step995_market_trades_existing_public_exact: true,
+        coinbase_step1022_product_book_official_fields: ['mid_market', 'spread_bps', 'spread_absolute'],
+        coinbase_step1022_product_book_auth_required: true,
+        coinbase_step1022_render_environment_secret_only: true,
+        coinbase_step1022_official_fields_primary: true,
+        coinbase_step1022_same_product_level2_ws_bbo_fallback_only: true,
+        coinbase_step1022_user_read_direct_rest_requests: 0,
+        coinbase_step1022_active_symbol_slot_cap: 12,
         gate_liquidation_history_deferred_to_step997: false,
         gate_liquidation_history_step997_ready: true,
         binance_contract_full_market_bbo_shared_ws: true,
@@ -980,5 +987,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + three-platform official RPI overlay + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + persistent Binance contract market + contract flow + contract depth + Coinbase official product-book metrics with bounded Level2 fallback + shared five-platform liquidation + shared five-platform derived basis + focus-pool deep shared depth/flow + three-platform official RPI overlay + five-platform funding + shared current funding/mark/index persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

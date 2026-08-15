@@ -1,5 +1,7 @@
+import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
+
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.92';
+const STEP_VERSION = '650.8.15.93';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -56,6 +58,38 @@ const COINBASE_L2_IDLE_MS = 75_000;
 const COINBASE_L2_STALE_MS = 15_000;
 const COINBASE_L2_START_TIMEOUT_MS = 8_000;
 const COINBASE_L2_MAX_SYMBOLS = 12;
+const COINBASE_PRODUCT_BOOK_HOST = 'api.coinbase.com';
+const COINBASE_PRODUCT_BOOK_PATH = '/api/v3/brokerage/market/product_book';
+const COINBASE_PRODUCT_BOOK_REFRESH_MS = Math.max(
+  8_000,
+  Number(process.env.KAKA_COINBASE_PRODUCT_BOOK_REFRESH_MS || 10_000),
+);
+const COINBASE_PRODUCT_BOOK_FRESH_MS = Math.max(
+  COINBASE_PRODUCT_BOOK_REFRESH_MS,
+  Number(process.env.KAKA_COINBASE_PRODUCT_BOOK_FRESH_MS || 20_000),
+);
+const COINBASE_PRODUCT_BOOK_STALE_MS = Math.max(
+  COINBASE_PRODUCT_BOOK_FRESH_MS,
+  Number(process.env.KAKA_COINBASE_PRODUCT_BOOK_STALE_MS || 90_000),
+);
+const COINBASE_PRODUCT_BOOK_RETRY_MS = Math.max(
+  30_000,
+  Number(process.env.KAKA_COINBASE_PRODUCT_BOOK_RETRY_MS || 60_000),
+);
+const COINBASE_CDP_KEY_NAME = String(
+  process.env.KAKA_COINBASE_CDP_KEY_NAME ||
+  process.env.COINBASE_CDP_API_KEY_NAME ||
+  '',
+).trim();
+const COINBASE_CDP_KEY_SECRET = String(
+  process.env.KAKA_COINBASE_CDP_KEY_SECRET ||
+  process.env.COINBASE_CDP_API_KEY_SECRET ||
+  '',
+).replace(/\\n/g, '\n').trim();
+const COINBASE_PRODUCT_BOOK_CREDENTIALS_CONFIGURED = Boolean(
+  COINBASE_CDP_KEY_NAME && COINBASE_CDP_KEY_SECRET,
+);
+let coinbaseCdpPrivateKey = null;
 const COINBASE_L2_STATS = {
   connections_started: 0,
   snapshots_received: 0,
@@ -65,6 +99,18 @@ const COINBASE_L2_STATS = {
   heartbeats_subscribed: 0,
   idle_closes: 0,
   capacity_rejections: 0,
+};
+const COINBASE_PRODUCT_BOOK_STATS = {
+  background_ticks: 0,
+  eligible_active_symbols: 0,
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  fresh_cache_skips: 0,
+  retry_cooldown_skips: 0,
+  missing_credentials_skips: 0,
+  last_success_at: null,
+  last_error: '',
 };
 
 function coinbaseLevel2Route(native) {
@@ -76,6 +122,128 @@ function coinbaseLevel2Route(native) {
     aliasNative,
     acceptedProductIds: new Set([requestedNative, aliasNative].filter(Boolean)),
     aliasMode: aliasNative ? 'coinbase_usd_usdc_unified' : '',
+  };
+}
+
+function base64Url(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function coinbaseProductBookJwt() {
+  if (!COINBASE_PRODUCT_BOOK_CREDENTIALS_CONFIGURED) {
+    throw new Error('coinbase_product_book_credentials_not_configured');
+  }
+  if (!coinbaseCdpPrivateKey) {
+    coinbaseCdpPrivateKey = createPrivateKey(COINBASE_CDP_KEY_SECRET);
+  }
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const header = {
+    alg: 'ES256',
+    typ: 'JWT',
+    kid: COINBASE_CDP_KEY_NAME,
+    nonce: randomBytes(16).toString('hex'),
+  };
+  const payload = {
+    iss: 'cdp',
+    nbf: nowSeconds,
+    exp: nowSeconds + 120,
+    sub: COINBASE_CDP_KEY_NAME,
+    uri: `GET ${COINBASE_PRODUCT_BOOK_HOST}${COINBASE_PRODUCT_BOOK_PATH}`,
+  };
+  const signingInput = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
+  const signature = cryptoSign(
+    'sha256',
+    Buffer.from(signingInput),
+    { key: coinbaseCdpPrivateKey, dsaEncoding: 'ieee-p1363' },
+  );
+  return `${signingInput}.${base64Url(signature)}`;
+}
+
+function coinbaseBookMetricsFromBbo(bids, asks) {
+  const bestBid = positiveNumber(Array.isArray(bids) ? bids[0]?.price : null);
+  const bestAsk = positiveNumber(Array.isArray(asks) ? asks[0]?.price : null);
+  if (bestBid == null || bestAsk == null || bestAsk < bestBid) {
+    return {
+      mid_market: null,
+      spread_bps: null,
+      spread_absolute: null,
+    };
+  }
+  const spreadAbsolute = bestAsk - bestBid;
+  const midMarket = (bestBid + bestAsk) / 2;
+  return {
+    mid_market: midMarket,
+    spread_bps: midMarket > 0 ? spreadAbsolute / midMarket * 10_000 : null,
+    spread_absolute: spreadAbsolute,
+  };
+}
+
+function resolveCoinbaseBookMetrics(state, bids, asks) {
+  const fallback = coinbaseBookMetricsFromBbo(bids, asks);
+  const officialAgeMs = state.officialBookMetricsAt > 0
+    ? Date.now() - state.officialBookMetricsAt
+    : null;
+  const official = officialAgeMs != null && officialAgeMs <= COINBASE_PRODUCT_BOOK_STALE_MS
+    ? state.officialBookMetrics
+    : null;
+  const officialComplete = Boolean(
+    official &&
+    positiveNumber(official.mid_market) != null &&
+    numberValue(official.spread_bps) != null &&
+    numberValue(official.spread_bps) >= 0 &&
+    numberValue(official.spread_absolute) != null &&
+    numberValue(official.spread_absolute) >= 0,
+  );
+  return {
+    mid_market: officialComplete ? official.mid_market : fallback.mid_market,
+    spread_bps: officialComplete ? official.spread_bps : fallback.spread_bps,
+    spread_absolute: officialComplete ? official.spread_absolute : fallback.spread_absolute,
+    book_metrics_source: officialComplete
+      ? 'coinbase_advanced_trade_authenticated_product_book_official_fields'
+      : 'coinbase_official_level2_websocket_bbo_derived_fallback',
+    book_metrics_official: officialComplete,
+    book_metrics_fallback_used: !officialComplete,
+    official_mid_market: officialComplete ? official.mid_market : null,
+    official_spread_bps: officialComplete ? official.spread_bps : null,
+    official_spread_absolute: officialComplete ? official.spread_absolute : null,
+    ws_derived_mid_market: fallback.mid_market,
+    ws_derived_spread_bps: fallback.spread_bps,
+    ws_derived_spread_absolute: fallback.spread_absolute,
+    official_metrics_timestamp_ms: officialComplete ? official.timestamp_ms : null,
+    official_metrics_product_id: officialComplete ? official.product_id : null,
+    official_metrics_age_ms: officialComplete ? officialAgeMs : null,
+  };
+}
+
+function coinbaseBookMetricsSelfTest() {
+  const bids = [{ price: 100, quantity: 1 }];
+  const asks = [{ price: 102, quantity: 1 }];
+  const fallback = coinbaseBookMetricsFromBbo(bids, asks);
+  const state = {
+    officialBookMetrics: {
+      mid_market: 101.25,
+      spread_bps: 19.75,
+      spread_absolute: 0.2,
+      timestamp_ms: Date.now(),
+      product_id: 'BTC-USD',
+    },
+    officialBookMetricsAt: Date.now(),
+  };
+  const official = resolveCoinbaseBookMetrics(state, bids, asks);
+  const close = (left, right) => Math.abs(Number(left) - Number(right)) <= 1e-9;
+  const tests = [
+    ['fallback_mid_market', close(fallback.mid_market, 101)],
+    ['fallback_spread_absolute', close(fallback.spread_absolute, 2)],
+    ['fallback_spread_bps', close(fallback.spread_bps, 2 / 101 * 10_000)],
+    ['official_mid_market_precedence', close(official.mid_market, 101.25)],
+    ['official_spread_bps_precedence', close(official.spread_bps, 19.75)],
+    ['official_spread_absolute_precedence', close(official.spread_absolute, 0.2)],
+    ['official_source', official.book_metrics_official === true],
+  ].map(([name, ok]) => ({ name, ok: ok === true }));
+  return {
+    ok: tests.every((item) => item.ok),
+    checks: tests.length,
+    tests,
   };
 }
 
@@ -697,7 +865,7 @@ function openCircuit(key, error) {
   });
 }
 
-async function fetchJson(url, timeoutMs = 8_000) {
+async function fetchJson(url, timeoutMs = 8_000, extraHeaders = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -706,6 +874,7 @@ async function fetchJson(url, timeoutMs = 8_000) {
       headers: {
         accept: 'application/json',
         'user-agent': 'KakaWeb3-contract-depth/639',
+        ...extraHeaders,
       },
       signal: controller.signal,
     });
@@ -1501,6 +1670,11 @@ function coinbaseL2State(requestedNative) {
     lastProductId: '',
     lastError: '',
     aliasFallbackAttempted: false,
+    officialBookMetrics: null,
+    officialBookMetricsAt: 0,
+    officialBookMetricsInFlight: null,
+    officialBookMetricsNextAttemptAt: 0,
+    officialBookMetricsLastError: '',
   };
   COINBASE_L2_STATES.set(route.requestedNative, state);
   return state;
@@ -1623,6 +1797,83 @@ async function waitForCoinbaseLevel2Book(state, timeoutMs) {
   return state.bids.size > 0 && state.asks.size > 0;
 }
 
+async function refreshCoinbaseOfficialBookMetrics(state) {
+  if (!COINBASE_PRODUCT_BOOK_CREDENTIALS_CONFIGURED) {
+    COINBASE_PRODUCT_BOOK_STATS.missing_credentials_skips += 1;
+    return null;
+  }
+  const now = Date.now();
+  if (state.officialBookMetrics &&
+      now - state.officialBookMetricsAt <= COINBASE_PRODUCT_BOOK_FRESH_MS) {
+    COINBASE_PRODUCT_BOOK_STATS.fresh_cache_skips += 1;
+    return state.officialBookMetrics;
+  }
+  if (state.officialBookMetricsNextAttemptAt > now) {
+    COINBASE_PRODUCT_BOOK_STATS.retry_cooldown_skips += 1;
+    return state.officialBookMetrics;
+  }
+  if (state.officialBookMetricsInFlight) {
+    return state.officialBookMetricsInFlight;
+  }
+  const productId = String(
+    state.lastProductId || state.subscribeNative || state.requestedNative || '',
+  ).trim().toUpperCase();
+  if (!productId || !state.acceptedProductIds.has(productId)) return null;
+
+  COINBASE_PRODUCT_BOOK_STATS.attempts += 1;
+  state.officialBookMetricsInFlight = (async () => {
+    const url = new URL(`https://${COINBASE_PRODUCT_BOOK_HOST}${COINBASE_PRODUCT_BOOK_PATH}`);
+    url.searchParams.set('product_id', productId);
+    url.searchParams.set('limit', '20');
+    const decoded = await fetchJson(
+      url.toString(),
+      6_500,
+      { authorization: `Bearer ${coinbaseProductBookJwt()}` },
+    );
+    const payloadProductId = String(decoded?.pricebook?.product_id || '').trim().toUpperCase();
+    if (!payloadProductId || !state.acceptedProductIds.has(payloadProductId)) {
+      throw new Error('coinbase_product_book_identity_mismatch');
+    }
+    const numericField = (value, { positive = false } = {}) => {
+      if (value == null || String(value).trim() === '') return null;
+      const parsed = numberValue(value);
+      if (parsed == null) return null;
+      return positive ? (parsed > 0 ? parsed : null) : (parsed >= 0 ? parsed : null);
+    };
+    const midMarket = numericField(decoded?.mid_market, { positive: true });
+    const spreadBps = numericField(decoded?.spread_bps);
+    const spreadAbsolute = numericField(decoded?.spread_absolute);
+    if (midMarket == null || spreadBps == null || spreadAbsolute == null) {
+      throw new Error('coinbase_product_book_official_metrics_incomplete');
+    }
+    const timestampMs = Date.parse(String(decoded?.pricebook?.time || '')) || Date.now();
+    state.officialBookMetrics = {
+      product_id: payloadProductId,
+      mid_market: midMarket,
+      spread_bps: spreadBps,
+      spread_absolute: spreadAbsolute,
+      timestamp_ms: timestampMs,
+    };
+    state.officialBookMetricsAt = Date.now();
+    state.officialBookMetricsNextAttemptAt = 0;
+    state.officialBookMetricsLastError = '';
+    COINBASE_PRODUCT_BOOK_STATS.successes += 1;
+    COINBASE_PRODUCT_BOOK_STATS.last_success_at = new Date().toISOString();
+    COINBASE_PRODUCT_BOOK_STATS.last_error = '';
+    return state.officialBookMetrics;
+  })().catch((error) => {
+    const message = String(error?.message || error || 'coinbase_product_book_refresh_failed').slice(0, 220);
+    state.officialBookMetricsLastError = message;
+    state.officialBookMetricsNextAttemptAt = Date.now() + COINBASE_PRODUCT_BOOK_RETRY_MS;
+    COINBASE_PRODUCT_BOOK_STATS.failures += 1;
+    COINBASE_PRODUCT_BOOK_STATS.last_error = message;
+    return state.officialBookMetrics;
+  }).finally(() => {
+    state.officialBookMetricsInFlight = null;
+  });
+  return state.officialBookMetricsInFlight;
+}
+
 async function loadCoinbaseLevel2Book(requestedNative, limit) {
   const state = coinbaseL2State(requestedNative);
   state.lastAccessAt = Date.now();
@@ -1664,9 +1915,11 @@ async function loadCoinbaseLevel2Book(requestedNative, limit) {
     .map(([price, quantity]) => ({ price, quantity, quote_amount: price * quantity }))
     .sort((a, b) => a.price - b.price)
     .slice(0, limit);
+  const bookMetrics = resolveCoinbaseBookMetrics(state, bids, asks);
   return {
     bids,
     asks,
+    ...bookMetrics,
     timestamp_ms: state.timestamp_ms || state.lastMessageAt || Date.now(),
     upstream_host: 'advanced-trade-ws.coinbase.com',
     native_symbol: state.requestedNative,
@@ -1679,8 +1932,14 @@ async function loadCoinbaseLevel2Book(requestedNative, limit) {
 
 const coinbaseL2CleanupTimer = setInterval(() => {
   const now = Date.now();
+  COINBASE_PRODUCT_BOOK_STATS.background_ticks += 1;
+  COINBASE_PRODUCT_BOOK_STATS.eligible_active_symbols = 0;
   for (const [native, state] of COINBASE_L2_STATES.entries()) {
-    if (now - state.lastAccessAt <= COINBASE_L2_IDLE_MS) continue;
+    if (now - state.lastAccessAt <= COINBASE_L2_IDLE_MS) {
+      COINBASE_PRODUCT_BOOK_STATS.eligible_active_symbols += 1;
+      refreshCoinbaseOfficialBookMetrics(state).catch(() => {});
+      continue;
+    }
     closeWsQuietly(state.socket);
     state.socket = null;
     COINBASE_L2_STATES.delete(native);
@@ -1825,8 +2084,13 @@ function buildPayload(provider, marketType, view, requestedSymbol, limit, data, 
   const asks = Array.isArray(data.asks) ? data.asks.slice(0, limit) : [];
   const bestBid = positiveNumber(bids[0]?.price);
   const bestAsk = positiveNumber(asks[0]?.price);
-  const spreadPercent = bestBid != null && bestAsk != null && bestAsk >= bestBid ? ((bestAsk - bestBid) / bestBid) * 100 : null;
-  return {
+  const suppliedSpreadBps = numberValue(data.spread_bps);
+  const spreadPercent = suppliedSpreadBps != null && suppliedSpreadBps >= 0
+    ? suppliedSpreadBps / 100
+    : bestBid != null && bestAsk != null && bestAsk >= bestBid
+      ? ((bestAsk - bestBid) / bestBid) * 100
+      : null;
+  const payload = {
     ...common,
     bids,
     asks,
@@ -1834,6 +2098,47 @@ function buildPayload(provider, marketType, view, requestedSymbol, limit, data, 
     best_ask: bestAsk,
     spread_percent: spreadPercent,
   };
+  if (provider === 'coinbase' && marketType === 'spot') {
+    payload.mid_market = positiveNumber(data.mid_market);
+    payload.spread_bps = suppliedSpreadBps != null && suppliedSpreadBps >= 0
+      ? suppliedSpreadBps
+      : null;
+    const spreadAbsolute = numberValue(data.spread_absolute);
+    payload.spread_absolute = spreadAbsolute != null && spreadAbsolute >= 0
+      ? spreadAbsolute
+      : null;
+    payload.book_metrics_source = String(data.book_metrics_source || '');
+    payload.book_metrics_official = data.book_metrics_official === true;
+    payload.book_metrics_fallback_used = data.book_metrics_fallback_used === true;
+    payload.official_mid_market = positiveNumber(data.official_mid_market);
+    const officialSpreadBps = numberValue(data.official_spread_bps);
+    payload.official_spread_bps = officialSpreadBps != null && officialSpreadBps >= 0
+      ? officialSpreadBps
+      : null;
+    const officialSpreadAbsolute = numberValue(data.official_spread_absolute);
+    payload.official_spread_absolute = officialSpreadAbsolute != null && officialSpreadAbsolute >= 0
+      ? officialSpreadAbsolute
+      : null;
+    payload.ws_derived_mid_market = positiveNumber(data.ws_derived_mid_market);
+    const wsSpreadBps = numberValue(data.ws_derived_spread_bps);
+    payload.ws_derived_spread_bps = wsSpreadBps != null && wsSpreadBps >= 0
+      ? wsSpreadBps
+      : null;
+    const wsSpreadAbsolute = numberValue(data.ws_derived_spread_absolute);
+    payload.ws_derived_spread_absolute = wsSpreadAbsolute != null && wsSpreadAbsolute >= 0
+      ? wsSpreadAbsolute
+      : null;
+    payload.official_metrics_timestamp_ms = integerValue(data.official_metrics_timestamp_ms) || null;
+    payload.official_metrics_product_id = data.official_metrics_product_id
+      ? String(data.official_metrics_product_id)
+      : null;
+    const officialMetricsAgeMs = numberValue(data.official_metrics_age_ms);
+    payload.official_metrics_age_ms =
+      officialMetricsAgeMs != null && officialMetricsAgeMs >= 0
+        ? Math.floor(officialMetricsAgeMs)
+        : null;
+  }
+  return payload;
 }
 
 async function resolveCached(provider, marketType, view, symbol, limit) {
@@ -1965,6 +2270,26 @@ export function getContractDepthHealth() {
     coinbase_level2_symbols: COINBASE_L2_STATES.size,
     coinbase_level2_connections: [...COINBASE_L2_STATES.values()].filter((state) => wsReady(state.socket)).length,
     coinbase_level2_max_symbols: COINBASE_L2_MAX_SYMBOLS,
+    coinbase_product_book_endpoint: COINBASE_PRODUCT_BOOK_PATH,
+    coinbase_product_book_official_fields: ['mid_market', 'spread_bps', 'spread_absolute'],
+    coinbase_product_book_auth_required: true,
+    coinbase_product_book_credentials_configured: COINBASE_PRODUCT_BOOK_CREDENTIALS_CONFIGURED,
+    coinbase_product_book_secret_source: 'render_environment_only',
+    coinbase_product_book_secret_exposed_to_app: false,
+    coinbase_product_book_secret_stored_in_repository: false,
+    coinbase_product_book_refresh_ms: COINBASE_PRODUCT_BOOK_REFRESH_MS,
+    coinbase_product_book_fresh_ms: COINBASE_PRODUCT_BOOK_FRESH_MS,
+    coinbase_product_book_stale_ms: COINBASE_PRODUCT_BOOK_STALE_MS,
+    coinbase_product_book_retry_ms: COINBASE_PRODUCT_BOOK_RETRY_MS,
+    coinbase_product_book_background_active_symbols_only: true,
+    coinbase_product_book_user_read_starts_rest_request: false,
+    coinbase_product_book_user_count_scales_rest_requests: false,
+    coinbase_product_book_bounded_by_level2_symbol_slots: true,
+    coinbase_product_book_official_fields_take_precedence: true,
+    coinbase_product_book_ws_bbo_fallback_only_when_official_missing: true,
+    coinbase_product_book_cross_product_substitution: false,
+    coinbase_product_book_self_test: coinbaseBookMetricsSelfTest(),
+    coinbase_product_book_stats: { ...COINBASE_PRODUCT_BOOK_STATS },
     gate_btc_usd_inverse_depth_enabled: true,
     gate_btc_usd_quote_value_per_contract:
       GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,
@@ -1985,6 +2310,15 @@ export function getContractDepthHealth() {
       last_error: state.lastError,
       bids: state.bids.size,
       asks: state.asks.size,
+      official_metrics_ready: Boolean(
+        state.officialBookMetrics &&
+        Date.now() - state.officialBookMetricsAt <= COINBASE_PRODUCT_BOOK_STALE_MS,
+      ),
+      official_metrics_product_id: state.officialBookMetrics?.product_id || null,
+      official_metrics_age_ms: state.officialBookMetricsAt > 0
+        ? Date.now() - state.officialBookMetricsAt
+        : null,
+      official_metrics_last_error: state.officialBookMetricsLastError,
     })),
     ...COINBASE_L2_STATS,
     ...BINANCE_WS_STATS,
