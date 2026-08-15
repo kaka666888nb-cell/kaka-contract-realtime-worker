@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.148",
+  "version": "650.8.15.149",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Step1026.1 Coinbase EQUITY canonical product fix + Step1026 all-asset shared market layer + all-asset Kline"
+  "description": "KakaWeb3 Step1026.3 clean asset-market rebuild: Coinbase EQUITY shared Products catalog identity/rules/status/session only + verified other-provider market fields"
 }
