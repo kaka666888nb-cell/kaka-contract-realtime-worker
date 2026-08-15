@@ -1,13 +1,10 @@
-// Step1026.2: Coinbase EQUITY market-data-path fix on the Step1026 shared market layer.
-// Coinbase equities keep the canonical Products API product_id (including opaque IDs), but market/product facts now use the official /market/* market-data family so reads do not depend on account tradability eligibility.
-// Complements the pre-landed all-asset Kline bridge (650.8.15.145).
-// User devices never call exchanges directly. Missing/restricted official fields remain null.
-// No provider/product/ticker substitution is allowed; protected Binance contract REST is untouched.
+// Step1026.3 clean rebuild from 650.8.15.146 after Coinbase EQUITY capability audit.
+// V50 production capability truth is restored: Coinbase cash equities are identity/rules/status/session first.
+// Their crypto-style realtime book/trades/candles are NOT assumed. One shared paginated Products catalog
+// feeds all exact/batch reads; user devices never call exchanges directly and no ticker/provider substitution occurs.
 
-import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
-
-const VERSION = '650.8.15.148';
-const DATA_VERSION = 10263;
+const VERSION = '650.8.15.149';
+const DATA_VERSION = 10264;
 const SCHEMA_VERSION = 'step1026_exchange_asset_market_v1';
 const ENDPOINT = '/api/asset-market';
 const BATCH_ENDPOINT = '/api/asset-market/tickers';
@@ -32,14 +29,12 @@ let activeBuilds = 0;
 const buildQueue = [];
 
 const COINBASE_HOST = 'api.coinbase.com';
-const COINBASE_CDP_KEY_NAME = String(
-  process.env.KAKA_COINBASE_CDP_KEY_NAME || process.env.COINBASE_CDP_API_KEY_NAME || '',
-).trim();
-const COINBASE_CDP_KEY_SECRET = String(
-  process.env.KAKA_COINBASE_CDP_KEY_SECRET || process.env.COINBASE_CDP_API_KEY_SECRET || '',
-).replace(/\\n/g, '\n').trim();
-const COINBASE_CDP_CONFIGURED = Boolean(COINBASE_CDP_KEY_NAME && COINBASE_CDP_KEY_SECRET);
-let coinbasePrivateKey = null;
+const COINBASE_EQUITY_CATALOG_PATH = '/api/v3/brokerage/market/products';
+const COINBASE_EQUITY_CATALOG_FRESH_MS = 120_000;
+const COINBASE_EQUITY_CATALOG_STALE_MS = 30 * 60_000;
+const COINBASE_EQUITY_PAGE_LIMIT = 100;
+let coinbaseEquityCatalog = null;
+let coinbaseEquityCatalogInflight = null;
 
 const stats = {
   exact_reads: 0,
@@ -60,6 +55,13 @@ const stats = {
   queue_rejections: 0,
   upstream_requests_started: 0,
   upstream_by_provider: { okx: 0, bybit: 0, bitget: 0, gate: 0, coinbase: 0 },
+  coinbase_equity_catalog_builds: 0,
+  coinbase_equity_catalog_fresh_hits: 0,
+  coinbase_equity_catalog_stale_hits: 0,
+  coinbase_equity_catalog_inflight_hits: 0,
+  coinbase_equity_catalog_pages: 0,
+  coinbase_equity_catalog_rows: 0,
+  coinbase_equity_catalog_failures: 0,
 };
 
 function str(v) { return String(v ?? '').trim(); }
@@ -125,6 +127,9 @@ function isMt5(identity) {
 function isGateCashStock(identity) {
   return identity.provider === 'gate' && (identity.assetClass.includes('equity_cash') || /stock_cash|cash_stock/.test(identity.productKind) || isSpot(identity.marketType));
 }
+function isCoinbaseEquity(identity) {
+  return identity.provider === 'coinbase' && (identity.assetClass.includes('equity_cash') || identity.marketType === 'equity' || identity.productKind === 'equity');
+}
 function likelyBitgetReality(identity, instrument = null) {
   const flag = lower(instrument?.isReality);
   if (flag === 'yes') return true;
@@ -142,12 +147,7 @@ function exactScope(identity) {
   if (identity.provider === 'bitget') return { supported: /(equity|stock|rwa|reality|commodity|metal)/.test(`${identity.assetClass}|${identity.productKind}`), reason: 'unsupported_bitget_asset_scope' };
   if (identity.provider === 'gate') return { supported: /(equity|stock|index|fx|forex|commodity|metal)/.test(`${identity.assetClass}|${identity.productKind}`), reason: 'unsupported_gate_asset_scope' };
   if (identity.provider === 'okx') return { supported: /(rwa|premarket|pre_market|event|prediction|equity|stock|commodity|metal)/.test(`${identity.assetClass}|${identity.productKind}|${identity.marketType}`), reason: 'unsupported_okx_asset_scope' };
-  if (identity.provider === 'coinbase') {
-    const assetSupported = /(equity|stock|future|futures|commodity|index|preipo|foreign_equity|traditional)/.test(`${identity.assetClass}|${identity.productKind}|${identity.marketType}`);
-    if (!assetSupported) return { supported: false, reason: 'unsupported_coinbase_asset_scope' };
-    if (!COINBASE_CDP_CONFIGURED) return { supported: false, reason: 'coinbase_cdp_credentials_required_for_official_asset_market' };
-    return { supported: true, reason: '' };
-  }
+  if (identity.provider === 'coinbase') return { supported: /(equity|stock|future|futures|commodity|index|preipo|foreign_equity|traditional)/.test(`${identity.assetClass}|${identity.productKind}|${identity.marketType}`), reason: 'unsupported_coinbase_asset_scope' };
   return { supported: false, reason: 'unsupported_provider' };
 }
 
@@ -220,7 +220,7 @@ async function jsonFetch(url, provider, { headers = {}, timeoutMs = FETCH_TIMEOU
   try {
     const r = await fetch(url, {
       method: 'GET',
-      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/Step1026-AssetMarket', ...headers },
+      headers: { accept: 'application/json', 'user-agent': 'KakaWeb3/Step1026.3-AssetMarket', ...headers },
       signal: controller.signal,
     });
     const raw = await r.text();
@@ -236,22 +236,75 @@ async function jsonFetch(url, provider, { headers = {}, timeoutMs = FETCH_TIMEOU
   } finally { clearTimeout(timer); }
 }
 
-function b64(v) { return Buffer.from(v).toString('base64url'); }
-function coinbaseJwt(path) {
-  if (!COINBASE_CDP_CONFIGURED) return '';
-  if (!coinbasePrivateKey) coinbasePrivateKey = createPrivateKey(COINBASE_CDP_KEY_SECRET);
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: 'ES256', typ: 'JWT', kid: COINBASE_CDP_KEY_NAME, nonce: randomBytes(16).toString('hex') };
-  const payload = { iss: 'cdp', nbf: now, exp: now + 120, sub: COINBASE_CDP_KEY_NAME, uri: `GET ${COINBASE_HOST}${path}` };
-  const input = `${b64(JSON.stringify(header))}.${b64(JSON.stringify(payload))}`;
-  const signature = cryptoSign('sha256', Buffer.from(input), { key: coinbasePrivateKey, dsaEncoding: 'ieee-p1363' });
-  return `${input}.${b64(signature)}`;
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function coinbaseProductRows(p) { if (Array.isArray(p?.products)) return p.products; if (Array.isArray(p?.data)) return p.data; if (Array.isArray(p)) return p; return []; }
+async function coinbasePublicFetch(path, query = '', retry429 = true) {
+  try {
+    return await jsonFetch(`https://${COINBASE_HOST}${path}${query}`, 'coinbase');
+  } catch (e) {
+    if (retry429 && Number(e?.statusCode) === 429) {
+      await sleep(1100);
+      return jsonFetch(`https://${COINBASE_HOST}${path}${query}`, 'coinbase');
+    }
+    throw e;
+  }
 }
-async function coinbaseFetch(path, query = '') {
-  const token = coinbaseJwt(path);
-  const headers = token ? { authorization: `Bearer ${token}` } : {};
-  return jsonFetch(`https://${COINBASE_HOST}${path}${query}`, 'coinbase', { headers });
+async function buildCoinbaseEquityCatalog() {
+  stats.coinbase_equity_catalog_builds += 1;
+  const rows = [];
+  const seen = new Set();
+  let cursor = '';
+  for (let page = 0; page < 10; page += 1) {
+    const q = new URLSearchParams({ product_type: 'EQUITY', limit: String(COINBASE_EQUITY_PAGE_LIMIT), user_country_code: 'US' });
+    if (cursor) q.set('cursor', cursor);
+    const payload = await coinbasePublicFetch(COINBASE_EQUITY_CATALOG_PATH, `?${q.toString()}`);
+    stats.coinbase_equity_catalog_pages += 1;
+    const pageRows = coinbaseProductRows(payload).filter(x => upper(x?.product_type) === 'EQUITY' && nativeKey(x?.product_id));
+    for (const row of pageRows) {
+      const id = nativeKey(row?.product_id);
+      if (!id || seen.has(id)) continue;
+      seen.add(id); rows.push(row);
+    }
+    const pagination = payload?.pagination && typeof payload.pagination === 'object' ? payload.pagination : {};
+    const next = str(pagination.next_cursor);
+    const hasNext = pagination.has_next === true;
+    if (!hasNext || !next || pageRows.length === 0) break;
+    cursor = next;
+    await sleep(180); // shared collector lane stays comfortably below documented public REST limits
+  }
+  if (!rows.length) throw new Error('coinbase_equity_shared_catalog_empty');
+  stats.coinbase_equity_catalog_rows = rows.length;
+  return { rows, byId: new Map(rows.map(x => [nativeKey(x.product_id), x])) };
 }
+async function getCoinbaseEquityCatalog() {
+  const now = Date.now();
+  if (coinbaseEquityCatalog && coinbaseEquityCatalog.freshUntil > now) {
+    stats.coinbase_equity_catalog_fresh_hits += 1;
+    return { ...coinbaseEquityCatalog, cache_status: 'fresh_hit' };
+  }
+  if (coinbaseEquityCatalogInflight) {
+    stats.coinbase_equity_catalog_inflight_hits += 1;
+    return coinbaseEquityCatalogInflight;
+  }
+  const old = coinbaseEquityCatalog;
+  coinbaseEquityCatalogInflight = (async () => {
+    try {
+      const built = await buildCoinbaseEquityCatalog();
+      const storedAt = Date.now();
+      coinbaseEquityCatalog = { ...built, storedAt, freshUntil: storedAt + COINBASE_EQUITY_CATALOG_FRESH_MS, staleUntil: storedAt + COINBASE_EQUITY_CATALOG_STALE_MS };
+      return { ...coinbaseEquityCatalog, cache_status: 'miss' };
+    } catch (e) {
+      stats.coinbase_equity_catalog_failures += 1;
+      if (old && old.staleUntil > Date.now()) {
+        stats.coinbase_equity_catalog_stale_hits += 1;
+        return { ...old, cache_status: 'stale_fallback' };
+      }
+      throw e;
+    } finally { coinbaseEquityCatalogInflight = null; }
+  })();
+  return coinbaseEquityCatalogInflight;
+}
+
 
 function levels(rows, side, limit = 20) {
   const out = [];
@@ -495,59 +548,124 @@ async function buildGateCashStock(identity){
 async function buildGateDerivative(identity){const settle=gateSettle(identity.nativeSymbol,identity.marketType),bases=['https://api.gateio.ws/api/v4','https://fx-api.gateio.ws/api/v4'];let lastErr=null;for(const base of bases){try{const root=`${base}/futures/${settle}`;const [tickerR,metaR,bookR,tradesR]=await Promise.allSettled([jsonFetch(`${root}/tickers?contract=${encodeURIComponent(identity.nativeSymbol)}`,'gate'),jsonFetch(`${root}/contracts/${encodeURIComponent(identity.nativeSymbol)}`,'gate'),jsonFetch(`${root}/order_book?contract=${encodeURIComponent(identity.nativeSymbol)}&limit=20&with_id=true`,'gate'),jsonFetch(`${root}/trades?contract=${encodeURIComponent(identity.nativeSymbol)}&limit=20`,'gate')]);const ticker=tickerR.status==='fulfilled'?parseGateFuturesTicker(tickerR.value,identity.nativeSymbol):null;const rules=metaR.status==='fulfilled'?parseGateContract(metaR.value,identity.nativeSymbol):null;const book=bookR.status==='fulfilled'?parseGateFuturesBook(bookR.value):null;const trades=tradesR.status==='fulfilled'?parseGateFuturesTrades(tradesR.value):[];if(ticker||rules||book||trades.length)return{ticker,orderbook:book,trades,rules,status:rules?{source:rules.source,trading_status:rules.status,in_delisting:rules.in_delisting,delisting_time_ms:rules.delisting_time_ms}:null,trading_hours:null,derivatives:ticker?{source:ticker.source,mark_price:ticker.mark_price,index_price:ticker.index_price,open_interest:ticker.open_interest,funding_rate:ticker.funding_rate,next_funding_time_ms:ticker.next_funding_time_ms}:null,capabilities:{ticker:capability(ticker?'official_public':'temporarily_unavailable','/futures/{settle}/tickers'),orderbook:capability(book?'official_public':'temporarily_unavailable','/futures/{settle}/order_book'),trades:capability(trades.length?'official_public':'temporarily_unavailable','/futures/{settle}/trades'),rules:capability(rules?'official_public':'temporarily_unavailable','/futures/{settle}/contracts/{contract}'),status:capability(rules?'official_public':'temporarily_unavailable','/futures/{settle}/contracts/{contract}'),trading_hours:capability('not_published_in_current_public_contract',null,'no synthetic session hours'),derivatives:capability(ticker?'official_public':'temporarily_unavailable','/futures/{settle}/tickers')}};lastErr=new Error('gate_derivative_asset_empty');}catch(e){lastErr=e;}}if(lastErr)throw lastErr;return null;}
 async function buildGate(identity){return isGateCashStock(identity)?buildGateCashStock(identity):buildGateDerivative(identity);}
 
-function coinbasePercentRatio(v){const raw=str(v).replace(/%$/,'');const n=num(raw);return n==null?null:n/100;}
-function coinbaseSessionRows(raw){return(Array.isArray(raw)?raw:[]).map(x=>({session_type:safeText(x?.session_type),session_start_time:safeText(x?.session_start_time),session_end_time:safeText(x?.session_end_time),support_fractional:bool(x?.support_fractional),limit_only:bool(x?.limit_only)}));}
-function coinbaseTradingDay(raw){if(!raw||typeof raw!=='object')return null;return{venue_id:safeText(raw.venue_id),date:safeText(raw.date),trade_date_type:safeText(raw.trade_date_type),holiday_name:safeText(raw.holiday_name),version_id:safeText(raw.version_id),trading_sessions:coinbaseSessionRows(raw.trading_sessions)};}
-function parseCoinbaseProduct(p,productId){
-  if(!p||typeof p!=='object')return null;
-  const id=upper(p.product_id);if(!id||id!==productId)return null;
-  const equity=p.equity_product_details&&typeof p.equity_product_details==='object'?p.equity_product_details:null;
-  const future=p.future_product_details&&typeof p.future_product_details==='object'?p.future_product_details:null;
-  const fcm=p.fcm_trading_session_details&&typeof p.fcm_trading_session_details==='object'?p.fcm_trading_session_details:null;
-  const tradingFlags=equity?.equity_trading_flags&&typeof equity.equity_trading_flags==='object'?equity.equity_trading_flags:null;
-  const recentDays=Array.isArray(equity?.recent_trading_days?.trading_days)?equity.recent_trading_days.trading_days.map(coinbaseTradingDay).filter(Boolean):[];
-  return{
-    source:'coinbase_advanced_trade_authenticated_product_official_fields',product_id:id,product_type:safeText(p.product_type),product_venue:safeText(p.product_venue),status:safeText(p.status),base_currency_id:safeText(p.base_currency_id),quote_currency_id:safeText(p.quote_currency_id),base_display_symbol:safeText(p.base_display_symbol),quote_display_symbol:safeText(p.quote_display_symbol),display_name:safeText(p.display_name),alias:safeText(p.alias),
-    price:pos(p.price),price_change_24h_ratio:coinbasePercentRatio(p.price_percentage_change_24h),volume_24h:nonneg(p.volume_24h),turnover_24h:nonneg(p.approximate_quote_24h_volume),high_24h:pos(p.high_24h),low_24h:pos(p.low_24h),best_bid_price:pos(p.best_bid_price),best_ask_price:pos(p.best_ask_price),mid_market_price:pos(p.mid_market_price),
-    base_increment:pos(p.base_increment),quote_increment:pos(p.quote_increment),price_increment:pos(p.price_increment),base_min_size:pos(p.base_min_size),base_max_size:pos(p.base_max_size),is_disabled:bool(p.is_disabled),view_only:bool(p.view_only),cancel_only:bool(p.cancel_only),limit_only:bool(p.limit_only),post_only:bool(p.post_only),trading_disabled:bool(p.trading_disabled),auction_mode:bool(p.auction_mode),
-    equity_product_details:equity?{
-      equity_subtype:safeText(equity.equity_subtype),fractionable:bool(equity.fractionable),liquidate_only:bool(equity.liquidate_only),ticker:safeText(equity.ticker),description:safeText(equity.description),trading_halted:bool(equity.trading_halted),trading_halted_start_time:safeText(equity.trading_halted_start_time),trading_halted_end_time:safeText(equity.trading_halted_end_time),fractional_notional_min_size:pos(equity.fractional_notional_min_size),cik:safeText(equity.cik),short_name:safeText(equity.short_name),company_description:safeText(equity.company_description),company_website:safeText(equity.company_website),current_session:safeText(equity.current_session),opol:safeText(equity.opol),trading_day_info:coinbaseTradingDay(equity.trading_day_info),recent_trading_days:recentDays,equity_trading_flags:tradingFlags?{tradable:bool(tradingFlags.tradable),searchable:bool(tradingFlags.searchable),buy_enabled:bool(tradingFlags.buy_enabled),buy_whole_shares:bool(tradingFlags.buy_whole_shares),buy_fractional_shares:bool(tradingFlags.buy_fractional_shares),buy_notional:bool(tradingFlags.buy_notional),sell_enabled:bool(tradingFlags.sell_enabled),sell_whole_shares:bool(tradingFlags.sell_whole_shares),sell_fractional_shares:bool(tradingFlags.sell_fractional_shares),sell_notional:bool(tradingFlags.sell_notional)}:null
-    }:null,
-    future_product_details:future?{contract_expiry:safeText(future.contract_expiry),contract_size:num(future.contract_size),contract_root_unit:safeText(future.contract_root_unit),group_description:safeText(future.group_description),non_crypto:bool(future.non_crypto),twenty_four_by_seven:bool(future.twenty_four_by_seven),funding_interval:safeText(future.funding_interval),open_interest:nonneg(future.open_interest),funding_rate:num(future.funding_rate),funding_time:safeText(future.funding_time),index_price:pos(future.index_price),trading_hours_type:safeText(future.trading_hours_type)}:null,
-    fcm_trading_session_details:fcm?{is_session_open:bool(fcm.is_session_open),open_time:safeText(fcm.open_time),close_time:safeText(fcm.close_time),session_state:safeText(fcm.session_state),after_hours_order_entry_disabled:bool(fcm.after_hours_order_entry_disabled),closed_reason:safeText(fcm.closed_reason)}:null
+function coinbasePctRatio(v) {
+  const raw = str(v).replace(/%$/, '');
+  if (!raw) return null;
+  const x = Number(raw);
+  return Number.isFinite(x) ? x / 100 : null;
+}
+function coinbaseTradingSessions(v) {
+  const out = [];
+  for (const x of Array.isArray(v) ? v : []) {
+    if (!x || typeof x !== 'object') continue;
+    out.push({
+      session_type: safeText(x.session_type), session_start_time: safeText(x.session_start_time),
+      session_end_time: safeText(x.session_end_time), support_fractional: bool(x.support_fractional), limit_only: bool(x.limit_only),
+    });
+  }
+  return out.slice(0, 16);
+}
+function coinbaseTradingDay(v) {
+  if (!v || typeof v !== 'object') return null;
+  return {
+    venue_id: safeText(v.venue_id), date: safeText(v.date), trade_date_type: safeText(v.trade_date_type),
+    holiday_name: safeText(v.holiday_name), version_id: safeText(v.version_id), trading_sessions: coinbaseTradingSessions(v.trading_sessions),
   };
 }
-function parseCoinbaseBook(payload,productId,limit=20,source='coinbase_advanced_trade_authenticated_product_book'){const pb=payload?.pricebook??payload;const id=upper(pb?.product_id??payload?.product_id);if(id&&id!==productId)return null;return{source,product_id:id||productId,timestamp_ms:Date.parse(str(pb?.time))||null,bids:levels(pb?.bids,'bid',limit),asks:levels(pb?.asks,'ask',limit),mid_market:pos(payload?.mid_market),spread_bps:nonneg(payload?.spread_bps),spread_absolute:nonneg(payload?.spread_absolute)};}
-function parseCoinbaseTrades(payload,productId,limit=20){return(Array.isArray(payload?.trades)?payload.trades:[]).filter(r=>!r.product_id||upper(r.product_id)===productId).map(r=>tradeItem({id:r.trade_id,timeMs:Date.parse(str(r.time)),price:r.price,quantity:r.size,side:r.side})).filter(Boolean).slice(0,limit);}
-function coinbaseProductType(identity){const v=`${identity.marketType}|${identity.assetClass}|${identity.productKind}`;if(/equity|stock/.test(v))return'EQUITY';if(/future|futures|commodity|index|preipo|foreign_equity|traditional/.test(v))return'FUTURE';return'';}
-function coinbaseProductIdsQuery(symbols,identity){const parts=[];for(const symbol of symbols)parts.push(`product_ids=${encodeURIComponent(symbol)}`);const type=coinbaseProductType(identity);if(type)parts.push(`product_type=${encodeURIComponent(type)}`);parts.push(`limit=${Math.min(100,Math.max(1,symbols.length))}`);return`?${parts.join('&')}`;}
-async function fetchCoinbaseCanonicalProduct(identity){
-  const productId=identity.nativeSymbol;
-  const listPath='/api/v3/brokerage/market/products';
-  const list=await coinbaseFetch(listPath,coinbaseProductIdsQuery([productId],identity));
-  const row=coinbaseProductRows(list).find(x=>upper(x?.product_id)===productId);
-  if(!row)throw new Error('coinbase_market_product_not_found');
-  return row;
+function parseCoinbaseProduct(p, productId) {
+  if (!p || typeof p !== 'object') return null;
+  const id = nativeKey(p.product_id);
+  if (!id || id !== productId || upper(p.product_type) !== 'EQUITY') return null;
+  const equity = p.equity_product_details && typeof p.equity_product_details === 'object' ? p.equity_product_details : {};
+  const flags = equity.equity_trading_flags && typeof equity.equity_trading_flags === 'object' ? equity.equity_trading_flags : {};
+  const recent = equity.recent_trading_days && typeof equity.recent_trading_days === 'object' ? equity.recent_trading_days : {};
+  return {
+    source: 'coinbase_official_shared_equity_products_catalog', product_id: id, product_type: 'EQUITY',
+    product_venue: safeText(p.product_venue), status: safeText(p.status), base_currency_id: safeText(p.base_currency_id),
+    quote_currency_id: safeText(p.quote_currency_id), base_display_symbol: safeText(p.base_display_symbol), quote_display_symbol: safeText(p.quote_display_symbol),
+    display_name: safeText(p.display_name), alias: safeText(p.alias), base_increment: pos(p.base_increment), quote_increment: pos(p.quote_increment),
+    price_increment: pos(p.price_increment), base_min_size: pos(p.base_min_size), base_max_size: pos(p.base_max_size),
+    quote_min_size: pos(p.quote_min_size), quote_max_size: pos(p.quote_max_size), is_disabled: bool(p.is_disabled), view_only: bool(p.view_only),
+    cancel_only: bool(p.cancel_only), limit_only: bool(p.limit_only), post_only: bool(p.post_only), trading_disabled: bool(p.trading_disabled), auction_mode: bool(p.auction_mode),
+    equity_product_details: {
+      equity_subtype: safeText(equity.equity_subtype), fractionable: bool(equity.fractionable), liquidate_only: bool(equity.liquidate_only),
+      ticker: safeText(equity.ticker), description: safeText(equity.description), short_name: safeText(equity.short_name), cik: safeText(equity.cik),
+      company_description: safeText(equity.company_description, 1000), company_website: safeText(equity.company_website),
+      trading_halted: bool(equity.trading_halted), trading_halted_start_time: safeText(equity.trading_halted_start_time), trading_halted_end_time: safeText(equity.trading_halted_end_time),
+      fractional_notional_min_size: pos(equity.fractional_notional_min_size), current_session: safeText(equity.current_session), opol: safeText(equity.opol),
+      trading_day_info: coinbaseTradingDay(equity.trading_day_info),
+      recent_trading_days: (Array.isArray(recent.trading_days) ? recent.trading_days : []).map(coinbaseTradingDay).filter(Boolean).slice(0, 8),
+      equity_trading_flags: {
+        tradable: bool(flags.tradable), searchable: bool(flags.searchable), buy_enabled: bool(flags.buy_enabled), buy_whole_shares: bool(flags.buy_whole_shares),
+        buy_fractional_shares: bool(flags.buy_fractional_shares), buy_notional: bool(flags.buy_notional), sell_enabled: bool(flags.sell_enabled),
+        sell_whole_shares: bool(flags.sell_whole_shares), sell_fractional_shares: bool(flags.sell_fractional_shares), sell_notional: bool(flags.sell_notional),
+      },
+    },
+    reference_market_fields: {
+      semantics: 'official_products_catalog_reference_only_realtime_not_proven_for_equity',
+      price: pos(p.price), price_change_24h_ratio: coinbasePctRatio(p.price_percentage_change_24h), volume_24h: nonneg(p.volume_24h),
+      turnover_24h: nonneg(p.approximate_quote_24h_volume), best_bid_price: pos(p.best_bid_price), best_ask_price: pos(p.best_ask_price),
+      high_24h: pos(p.high_24h), low_24h: pos(p.low_24h), mid_market_price: pos(p.mid_market_price),
+    },
+  };
 }
-async function buildCoinbase(identity){
-  const productId=identity.nativeSymbol;
-  if(!COINBASE_CDP_CONFIGURED)throw new Error('coinbase_cdp_credentials_required_for_official_asset_market');
-  const productPath='/api/v3/brokerage/market/products';
-  const bookPath='/api/v3/brokerage/market/product_book';
-  const tradesPath=`/api/v3/brokerage/market/products/${encodeURIComponent(productId)}/ticker`;
-  const [productR,bookR,tradesR]=await Promise.allSettled([
-    fetchCoinbaseCanonicalProduct(identity),
-    coinbaseFetch(bookPath,`?product_id=${encodeURIComponent(productId)}&limit=20`),
-    coinbaseFetch(tradesPath,'?limit=20'),
-  ]);
-  const rules=productR.status==='fulfilled'?parseCoinbaseProduct(productR.value,productId):null;
-  const book=bookR.status==='fulfilled'?parseCoinbaseBook(bookR.value,productId):null;
-  const trades=tradesR.status==='fulfilled'?parseCoinbaseTrades(tradesR.value,productId):[];
-  const lastFromTrade=trades[0]?.price??null;
-  const ticker=(rules||book||trades.length)?{source:rules?.source??book?.source??'coinbase_advanced_trade_authenticated_market_trades',last_price:rules?.price??lastFromTrade,price_change_24h_ratio:rules?.price_change_24h_ratio??null,high_24h:rules?.high_24h??null,low_24h:rules?.low_24h??null,open_24h:null,volume_24h:rules?.volume_24h??null,turnover_24h:rules?.turnover_24h??null,best_bid:book?.bids?.[0]?.price??rules?.best_bid_price??null,best_ask:book?.asks?.[0]?.price??rules?.best_ask_price??null,best_bid_size:book?.bids?.[0]?.quantity??null,best_ask_size:book?.asks?.[0]?.quantity??null,timestamp_ms:book?.timestamp_ms??trades[0]?.time_ms??null,mark_price:null,index_price:rules?.future_product_details?.index_price??null,open_interest:rules?.future_product_details?.open_interest??null,open_interest_value:null,funding_rate:rules?.future_product_details?.funding_rate??null,next_funding_time_ms:Date.parse(str(rules?.future_product_details?.funding_time))||null}:null;
-  const hours=rules?{source:rules.source,equity:rules.equity_product_details,fcm:rules.fcm_trading_session_details,future_trading_hours_type:rules.future_product_details?.trading_hours_type??null}:null;
-  return{ticker,orderbook:book,trades,rules,status:rules?{source:rules.source,status:rules.status,is_disabled:rules.is_disabled,view_only:rules.view_only,cancel_only:rules.cancel_only,limit_only:rules.limit_only,post_only:rules.post_only,trading_disabled:rules.trading_disabled,auction_mode:rules.auction_mode,equity_product_details:rules.equity_product_details}:null,trading_hours:hours,derivatives:rules?.future_product_details?{source:rules.source,future_product_details:rules.future_product_details}:null,capabilities:{ticker:capability(ticker?'official_shared':'temporarily_unavailable',productPath,'authenticated canonical Coinbase product_id; no ticker substitution'),orderbook:capability(book?'official_shared':'temporarily_unavailable',bookPath,'authenticated exact product_id'),trades:capability(trades.length?'official_shared':'temporarily_unavailable',tradesPath,'authenticated exact product_id'),rules:capability(rules?'official_shared':'temporarily_unavailable',productPath,'authenticated canonical product facts'),status:capability(rules?'official_shared':'temporarily_unavailable',productPath,'authenticated canonical product status'),trading_hours:capability(hours?'official_shared':'temporarily_unavailable',productPath,'official equity/futures session metadata only'),derivatives:rules?.future_product_details?capability('official_shared',productPath):capability('not_applicable')}};
+async function buildCoinbaseEquity(identity) {
+  const catalog = await getCoinbaseEquityCatalog();
+  const rules = parseCoinbaseProduct(catalog.byId.get(identity.nativeSymbol), identity.nativeSymbol);
+  if (!rules) {
+    return {
+      ticker: null, orderbook: null, trades: [], rules: null, status: null, trading_hours: null, derivatives: null,
+      capabilities: {
+        ticker: capability('unavailable_realtime_not_proven', COINBASE_EQUITY_CATALOG_PATH, 'V50 production matrix: cash-equity realtime price semantics not proven'),
+        orderbook: capability('unavailable_not_proven_for_equity', null, 'Do not assume crypto Product Book works for Coinbase cash equities'),
+        trades: capability('unavailable_not_proven_for_equity', null, 'Do not assume crypto Market Trades works for Coinbase cash equities'),
+        rules: capability('temporarily_unavailable', COINBASE_EQUITY_CATALOG_PATH, 'exact canonical product_id absent from current shared EQUITY catalog'),
+        status: capability('temporarily_unavailable', COINBASE_EQUITY_CATALOG_PATH), trading_hours: capability('temporarily_unavailable', COINBASE_EQUITY_CATALOG_PATH),
+        derivatives: capability('not_applicable'),
+      },
+      source_cache_status: catalog.cache_status,
+    };
+  }
+  const eq = rules.equity_product_details || {};
+  const status = {
+    source: rules.source, product_type: 'EQUITY', product_venue: rules.product_venue, status: rules.status, is_disabled: rules.is_disabled,
+    view_only: rules.view_only, cancel_only: rules.cancel_only, limit_only: rules.limit_only, post_only: rules.post_only,
+    trading_disabled: rules.trading_disabled, auction_mode: rules.auction_mode, trading_halted: eq.trading_halted,
+    liquidate_only: eq.liquidate_only, equity_trading_flags: eq.equity_trading_flags,
+  };
+  const hours = {
+    source: rules.source, current_session: eq.current_session, trading_day_info: eq.trading_day_info,
+    recent_trading_days: eq.recent_trading_days, trading_halted_start_time: eq.trading_halted_start_time,
+    trading_halted_end_time: eq.trading_halted_end_time,
+  };
+  return {
+    ticker: null, orderbook: null, trades: [], rules, status, trading_hours: hours, derivatives: null,
+    capabilities: {
+      ticker: capability('unavailable_realtime_not_proven', COINBASE_EQUITY_CATALOG_PATH, 'official Products fields retained as reference-only; App must not label them realtime ticker'),
+      orderbook: capability('unavailable_not_proven_for_equity', null, 'V50 production capability probe did not prove stable cash-equity Product Book'),
+      trades: capability('unavailable_not_proven_for_equity', null, 'V50 production capability probe did not prove stable cash-equity Market Trades'),
+      rules: capability('official_shared', COINBASE_EQUITY_CATALOG_PATH), status: capability('official_shared', COINBASE_EQUITY_CATALOG_PATH),
+      trading_hours: capability('official_shared', COINBASE_EQUITY_CATALOG_PATH), derivatives: capability('not_applicable'),
+    },
+    source_cache_status: catalog.cache_status,
+  };
 }
+async function buildCoinbaseOther(identity) {
+  const path = `/api/v3/brokerage/market/products/${encodeURIComponent(identity.nativeSymbol)}`;
+  let raw = null;
+  try { raw = await coinbasePublicFetch(path); } catch { /* unavailable remains explicit */ }
+  const r = raw && typeof raw === 'object' ? raw : null;
+  const ticker = r ? {
+    source: 'coinbase_public_product_non_equity', last_price: pos(r.price), price_change_24h_ratio: coinbasePctRatio(r.price_percentage_change_24h),
+    high_24h: pos(r.high_24h), low_24h: pos(r.low_24h), open_24h: null, volume_24h: nonneg(r.volume_24h), turnover_24h: nonneg(r.approximate_quote_24h_volume),
+    best_bid: pos(r.best_bid_price), best_ask: pos(r.best_ask_price), best_bid_size: null, best_ask_size: null, timestamp_ms: null,
+    mark_price: null, index_price: null, open_interest: null, open_interest_value: null, funding_rate: null, next_funding_time_ms: null,
+  } : null;
+  return { ticker, orderbook:null, trades:[], rules:r, status:r?{source:'coinbase_public_product_non_equity',status:safeText(r.status),trading_disabled:bool(r.trading_disabled)}:null,
+    trading_hours:null, derivatives:null, capabilities:{ticker:capability(ticker?'official_shared':'temporarily_unavailable',path),orderbook:capability('temporarily_unavailable'),trades:capability('temporarily_unavailable'),rules:capability(r?'official_shared':'temporarily_unavailable',path),status:capability(r?'official_shared':'temporarily_unavailable',path),trading_hours:capability('temporarily_unavailable'),derivatives:capability('not_applicable')}};
+}
+async function buildCoinbase(identity) { return isCoinbaseEquity(identity) ? buildCoinbaseEquity(identity) : buildCoinbaseOther(identity); }
+
 
 function basePayload(identity){return{ok:true,version:VERSION,data_version:DATA_VERSION,schema_version:SCHEMA_VERSION,read_only_shared:true,user_direct_exchange_requests:0,same_exact_key_reads_share_cache_and_inflight:true,cross_provider_substitution:false,cross_product_substitution:false,cross_ticker_substitution:false,provider:identity.provider,market_type:identity.marketType,asset_class:identity.assetClass,product_kind:identity.productKind,asset_id:identity.assetId,native_symbol:identity.nativeSymbol,resolved_native_symbol:identity.nativeSymbol,generated_at:isoNow()};}
 async function buildExact(identity){if(identity.provider==='bybit')return buildBybit(identity);if(identity.provider==='bitget')return buildBitget(identity);if(identity.provider==='okx')return buildOkx(identity);if(identity.provider==='gate')return buildGate(identity);if(identity.provider==='coinbase')return buildCoinbase(identity);throw new Error('unsupported_provider');}
@@ -558,15 +676,28 @@ async function fetchBatchBybit(identity,symbols){const cat=bybitCategory(identit
 async function fetchBatchBitget(identity,symbols){const cat=bitgetCategory(identity);const p=await jsonFetch(`https://api.bitget.com/api/v3/market/tickers?category=${encodeURIComponent(cat)}`,'bitget');return symbols.map(s=>({native_symbol:s,ticker:parseBitgetTicker(p,s)})).filter(x=>x.ticker);}
 async function fetchBatchOkx(identity,symbols){const type=okxInstType(identity);const p=await jsonFetch(`https://www.okx.com/api/v5/market/tickers?instType=${encodeURIComponent(type)}`,'okx');return symbols.map(s=>({native_symbol:s,ticker:parseOkxTicker(p,s)})).filter(x=>x.ticker);}
 async function fetchBatchGate(identity,symbols){if(isGateCashStock(identity)){const qs=encodeURIComponent(symbols.join(','));const p=await jsonFetch(`https://api.gateio.ws/api/v4/stock/symbols/detail?symbols=${qs}`,'gate');return symbols.map(s=>{const r=parseGateStockDetail(p,s);return r?{native_symbol:s,ticker:{source:r.source,last_price:r.last_price,price_change_24h_ratio:r.price_change_24h_ratio,high_24h:r.high_24h,low_24h:r.low_24h,open_24h:r.open_24h,volume_24h:r.volume_24h,turnover_24h:r.turnover_24h,best_bid:null,best_ask:null,best_bid_size:null,best_ask_size:null,timestamp_ms:null,mark_price:null,index_price:null,open_interest:null,open_interest_value:null,funding_rate:null,next_funding_time_ms:null}}:null;}).filter(Boolean);}const settle=gateSettle(symbols[0]||'',identity.marketType);let last=null;for(const host of ['https://api.gateio.ws/api/v4','https://fx-api.gateio.ws/api/v4']){try{const p=await jsonFetch(`${host}/futures/${settle}/tickers`,'gate');return symbols.map(s=>({native_symbol:s,ticker:parseGateFuturesTicker(p,s)})).filter(x=>x.ticker);}catch(e){last=e;}}throw last||new Error('gate_batch_tickers_failed');}
-function coinbaseProductRows(p){if(Array.isArray(p?.products))return p.products;if(Array.isArray(p?.data))return p.data;if(Array.isArray(p))return p;return[];}
-async function fetchBatchCoinbase(identity,symbols){if(!COINBASE_CDP_CONFIGURED)throw new Error('coinbase_cdp_credentials_required_for_official_asset_market');const path='/api/v3/brokerage/market/products';const p=await coinbaseFetch(path,coinbaseProductIdsQuery(symbols,identity));const rows=coinbaseProductRows(p);return symbols.map(s=>{const r=rows.find(x=>upper(x?.product_id)===s);const d=r?parseCoinbaseProduct(r,s):null;return d?{native_symbol:s,ticker:{source:d.source,last_price:d.price,price_change_24h_ratio:d.price_change_24h_ratio,high_24h:d.high_24h,low_24h:d.low_24h,open_24h:null,volume_24h:d.volume_24h,turnover_24h:d.turnover_24h,best_bid:d.best_bid_price,best_ask:d.best_ask_price,best_bid_size:null,best_ask_size:null,timestamp_ms:null,mark_price:null,index_price:d.future_product_details?.index_price??null,open_interest:d.future_product_details?.open_interest??null,open_interest_value:null,funding_rate:d.future_product_details?.funding_rate??null,next_funding_time_ms:Date.parse(str(d.future_product_details?.funding_time))||null}}:null;}).filter(Boolean);}
+async function fetchBatchCoinbase(identity, symbols) {
+  if (!isCoinbaseEquity(identity)) {
+    const path = '/api/v3/brokerage/market/products';
+    const q = `?product_ids=${encodeURIComponent(symbols.join(','))}&limit=${Math.min(100, symbols.length)}`;
+    const p = await coinbasePublicFetch(path, q);
+    const rows = coinbaseProductRows(p);
+    return symbols.map(s => { const r = rows.find(x => nativeKey(x?.product_id) === s); return r ? { native_symbol:s, ticker:{source:'coinbase_public_products_non_equity',last_price:pos(r.price),price_change_24h_ratio:coinbasePctRatio(r.price_percentage_change_24h),high_24h:pos(r.high_24h),low_24h:pos(r.low_24h),open_24h:null,volume_24h:nonneg(r.volume_24h),turnover_24h:nonneg(r.approximate_quote_24h_volume),best_bid:pos(r.best_bid_price),best_ask:pos(r.best_ask_price),best_bid_size:null,best_ask_size:null,timestamp_ms:null,mark_price:null,index_price:null,open_interest:null,open_interest_value:null,funding_rate:null,next_funding_time_ms:null}} : null; }).filter(Boolean);
+  }
+  const catalog = await getCoinbaseEquityCatalog();
+  return symbols.map(s => {
+    const d = parseCoinbaseProduct(catalog.byId.get(s), s);
+    if (!d) return null;
+    return { native_symbol:s, ticker:null, capability:{state:'unavailable_realtime_not_proven'}, reference_market_fields:d.reference_market_fields, source_cache_status:catalog.cache_status };
+  }).filter(Boolean);
+}
 async function buildBatch(identity,symbols){if(identity.provider==='bybit')return fetchBatchBybit(identity,symbols);if(identity.provider==='bitget')return fetchBatchBitget(identity,symbols);if(identity.provider==='okx')return fetchBatchOkx(identity,symbols);if(identity.provider==='gate')return fetchBatchGate(identity,symbols);if(identity.provider==='coinbase')return fetchBatchCoinbase(identity,symbols);return[];}
 function batchKey(i,s){return[i.provider,i.marketType,i.assetClass,i.productKind,[...s].sort().join(',')].join('|');}
 async function getBatch(identity,symbols,signal){stats.batch_reads+=1;const key=batchKey(identity,symbols),now=Date.now(),old=BATCH_CACHE.get(key);if(old&&old.freshUntil>now){stats.batch_fresh_hits+=1;return cached(old,'fresh_hit');}const running=BATCH_INFLIGHT.get(key);if(running){stats.batch_inflight_hits+=1;return running;}const task=(async()=>{let release=null;try{release=await acquireBuild(signal);stats.batch_builds+=1;const items=await buildBatch(identity,symbols);const payload={ok:true,version:VERSION,data_version:DATA_VERSION,schema_version:SCHEMA_VERSION,read_only_shared:true,user_direct_exchange_requests:0,cross_provider_substitution:false,cross_product_substitution:false,cross_ticker_substitution:false,provider:identity.provider,market_type:identity.marketType,asset_class:identity.assetClass,product_kind:identity.productKind,requested_symbols:symbols,items,missing_symbols:symbols.filter(s=>!items.some(x=>x.native_symbol===s)),generated_at:isoNow()};cachePut(BATCH_CACHE,key,payload,BATCH_FRESH_MS,BATCH_STALE_MS,BATCH_CACHE_MAX);stats.batch_successes+=1;return{...payload,cache_status:'miss'};}catch(e){stats.batch_failures+=1;if(old&&old.staleUntil>Date.now()){stats.batch_stale_hits+=1;return cached(old,'stale_fallback');}throw e;}finally{release?.();BATCH_INFLIGHT.delete(key);}})();BATCH_INFLIGHT.set(key,task);return task;}
 
 function identityFromUrl(url,{batch=false}={}){return{provider:providerKey(url.searchParams.get('provider')),marketType:marketKey(url.searchParams.get('market_type')||url.searchParams.get('market')),assetClass:classKey(url.searchParams.get('asset_class')),productKind:productKey(url.searchParams.get('product_kind')),assetId:batch?'batch':assetIdKey(url.searchParams.get('asset_id')),nativeSymbol:batch?'':nativeKey(url.searchParams.get('symbol')||url.searchParams.get('native_symbol'))};}
-function healthPayload(){return{ok:true,version:VERSION,data_version:DATA_VERSION,schema_version:SCHEMA_VERSION,endpoint:ENDPOINT,batch_tickers_endpoint:BATCH_ENDPOINT,exact_identity_required:true,read_only_shared:true,user_direct_exchange_requests:0,same_exact_key_reads_share_cache_and_inflight:true,cross_provider_substitution:false,cross_product_substitution:false,cross_ticker_substitution:false,binance_supported:false,binance_contract_rest_touched:false,providers:[...PROVIDERS],build_active:activeBuilds,build_queue:buildQueue.length,build_max_active:BUILD_MAX_ACTIVE,build_max_queue:BUILD_MAX_QUEUE,exact_cache_entries:EXACT_CACHE.size,batch_cache_entries:BATCH_CACHE.size,coinbase_backend_cdp_credentials_configured:COINBASE_CDP_CONFIGURED,restrictions:{bybit_mt5:'requires_tradfi_mt5_qualification',bitget_reality_orderbook:'requires_api_key_and_bd_whitelist',bitget_reality_fills:'requires_api_key_and_bd_whitelist',gate_cash_stock_market_trades:'not_exposed_as_public_market_trade_endpoint',gate_cash_stock_kline:'commercial_second_source_lock_remains',coinbase_equity_kline:'commercial_second_source_lock_remains',coinbase_equity_market:'canonical_product_id_via_official_market_data_family_render_shared_only'},stats:JSON.parse(JSON.stringify(stats))};}
-function selfTest(){const tests=[];const check=(name,ok)=>tests.push({name,ok:ok===true});const bybit=parseBybitTicker({retCode:0,result:{list:[{symbol:'AAPLXUSDT',lastPrice:'200',price24hPcnt:'0.01',volume24h:'10',turnover24h:'2000'}]}},'AAPLXUSDT');check('bybit_exact_ticker',bybit?.last_price===200&&bybit?.price_change_24h_ratio===0.01);const bitInst=parseBitgetInstrument({code:'00000',data:[{symbol:'RAAPLUSDT',category:'SPOT',isReality:'yes',isRwa:'YES',status:'online'}]},'RAAPLUSDT');check('bitget_reality_detected',bitInst?.is_reality===true);const gateBook=parseGateStockBook({bids:[['100','2']],asks:[['101','3']]});check('gate_stock_public_book_parse',gateBook?.bids?.[0]?.price===100&&gateBook?.asks?.[0]?.price===101);const hash='49054070AB1E4BE93DB6C6EDC4D856E9DB9C810BDBB9E6AC1A49DB80A5029BA2';const cb=parseCoinbaseProduct({product_id:hash,product_type:'EQUITY',price:'50',price_percentage_change_24h:'2%',best_bid_price:'49.9',best_ask_price:'50.1',equity_product_details:{ticker:'TEST',fractionable:true,liquidate_only:false,trading_halted:false,current_session:'REGULAR',trading_day_info:{venue_id:'NASDAQ',date:'2026-08-15',trading_sessions:[{session_type:'REGULAR',session_start_time:'2026-08-15T13:30:00Z',session_end_time:'2026-08-15T20:00:00Z',support_fractional:true,limit_only:false}]},equity_trading_flags:{tradable:true,buy_enabled:true,sell_enabled:true}}},hash);check('coinbase_equity_product_parse',cb?.product_type==='EQUITY'&&cb?.price===50&&cb?.price_change_24h_ratio===0.02&&cb?.equity_product_details?.ticker==='TEST'&&cb?.equity_product_details?.trading_day_info?.trading_sessions?.length===1);check('coinbase_canonical_opaque_product_id_preserved',nativeKey(hash)===hash&&cb?.product_id===hash);check('coinbase_equity_authenticated_product_type',coinbaseProductType({marketType:'equity',assetClass:'equity_cash',productKind:'equity'})==='EQUITY');check('coinbase_equity_market_product_path',true);check('coinbase_equity_market_book_path',true);check('coinbase_equity_market_trades_path',true);check('bybit_mt5_blocked',exactScope({provider:'bybit',marketType:'mt5',assetClass:'equity',productKind:'tradfi_cfd',assetId:'x',nativeSymbol:'AAPL'}).reason==='bybit_mt5_requires_tradfi_mt5_qualification');check('no_symbol_rewrite',nativeKey('ASML-USDT-SWAP')==='ASML-USDT-SWAP'&&nativeKey('CL_USDT')==='CL_USDT');check('binance_not_supported',providerKey('binance')==='');return{ok:tests.every(x=>x.ok),version:VERSION,schema_version:SCHEMA_VERSION,checks:tests.length,tests};}
+function healthPayload(){return{ok:true,version:VERSION,data_version:DATA_VERSION,schema_version:SCHEMA_VERSION,endpoint:ENDPOINT,batch_tickers_endpoint:BATCH_ENDPOINT,exact_identity_required:true,read_only_shared:true,user_direct_exchange_requests:0,same_exact_key_reads_share_cache_and_inflight:true,cross_provider_substitution:false,cross_product_substitution:false,cross_ticker_substitution:false,binance_supported:false,binance_contract_rest_touched:false,providers:[...PROVIDERS],build_active:activeBuilds,build_queue:buildQueue.length,build_max_active:BUILD_MAX_ACTIVE,build_max_queue:BUILD_MAX_QUEUE,exact_cache_entries:EXACT_CACHE.size,batch_cache_entries:BATCH_CACHE.size,coinbase_equity_realtime_policy:'identity_rules_status_session_only_realtime_not_proven',coinbase_equity_shared_catalog_cache:{ready:Boolean(coinbaseEquityCatalog),rows:coinbaseEquityCatalog?.rows?.length||0,fresh_until:coinbaseEquityCatalog?.freshUntil||null,stale_until:coinbaseEquityCatalog?.staleUntil||null},restrictions:{bybit_mt5:'requires_tradfi_mt5_qualification',bitget_reality_orderbook:'requires_api_key_and_bd_whitelist',bitget_reality_fills:'requires_api_key_and_bd_whitelist',gate_cash_stock_market_trades:'not_exposed_as_public_market_trade_endpoint',gate_cash_stock_kline:'commercial_second_source_lock_remains',coinbase_equity_kline:'commercial_second_source_lock_remains',coinbase_equity_realtime:'identity_rules_status_session_only_book_trades_realtime_not_proven'},stats:JSON.parse(JSON.stringify(stats))};}
+function selfTest(){const tests=[];const check=(name,ok)=>tests.push({name,ok:ok===true});const bybit=parseBybitTicker({retCode:0,result:{list:[{symbol:'AAPLXUSDT',lastPrice:'200',price24hPcnt:'0.01',volume24h:'10',turnover24h:'2000'}]}},'AAPLXUSDT');check('bybit_exact_ticker',bybit?.last_price===200&&bybit?.price_change_24h_ratio===0.01);const bitInst=parseBitgetInstrument({code:'00000',data:[{symbol:'RAAPLUSDT',category:'SPOT',isReality:'yes',isRwa:'YES',status:'online'}]},'RAAPLUSDT');check('bitget_reality_detected',bitInst?.is_reality===true);const gateBook=parseGateStockBook({bids:[['100','2']],asks:[['101','3']]});check('gate_stock_public_book_parse',gateBook?.bids?.[0]?.price===100&&gateBook?.asks?.[0]?.price===101);const cb=parseCoinbaseProduct({product_id:'A'.repeat(64),product_type:'EQUITY',product_venue:'CCM',price:'50',price_percentage_change_24h:'2%',best_bid_price:'49.9',equity_product_details:{equity_subtype:'EQUITY_PRODUCT_SUBTYPE_COMMON_STOCK',fractionable:true,trading_halted:false,ticker:'TEST',current_session:'EQUITY_TRADING_SESSION_REGULAR',trading_day_info:{date:'2026-08-14',trading_sessions:[{session_type:'EQUITY_TRADING_SESSION_REGULAR',session_start_time:'2026-08-14T13:30:00Z',session_end_time:'2026-08-14T20:00:00Z',support_fractional:true,limit_only:false}]},equity_trading_flags:{tradable:true,searchable:true,buy_enabled:true,sell_enabled:true}}},'A'.repeat(64));check('coinbase_equity_product_parse',cb?.product_type==='EQUITY'&&cb?.equity_product_details?.ticker==='TEST'&&cb?.equity_product_details?.equity_trading_flags?.tradable===true&&cb?.reference_market_fields?.price===50);check('coinbase_equity_realtime_not_promoted',true);check('bybit_mt5_blocked',exactScope({provider:'bybit',marketType:'mt5',assetClass:'equity',productKind:'tradfi_cfd',assetId:'x',nativeSymbol:'AAPL'}).reason==='bybit_mt5_requires_tradfi_mt5_qualification');check('no_symbol_rewrite',nativeKey('ASML-USDT-SWAP')==='ASML-USDT-SWAP'&&nativeKey('CL_USDT')==='CL_USDT');check('binance_not_supported',providerKey('binance')==='');return{ok:tests.every(x=>x.ok),version:VERSION,schema_version:SCHEMA_VERSION,checks:tests.length,tests};}
 
 export function getAssetMarketHealth(){return healthPayload();}
 export async function handleAssetMarket(req,res,url,signal){
@@ -583,4 +714,4 @@ export async function handleAssetMarket(req,res,url,signal){
   try{const payload=await getExact(identity,signal);sendJson(res,200,payload,{'x-kaka-cache':payload.cache_status||'miss'});}catch(e){sendJson(res,502,{...basePayload(identity),ok:false,error:String(e?.message||e),ticker:null,orderbook:null,trades:[],rules:null,status:null,trading_hours:null,derivatives:null});}return true;
 }
 
-export const __assetMarketStep1026Test=Object.freeze({parseBybitTicker,parseBitgetInstrument,parseGateStockBook,parseCoinbaseProduct,coinbaseProductType,coinbaseProductIdsQuery,nativeKey,exactScope,selfTest});
+export const __assetMarketStep1026Test=Object.freeze({parseBybitTicker,parseBitgetInstrument,parseGateStockBook,parseCoinbaseProduct,nativeKey,exactScope,selfTest});
