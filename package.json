@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.137",
+  "version": "650.8.15.138",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 contract realtime worker Step1019 official nine-field product-facts pass-through with zero additional exchange requests"
+  "description": "KakaWeb3 contract realtime worker Step1020 Bitget official funding bounds pass-through"
 }

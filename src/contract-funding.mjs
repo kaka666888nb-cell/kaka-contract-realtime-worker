@@ -6,7 +6,7 @@ import {
 import { getMarketUniverseRows } from './market-rest.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.41';
+const VERSION = '650.8.15.42';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -108,6 +108,8 @@ function normalizePersistedCurrent(raw) {
     index: raw.index_price,
     sourceTime: raw.source_time ?? raw.cached_at,
     intervalHours: raw.funding_interval_hours,
+    minFundingRate: raw.min_funding_rate,
+    maxFundingRate: raw.max_funding_rate,
   });
 }
 
@@ -634,7 +636,18 @@ function iso(value) {
   try { return new Date(ms).toISOString(); } catch (_) { return null; }
 }
 
-function currentRow({ provider, symbol, rate, nextTime, mark, index, sourceTime, intervalHours }) {
+function currentRow({
+  provider,
+  symbol,
+  rate,
+  nextTime,
+  mark,
+  index,
+  sourceTime,
+  intervalHours,
+  minFundingRate,
+  maxFundingRate,
+}) {
   const decimal = numberOrNull(rate);
   return {
     provider,
@@ -648,6 +661,8 @@ function currentRow({ provider, symbol, rate, nextTime, mark, index, sourceTime,
     mark_price: positivePriceOrNull(mark),
     index_price: positivePriceOrNull(index),
     funding_interval_hours: numberOrNull(intervalHours),
+    min_funding_rate: numberOrNull(minFundingRate),
+    max_funding_rate: numberOrNull(maxFundingRate),
     source_time: iso(sourceTime) || new Date().toISOString(),
     cached_at: new Date().toISOString(),
   };
@@ -951,6 +966,8 @@ async function fetchBitget(symbol, limit, { includeHistory = true } = {}) {
     nextTime: timeItem?.nextFundingTime ?? item?.nextFundingTime ?? item?.nextUpdate,
     sourceTime: fundingTimeRaw?.requestTime ?? currentRaw?.requestTime,
     intervalHours: timeItem?.ratePeriod ?? item?.fundingRateInterval,
+    minFundingRate: item?.minFundingRate,
+    maxFundingRate: item?.maxFundingRate,
   });
   const list = Array.isArray(historyRaw?.data) ? historyRaw.data : (Array.isArray(historyRaw?.data?.list) ? historyRaw.data.list : []);
   const history = list.map((row) => historyRow({
@@ -1054,6 +1071,7 @@ export async function handleContractFunding(req, res, url) {
       current_only_mode_skips_history_requests: true,
       binance_current_on_demand_mark_price_snapshot: true,
       bitget_next_funding_time_endpoint: '/api/v2/mix/market/funding-time',
+      bitget_official_funding_bounds_passthrough: true,
       native_contract_quotes: {
         USDT: ['binance','okx','bybit','bitget','gate'],
         USDC: ['binance','bybit','bitget'],
