@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.154';
+const STEP_VERSION = '650.8.15.155';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -309,6 +309,14 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: 'kaka-contract-realtime-worker',
       version: STEP_VERSION,
+      step1028_7_http_transport: {
+        keep_alive_timeout_ms: server.keepAliveTimeout,
+        headers_timeout_ms: server.headersTimeout,
+        max_requests_per_socket: server.maxRequestsPerSocket,
+        inbound_tls_terminated_by_render: true,
+        exchange_collectors_unchanged: true,
+        user_reads_add_exchange_requests: false,
+      },
       legacy_worker: '515.1.2',
       protocol: 'kaka.market.realtime.v1',
       providers: ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate'],
@@ -1008,6 +1016,11 @@ const server = http.createServer(async (req, res) => {
   }
   proxyHttp(req, res, url);
 });
+
+// Step1028.7: Render inbound HTTP transport resilience for shared snapshot fan-out.
+// No exchange collector/request path changes.
+server.keepAliveTimeout = 120_000;
+server.headersTimeout = 125_000;
 
 server.on('upgrade', (req, socket, head) => {
   const upstream = http.request({
