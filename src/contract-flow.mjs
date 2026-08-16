@@ -6,7 +6,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 
-const VERSION = '650.8.15.99';
+const VERSION = '650.8.15.100';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -557,6 +557,11 @@ let binanceOfficialTakerLastPersistError = '';
 let binanceOfficialTakerRecoveryTimer = null;
 let binanceOfficialTakerRound = 0;
 let binanceOfficialTakerLastSuccessfulFocusSignature = '';
+const binanceOfficialTakerRefreshDebt = new Set();
+let binanceOfficialTakerRefreshDebtSince = 0;
+let binanceOfficialTakerLastDebtReason = '';
+let binanceOfficialTakerPartialCycles = 0;
+let binanceOfficialTakerDebtRecoveries = 0;
 const binanceOfficialTakerStats = {
   attempts: 0,
   successes: 0,
@@ -2483,6 +2488,40 @@ function binanceOfficialTakerFocusTargets() {
   };
 }
 
+function pruneBinanceOfficialTakerRefreshDebt(focusSymbols) {
+  const keep = new Set(Array.isArray(focusSymbols) ? focusSymbols : []);
+  for (const symbol of [...binanceOfficialTakerRefreshDebt]) {
+    if (!keep.has(symbol)) binanceOfficialTakerRefreshDebt.delete(symbol);
+  }
+  if (binanceOfficialTakerRefreshDebt.size === 0) {
+    binanceOfficialTakerRefreshDebtSince = 0;
+    binanceOfficialTakerLastDebtReason = '';
+  }
+}
+
+function addBinanceOfficialTakerRefreshDebt(symbols, reason = '') {
+  let added = 0;
+  for (const raw of Array.isArray(symbols) ? symbols : []) {
+    const symbol = symbolKey(raw);
+    if (!symbol) continue;
+    if (!binanceOfficialTakerRefreshDebt.has(symbol)) added += 1;
+    binanceOfficialTakerRefreshDebt.add(symbol);
+  }
+  if (binanceOfficialTakerRefreshDebt.size > 0) {
+    if (!binanceOfficialTakerRefreshDebtSince) binanceOfficialTakerRefreshDebtSince = Date.now();
+    if (reason) binanceOfficialTakerLastDebtReason = String(reason).slice(0, 300);
+  }
+  return added;
+}
+
+function clearBinanceOfficialTakerRefreshDebt(symbol) {
+  binanceOfficialTakerRefreshDebt.delete(symbolKey(symbol));
+  if (binanceOfficialTakerRefreshDebt.size === 0) {
+    binanceOfficialTakerRefreshDebtSince = 0;
+    binanceOfficialTakerLastDebtReason = '';
+  }
+}
+
 function binanceOfficialTakerEntryFresh(entry) {
   const updated = Date.parse(String(entry?.updated_at || ''));
   return Number.isFinite(updated) && Date.now() - updated <= BINANCE_OFFICIAL_TAKER_STALE_MS && Number(entry?.row_count || 0) > 0;
@@ -2538,6 +2577,15 @@ function binanceOfficialTakerHealthPayload() {
     focus_change_detection: 'symbol_signature_not_round_counter',
     focus_round_is_not_used_as_symbol_change_signal: true,
     scheduled_same_signature_refresh_is_full_focus15: true,
+    partial_cycle_refresh_debt_tracking: true,
+    partial_cycle_never_committed_as_success: true,
+    recovery_retries_fresh_refresh_debt: true,
+    pending_refresh_debt_count: focus.symbols.filter((symbol)=>binanceOfficialTakerRefreshDebt.has(symbol)).length,
+    pending_refresh_debt_symbols: focus.symbols.filter((symbol)=>binanceOfficialTakerRefreshDebt.has(symbol)),
+    refresh_debt_since: binanceOfficialTakerRefreshDebtSince ? new Date(binanceOfficialTakerRefreshDebtSince).toISOString() : null,
+    refresh_debt_last_reason: binanceOfficialTakerLastDebtReason || null,
+    partial_cycles: binanceOfficialTakerPartialCycles,
+    refresh_debt_recoveries: binanceOfficialTakerDebtRecoveries,
     last_successful_focus_signature: binanceOfficialTakerLastSuccessfulFocusSignature,
     current_focus_signature: focus.signature,
     incomplete_focus_recovery_seconds: Math.round(BINANCE_OFFICIAL_TAKER_RETRY_MS/1000),
@@ -2557,15 +2605,28 @@ async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnl
     const focus=binanceOfficialTakerFocusTargets();
     binanceOfficialTakerStats.last_started_at=new Date().toISOString();
     binanceOfficialTakerStats.last_focus_round=focus.round;
+
     if(!focus.ready){
-      binanceOfficialTakerStats.last_error=`${reason}:binance_focus_not_ready:${focus.symbols.length}/15`;
+      binanceOfficialTakerStats.last_completed_at=new Date().toISOString();
+      binanceOfficialTakerStats.last_error=`binance_official_taker_focus_not_ready:${focus.symbols.length}/15`;
       return false;
     }
+
+    pruneBinanceOfficialTakerRefreshDebt(focus.symbols);
+    const debtBefore=focus.symbols.filter((symbol)=>binanceOfficialTakerRefreshDebt.has(symbol)).length;
+
+    const scanSymbols=focus.symbols.filter((symbol)=>{
+      const current=binanceOfficialTakerBySymbol.get(symbol);
+      if(!missingOnly) return true;
+      return binanceOfficialTakerRefreshDebt.has(symbol) || !binanceOfficialTakerEntryFresh(current);
+    });
+
     let anySuccess=false;
     const errors=[];
-    for(const symbol of focus.symbols){
-      const current=binanceOfficialTakerBySymbol.get(symbol);
-      if(missingOnly && binanceOfficialTakerEntryFresh(current)) continue;
+    let interrupted=false;
+
+    for(let index=0;index<scanSymbols.length;index+=1){
+      const symbol=scanSymbols[index];
       binanceOfficialTakerStats.attempts+=1;
       try{
         const native=nativeContractSymbol('binance',symbol);
@@ -2576,32 +2637,85 @@ async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnl
         const parsed=parseBinanceOfficialTakerRows(payload,symbol);
         if(!parsed || parsed.row_count<=0) throw new Error('binance_official_taker_empty');
         binanceOfficialTakerBySymbol.set(symbol,parsed);
+        clearBinanceOfficialTakerRefreshDebt(symbol);
         binanceOfficialTakerStats.successes+=1;
         anySuccess=true;
       }catch(error){
         binanceOfficialTakerStats.failures+=1;
         const message=String(error?.message||error).slice(0,220);
         errors.push(`${symbol}:${message}`);
+        addBinanceOfficialTakerRefreshDebt([symbol], `${reason}:${symbol}:${message}`);
+
+        const temporaryRelayStop =
+          error?.backgroundDeferred ||
+          error?.auxiliaryDeferred ||
+          error?.internalBinanceRestGuard ||
+          error?.internalBinanceRelayGuard ||
+          [403,418,429,451].includes(Number(error?.status||0));
+
         if(error?.backgroundDeferred||error?.auxiliaryDeferred){
           binanceOfficialTakerStats.background_deferrals+=1;
+        }
+
+        if(temporaryRelayStop){
+          // The old implementation broke here and forgot every unattempted
+          // symbol. Keep the entire remainder as explicit refresh debt.
+          const remainder=scanSymbols.slice(index+1);
+          addBinanceOfficialTakerRefreshDebt(
+            remainder,
+            `${reason}:interrupted_after:${symbol}:${message}`,
+          );
+          interrupted=true;
           break;
         }
-        if(error?.internalBinanceRestGuard||error?.internalBinanceRelayGuard||[403,418,429,451].includes(Number(error?.status||0))) break;
       }
     }
+
     if(anySuccess) binanceOfficialTakerRound+=1;
     binanceOfficialTakerStats.last_completed_at=new Date().toISOString();
+
+    const pending=focus.symbols.filter((symbol)=>binanceOfficialTakerRefreshDebt.has(symbol));
+    const cycleComplete=pending.length===0;
     const health=binanceOfficialTakerHealthPayload();
-    if(health.ready) {
+
+    if(!cycleComplete){
+      binanceOfficialTakerPartialCycles+=1;
+    }else if(debtBefore>0){
+      binanceOfficialTakerDebtRecoveries+=1;
+    }
+
+    // A partial refresh is never signed off merely because the previous cache
+    // is still within the 12-minute freshness window.
+    if(health.ready && cycleComplete){
       binanceOfficialTakerStats.last_successful_focus_round=focus.round;
       binanceOfficialTakerLastSuccessfulFocusSignature=focus.signature;
       await persistBinanceOfficialTakerSharedSnapshot().catch(()=>false);
     }
-    binanceOfficialTakerStats.last_error=health.ready?'':errors.join(' | ').slice(0,700);
-    return health.ready;
+
+    if(health.ready && cycleComplete){
+      binanceOfficialTakerStats.last_error='';
+    }else{
+      const parts=[...errors];
+      if(pending.length){
+        parts.push(`pending_refresh_debt:${pending.join(',')}`);
+      }
+      if(interrupted){
+        parts.push('partial_cycle_interrupted_by_existing_relay_guard_or_capacity');
+      }
+      binanceOfficialTakerStats.last_error=parts.join(' | ').slice(0,700);
+    }
+
+    // Returning false while refresh debt exists schedules the existing bounded
+    // recovery path even if old cache rows are still technically fresh.
+    return health.ready && cycleComplete;
   })();
+
   binanceOfficialTakerInflight=task;
-  try{return await task;}finally{if(binanceOfficialTakerInflight===task)binanceOfficialTakerInflight=null;}
+  try{
+    return await task;
+  }finally{
+    if(binanceOfficialTakerInflight===task) binanceOfficialTakerInflight=null;
+  }
 }
 
 function scheduleBinanceOfficialTakerRecovery() {
@@ -2641,7 +2755,10 @@ function startBinanceOfficialTakerCollector() {
   interval.unref?.();
   const focusWatcher=setInterval(async()=>{
     const health=binanceOfficialTakerHealthPayload();
-    if(!health.ready) await refreshBinanceOfficialTakerFocus('focus_missing_watch',{missingOnly:true}).catch(()=>false);
+    if(!health.ready || Number(health.pending_refresh_debt_count||0)>0){
+      const ready=await refreshBinanceOfficialTakerFocus('focus_missing_or_refresh_debt_watch',{missingOnly:true}).catch(()=>false);
+      if(!ready) scheduleBinanceOfficialTakerRecovery();
+    }
   },30_000);
   focusWatcher.unref?.();
 }
