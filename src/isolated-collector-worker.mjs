@@ -8,7 +8,7 @@ const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT
 process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
 process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
 if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
-const VERSION = '650.8.15.131';
+const VERSION = '650.8.15.162';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -87,6 +87,46 @@ if (ROLE === 'market-light') {
     provider_governor: getProviderGovernorHealth(),
     liquidation_persistence: module.getContractLiquidationPersistenceHealth(),
     binance_liquidation_ws: module.getBinanceLiquidationWsHealth(),
+    timestamp_ms: Date.now(),
+  });
+} else if (ROLE === 'exchange-assets') {
+  const assetMarket = await import('./exchange-asset-market.mjs');
+  const assetKline = await import('./exchange-asset-kline.mjs');
+
+  roleVersion = '650.8.15.162';
+  handleRoleRoute = async (req, res, url) => {
+    const controller = new AbortController();
+    const abortQueuedWork = () => {
+      if (!res.writableEnded && !controller.signal.aborted) controller.abort();
+    };
+    req.once('aborted', abortQueuedWork);
+    res.once('close', abortQueuedWork);
+    try {
+      if (await assetKline.handleAssetKline(req, res, url, controller.signal)) return true;
+      if (await assetMarket.handleAssetMarket(req, res, url, controller.signal)) return true;
+      return false;
+    } finally {
+      req.removeListener('aborted', abortQueuedWork);
+      res.removeListener('close', abortQueuedWork);
+    }
+  };
+  internalState = () => ({
+    ok: true,
+    collector_role: ROLE,
+    collector_version: VERSION,
+    module_version: roleVersion,
+    runtime: 'child_process',
+    pid: process.pid,
+    thread_id: null,
+    ppid: process.ppid,
+    uptime_seconds: Math.round(process.uptime()),
+    memory_usage: {
+      rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+      heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    },
+    provider_governor: getProviderGovernorHealth(),
+    asset_market: assetMarket.getAssetMarketHealth(),
+    asset_klines: assetKline.getAssetKlineHealth(),
     timestamp_ms: Date.now(),
   });
 } else if (ROLE === 'deep-market') {

@@ -3,7 +3,7 @@
 // This module never substitutes venue/product/ticker identities and never touches
 // the protected Binance contract REST path.
 
-const VERSION = '650.8.15.154';
+const VERSION = '650.8.15.162';
 const DATA_VERSION = 10261;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
@@ -14,8 +14,11 @@ const PROVIDERS = new Set(['okx', 'bybit', 'bitget', 'gate']);
 const INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d']);
 const CACHE_MAX = 512;
 const NEGATIVE_CACHE_MAX = 256;
-const BUILD_MAX_ACTIVE = 4;
-const BUILD_MAX_QUEUE = 80;
+const BUILD_MAX_ACTIVE = 4; // global emergency ceiling retained from .161
+const BUILD_MAX_QUEUE = 80; // global emergency queue ceiling retained from .161
+const BUILD_PROVIDER_MAX_ACTIVE = 1;
+const BUILD_PROVIDER_MAX_QUEUE = 20;
+const BUILD_PROVIDER_ORDER = Object.freeze(['okx', 'bybit', 'bitget', 'gate']);
 const STALE_MS = 15 * 60_000;
 const NEGATIVE_TTL_MS = 45_000;
 const FETCH_TIMEOUT_MS = 15_000;
@@ -23,8 +26,17 @@ const FETCH_TIMEOUT_MS = 15_000;
 const cache = new Map();
 const negativeCache = new Map();
 const inflight = new Map();
-const queue = [];
+const buildBulkheads = new Map(BUILD_PROVIDER_ORDER.map((provider) => [provider, {
+  provider,
+  active: 0,
+  queue: [],
+  started: 0,
+  completed: 0,
+  rejected: 0,
+  max_queue_seen: 0,
+}]));
 let activeBuilds = 0;
+let buildRoundRobinCursor = 0;
 
 const stats = {
   reads: 0,
@@ -199,42 +211,103 @@ function cachedPayload(entry, state) {
   };
 }
 
-function acquireBuildSlot(signal) {
-  if (signal?.aborted) return Promise.reject(new Error('asset_kline_request_aborted_before_queue'));
-  if (activeBuilds < BUILD_MAX_ACTIVE) {
-    activeBuilds += 1;
-    return Promise.resolve(() => releaseBuildSlot());
+function buildQueueTotal() {
+  let total = 0;
+  for (const state of buildBulkheads.values()) total += state.queue.length;
+  return total;
+}
+
+function buildBulkheadHealth() {
+  const providers = {};
+  for (const provider of BUILD_PROVIDER_ORDER) {
+    const state = buildBulkheads.get(provider);
+    providers[provider] = {
+      active: state.active,
+      queue: state.queue.length,
+      max_active: BUILD_PROVIDER_MAX_ACTIVE,
+      max_queue: BUILD_PROVIDER_MAX_QUEUE,
+      started: state.started,
+      completed: state.completed,
+      rejected: state.rejected,
+      max_queue_seen: state.max_queue_seen,
+    };
   }
-  if (queue.length >= BUILD_MAX_QUEUE) {
+  return providers;
+}
+
+function startQueuedBuild(provider, item) {
+  const state = buildBulkheads.get(provider);
+  if (!state || !item || item.signal?.aborted) return false;
+  if (item.signal && item.onAbort) item.signal.removeEventListener('abort', item.onAbort);
+  state.active += 1;
+  state.started += 1;
+  activeBuilds += 1;
+  item.resolve(() => releaseBuildSlot(provider));
+  return true;
+}
+
+function drainBuildQueues() {
+  while (activeBuilds < BUILD_MAX_ACTIVE) {
+    let startedOne = false;
+    for (let offset = 0; offset < BUILD_PROVIDER_ORDER.length; offset += 1) {
+      const index = (buildRoundRobinCursor + offset) % BUILD_PROVIDER_ORDER.length;
+      const provider = BUILD_PROVIDER_ORDER[index];
+      const state = buildBulkheads.get(provider);
+      if (!state || state.active >= BUILD_PROVIDER_MAX_ACTIVE) continue;
+      while (state.queue.length > 0) {
+        const item = state.queue.shift();
+        if (!item || item.signal?.aborted) continue;
+        buildRoundRobinCursor = (index + 1) % BUILD_PROVIDER_ORDER.length;
+        startQueuedBuild(provider, item);
+        startedOne = true;
+        break;
+      }
+      if (startedOne || activeBuilds >= BUILD_MAX_ACTIVE) break;
+    }
+    if (!startedOne) break;
+  }
+}
+
+function acquireBuildSlot(provider, signal) {
+  const state = buildBulkheads.get(provider);
+  if (!state) return Promise.reject(new Error('asset_kline_invalid_provider_bulkhead'));
+  if (signal?.aborted) return Promise.reject(new Error('asset_kline_request_aborted_before_queue'));
+  if (buildQueueTotal() === 0 && state.active < BUILD_PROVIDER_MAX_ACTIVE && activeBuilds < BUILD_MAX_ACTIVE) {
+    state.active += 1;
+    state.started += 1;
+    activeBuilds += 1;
+    return Promise.resolve(() => releaseBuildSlot(provider));
+  }
+  if (state.queue.length >= BUILD_PROVIDER_MAX_QUEUE || buildQueueTotal() >= BUILD_MAX_QUEUE) {
     stats.queue_rejections += 1;
-    return Promise.reject(new Error('asset_kline_queue_full'));
+    state.rejected += 1;
+    return Promise.reject(new Error(state.queue.length >= BUILD_PROVIDER_MAX_QUEUE ? 'asset_kline_provider_queue_full' : 'asset_kline_global_queue_full'));
   }
   return new Promise((resolve, reject) => {
-    const item = { resolve, reject, signal, onAbort: null };
+    const item = { provider, resolve, reject, signal, onAbort: null };
     if (signal) {
       item.onAbort = () => {
-        const index = queue.indexOf(item);
-        if (index >= 0) queue.splice(index, 1);
+        const index = state.queue.indexOf(item);
+        if (index >= 0) state.queue.splice(index, 1);
         reject(new Error('asset_kline_request_aborted_while_queued'));
+        drainBuildQueues();
       };
       signal.addEventListener('abort', item.onAbort, { once: true });
     }
-    queue.push(item);
+    state.queue.push(item);
+    state.max_queue_seen = Math.max(state.max_queue_seen, state.queue.length);
+    drainBuildQueues();
   });
 }
 
-function releaseBuildSlot() {
-  activeBuilds = Math.max(0, activeBuilds - 1);
-  while (queue.length > 0 && activeBuilds < BUILD_MAX_ACTIVE) {
-    const item = queue.shift();
-    if (!item || item.signal?.aborted) continue;
-    if (item.signal && item.onAbort) {
-      item.signal.removeEventListener('abort', item.onAbort);
-    }
-    activeBuilds += 1;
-    item.resolve(() => releaseBuildSlot());
-    break;
+function releaseBuildSlot(provider) {
+  const state = buildBulkheads.get(provider);
+  if (state) {
+    state.active = Math.max(0, state.active - 1);
+    state.completed += 1;
   }
+  activeBuilds = Math.max(0, activeBuilds - 1);
+  drainBuildQueues();
 }
 
 async function jsonFetch(url, provider, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -587,7 +660,7 @@ async function getSharedRows(identity, signal) {
   const task = (async () => {
     let release = null;
     try {
-      release = await acquireBuildSlot(signal);
+      release = await acquireBuildSlot(identity.provider, signal);
       stats.builds_started += 1;
       const rows = await buildRows(identity);
       if (!rows.length && !identity.sparse) {
@@ -734,8 +807,12 @@ export function getAssetKlineHealth() {
     cache_max: CACHE_MAX,
     build_active: activeBuilds,
     build_max_active: BUILD_MAX_ACTIVE,
-    build_queue: queue.length,
+    build_queue: buildQueueTotal(),
     build_max_queue: BUILD_MAX_QUEUE,
+    build_provider_max_active: BUILD_PROVIDER_MAX_ACTIVE,
+    build_provider_max_queue: BUILD_PROVIDER_MAX_QUEUE,
+    build_bulkhead_mode: 'per_provider_round_robin_with_global_emergency_ceiling',
+    provider_bulkheads: buildBulkheadHealth(),
     stale_seconds: Math.round(STALE_MS / 1000),
     negative_ttl_seconds: Math.round(NEGATIVE_TTL_MS / 1000),
     ...stats,

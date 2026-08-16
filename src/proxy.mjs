@@ -8,8 +8,6 @@ import { beginBinanceRestShutdown, getBinanceRestGuardHealth, runWithBinanceRequ
 import { getBinanceContractKlineSeedHealth } from './binance-contract-kline-seed.mjs';
 import { getBinanceContractKlineRelayHealth } from './binance-contract-kline-relay.mjs';
 import { getBinanceMarketRestHealth, handleMarketApi } from './market-rest.mjs';
-import { getAssetKlineHealth, handleAssetKline } from './exchange-asset-kline.mjs';
-import { getAssetMarketHealth, handleAssetMarket } from './exchange-asset-market.mjs';
 import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurrentSnapshotScanner } from './spot-current-snapshot.mjs';
 import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ticker.mjs';
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
@@ -28,12 +26,12 @@ import {
   startSlowStatsBridge,
 } from './slow-stats-bridge.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
-import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
+import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, requestIsolatedJson, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.161';
+const STEP_VERSION = '650.8.15.162';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -304,6 +302,13 @@ const server = http.createServer(async (req, res) => {
       error: String(error?.message || error),
       binance_shared_ws: null,
     }));
+    const exchangeAssetsState = await requestIsolatedJson('exchange-assets', '/_isolated/state', 750).catch((error) => ({
+      ok: false,
+      collector_role: 'exchange-assets',
+      error: String(error?.message || error),
+      asset_market: null,
+      asset_klines: null,
+    }));
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(JSON.stringify({
       ok: true,
@@ -377,12 +382,12 @@ const server = http.createServer(async (req, res) => {
       asset_klines: '/api/asset-klines',
       asset_klines_health: '/api/asset-klines/health',
       asset_klines_self_test: '/api/asset-klines/self-test',
-      asset_klines_state: getAssetKlineHealth(),
+      asset_klines_state: exchangeAssetsState?.asset_klines || null,
       asset_market: '/api/asset-market',
       asset_market_tickers: '/api/asset-market/tickers',
       asset_market_health: '/api/asset-market/health',
       asset_market_self_test: '/api/asset-market/self-test',
-      asset_market_state: getAssetMarketHealth(),
+      asset_market_state: exchangeAssetsState?.asset_market || null,
       all_market_second_history_end_time_pagination: true,
       all_market_second_history_latest_audit_cases: 11,
       all_market_second_history_older_target_cases: 11,
@@ -996,8 +1001,6 @@ const server = http.createServer(async (req, res) => {
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowHistory(req, res, url)) return true;
-      if (await handleAssetKline(req, res, url, requestAbortController.signal)) return true;
-      if (await handleAssetMarket(req, res, url, requestAbortController.signal)) return true;
       if (await handleMarketApi(req, res, url)) return true;
       if (await handleContractDepth(req, res, url)) return true;
       if (await handleContractFunding(req, res, url)) return true;

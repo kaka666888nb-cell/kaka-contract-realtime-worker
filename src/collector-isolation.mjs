@@ -5,11 +5,12 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.136';
+const VERSION = '650.8.15.162';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
 const SLOW_STATS_PORT = Number(process.env.KAKA_SLOW_STATS_COLLECTOR_PORT || 10014);
+const EXCHANGE_ASSETS_PORT = Number(process.env.KAKA_EXCHANGE_ASSETS_COLLECTOR_PORT || 10015);
 const DEEP_MARKET_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_DEEP_MARKET_WORKER_MAX_OLD_MB || 144));
 const SLOW_STATS_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_SLOW_STATS_WORKER_MAX_OLD_MB || 144));
 const RESTART_BASE_MS = Math.max(1_000, Number(process.env.KAKA_COLLECTOR_RESTART_BASE_MS || 2_000));
@@ -253,6 +254,7 @@ const ROLES = Object.freeze({
     runtime: 'worker_thread',
     max_old_generation_size_mb: SLOW_STATS_MAX_OLD_MB,
   }),
+  'exchange-assets': Object.freeze({ port: EXCHANGE_ASSETS_PORT, runtime: 'child_process' }),
 });
 
 const INSTANCE_ID = randomUUID();
@@ -408,6 +410,7 @@ export function isolatedCollectorPort(role) {
 export function collectorRoleForPath(pathname) {
   const path = String(pathname || '');
   if (path === '/api/market-light/current-snapshot' || path === '/api/market-light/health') return 'market-light';
+  if (path.startsWith('/api/asset-market') || path.startsWith('/api/asset-klines')) return 'exchange-assets';
   if (path.startsWith('/api/contract-liquidation')) return 'liquidation';
   if (
     path.startsWith('/api/contract-focus-pool') ||
@@ -549,8 +552,10 @@ export function getCollectorIsolationHealth() {
 
   const firstBatchNames = ['market-light', 'liquidation'];
   const secondBatchNames = ['deep-market', 'slow-stats'];
+  const exchangeAssetsNames = ['exchange-assets'];
   const firstBatchPids = firstBatchNames.map((role) => Number(roles[role]?.pid || 0)).filter((pid) => pid > 0);
   const secondBatchThreads = secondBatchNames.map((role) => Number(roles[role]?.thread_id || 0)).filter((id) => id > 0);
+  const exchangeAssetsPids = exchangeAssetsNames.map((role) => Number(roles[role]?.pid || 0)).filter((pid) => pid > 0);
 
   return {
     ok: true,
@@ -589,6 +594,13 @@ export function getCollectorIsolationHealth() {
     second_batch_worker_failure_isolated_from_parent: true,
     second_batch_worker_failure_isolated_from_sibling: true,
 
+    exchange_assets_runtime: 'child_process',
+    exchange_assets_roles: exchangeAssetsNames,
+    exchange_assets_roles_alive: exchangeAssetsNames.every((role) => roles[role]?.alive === true),
+    exchange_assets_child_pid_distinct_from_parent:
+      exchangeAssetsPids.length === exchangeAssetsNames.length && exchangeAssetsPids.every((pid) => pid !== process.pid),
+    exchange_assets_process_level_fault_domain: true,
+
     one_role_exit_does_not_exit_parent: true,
     role_scoped_supervisor_restart: true,
 
@@ -598,15 +610,19 @@ export function getCollectorIsolationHealth() {
     contract_flow_parent_scanner_started: false,
     contract_deep_parent_scanner_started: false,
     slow_stats_parent_modules_loaded: false,
+    exchange_assets_parent_modules_loaded: false,
 
     deep_market_owns_focus_pool: true,
     deep_market_owns_contract_flow: true,
     deep_market_owns_deep_shared: true,
     deep_market_owns_rpi_shared: true,
     slow_stats_owns_advanced_modules: true,
+    exchange_assets_owns_asset_market: true,
+    exchange_assets_owns_asset_klines: true,
     parent_routes_second_batch_to_workers: true,
+    parent_routes_exchange_assets_to_worker: true,
 
-    memory_safety_design: 'first_batch_child_processes_plus_second_batch_resource_limited_worker_isolates_plus_projected_internal_bridges',
+    memory_safety_design: 'first_batch_child_processes_plus_second_batch_resource_limited_worker_isolates_plus_exchange_assets_child_process_plus_projected_internal_bridges',
     projected_internal_bridge_payloads: true,
     full_market_rows_not_copied_to_second_batch: true,
     shared_read_transport_cache: {
