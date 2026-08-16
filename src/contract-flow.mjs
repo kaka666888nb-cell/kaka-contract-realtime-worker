@@ -6,7 +6,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 
-const VERSION = '650.8.15.102';
+const VERSION = '650.8.15.103';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -560,6 +560,7 @@ let binanceOfficialTakerLastSuccessfulFocusSignature = '';
 let binanceOfficialTakerCurrentInstancePrimed = false;
 let binanceOfficialTakerCurrentInstancePrimedAt = 0;
 let binanceOfficialTakerCurrentInstancePrimeSignature = '';
+const binanceOfficialTakerCurrentInstanceRefreshedSymbols = new Set();
 const binanceOfficialTakerRefreshDebt = new Set();
 let binanceOfficialTakerRefreshDebtSince = 0;
 let binanceOfficialTakerLastDebtReason = '';
@@ -2530,22 +2531,73 @@ function binanceOfficialTakerEntryFresh(entry) {
   return Number.isFinite(updated) && Date.now() - updated <= BINANCE_OFFICIAL_TAKER_STALE_MS && Number(entry?.row_count || 0) > 0;
 }
 
+function syncBinanceOfficialTakerCurrentInstancePrime(focus) {
+  const symbols = Array.isArray(focus?.symbols) ? focus.symbols : [];
+  const keep = new Set(symbols);
+
+  for (const symbol of [...binanceOfficialTakerCurrentInstanceRefreshedSymbols]) {
+    if (!keep.has(symbol)) {
+      binanceOfficialTakerCurrentInstanceRefreshedSymbols.delete(symbol);
+    }
+  }
+
+  const refreshedCoverage = symbols.filter(
+    (symbol) => binanceOfficialTakerCurrentInstanceRefreshedSymbols.has(symbol),
+  ).length;
+
+  const primedNow =
+    focus?.ready === true &&
+    symbols.length === 15 &&
+    refreshedCoverage === 15;
+
+  if (primedNow) {
+    if (
+      !binanceOfficialTakerCurrentInstancePrimed ||
+      binanceOfficialTakerCurrentInstancePrimeSignature !== focus.signature
+    ) {
+      binanceOfficialTakerCurrentInstancePrimedAt = Date.now();
+    }
+    binanceOfficialTakerCurrentInstancePrimed = true;
+    binanceOfficialTakerCurrentInstancePrimeSignature = focus.signature;
+  } else {
+    binanceOfficialTakerCurrentInstancePrimed = false;
+    binanceOfficialTakerCurrentInstancePrimeSignature = '';
+  }
+
+  return {
+    coverage: refreshedCoverage,
+    missing: symbols.filter(
+      (symbol) => !binanceOfficialTakerCurrentInstanceRefreshedSymbols.has(symbol),
+    ),
+    ready: primedNow,
+  };
+}
+
 function binanceOfficialTakerHealthPayload() {
   const focus = binanceOfficialTakerFocusTargets();
+  const currentInstancePrime = syncBinanceOfficialTakerCurrentInstancePrime(focus);
   const relay = getBinanceContractKlineRelayHealth();
   const coverage = focus.symbols.filter((symbol)=>binanceOfficialTakerEntryFresh(binanceOfficialTakerBySymbol.get(symbol))).length;
   const totalRows = focus.symbols.reduce((sum,symbol)=>sum+Number(binanceOfficialTakerBySymbol.get(symbol)?.row_count||0),0);
   const missing = focus.symbols.filter((symbol)=>!binanceOfficialTakerEntryFresh(binanceOfficialTakerBySymbol.get(symbol)));
   return {
-    ready: focus.ready && coverage === 15 && binanceOfficialTakerCurrentInstancePrimed,
+    ready: focus.ready && coverage === 15 && currentInstancePrime.ready,
     focus_target: 15,
     focus_round: focus.round,
     current_instance_full_sweep_required: true,
-    current_instance_full_sweep_completed: binanceOfficialTakerCurrentInstancePrimed,
-    current_instance_full_sweep_completed_at: binanceOfficialTakerCurrentInstancePrimedAt
+    current_instance_full_sweep_completed: currentInstancePrime.ready,
+    current_instance_full_sweep_completed_at: currentInstancePrime.ready && binanceOfficialTakerCurrentInstancePrimedAt
       ? new Date(binanceOfficialTakerCurrentInstancePrimedAt).toISOString()
       : null,
-    current_instance_full_sweep_signature: binanceOfficialTakerCurrentInstancePrimeSignature || null,
+    current_instance_full_sweep_signature: currentInstancePrime.ready
+      ? (binanceOfficialTakerCurrentInstancePrimeSignature || null)
+      : null,
+    current_instance_prime_mode: 'cumulative_success_per_current_focus_symbol_across_full_sweep_and_debt_recovery',
+    current_instance_success_coverage_rows: currentInstancePrime.coverage,
+    current_instance_success_missing_symbols: currentInstancePrime.missing,
+    current_instance_success_restored_cache_counts: false,
+    current_instance_success_survives_partial_cycle_recovery: true,
+    current_instance_focus_membership_change_revalidates_new_symbols: true,
     restored_cache_can_serve_rows_before_runtime_ready: true,
     restored_cache_alone_cannot_mark_runtime_ready: true,
     official_coverage_rows: coverage,
@@ -2594,6 +2646,9 @@ function binanceOfficialTakerHealthPayload() {
     scheduled_same_signature_refresh_is_full_focus15: true,
     partial_cycle_refresh_debt_tracking: true,
     startup_current_instance_full_focus_prime: true,
+    current_instance_prime_requires_each_focus_symbol_success_this_process: true,
+    current_instance_prime_allows_cross_cycle_debt_recovery_completion: true,
+    current_instance_prime_does_not_require_one_perfect_full_cycle: true,
     startup_restore_cache_shortcut_removed: true,
     startup_prime_uses_existing_auxiliary_relay: true,
     startup_prime_adds_no_user_triggered_requests: true,
@@ -2656,6 +2711,7 @@ async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnl
         const parsed=parseBinanceOfficialTakerRows(payload,symbol);
         if(!parsed || parsed.row_count<=0) throw new Error('binance_official_taker_empty');
         binanceOfficialTakerBySymbol.set(symbol,parsed);
+        binanceOfficialTakerCurrentInstanceRefreshedSymbols.add(symbol);
         clearBinanceOfficialTakerRefreshDebt(symbol);
         binanceOfficialTakerStats.successes+=1;
         anySuccess=true;
@@ -2695,18 +2751,10 @@ async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnl
 
     const pending=focus.symbols.filter((symbol)=>binanceOfficialTakerRefreshDebt.has(symbol));
     const cycleComplete=pending.length===0;
-    const fullFocusSweepComplete =
-      !missingOnly &&
-      scanSymbols.length === focus.symbols.length &&
-      focus.symbols.length === 15 &&
-      cycleComplete;
-
-    if(fullFocusSweepComplete){
-      binanceOfficialTakerCurrentInstancePrimed=true;
-      binanceOfficialTakerCurrentInstancePrimedAt=Date.now();
-      binanceOfficialTakerCurrentInstancePrimeSignature=focus.signature;
-    }
-
+    // Current-instance prime is cumulative across successful refreshes.
+    // A partial full sweep plus later debt recovery is valid once all current
+    // focus15 symbols have been successfully fetched by this process.
+    syncBinanceOfficialTakerCurrentInstancePrime(focus);
     const health=binanceOfficialTakerHealthPayload();
 
     if(!cycleComplete){
