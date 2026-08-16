@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.142';
+const VERSION = '650.8.15.143';
 const SNAPSHOT_ROUTE = '/api/bybit-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bybit-advanced/health';
 
@@ -14,7 +14,7 @@ const START_DELAY_MS = Math.max(5_000, Number(process.env.KAKA_BYBIT_ADVANCED_ST
 const STARTUP_RETRY_MS = Math.max(15_000, Number(process.env.KAKA_BYBIT_ADVANCED_STARTUP_RETRY_MS || 30_000));
 const FULL_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_FULL_REFRESH_MS || 6 * 60 * 60_000));
 const INSURANCE_REFRESH_MS = Math.max(10 * 60_000, Number(process.env.KAKA_BYBIT_ADVANCED_INSURANCE_REFRESH_MS || 30 * 60_000));
-const FOCUS_WATCH_MS = Math.max(15_000, Number(process.env.KAKA_BYBIT_ADVANCED_FOCUS_WATCH_MS || 30_000));
+const FOCUS_WATCH_MS = Math.max(5_000, Number(process.env.KAKA_BYBIT_ADVANCED_FOCUS_WATCH_MS || 10_000));
 const PRICE_LIMIT_START_DELAY_MS = Math.max(5_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_START_DELAY_MS || 7_000));
 const PRICE_LIMIT_REFRESH_MS = Math.max(10_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_REFRESH_MS || 15_000));
 const PRICE_LIMIT_STALE_MS = Math.max(30_000, Number(process.env.KAKA_BYBIT_PRICE_LIMIT_STALE_MS || 60_000));
@@ -450,7 +450,6 @@ async function refreshHistoryAndRisk(reason = 'scheduled', { missingOnly = false
       }
     }
 
-    lastFocusSignature = focusSignature(focus.rows);
     round += 1;
     responseCache.clear();
     lastCompletedAt = new Date().toISOString();
@@ -461,6 +460,7 @@ async function refreshHistoryAndRisk(reason = 'scheduled', { missingOnly = false
       totalBuildFailures += 1;
       return false;
     }
+    lastFocusSignature = focusSignature(focus.rows);
     lastError = '';
     return true;
   })();
@@ -528,7 +528,6 @@ async function refreshOrderPriceLimits(reason = 'scheduled', { missingOnly = fal
       await sleep(PER_REQUEST_GAP_MS);
     }
 
-    lastPriceLimitFocusSignature = focusSignature(focus.rows);
     priceLimitRound += 1;
     priceLimitLastCompletedAt = new Date().toISOString();
     responseCache.clear();
@@ -537,6 +536,7 @@ async function refreshOrderPriceLimits(reason = 'scheduled', { missingOnly = fal
       priceLimitLastError = `${reason}:bybit_order_price_limit_coverage:${coverage}/${FOCUS_TARGET}:failures=${failures}`;
       return false;
     }
+    lastPriceLimitFocusSignature = focusSignature(focus.rows);
     priceLimitLastError = '';
     return true;
   })();
@@ -593,7 +593,6 @@ async function refreshIndexComponents(reason = 'scheduled', { missingOnly = fals
       await sleep(PER_REQUEST_GAP_MS);
     }
 
-    lastIndexComponentFocusSignature = focusSignature(focus.rows);
     indexComponentRound += 1;
     indexComponentLastCompletedAt = new Date().toISOString();
     responseCache.clear();
@@ -602,6 +601,7 @@ async function refreshIndexComponents(reason = 'scheduled', { missingOnly = fals
       indexComponentLastError = `${reason}:bybit_index_component_coverage:${coverage}/${FOCUS_TARGET}:failures=${failures}`;
       return false;
     }
+    lastIndexComponentFocusSignature = focusSignature(focus.rows);
     indexComponentLastError = '';
     return true;
   })();
@@ -821,6 +821,8 @@ function buildSnapshot({ includeRows = true, useCache = true } = {}) {
     full_cycle_insurance_request_cap: 1,
     full_cycle_total_request_cap: FOCUS_TARGET * HISTORY_INTERVALS.length + FOCUS_TARGET + FOCUS_TARGET + FOCUS_TARGET + 1,
     focus_change_missing_only: true,
+    focus_watch_seconds: Math.round(FOCUS_WATCH_MS / 1000),
+    focus_change_signature_commits_only_after_coverage: true,
     official_empty_history_counts_as_official_coverage_without_fabricating_rows: true,
     official_empty_risk_counts_as_official_coverage_without_fabricating_tiers: true,
     insurance_unmapped_stays_null_but_counts_as_official_checked: true,

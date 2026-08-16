@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.142';
+const VERSION = '650.8.15.143';
 const SNAPSHOT_ROUTE = '/api/okx-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/okx-advanced/health';
 const OI_HISTORY_ROUTE = '/api/okx-advanced/open-interest-history';
@@ -12,6 +12,7 @@ const WS_URL = 'wss://ws.okx.com:8443/ws/v5/public';
 const START_DELAY_MS = Math.max(2_000, Number(process.env.KAKA_OKX_ADVANCED_START_DELAY_MS || 10_000));
 const STARTUP_RETRY_MS = Math.max(10_000, Number(process.env.KAKA_OKX_ADVANCED_STARTUP_RETRY_MS || 15_000));
 const FOCUS_REFRESH_MS = Math.max(2 * 60_000, Number(process.env.KAKA_OKX_ADVANCED_FOCUS_REFRESH_MS || 5 * 60_000));
+const FOCUS_WATCH_MS = Math.max(5_000, Number(process.env.KAKA_OKX_ADVANCED_FOCUS_WATCH_MS || 10_000));
 const SECURITY_FUND_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_OKX_ADVANCED_SECURITY_FUND_REFRESH_MS || 6 * 60 * 60_000));
 const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_OKX_ADVANCED_RESPONSE_CACHE_TTL_MS || 20_000));
 const FOCUS_STALE_MS = Math.max(5 * 60_000, Number(process.env.KAKA_OKX_ADVANCED_FOCUS_STALE_MS || 12 * 60_000));
@@ -45,6 +46,8 @@ let securityFundRunning = null;
 let focusTimer = null;
 let focusRecoveryTimer = null;
 let focusInterval = null;
+let focusWatchInterval = null;
+let lastFocusSignature = '';
 let securityFundTimer = null;
 let securityFundRecoveryTimer = null;
 let securityFundInterval = null;
@@ -198,6 +201,10 @@ function okxFocusTargets() {
     focus_round: Number(focus?.round || 0),
     rows: unique.slice(0, FOCUS_TARGET),
   };
+}
+
+function focusSignature(rows) {
+  return [...rows].map((row) => `${row.slot}:${row.symbol}`).sort().join('|');
 }
 
 function okxOpenInterestMap() {
@@ -1231,6 +1238,34 @@ export function startOkxAdvancedStatsScanner() {
   }, START_DELAY_MS + 1_500);
   securityFundTimer.unref?.();
 
+  focusWatchInterval = setInterval(async () => {
+    const focus = okxFocusTargets();
+    if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) return;
+    const signature = focusSignature(focus.rows);
+    if (signature === lastFocusSignature) return;
+
+    await refreshFocusStats('focus_change_missing_only', { missingOnly: true }).catch(() => false);
+    if (!focusStartupReady()) scheduleFocusStartupRecovery();
+
+    await refreshSecurityFund('focus_change_missing_only', { missingOnly: true }).catch(() => false);
+    if (!securityFundStartupReady()) scheduleSecurityFundStartupRecovery();
+
+    await refreshOiHistory('focus_change_missing_only', { missingOnly: true }).catch(() => false);
+    const oiCoverage = oiHistoryCoverage();
+    if (oiCoverage.target_count !== FOCUS_TARGET || oiCoverage.fresh_count !== FOCUS_TARGET) {
+      scheduleOiHistoryRecovery();
+    }
+
+    if (!wsOpen()) connectAdlWarningWs();
+    else syncAdlSubscriptions();
+
+    responseCache.clear();
+    const advancedReady = getOkxAdvancedStatsHealth().ready === true;
+    const historyReady = oiHistoryHealthPayload().ready === true;
+    if (advancedReady && historyReady) lastFocusSignature = signature;
+  }, FOCUS_WATCH_MS);
+  focusWatchInterval.unref?.();
+
   focusInterval = setInterval(() => refreshFocusStats('interval').catch(() => {}), FOCUS_REFRESH_MS);
   focusInterval.unref?.();
   securityFundInterval = setInterval(() => refreshSecurityFund('interval').catch(() => {}), SECURITY_FUND_REFRESH_MS);
@@ -1355,6 +1390,11 @@ function snapshotPayload({ includeRows = true } = {}) {
     adl_warning_subscribed_families: adlSubscribedFamilies.size,
     adl_warning_desired_families: desiredFamilies.length,
     focus_refresh_seconds: Math.round(FOCUS_REFRESH_MS / 1000),
+    focus_watch_seconds: Math.round(FOCUS_WATCH_MS / 1000),
+    focus_change_missing_only_recovery: true,
+    focus_change_oi_history_missing_only_recovery: true,
+    focus_change_security_fund_missing_only_recovery: true,
+    focus_change_signature_commits_only_after_advanced_and_history_ready: true,
     security_fund_refresh_seconds: Math.round(SECURITY_FUND_REFRESH_MS / 1000),
     security_fund_official_update_policy: 'daily_after_settlement_around_08:00_UTC_per_OKX_2026_update',
     per_request_gap_ms: PER_REQUEST_GAP_MS,

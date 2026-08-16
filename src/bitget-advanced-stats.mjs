@@ -1,7 +1,7 @@
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.10';
+const VERSION = '650.8.15.11';
 const SNAPSHOT_ROUTE = '/api/bitget-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/bitget-advanced/health';
 const HISTORY_ROUTE = '/api/bitget-advanced/history-snapshot';
@@ -11,6 +11,7 @@ const BASE = 'https://api.bitget.com';
 const START_DELAY_MS = Math.max(2_000, Number(process.env.KAKA_BITGET_ADVANCED_START_DELAY_MS || 8_000));
 const STARTUP_RETRY_MS = Math.max(10_000, Number(process.env.KAKA_BITGET_ADVANCED_STARTUP_RETRY_MS || 15_000));
 const FOCUS_REFRESH_MS = Math.max(2 * 60_000, Number(process.env.KAKA_BITGET_ADVANCED_FOCUS_REFRESH_MS || 5 * 60_000));
+const FOCUS_WATCH_MS = Math.max(5_000, Number(process.env.KAKA_BITGET_ADVANCED_FOCUS_WATCH_MS || 10_000));
 const BATCH_REFRESH_MS = Math.max(30_000, Number(process.env.KAKA_BITGET_ADVANCED_BATCH_REFRESH_MS || 60_000));
 const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_BITGET_ADVANCED_RESPONSE_CACHE_TTL_MS || 20_000));
 const STALE_MS = Math.max(5 * 60_000, Number(process.env.KAKA_BITGET_ADVANCED_STALE_MS || 12 * 60_000));
@@ -19,7 +20,7 @@ const FOCUS_TARGET = 15;
 const RISK_HISTORY_START_DELAY_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_START_DELAY_MS || 60_000));
 const RISK_HISTORY_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_REFRESH_MS || 6 * 60 * 60_000));
 const RISK_HISTORY_STALE_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_STALE_MS || 12 * 60 * 60_000));
-const RISK_HISTORY_WATCH_MS = Math.max(20_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_WATCH_MS || 30_000));
+const RISK_HISTORY_WATCH_MS = Math.max(5_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_WATCH_MS || 10_000));
 const RISK_HISTORY_REQUEST_GAP_MS = Math.max(1_500, Number(process.env.KAKA_BITGET_RISK_HISTORY_REQUEST_GAP_MS || 2_500));
 const RISK_HISTORY_RATE_LIMIT_COOLDOWN_MS = Math.max(60_000, Number(process.env.KAKA_BITGET_RISK_HISTORY_RATE_LIMIT_COOLDOWN_MS || 75_000));
 const RISK_HISTORY_SYMBOL_FALLBACK_LIMIT = Math.max(1, Math.min(4, Number(process.env.KAKA_BITGET_RISK_HISTORY_SYMBOL_FALLBACK_LIMIT || 3)));
@@ -55,6 +56,8 @@ let batchTimer = null;
 let focusRecoveryTimer = null;
 let fundingRecoveryTimer = null;
 let focusInterval = null;
+let focusWatchInterval = null;
+let lastFocusSignature = '';
 let batchInterval = null;
 let riskHistoryRunning = null;
 let riskHistoryTimer = null;
@@ -262,6 +265,10 @@ function bitgetFocusTargets() {
     focus_round: Number(focus?.round || 0),
     rows: unique.slice(0, FOCUS_TARGET),
   };
+}
+
+function focusSignature(rows) {
+  return [...rows].map((row) => `${row.slot}:${row.symbol}`).sort().join('|');
 }
 
 function bitgetSpotTargetSymbols(contractTargets) {
@@ -901,16 +908,30 @@ function mergeSpotStats(symbols, lanes) {
   return out;
 }
 
-async function refreshFocusStats(reason = 'interval') {
+async function refreshFocusStats(reason = 'interval', { missingOnly = false } = {}) {
   if (focusRunning) return await focusRunning;
   const task = (async () => runAdvancedUpstreamLane('focus_stats', async () => {
     lastFocusStartedAt = new Date().toISOString();
     totalFocusBuilds += 1;
     const targetState = bitgetFocusTargets();
-    const targets = targetState.rows;
-    if (!targetState.focus_ready || targets.length !== FOCUS_TARGET) {
-      throw new Error(`bitget_focus_not_ready:${targets.length}/${FOCUS_TARGET}`);
+    const allTargets = targetState.rows;
+    if (!targetState.focus_ready || allTargets.length !== FOCUS_TARGET) {
+      throw new Error(`bitget_focus_not_ready:${allTargets.length}/${FOCUS_TARGET}`);
     }
+    const targets = missingOnly
+      ? allTargets.filter((target) => {
+          const row = contractRows.get(target.symbol);
+          return !(
+            row &&
+            row.active_buy_sell &&
+            row.long_short &&
+            row.position_long_short &&
+            row.account_long_short &&
+            row.position_tier &&
+            row.index_components
+          );
+        })
+      : allTargets;
     const contractSymbols = targets.map((row) => row.symbol);
     const spotSymbols = bitgetSpotTargetSymbols(targets);
 
@@ -984,12 +1005,24 @@ async function refreshFocusStats(reason = 'interval') {
     const nextContractRows = mergeContractStats(targets, { active, longShort, position, account, tier, index });
     const nextSpotRows = mergeSpotStats(spotSymbols, { whale, fund, net });
 
-    if (nextContractRows.size === FOCUS_TARGET) contractRows = nextContractRows;
-    else if (!contractRows.size) contractRows = nextContractRows;
+    if (missingOnly) {
+      const mergedContract = new Map(contractRows);
+      for (const [symbol, row] of nextContractRows.entries()) mergedContract.set(symbol, row);
+      contractRows = mergedContract;
 
-    if (nextSpotRows.size > 0) spotRows = nextSpotRows;
+      if (nextSpotRows.size > 0) {
+        const mergedSpot = new Map(spotRows);
+        for (const [symbol, row] of nextSpotRows.entries()) mergedSpot.set(symbol, row);
+        spotRows = mergedSpot;
+      }
+    } else {
+      if (nextContractRows.size === FOCUS_TARGET) contractRows = nextContractRows;
+      else if (!contractRows.size) contractRows = nextContractRows;
+      if (nextSpotRows.size > 0) spotRows = nextSpotRows;
+    }
 
     round += 1;
+    if (focusStartupReady()) lastFocusSignature = focusSignature(allTargets);
     lastFocusCompletedAt = new Date().toISOString();
     lastFocusError = '';
     responseCache.clear();
@@ -1566,7 +1599,7 @@ function scheduleFocusStartupRecovery() {
   if (!started || focusStartupReady() || focusRecoveryTimer) return;
   focusRecoveryTimer = setTimeout(async () => {
     focusRecoveryTimer = null;
-    await refreshFocusStats('startup_recovery').catch(() => false);
+    await refreshFocusStats('startup_recovery_missing_only', { missingOnly: true }).catch(() => false);
     if (!focusStartupReady()) scheduleFocusStartupRecovery();
   }, STARTUP_RETRY_MS);
   focusRecoveryTimer.unref?.();
@@ -1633,6 +1666,18 @@ export function startBitgetAdvancedStatsScanner() {
     }
   }, RISK_HISTORY_WATCH_MS);
   riskHistoryWatchInterval.unref?.();
+
+  focusWatchInterval = setInterval(async () => {
+    const focus = bitgetFocusTargets();
+    if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) return;
+    const signature = focusSignature(focus.rows);
+    if (signature === lastFocusSignature) return;
+
+    await refreshFocusStats('focus_change_missing_only', { missingOnly: true }).catch(() => false);
+    if (!focusStartupReady()) scheduleFocusStartupRecovery();
+    responseCache.clear();
+  }, FOCUS_WATCH_MS);
+  focusWatchInterval.unref?.();
 
   focusInterval = setInterval(() => refreshFocusStats('interval').catch(() => {}), FOCUS_REFRESH_MS);
   focusInterval.unref?.();
@@ -1731,6 +1776,10 @@ function snapshotPayload({ includeRows = true } = {}) {
     spot_timestamped_history_additional_exchange_requests: 0,
     spot_timestamped_history_reuses_existing_step991_response_arrays: true,
     focus_refresh_seconds: Math.round(FOCUS_REFRESH_MS / 1000),
+    focus_watch_seconds: Math.round(FOCUS_WATCH_MS / 1000),
+    focus_change_missing_only_recovery: true,
+    focus_change_preserves_verified_contract_cache: true,
+    risk_history_watch_seconds: Math.round(RISK_HISTORY_WATCH_MS / 1000),
     batch_refresh_seconds: Math.round(BATCH_REFRESH_MS / 1000),
     one_per_second_lane_gap_ms: ONE_PER_SECOND_GAP_MS,
     official_endpoint_rate_policy: {
