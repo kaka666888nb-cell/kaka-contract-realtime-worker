@@ -1,4 +1,4 @@
-const VERSION = '650.8.15.144';
+const VERSION = '650.8.15.163';
 const SNAPSHOT_ROUTE = '/api/derivatives-public/current-snapshot';
 const HEALTH_ROUTE = '/api/derivatives-public/health';
 
@@ -691,10 +691,17 @@ async function buildCycle() {
     totalBuilds += 1;
     lastStartedAt = nowIso();
     const failures = [];
-    for (const [provider, fn] of [['okx', refreshOkx], ['bybit', refreshBybit], ['gate', refreshGate]]) {
-      try { await refreshProvider(provider, fn); }
-      catch (error) { failures.push(`${provider}:${String(error?.message || error)}`); }
-    }
+    const providerJobs = [['okx', refreshOkx], ['bybit', refreshBybit], ['gate', refreshGate]];
+    const settled = await Promise.allSettled(providerJobs.map(async ([provider, fn]) => {
+      try {
+        await refreshProvider(provider, fn);
+        return { provider, ok: true };
+      } catch (error) {
+        failures.push(`${provider}:${String(error?.message || error)}`);
+        return { provider, ok: false };
+      }
+    }));
+    void settled;
     lastCompletedAt = nowIso();
     if (failures.length) {
       totalBuildFailures += 1;
@@ -760,6 +767,8 @@ export function getDerivativesPublicHealth() {
     health_endpoint: HEALTH_ROUTE,
     collector_role: 'slow-stats',
     shared_background_collector: true,
+    provider_refresh_isolated: true,
+    provider_refresh_scheduling: 'parallel_all_settled_provider_governor_bounded',
     user_reads_trigger_collector: false,
     user_reads_trigger_exchange_requests: false,
     reads_scale_with_users: false,

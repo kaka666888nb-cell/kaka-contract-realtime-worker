@@ -1,6 +1,6 @@
 import { tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.47';
+const STEP_VERSION = '650.8.15.163';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const HIGH_ACTIVITY_PER_PROVIDER = 4;
 const ROTATING_PER_PROVIDER = 16;
@@ -178,9 +178,7 @@ export async function runSpotCurrentSnapshotCycle({ reason = 'scheduled' } = {})
   lastError = '';
   const round = cycle + 1;
   try {
-    for (const provider of PROVIDERS) {
-      await scanProvider(provider, round);
-    }
+    await Promise.allSettled(PROVIDERS.map((provider) => scanProvider(provider, round)));
     cycle = round;
     lastCompletedAt = new Date().toISOString();
     const successfulProviders = PROVIDERS.filter((provider) => (rowsByProvider.get(provider) || []).length > 0);
@@ -233,7 +231,7 @@ export function getSpotCurrentSnapshotHealth() {
     ok: true,
     version: STEP_VERSION,
     enabled: started || process.env.KAKA_DISABLE_SPOT_CURRENT_SCANNER !== '1',
-    mode: 'backend_shared_bounded_five_provider_spot_ticker_rotation',
+    mode: 'backend_shared_bounded_five_provider_spot_ticker_rotation_parallel_provider_fault_isolation',
     endpoint: '/api/spot-market/current-snapshot',
     health_endpoint: '/api/spot-market/health',
     providers: PROVIDERS,
@@ -242,7 +240,9 @@ export function getSpotCurrentSnapshotHealth() {
     rotating_per_provider: ROTATING_PER_PROVIDER,
     scan_interval_minutes: SCAN_INTERVAL_MS / 60_000,
     stale_minutes: STALE_MS / 60_000,
-    global_concurrency: 1,
+    global_concurrency: PROVIDERS.length,
+    provider_refresh_isolated: true,
+    provider_refresh_scheduling: 'parallel_all_settled_provider_governor_bounded',
     running,
     cycle,
     last_started_at: lastStartedAt,
