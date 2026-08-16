@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, getCo
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.153';
+const STEP_VERSION = '650.8.15.154';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -798,6 +798,10 @@ const server = http.createServer(async (req, res) => {
         step1026_7_coinbase_equity_opaque_product_id_case_preserved: true,
         step1026_7_coinbase_equity_generic_symbol_uppercase_normalizer_bypassed: true,
         step1026_7_coinbase_equity_product_id_case_rewrite: false,
+        step1026_8_okx_xperp_exact_ticker_uses_futures_tickers: true,
+        step1026_8_okx_xperp_funding_rate_futures_supported: true,
+        step1026_8_okx_asset_kline_uses_current_candles_route: '/api/v5/market/candles',
+        step1026_8_okx_history_candles_not_used_for_latest_asset_window: true,
         step1024_cross_provider_substitution: false,
         step1024_cross_quote_substitution: false,
         coinbase_step995_ticker_batch_existing_shared: true,

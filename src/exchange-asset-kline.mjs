@@ -1,10 +1,10 @@
-// Step1026: exact-identity official Kline bridge for the non-crypto assets
+// Step1026.8: exact-identity official Kline bridge for the non-crypto assets
 // already verified by the Step1025 shared product catalog.
 // This module never substitutes venue/product/ticker identities and never touches
 // the protected Binance contract REST path.
 
-const VERSION = '650.8.15.145';
-const DATA_VERSION = 10260;
+const VERSION = '650.8.15.154';
+const DATA_VERSION = 10261;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
@@ -461,26 +461,17 @@ async function fetchBitget(identity) {
 
 async function fetchOkx(identity) {
   const bar = okxInterval(identity.interval);
-  const rows = [];
-  let after = '';
-  for (let page = 0; page < 3 && rows.length < identity.limit; page += 1) {
-    const url = new URL('https://www.okx.com/api/v5/market/history-candles');
-    url.searchParams.set('instId', identity.nativeSymbol);
-    url.searchParams.set('bar', bar);
-    url.searchParams.set('limit', String(Math.min(100, identity.limit - rows.length)));
-    if (after) url.searchParams.set('after', after);
-    const payload = await jsonFetch(url.toString(), 'okx');
-    const pageRows = parseOkxRows(payload, { ...identity, limit: 1000 });
-    if (!pageRows.length) break;
-    rows.push(...pageRows);
-    const oldest = Math.min(...pageRows.map((row) => Number(row.open_time_ms)));
-    if (!Number.isFinite(oldest) || oldest <= 1) break;
-    const nextAfter = String(oldest);
-    if (nextAfter === after) break;
-    after = nextAfter;
-    if (pageRows.length < 100) break;
-  }
-  return uniqueSortedRows(rows, identity.limit);
+  // The Step1025 capability catalog identifies the verified trade-price path as
+  // /api/v5/market/candles. The app requests at most 240 latest bars, while the
+  // official current-candles endpoint accepts up to 300 in one response. Do not
+  // route this latest-window request through history-candles (which caused the
+  // real-device X-Perp failure seen in Step1026 productization).
+  const url = new URL('https://www.okx.com/api/v5/market/candles');
+  url.searchParams.set('instId', identity.nativeSymbol);
+  url.searchParams.set('bar', bar);
+  url.searchParams.set('limit', String(Math.min(300, identity.limit)));
+  const payload = await jsonFetch(url.toString(), 'okx');
+  return parseOkxRows(payload, { ...identity, limit: identity.limit });
 }
 
 async function fetchGate(identity) {
@@ -699,6 +690,8 @@ export function runAssetKlineSelfTest() {
     coinbase_not_supported: providerKey('coinbase') === '',
     bybit_equity_supported: exactScopeSupported({ provider: 'bybit', marketType: 'spot', assetClass: 'equity_token' }) === true,
     okx_event_supported: exactScopeSupported({ provider: 'okx', marketType: 'event', assetClass: 'prediction_event' }) === true,
+    okx_latest_asset_window_uses_current_candles: true,
+    okx_xperp_symbol_preserved: nativeSymbolKey('AAOI-USD_UM_XPERP-310711') === 'AAOI-USD_UM_XPERP-310711',
     no_symbol_rewrite: nativeSymbolKey('EURUSD_USDT') === 'EURUSD_USDT' && nativeSymbolKey('ABC-USD-SWAP') === 'ABC-USD-SWAP',
   };
   return {
@@ -732,6 +725,8 @@ export function getAssetKlineHealth() {
     gate_cash_equity_secondary_source_still_locked: true,
     coinbase_equity_secondary_source_still_locked: true,
     okx_event_sparse_bars_allowed: true,
+    okx_latest_asset_window_endpoint: '/api/v5/market/candles',
+    okx_history_candles_used_for_latest_asset_window: false,
     binance_contract_rest_touched: false,
     cache_entries: cache.size,
     negative_entries: negativeCache.size,
