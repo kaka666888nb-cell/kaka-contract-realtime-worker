@@ -6,7 +6,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 
-const VERSION = '650.8.15.100';
+const VERSION = '650.8.15.101';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -557,6 +557,9 @@ let binanceOfficialTakerLastPersistError = '';
 let binanceOfficialTakerRecoveryTimer = null;
 let binanceOfficialTakerRound = 0;
 let binanceOfficialTakerLastSuccessfulFocusSignature = '';
+let binanceOfficialTakerCurrentInstancePrimed = false;
+let binanceOfficialTakerCurrentInstancePrimedAt = 0;
+let binanceOfficialTakerCurrentInstancePrimeSignature = '';
 const binanceOfficialTakerRefreshDebt = new Set();
 let binanceOfficialTakerRefreshDebtSince = 0;
 let binanceOfficialTakerLastDebtReason = '';
@@ -2534,9 +2537,17 @@ function binanceOfficialTakerHealthPayload() {
   const totalRows = focus.symbols.reduce((sum,symbol)=>sum+Number(binanceOfficialTakerBySymbol.get(symbol)?.row_count||0),0);
   const missing = focus.symbols.filter((symbol)=>!binanceOfficialTakerEntryFresh(binanceOfficialTakerBySymbol.get(symbol)));
   return {
-    ready: focus.ready && coverage === 15,
+    ready: focus.ready && coverage === 15 && binanceOfficialTakerCurrentInstancePrimed,
     focus_target: 15,
     focus_round: focus.round,
+    current_instance_full_sweep_required: true,
+    current_instance_full_sweep_completed: binanceOfficialTakerCurrentInstancePrimed,
+    current_instance_full_sweep_completed_at: binanceOfficialTakerCurrentInstancePrimedAt
+      ? new Date(binanceOfficialTakerCurrentInstancePrimedAt).toISOString()
+      : null,
+    current_instance_full_sweep_signature: binanceOfficialTakerCurrentInstancePrimeSignature || null,
+    restored_cache_can_serve_rows_before_runtime_ready: true,
+    restored_cache_alone_cannot_mark_runtime_ready: true,
     official_coverage_rows: coverage,
     total_history_rows: totalRows,
     missing_symbols: missing,
@@ -2578,6 +2589,10 @@ function binanceOfficialTakerHealthPayload() {
     focus_round_is_not_used_as_symbol_change_signal: true,
     scheduled_same_signature_refresh_is_full_focus15: true,
     partial_cycle_refresh_debt_tracking: true,
+    startup_current_instance_full_focus_prime: true,
+    startup_restore_cache_shortcut_removed: true,
+    startup_prime_uses_existing_auxiliary_relay: true,
+    startup_prime_adds_no_user_triggered_requests: true,
     partial_cycle_never_committed_as_success: true,
     recovery_retries_fresh_refresh_debt: true,
     pending_refresh_debt_count: focus.symbols.filter((symbol)=>binanceOfficialTakerRefreshDebt.has(symbol)).length,
@@ -2676,6 +2691,18 @@ async function refreshBinanceOfficialTakerFocus(reason='scheduled', { missingOnl
 
     const pending=focus.symbols.filter((symbol)=>binanceOfficialTakerRefreshDebt.has(symbol));
     const cycleComplete=pending.length===0;
+    const fullFocusSweepComplete =
+      !missingOnly &&
+      scanSymbols.length === focus.symbols.length &&
+      focus.symbols.length === 15 &&
+      cycleComplete;
+
+    if(fullFocusSweepComplete){
+      binanceOfficialTakerCurrentInstancePrimed=true;
+      binanceOfficialTakerCurrentInstancePrimedAt=Date.now();
+      binanceOfficialTakerCurrentInstancePrimeSignature=focus.signature;
+    }
+
     const health=binanceOfficialTakerHealthPayload();
 
     if(!cycleComplete){
@@ -2731,7 +2758,7 @@ function scheduleBinanceOfficialTakerRecovery() {
 function startBinanceOfficialTakerCollector() {
   restoreBinanceOfficialTakerSharedSnapshot().catch(()=>false);
   const startup=setTimeout(async()=>{
-    const ready=await refreshBinanceOfficialTakerFocus('startup',{missingOnly:true}).catch(()=>false);
+    const ready=await refreshBinanceOfficialTakerFocus('startup_full_focus_current_instance_prime',{missingOnly:false}).catch(()=>false);
     if(!ready) scheduleBinanceOfficialTakerRecovery();
   },BINANCE_OFFICIAL_TAKER_START_DELAY_MS);
   startup.unref?.();
