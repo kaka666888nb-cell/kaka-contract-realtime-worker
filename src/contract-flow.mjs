@@ -6,7 +6,7 @@ import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs'
 import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 
-const VERSION = '650.8.15.101';
+const VERSION = '650.8.15.102';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const MAX_TRADES_PER_STREAM = 120000;
@@ -2487,7 +2487,7 @@ function binanceOfficialTakerFocusTargets() {
     ready: focus.ready === true && symbols.length === 15,
     round: Number(focus.round || 0),
     symbols,
-    signature: symbols.join('|'),
+    signature: [...symbols].sort().join('|'),
   };
 }
 
@@ -2585,7 +2585,11 @@ function binanceOfficialTakerHealthPayload() {
     defer_when_busy: false,
     visible_kline_and_critical_priority_preserved_by_existing_relay_queue: true,
     focus_change_missing_only_recovery: true,
-    focus_change_detection: 'symbol_signature_not_round_counter',
+    focus_change_detection: 'order_invariant_symbol_membership_signature_not_round_counter',
+    focus_change_signature_order_invariant: true,
+    focus_change_detects_membership_not_score_order: true,
+    hot_score_resort_does_not_trigger_missing_only: true,
+    focus_scan_order_preserved: true,
     focus_round_is_not_used_as_symbol_change_signal: true,
     scheduled_same_signature_refresh_is_full_focus15: true,
     partial_cycle_refresh_debt_tracking: true,
