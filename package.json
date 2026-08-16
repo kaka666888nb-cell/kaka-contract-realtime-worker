@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.161",
+  "version": "650.8.15.162",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Step1026.7 Coinbase EQUITY opaque canonical product_id case preservation; exact shared metadata"
+  "description": "KakaWeb3 Step1028.17B exchange-assets dedicated fault domain + per-provider asset market/Kline bulkheads"
 }
