@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.144';
+const VERSION = '650.8.15.145';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -439,7 +439,11 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         contractFlow.binance_official_taker?.normalized_shared_snapshot_persisted === true &&
         contractFlow.binance_official_taker?.render_direct_binance_rest === false &&
         contractFlow.binance_official_taker?.custom_provider_governor_created === false &&
-        contractFlow.binance_official_taker?.focus_change_detection === 'symbol_signature_not_round_counter' &&
+        contractFlow.binance_official_taker?.focus_change_detection === 'order_invariant_symbol_membership_signature_not_round_counter' &&
+        contractFlow.binance_official_taker?.focus_change_signature_order_invariant === true &&
+        contractFlow.binance_official_taker?.focus_change_detects_membership_not_score_order === true &&
+        contractFlow.binance_official_taker?.hot_score_resort_does_not_trigger_missing_only === true &&
+        contractFlow.binance_official_taker?.focus_scan_order_preserved === true &&
         contractFlow.binance_official_taker?.focus_round_is_not_used_as_symbol_change_signal === true &&
         contractFlow.binance_official_taker?.scheduled_same_signature_refresh_is_full_focus15 === true &&
         liquidationHistory.bitget_liquidations_history?.collector_ready === true &&
@@ -477,6 +481,10 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       binance_official_taker_relay_guard_next_allowed_at: contractFlow.binance_official_taker?.relay_guard_next_allowed_at || null,
       binance_official_taker_user_reads_trigger_exchange_requests: contractFlow.binance_official_taker?.user_reads_trigger_exchange_requests === true,
       binance_official_taker_focus_change_detection: contractFlow.binance_official_taker?.focus_change_detection || null,
+      binance_official_taker_focus_change_signature_order_invariant: contractFlow.binance_official_taker?.focus_change_signature_order_invariant === true,
+      binance_official_taker_focus_change_detects_membership_not_score_order: contractFlow.binance_official_taker?.focus_change_detects_membership_not_score_order === true,
+      binance_official_taker_hot_score_resort_does_not_trigger_missing_only: contractFlow.binance_official_taker?.hot_score_resort_does_not_trigger_missing_only === true,
+      binance_official_taker_focus_scan_order_preserved: contractFlow.binance_official_taker?.focus_scan_order_preserved === true,
       binance_official_taker_round_not_symbol_change_signal: contractFlow.binance_official_taker?.focus_round_is_not_used_as_symbol_change_signal === true,
       binance_official_taker_same_signature_full_refresh: contractFlow.binance_official_taker?.scheduled_same_signature_refresh_is_full_focus15 === true,
       bitget_liquidation_history_ready: liquidationHistory.bitget_liquidations_history?.collector_ready === true && liquidationHistory.bitget_liquidations_history?.official_endpoint_operational === true,
