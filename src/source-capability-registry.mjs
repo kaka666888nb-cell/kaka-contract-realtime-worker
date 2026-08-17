@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.145';
+const VERSION = '650.8.15.164';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -45,9 +45,9 @@ const CAPABILITIES = Object.freeze([
   { provider: 'gate', market: 'option', capability: 'option_public_market', official_available: true, official_scope: 'current_public_crypto_option_underlyings_and_tickers', transport: 'official_public_REST_shared_background', batch_mode: 'official_underlyings_plus_tickers_per_official_underlying', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1004_5', fallback_policy: 'last_verified_shared_snapshot_until_refresh; missing fields stay null', history_policy: 'current_only_step1004_5', source_url: 'https://www.gate.com/docs/developers/apiv4/en/' },
   { provider: 'bitget', market: 'option', capability: 'option_public_market', official_available: false, official_scope: 'none_in_current_public_crypto_UTA_product_categories', transport: 'none', batch_mode: 'none', rate_limit_class: 'none', collector: 'none', target_layer: 'derivatives_public', current_integration: 'crypto_options_not_in_current_public_crypto_product_family', fallback_policy: 'missing; Stock+ US stock options excluded from crypto derivatives scope', history_policy: 'none', source_url: 'https://www.bitget.com/api-doc/uta/public/Instruments' },
   // Binance
-  { provider: 'binance', market: 'spot', capability: 'directory', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST', batch_mode: 'data-api ticker_24hr symbol_omitted TRADING full-market shared baseline', rate_limit_class: '80_weight_per_2m_shared', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
-  { provider: 'binance', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST_plus_market_stream', batch_mode: 'data-api ticker_24hr TRADING baseline plus data-stream !miniTicker@arr changed updates', rate_limit_class: 'one_shared_stream_plus_80_weight_per_2m', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_shared_public_market_data_baseline; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/faqs/market_data_only' },
-  { provider: 'binance', market: 'spot', capability: 'bbo', official_available: true, official_scope: 'full_market', transport: 'public_market_data_only_REST', batch_mode: 'data-api ticker_24hr TRADING baseline BBO', rate_limit_class: 'shared_baseline', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1001_7', fallback_policy: 'last_verified_public_market_data_baseline_bbo_or_null; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market' },
+  { provider: 'binance', market: 'spot', capability: 'directory', official_available: true, official_scope: 'live_USDT_symbols_observed_by_official_all_market_stream', transport: 'public_market_data_only_WebSocket', batch_mode: 'one_shared_data-stream_miniTicker_arr_changed-symbol_observation', rate_limit_class: 'one_shared_stream_zero_REST_weight', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1031_2_stream_bootstrap', fallback_policy: 'last_verified_stream_snapshot; optional_heavy_REST_baseline_disabled_by_default; no authenticated REST or Edge relay', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/testnet/web-socket-streams' },
+  { provider: 'binance', market: 'spot', capability: 'ticker_24h', official_available: true, official_scope: 'live_USDT_symbols_changed_in_official_all_market_stream', transport: 'public_market_data_only_WebSocket', batch_mode: 'one_shared_data-stream_miniTicker_arr_price_open_high_low_base_quote_volume', rate_limit_class: 'one_shared_stream_zero_REST_weight', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready_step1031_2_stream_bootstrap', fallback_policy: 'last_verified_stream_snapshot; no user-scaled REST; no cross-provider substitution', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/testnet/web-socket-streams' },
+  { provider: 'binance', market: 'spot', capability: 'bbo', official_available: true, official_scope: 'not_in_miniTicker_stream', transport: 'optional_public_market_data_only_REST_or_exact_market_source', batch_mode: 'market_light_stream_bootstrap_keeps_bbo_null_when_optional_REST_disabled', rate_limit_class: 'optional_not_required_for_market_light_ready', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'intentional_null_step1031_2_stream_only_default', fallback_policy: 'null_until_verified_official_BBO_source_available; never derive; no cross-provider substitution', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/products/spot/testnet/web-socket-streams' },
   { provider: 'binance', market: 'contract', capability: 'directory', official_available: true, official_scope: 'full_market', transport: 'WS/shared_identity', batch_mode: 'all_market_identity', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
   { provider: 'binance', market: 'contract', capability: 'ticker_24h', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_market_ticker', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'none', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
   { provider: 'binance', market: 'contract', capability: 'mark_index_funding', official_available: true, official_scope: 'full_market', transport: 'WS', batch_mode: 'all_market_mark_price', rate_limit_class: 'light', collector: 'market-light-collector', target_layer: 'market_light', current_integration: 'ready', fallback_policy: 'last_verified_shared_snapshot', history_policy: 'funding_history_separate', source_url: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
@@ -188,7 +188,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
     version: VERSION,
     schema_version: '1.0',
     source: 'kaka_runtime_official_public_source_capability_registry',
-    source_checked_at: '2026-08-15',
+    source_checked_at: '2026-08-18',
     provider_keys: ['binance', 'okx', 'bybit', 'bitget', 'gate', 'coinbase'],
     contract_provider_keys: ['binance', 'okx', 'bybit', 'bitget', 'gate'],
     coinbase_project_scope: 'spot_only',
@@ -205,14 +205,15 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
     runtime_market_light_11_exact: allMarketExact,
     runtime_market_light_coverage: coverage,
     binance_spot_step1001_7: {
+      implementation_revision: 'step1031_2_stream_bootstrap_rest_independent',
       ready: health.binance_spot_ticker_shared_ws?.ready === true &&
         Number(health.binance_spot_ticker_shared_ws?.cached_rows || 0) > 0 &&
         Number(health.binance_spot_ticker_shared_ws?.cached_rows || 0) === Number(health.binance_spot_ticker_shared_ws?.directory_rows || 0) &&
-        health.binance_spot_ticker_shared_ws?.public_market_data_only_rest_used === true &&
+        health.binance_spot_ticker_shared_ws?.stream_connected === true &&
+        health.binance_spot_ticker_shared_ws?.stream_bootstrap_enabled === true &&
+        health.binance_spot_ticker_shared_ws?.rest_baseline_required_for_ready === false &&
         health.binance_spot_ticker_shared_ws?.authenticated_rest_used === false &&
         health.binance_spot_ticker_shared_ws?.edge_relay_used === false &&
-        health.binance_spot_ticker_shared_ws?.directory_from_public_market_data_rest_baseline === true &&
-        health.binance_spot_ticker_shared_ws?.background_baseline_only === true &&
         health.binance_spot_ticker_shared_ws?.user_reads_trigger_baseline_requests === false &&
         health.binance_spot_ticker_shared_ws?.reads_scale_with_users === false,
       public_market_data_rest_base: health.binance_spot_ticker_shared_ws?.public_market_data_rest_base || null,
@@ -226,6 +227,10 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       cached_rows: Number(health.binance_spot_ticker_shared_ws?.cached_rows || 0),
       directory_rows: Number(health.binance_spot_ticker_shared_ws?.directory_rows || 0),
       public_market_data_only_rest_used: health.binance_spot_ticker_shared_ws?.public_market_data_only_rest_used === true,
+      rest_baseline_enabled: health.binance_spot_ticker_shared_ws?.rest_baseline_enabled === true,
+      rest_baseline_required_for_ready: health.binance_spot_ticker_shared_ws?.rest_baseline_required_for_ready === true,
+      stream_bootstrap_enabled: health.binance_spot_ticker_shared_ws?.stream_bootstrap_enabled === true,
+      stream_bootstrap_rows: Number(health.binance_spot_ticker_shared_ws?.stream_bootstrap_rows || 0),
       authenticated_rest_used: health.binance_spot_ticker_shared_ws?.authenticated_rest_used === true,
       edge_relay_used: health.binance_spot_ticker_shared_ws?.edge_relay_used === true,
       user_reads_trigger_baseline_requests: health.binance_spot_ticker_shared_ws?.user_reads_trigger_baseline_requests === true,

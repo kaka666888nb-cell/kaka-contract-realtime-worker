@@ -1,6 +1,7 @@
 import { tickers as loadMarketTickers } from './market-rest.mjs';
+import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const STEP_VERSION = '650.8.15.163';
+const STEP_VERSION = '650.8.15.164';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const HIGH_ACTIVITY_PER_PROVIDER = 4;
 const ROTATING_PER_PROVIDER = 16;
@@ -32,6 +33,8 @@ let lastStartedAt = null;
 let lastCompletedAt = null;
 let lastError = '';
 let totalUpstreamTickerLoads = 0;
+let totalBinanceMarketLightReuses = 0;
+let totalBinanceBridgeWaitRetries = 0;
 let totalSnapshotReads = 0;
 let timer = null;
 let interval = null;
@@ -154,10 +157,35 @@ function selectRows(provider, rawRows, observedAt, round) {
 
 async function scanProvider(provider, round) {
   attemptsByProvider[provider] += 1;
-  totalUpstreamTickerLoads += 1;
   const observedAt = new Date().toISOString();
   try {
-    const rawRows = await loadMarketTickers(provider, 'spot', []);
+    let rawRows;
+    if (provider === 'binance') {
+      // Step1031.2: Binance USDT current snapshot must never start the former
+      // heavy all-symbol REST ticker request. Reuse the already-running shared
+      // market-light WebSocket snapshot instead; users still read only cache.
+      let shared = getMarketLightInternalSnapshot({
+        market: 'spot',
+        provider: 'binance',
+      });
+      rawRows = Array.isArray(shared?.rows) ? shared.rows : [];
+      totalBinanceMarketLightReuses += 1;
+      // Cold deploy: the isolated market-light child starts independently.
+      // Give the localhost bridge a few short read-only retries so Binance does
+      // not miss the entire next 5-minute spot-current cycle.
+      for (let retry = 0; rawRows.length === 0 && retry < 3; retry += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        totalBinanceBridgeWaitRetries += 1;
+        shared = getMarketLightInternalSnapshot({
+          market: 'spot',
+          provider: 'binance',
+        });
+        rawRows = Array.isArray(shared?.rows) ? shared.rows : [];
+      }
+    } else {
+      totalUpstreamTickerLoads += 1;
+      rawRows = await loadMarketTickers(provider, 'spot', []);
+    }
     const selected = selectRows(provider, rawRows, observedAt, round);
     if (!selected.length) throw new Error('spot_ticker_rows_empty');
     rowsByProvider.set(provider, selected);
@@ -231,7 +259,7 @@ export function getSpotCurrentSnapshotHealth() {
     ok: true,
     version: STEP_VERSION,
     enabled: started || process.env.KAKA_DISABLE_SPOT_CURRENT_SCANNER !== '1',
-    mode: 'backend_shared_bounded_five_provider_spot_ticker_rotation_parallel_provider_fault_isolation',
+    mode: 'backend_shared_bounded_five_provider_spot_ticker_rotation_parallel_provider_fault_isolation_binance_market_light_reuse',
     endpoint: '/api/spot-market/current-snapshot',
     health_endpoint: '/api/spot-market/health',
     providers: PROVIDERS,
@@ -243,6 +271,9 @@ export function getSpotCurrentSnapshotHealth() {
     global_concurrency: PROVIDERS.length,
     provider_refresh_isolated: true,
     provider_refresh_scheduling: 'parallel_all_settled_provider_governor_bounded',
+    binance_current_ticker_source: 'shared_market_light_websocket_snapshot',
+    binance_current_ticker_rest_requests: 0,
+    binance_current_ticker_user_scaled_requests: 0,
     running,
     cycle,
     last_started_at: lastStartedAt,
@@ -255,6 +286,8 @@ export function getSpotCurrentSnapshotHealth() {
     rows_by_provider: Object.fromEntries(PROVIDERS.map((provider) => [provider, (rowsByProvider.get(provider) || []).length])),
     provider_coverage: coverage,
     total_upstream_ticker_loads: totalUpstreamTickerLoads,
+    total_binance_market_light_reuses: totalBinanceMarketLightReuses,
+    total_binance_bridge_wait_retries: totalBinanceBridgeWaitRetries,
     total_snapshot_reads: totalSnapshotReads,
     snapshot_reads_start_exchange_requests: false,
     snapshot_reads_start_exchange_connections: false,

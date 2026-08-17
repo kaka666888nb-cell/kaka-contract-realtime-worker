@@ -1,6 +1,7 @@
 import { tickers } from './market-rest.mjs';
+import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const VERSION = '650.8.15.163';
+const VERSION = '650.8.15.164';
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 
 const CACHE_TTL_MS = 20_000;
@@ -33,6 +34,8 @@ const stats = {
   queue_rejections: 0,
   cache_evictions: 0,
   upstream_ticker_builds: 0,
+  binance_market_light_reuse_builds: 0,
+  binance_bridge_wait_retries: 0,
 };
 
 function providerKey(raw) {
@@ -183,8 +186,33 @@ function releaseBuildSlot(provider) {
 }
 
 async function buildExactTicker(provider, symbol) {
-  stats.upstream_ticker_builds += 1;
-  const rows = await tickers(provider, 'spot', [symbol]);
+  let rows;
+  if (provider === 'binance') {
+    // Step1031.2: exact Binance USDT ticker is projected from the shared
+    // market-light WebSocket snapshot. No per-user or per-symbol REST build.
+    let shared = getMarketLightInternalSnapshot({
+      market: 'spot',
+      provider: 'binance',
+    });
+    rows = Array.isArray(shared?.rows)
+      ? shared.rows.filter((row) => symbolKey(row?.symbol) === symbol)
+      : [];
+    stats.binance_market_light_reuse_builds += 1;
+    for (let retry = 0; rows.length === 0 && retry < 3; retry += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      stats.binance_bridge_wait_retries += 1;
+      shared = getMarketLightInternalSnapshot({
+        market: 'spot',
+        provider: 'binance',
+      });
+      rows = Array.isArray(shared?.rows)
+        ? shared.rows.filter((row) => symbolKey(row?.symbol) === symbol)
+        : [];
+    }
+  } else {
+    stats.upstream_ticker_builds += 1;
+    rows = await tickers(provider, 'spot', [symbol]);
+  }
   if (!Array.isArray(rows)) return null;
   for (const raw of rows) {
     if (!raw || typeof raw !== 'object') continue;
@@ -313,7 +341,7 @@ export function getSpotExactTickerHealth() {
     endpoint: '/api/spot-market/exact-ticker',
     health_endpoint: '/api/spot-market/exact-ticker-health',
     providers: [...PROVIDERS],
-    mode: 'backend_shared_exact_provider_spot_symbol_ticker',
+    mode: 'backend_shared_exact_provider_spot_symbol_ticker_binance_market_light_reuse',
     cache_ttl_seconds: Math.round(CACHE_TTL_MS / 1000),
     stale_seconds: Math.round(STALE_MS / 1000),
     negative_ttl_seconds: Math.round(NEGATIVE_TTL_MS / 1000),
@@ -331,6 +359,9 @@ export function getSpotExactTickerHealth() {
     provider_bulkheads: buildBulkheadHealth(),
     same_exact_key_reads_share_cache_and_inflight: true,
     fresh_snapshot_reads_start_exchange_requests: false,
+    binance_exact_ticker_source: 'shared_market_light_websocket_snapshot',
+    binance_exact_ticker_rest_requests: 0,
+    binance_exact_ticker_user_scaled_requests: 0,
     empty_or_failed_build_never_overwrites_verified_stale_payload: true,
     app_no_longer_calls_spot_detail_ticker_edge: true,
     app_no_longer_uses_device_direct_spot_ticker_fallback_for_detail_first_paint: true,

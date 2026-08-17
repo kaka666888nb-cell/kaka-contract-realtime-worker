@@ -14,7 +14,10 @@ const DEEP_CONTRACT_KEYS = Object.freeze([
 
 const PARENT_SPOT_KEYS = Object.freeze([
   'symbol', 'base_asset', 'quote_asset', 'quote_symbol',
-  'last_price', 'price', 'source_time', 'cached_at', 'updated_at',
+  'last_price', 'price', 'price_change_percent_24h',
+  'base_volume_24h', 'quote_volume_24h', 'high_24h', 'low_24h',
+  'best_bid', 'best_ask', 'bid_price', 'ask_price', 'spread_percent',
+  'source', 'transport', 'source_time', 'cached_at', 'updated_at',
 ]);
 
 const PARENT_CONTRACT_KEYS = Object.freeze([

@@ -1653,18 +1653,38 @@ async function tickers(provider, market, wantedSymbols = []) {
     if (market === 'contract') {
       return getBinanceContractTickers({ symbols: wanted });
     }
+
+    // Step1031.2: USDT spot current-ticker reads reuse the one shared
+    // market-light WebSocket snapshot. This removes the former heavy
+    // all-symbol /api/v3/ticker/24hr REST request from every generic ticker
+    // caller while preserving exact provider/symbol identity. Non-USDT
+    // quote families keep their existing bounded relay path.
+    if (requestedQuote === 'USDT') {
+      const { getMarketLightInternalSnapshot } = await import('./market-light-bridge.mjs');
+      const snapshot = getMarketLightInternalSnapshot({
+        market: 'spot',
+        provider: 'binance',
+      });
+      const rows = Array.isArray(snapshot?.rows) ? snapshot.rows : [];
+      return rows
+        .filter((row) => !wanted.length || wanted.includes(compact(row?.symbol)))
+        .map((row) => ({ ...row }));
+    }
+
     const payload = await sharedBinanceResult(
-      'spot_ticker:24hr_all',
+      `spot_ticker:24hr_all:${requestedQuote}`,
       10_000,
       () => binanceRestJsonFetch(
         'https://data-api.binance.vision/api/v3/ticker/24hr',
         15_000,
-        'spot_ticker:24hr_all',
+        `spot_ticker:24hr_all:${requestedQuote}`,
       ),
     );
     return (Array.isArray(payload) ? payload : [])
       .map((item) => tickerRow(provider, market, item, item.symbol))
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter((row) => split(row.symbol)[1] === requestedQuote)
+      .filter((row) => !wanted.length || wanted.includes(row.symbol));
   }
 
   if (provider === 'bybit' && market === 'contract') {
