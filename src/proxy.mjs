@@ -16,7 +16,6 @@ import { getMarketLightSnapshotHealth, startMarketLightBridge } from './market-l
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
 import { getProjectFundamentalsHealth, handleProjectFundamentals, startProjectFundamentalsCollector } from './project-fundamentals.mjs';
-import { getStockCatalogV2Health, handleStockCatalogV2, startStockCatalogV2Collector } from './stock-catalog-v2.mjs';
 import {
   getBinanceAdvancedStatsHealth,
   getBitgetAdvancedStatsHealth,
@@ -33,7 +32,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.181';
+const STEP_VERSION = '650.8.15.169';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -44,7 +43,6 @@ startContractFundingHistoryMaintainer();
 startSpotCurrentSnapshotScanner();
 startContractBasisScanner();
 startProjectFundamentalsCollector();
-startStockCatalogV2Collector();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -353,10 +351,6 @@ const server = http.createServer(async (req, res) => {
       project_fundamentals_current: '/api/project-fundamentals/current',
       project_fundamentals_health: '/api/project-fundamentals/health',
       project_fundamentals_state: getProjectFundamentalsHealth(),
-      stock_catalog_v2_current: '/api/stock-catalog-v2/current',
-      stock_catalog_v2_health: '/api/stock-catalog-v2/health',
-      stock_catalog_v2_self_test: '/api/stock-catalog-v2/self-test',
-      stock_catalog_v2_state: getStockCatalogV2Health(),
       crypto_sector_professional_history_state:
         getMarketLightSnapshotHealth()?.crypto_sector_history || null,
       collector_isolation: getCollectorIsolationHealth(),
@@ -1038,7 +1032,6 @@ const server = http.createServer(async (req, res) => {
     // queued/paced work; an already-started upstream request is still fully observed.
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
-      if (await handleStockCatalogV2(req, res, url)) return true;
       if (await handleSourceCapabilityRegistry(req, res, url)) return true;
       if (await handleProjectFundamentals(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
