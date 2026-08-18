@@ -17,7 +17,7 @@ import { getProjectFundamentalsHealth } from './project-fundamentals.mjs';
 import { getStockCatalogV2Health } from './stock-catalog-v2.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.183';
+const VERSION = '650.8.15.182';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -343,7 +343,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         Number(stockCatalogV2?.coinbase_market?.snapshot_rows || 0) >= 1000 &&
         Number(stockCatalogV2?.coinbase_market?.snapshot_persist_successes || 0) > 0 &&
         Number(stockCatalogV2?.coinbase_market?.match_ratio || 0) >= 0.90 &&
-        stockCatalogV2?.coinbase?.nonpositive_price_normalized_to_missing === true &&
+        Number(stockCatalogV2?.coinbase?.priced_rows || 0) >= 50 &&
         Number(stockCatalogV2?.coinbase?.priced_rows || 0) <= Number(stockCatalogV2?.coinbase?.product_rows || 0) &&
         Number(stockCatalogV2?.coinbase?.current_session_rows || 0) >= 100 &&
         Number(stockCatalogV2?.coinbase?.current_session_rows || 0) <= Number(stockCatalogV2?.coinbase?.product_rows || 0) &&
@@ -352,7 +352,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         stockCatalogV2?.security_identity?.user_list_dedupes_by_security_key === true &&
         stockCatalogV2?.localization?.chinese_search_aliases === true &&
         stockCatalogV2?.localization?.canonical_commodity_aliases === true,
-      readiness_contract: 'authoritative_stock_health_plus_catalog_highwater_integrity_plus_zero_placeholder_suppression_plus_static_identity_localization_and_bounded_shared_market_safety',
+      readiness_contract: 'authoritative_stock_health_plus_catalog_highwater_integrity_plus_static_identity_localization_and_bounded_shared_market_safety',
       ephemeral_refresh_success_counters_are_not_hard_gate: true,
       stock_coverage_ready: stockCatalogV2?.coverage_ready === true,
       gate_session_refresh_capability_enabled: stockCatalogV2?.gate?.shared_session_refresh === true,
