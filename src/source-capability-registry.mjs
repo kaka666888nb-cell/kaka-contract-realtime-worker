@@ -17,7 +17,7 @@ import { getProjectFundamentalsHealth } from './project-fundamentals.mjs';
 import { getStockCatalogV2Health } from './stock-catalog-v2.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.174';
+const VERSION = '650.8.15.175';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -34,7 +34,7 @@ const DECISION_POLICY = Object.freeze({
 });
 
 const CAPABILITIES = Object.freeze([
-  { provider: 'kaka_backend', market: 'shared', capability: 'stock_catalog_v2_full_i18n_security_session', official_available: true, official_scope: 'Gate_full_us_hk_kr_cash_stock_ETF_plus_Coinbase_full_equity_cursor_catalog_exact_product_identity', transport: 'fixed_shared_background_collector_plus_private_supabase_catalog_and_parent_memory_market_snapshot', batch_mode: 'Gate_full_pagination_6h_Coinbase_full_identity_6h_and_light_market_15m_not_per_user', rate_limit_class: 'slow_shared_reference_catalog', collector: 'stock-catalog-v2-parent', target_layer: 'exchange_asset_catalog', current_integration: 'candidate_step1035_5_restore_reconcile_exact_shared_market_health', fallback_policy: 'persisted_verified_catalog; exact_product_identity_only; missing_market_fields_stay_null', history_policy: 'current_catalog_only', source_url: 'Gate Stock API + Coinbase Advanced Trade Products' },
+  { provider: 'kaka_backend', market: 'shared', capability: 'stock_catalog_v2_full_i18n_security_session', official_available: true, official_scope: 'Gate_full_us_hk_kr_cash_stock_ETF_plus_Coinbase_full_equity_cursor_catalog_exact_product_identity', transport: 'fixed_shared_background_collector_plus_private_supabase_catalog_and_parent_memory_market_snapshot', batch_mode: 'Gate_full_pagination_6h_Coinbase_full_identity_6h_and_light_market_15m_not_per_user', rate_limit_class: 'slow_shared_reference_catalog', collector: 'stock-catalog-v2-parent', target_layer: 'exchange_asset_catalog', current_integration: 'ready_step1035_7_registry_contract_aligned_to_authoritative_stock_health', fallback_policy: 'persisted_verified_catalog; exact_product_identity_only; missing_market_fields_stay_null', history_policy: 'current_catalog_only', source_url: 'Gate Stock API + Coinbase Advanced Trade Products' },
   { provider: 'kaka_backend', market: 'shared', capability: 'project_protocol_fundamentals', official_available: true, official_scope: 'DefiLlama_public_protocol_TVL_fees_revenue_exact_unique_CoinGecko_gecko_id_mapping', transport: 'fixed_hourly_shared_backend_collector_plus_private_supabase_persistence', batch_mode: 'three_public_DefiLlama_catalog_requests_per_shared_refresh_not_per_user', rate_limit_class: 'hourly_reference_shared_background', collector: 'project-fundamentals-parent', target_layer: 'project_protocol_fundamentals', current_integration: 'candidate_step1034', fallback_policy: 'persisted_verified_snapshot; missing_or_ambiguous_gecko_id_stays_unavailable; no_symbol_or_name_match', history_policy: 'current_reference_snapshot_only', source_url: 'https://defillama.com/docs/api' },
   { provider: 'kaka_backend', market: 'shared', capability: 'crypto_sector_professional_baskets', official_available: true, official_scope: 'derived_from_verified_shared_spot_market_snapshots_only', transport: 'market_light_isolated_collector_shared_memory_plus_cached_read_route', batch_mode: 'nine_observational_sector_baskets_from_five_USDT_venues_plus_Coinbase_USD_presence', rate_limit_class: 'internal_shared_derivation_no_additional_exchange_request', collector: 'market-light-collector', target_layer: 'crypto_sector_professional', current_integration: 'ready_step1033_history_rotation', fallback_policy: 'last verified device/shared snapshot; missing stays null; no cross-quote or cross-provider price substitution', history_policy: 'persisted_15m_30d_forward_archive_no_bulk_backfill', source_url: 'internal_shared_market_light_plus_supabase_persisted_aggregate_history' },
   { provider: 'okx', market: 'option', capability: 'option_iv_greeks_summary', official_available: true, official_scope: 'current_public_option_summary_per_instrument_family', transport: 'official_public_REST_shared_background', batch_mode: 'bounded_official_instFamily_opt_summary', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1024', fallback_policy: 'official empty fields stay null; no derived Greeks', history_policy: 'current_only', source_url: 'https://www.okx.com/docs-v5/en/' },
@@ -334,11 +334,9 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         stockCatalogV2?.coinbase?.hard_old_6_page_cap_removed === true &&
         Number(stockCatalogV2?.gate?.chinese_name_rows || 0) >= 40 &&
         stockCatalogV2?.gate?.shared_session_refresh === true &&
-        Number(stockCatalogV2?.gate?.session_refresh_successes || 0) > 0 &&
-        !String(stockCatalogV2?.gate?.last_session_error || '') &&
-        (Number(stockCatalogV2?.coinbase_market?.refresh_successes || 0) > 0 || stockCatalogV2?.coinbase_market?.restored_verified_snapshot === true) &&
-        !String(stockCatalogV2?.coinbase_market?.last_error || '') &&
+        stockCatalogV2?.coinbase_market?.bounded_to_committed_catalog === true &&
         stockCatalogV2?.coinbase_market?.counts_bounded_to_committed_catalog === true &&
+        stockCatalogV2?.coinbase_market?.full_metadata_duplication === false &&
         Number(stockCatalogV2?.coinbase?.priced_rows || 0) >= 50 &&
         Number(stockCatalogV2?.coinbase?.priced_rows || 0) <= Number(stockCatalogV2?.coinbase?.product_rows || 0) &&
         Number(stockCatalogV2?.coinbase?.current_session_rows || 0) >= 100 &&
@@ -348,6 +346,11 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
         stockCatalogV2?.security_identity?.user_list_dedupes_by_security_key === true &&
         stockCatalogV2?.localization?.chinese_search_aliases === true &&
         stockCatalogV2?.localization?.canonical_commodity_aliases === true,
+      readiness_contract: 'authoritative_stock_health_plus_static_identity_localization_and_bounded_shared_market_safety',
+      ephemeral_refresh_success_counters_are_not_hard_gate: true,
+      stock_coverage_ready: stockCatalogV2?.coverage_ready === true,
+      gate_session_refresh_capability_enabled: stockCatalogV2?.gate?.shared_session_refresh === true,
+      coinbase_market_bounded: stockCatalogV2?.coinbase_market?.counts_bounded_to_committed_catalog === true,
       version: stockCatalogV2?.version || null,
       data_version: Number(stockCatalogV2?.data_version || 0),
       schema_version: stockCatalogV2?.schema_version || null,
