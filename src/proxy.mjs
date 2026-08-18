@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.167';
+const STEP_VERSION = '650.8.15.168';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -344,6 +344,10 @@ const server = http.createServer(async (req, res) => {
       crypto_sector_professional_health: '/api/crypto-sector-professional/health',
       crypto_sector_professional_state:
         getMarketLightSnapshotHealth()?.crypto_sector_professional || null,
+      crypto_sector_professional_history: '/api/crypto-sector-professional/history',
+      crypto_sector_professional_history_health: '/api/crypto-sector-professional/history-health',
+      crypto_sector_professional_history_state:
+        getMarketLightSnapshotHealth()?.crypto_sector_history || null,
       collector_isolation: getCollectorIsolationHealth(),
       collector_isolation_first_batch: getCollectorIsolationHealth(),
       source_capabilities_current_snapshot: '/api/source-capabilities/current-snapshot',
@@ -851,6 +855,15 @@ const server = http.createServer(async (req, res) => {
         step1032_crypto_sector_cross_quote_aggregation: false,
         step1032_crypto_sector_tradeable_index: false,
         step1032_crypto_sector_membership_overlap_allowed: true,
+        step1033_crypto_sector_history_route: '/api/crypto-sector-professional/history',
+        step1033_crypto_sector_history_health_route: '/api/crypto-sector-professional/history-health',
+        step1033_crypto_sector_archive_interval_minutes: 15,
+        step1033_crypto_sector_history_retention_days: 30,
+        step1033_crypto_sector_history_forward_archive_only: true,
+        step1033_crypto_sector_history_bulk_backfill: false,
+        step1033_crypto_sector_rotation_is_observational_not_fund_flow: true,
+        step1033_crypto_sector_history_user_reads_start_exchange_requests: false,
+        step1033_crypto_sector_history_reads_scale_with_users: false,
         spot_capital_shared_history_endpoint: '/api/spot-flow/history',
         spot_capital_shared_history_cache_ttl_seconds: 120,
         spot_capital_shared_history_stale_seconds: 900,

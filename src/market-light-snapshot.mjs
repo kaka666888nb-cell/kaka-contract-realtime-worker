@@ -1,6 +1,7 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
+import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.166';
+const STEP_VERSION = '650.8.15.168';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 const SECTOR_SNAPSHOT_ROUTE = '/api/crypto-sector-professional/current-snapshot';
@@ -1998,6 +1999,9 @@ export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {})
     round = cycleRound;
     lastCompletedAt = new Date().toISOString();
     responseCache.clear();
+    if (successful > 0) {
+      maybeArchiveCryptoSectorSnapshot(buildSectorProfessionalSnapshot()).catch(() => {});
+    }
     return successful > 0;
   } catch (error) {
     lastError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
@@ -2010,6 +2014,7 @@ export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {})
 export function startMarketLightSnapshotScanner() {
   if (started || process.env.KAKA_DISABLE_MARKET_LIGHT_SCANNER === '1') return;
   started = true;
+  primeCryptoSectorHistory();
   ensureCoinbaseTickerBatch().catch(() => {});
   ensureBinanceSpotMiniTicker().catch(() => {});
   refreshBinanceSpotTickerBaseline().catch(() => {});
@@ -2488,6 +2493,7 @@ export function getMarketLightSnapshotHealth() {
     response_cache_hits: responseCacheHits,
     response_cache_misses: responseCacheMisses,
     crypto_sector_professional: getCryptoSectorProfessionalHealth(),
+    crypto_sector_history: getCryptoSectorHistoryHealth(),
     snapshot_reads_start_exchange_requests: false,
     snapshot_reads_start_exchange_connections: false,
     snapshot_reads_scale_with_users: false,
@@ -2681,7 +2687,9 @@ function sendJson(res, status, payload) {
 }
 
 export async function handleMarketLightSnapshot(req, res, url) {
-  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname)) return false;
+  const sectorHistoryRoute = url.pathname === '/api/crypto-sector-professional/history' ||
+    url.pathname === '/api/crypto-sector-professional/history-health';
+  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -2702,6 +2710,9 @@ export async function handleMarketLightSnapshot(req, res, url) {
   if (url.pathname === SECTOR_HEALTH_ROUTE) {
     sendJson(res, 200, getCryptoSectorProfessionalHealth());
     return true;
+  }
+  if (sectorHistoryRoute) {
+    return handleCryptoSectorHistory(req, res, url, buildSectorProfessionalSnapshot());
   }
   if (url.pathname === SECTOR_SNAPSHOT_ROUTE) {
     sectorSnapshotReads += 1;
