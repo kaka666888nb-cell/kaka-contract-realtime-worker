@@ -1,6 +1,6 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.165';
+const STEP_VERSION = '650.8.15.166';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
 const SECTOR_SNAPSHOT_ROUTE = '/api/crypto-sector-professional/current-snapshot';
@@ -464,6 +464,24 @@ function fieldCoverage(rows) {
   return result;
 }
 
+function providerDirectoryGeneration(meta, latestDirectoryRows) {
+  const verifiedDirectoryRows = Number(meta?.verified_directory_count || 0);
+  const directoryRows = verifiedDirectoryRows > 0
+    ? verifiedDirectoryRows
+    : Number(latestDirectoryRows || 0);
+  const latestRows = Number(latestDirectoryRows || 0);
+  const directoryRefreshPending =
+    latestRows > 0 &&
+    directoryRows > 0 &&
+    latestRows !== directoryRows;
+  return {
+    directoryRows,
+    latestDirectoryRows: latestRows,
+    directoryDelta: latestRows - directoryRows,
+    directoryRefreshPending,
+  };
+}
+
 function providerMeta(provider, market) {
   const key = keyFor(market, provider);
   const rows = rowsByKey.get(key) || [];
@@ -471,13 +489,35 @@ function providerMeta(provider, market) {
   const updatedAt = String(meta.updated_at || '');
   const updatedMs = Date.parse(updatedAt);
   const stale = !Number.isFinite(updatedMs) || Date.now() - updatedMs > STALE_MS;
-  const directoryRows = Number(directoryCountByKey.get(key) || 0);
+  // Step1032.1: a directory refresh and a ticker build are independent
+  // background jobs. Never compare last verified ticker rows with a newer
+  // directory generation, because that produces a transient false 371/372
+  // "not exact" while both sources are healthy. Keep directory_count aligned
+  // with the generation used by the last successful row build; expose the
+  // newest directory separately. A genuine same-generation ticker miss still
+  // fails exact coverage on the next build and is never fabricated.
+  const generation = providerDirectoryGeneration(
+    meta,
+    Number(directoryCountByKey.get(key) || 0),
+  );
+  const directoryRows = generation.directoryRows;
+  const latestDirectoryRows = generation.latestDirectoryRows;
+  const latestDirectoryUpdatedAt = directoryUpdatedAtByKey.get(key) || null;
+  const verifiedDirectoryUpdatedAt = meta.verified_directory_updated_at || null;
+  const directoryRefreshPending = generation.directoryRefreshPending;
   return {
     provider,
     market_type: market,
     primary_quote: PRIMARY_QUOTE[market]?.[provider] || null,
     row_count: rows.length,
     directory_count: directoryRows,
+    verified_directory_count: directoryRows,
+    latest_directory_count: latestDirectoryRows,
+    directory_delta: generation.directoryDelta,
+    directory_refresh_pending: directoryRefreshPending,
+    directory_generation_aligned: !directoryRefreshPending,
+    directory_updated_at: verifiedDirectoryUpdatedAt,
+    latest_directory_updated_at: latestDirectoryUpdatedAt,
     directory_coverage_percent: directoryRows > 0 ? Math.min(100, (rows.length / directoryRows) * 100) : null,
     stale,
     updated_at: meta.updated_at || null,
@@ -921,6 +961,8 @@ async function buildProvider(provider, market, cycleRound) {
       totalBuildFailures += 1;
       return false;
     }
+    const verifiedDirectoryCount = Number(directoryCountByKey.get(providerKey) || 0);
+    const verifiedDirectoryUpdatedAt = directoryUpdatedAtByKey.get(providerKey) || null;
     rowsByKey.set(providerKey, rows.map((row) => ({
       ...row,
       shared_round: cycleRound,
@@ -929,6 +971,8 @@ async function buildProvider(provider, market, cycleRound) {
     metaByKey.set(providerKey, {
       ...current,
       updated_at: observedAt,
+      verified_directory_count: verifiedDirectoryCount,
+      verified_directory_updated_at: verifiedDirectoryUpdatedAt,
       last_error: '',
       build_calls: Number(current.build_calls || 0) + 1,
       successful_builds: Number(current.successful_builds || 0) + 1,
@@ -965,6 +1009,8 @@ async function buildProvider(provider, market, cycleRound) {
       totalBuildFailures += 1;
       return false;
     }
+    const verifiedDirectoryCount = Number(directoryCountByKey.get(providerKey) || 0);
+    const verifiedDirectoryUpdatedAt = directoryUpdatedAtByKey.get(providerKey) || null;
     rowsByKey.set(providerKey, rows.map((row) => ({
       ...row,
       shared_round: cycleRound,
@@ -974,6 +1020,8 @@ async function buildProvider(provider, market, cycleRound) {
     metaByKey.set(providerKey, {
       ...current,
       updated_at: observedAt,
+      verified_directory_count: verifiedDirectoryCount,
+      verified_directory_updated_at: verifiedDirectoryUpdatedAt,
       last_error: '',
       build_calls: Number(current.build_calls || 0) + 1,
       successful_builds: Number(current.successful_builds || 0) + 1,
@@ -992,6 +1040,11 @@ async function buildProvider(provider, market, cycleRound) {
     const rows = dedupeRows(provider, market, rawRows, observedAt, primaryQuote);
     if (!rows.length) throw new Error('market_light_rows_empty');
     assertNoSeverePartialOverwrite(key, rows);
+    // No await is allowed between dedupeRows and this capture: the directory
+    // count stored here is the exact generation paired with the published
+    // ticker rows.
+    const verifiedDirectoryCount = Number(directoryCountByKey.get(key) || 0);
+    const verifiedDirectoryUpdatedAt = directoryUpdatedAtByKey.get(key) || null;
     rowsByKey.set(key, rows.map((row) => ({
       ...row,
       shared_round: cycleRound,
@@ -1000,6 +1053,8 @@ async function buildProvider(provider, market, cycleRound) {
     metaByKey.set(key, {
       ...current,
       updated_at: observedAt,
+      verified_directory_count: verifiedDirectoryCount,
+      verified_directory_updated_at: verifiedDirectoryUpdatedAt,
       last_error: '',
       build_calls: Number(current.build_calls || 0) + 1,
       successful_builds: Number(current.successful_builds || 0) + 1,
@@ -2068,7 +2123,12 @@ export function getMarketLightInternalSnapshot({ market = '', provider = '' } = 
     provider: normalizedProvider,
     primary_quote: PRIMARY_QUOTE[normalizedMarket]?.[normalizedProvider] || null,
     row_count: rows.length,
-    directory_count: Number(directoryCountByKey.get(key) || 0),
+    directory_count: Number(meta.directory_count || 0),
+    verified_directory_count: Number(meta.verified_directory_count || meta.directory_count || 0),
+    latest_directory_count: Number(meta.latest_directory_count || 0),
+    directory_delta: Number(meta.directory_delta || 0),
+    directory_refresh_pending: meta.directory_refresh_pending === true,
+    directory_generation_aligned: meta.directory_generation_aligned === true,
     stale: Boolean(meta.stale),
     updated_at: meta.updated_at || null,
     last_error: meta.last_error || '',
@@ -2670,6 +2730,7 @@ export async function handleMarketLightSnapshot(req, res, url) {
 }
 
 export const __marketLightStep1032Test = Object.freeze({
+  providerDirectoryGeneration,
   sectorMedian,
   sectorLeveragedBase,
   sectorDedupedUsdtRows,

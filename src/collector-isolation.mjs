@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.165';
+const VERSION = '650.8.15.166';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);

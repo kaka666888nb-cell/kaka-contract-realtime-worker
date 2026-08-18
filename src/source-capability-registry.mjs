@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.165';
+const VERSION = '650.8.15.166';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -146,6 +146,10 @@ function runtimeCoverage() {
     out[key] = {
       rows: Number(value?.row_count || 0),
       directory: Number(value?.directory_count || 0),
+      verified_directory: Number(value?.verified_directory_count || value?.directory_count || 0),
+      latest_directory: Number(value?.latest_directory_count || value?.directory_count || 0),
+      directory_delta: Number(value?.directory_delta || 0),
+      directory_refresh_pending: value?.directory_refresh_pending === true,
       exact: Number(value?.row_count || 0) > 0 && Number(value?.row_count || 0) === Number(value?.directory_count || 0) && value?.stale !== true && !String(value?.last_error || ''),
       stale: Boolean(value?.stale),
       last_error: String(value?.last_error || ''),
