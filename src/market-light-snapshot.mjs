@@ -1,8 +1,75 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.164';
+const STEP_VERSION = '650.8.15.165';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const HEALTH_ROUTE = '/api/market-light/health';
+const SECTOR_SNAPSHOT_ROUTE = '/api/crypto-sector-professional/current-snapshot';
+const SECTOR_HEALTH_ROUTE = '/api/crypto-sector-professional/health';
+const SECTOR_CACHE_TTL_MS = Math.max(
+  5_000,
+  Number(process.env.KAKA_CRYPTO_SECTOR_PROFESSIONAL_CACHE_TTL_MS || 10_000),
+);
+const SECTOR_MIN_TURNOVER_USDT = Math.max(
+  0,
+  Number(process.env.KAKA_CRYPTO_SECTOR_MIN_TURNOVER_USDT || 100_000),
+);
+const SECTOR_USDT_PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const SECTOR_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    key: 'btc',
+    zh: 'BTC生态',
+    en: 'Bitcoin Ecosystem',
+    symbols: Object.freeze(['BTC','BCH','STX','ORDI','SATS','RATS','CORE','CKB','BB','MERL']),
+  }),
+  Object.freeze({
+    key: 'eth',
+    zh: 'ETH生态',
+    en: 'Ethereum Ecosystem',
+    symbols: Object.freeze(['ETH','LDO','RPL','ENS','EIGEN','ETHFI','ENA','PENDLE','STRK','ZK']),
+  }),
+  Object.freeze({
+    key: 'l2',
+    zh: 'L2',
+    en: 'Layer 2',
+    symbols: Object.freeze(['ARB','OP','STRK','ZK','MNT','METIS','IMX','POL','BLAST','MODE']),
+  }),
+  Object.freeze({
+    key: 'defi',
+    zh: 'DeFi',
+    en: 'DeFi',
+    symbols: Object.freeze(['UNI','AAVE','SKY','MKR','CRV','COMP','SNX','PENDLE','LDO','DYDX','GMX','JUP','RAY','ENA','1INCH']),
+  }),
+  Object.freeze({
+    key: 'ai',
+    zh: 'AI',
+    en: 'AI',
+    symbols: Object.freeze(['FET','TAO','RENDER','RNDR','WLD','NEAR','AKT','ARKM','VIRTUAL','AIOZ','IO','PHB','NMR','GRIFFAIN']),
+  }),
+  Object.freeze({
+    key: 'meme',
+    zh: 'Meme',
+    en: 'Meme',
+    symbols: Object.freeze(['DOGE','SHIB','PEPE','BONK','FLOKI','WIF','BRETT','PENGU','TRUMP','MOG','POPCAT','TURBO','BOME','MEW']),
+  }),
+  Object.freeze({
+    key: 'rwa',
+    zh: 'RWA',
+    en: 'RWA',
+    symbols: Object.freeze(['ONDO','POLYX','CFG','OM','XDC','MPL','RSR']),
+  }),
+  Object.freeze({
+    key: 'gamefi',
+    zh: 'GameFi',
+    en: 'GameFi',
+    symbols: Object.freeze(['IMX','GALA','SAND','MANA','AXS','ENJ','RON','ILV','PIXEL','YGG','MAGIC','SUPER','BEAM']),
+  }),
+  Object.freeze({
+    key: 'depin',
+    zh: 'DePIN',
+    en: 'DePIN',
+    symbols: Object.freeze(['FIL','RENDER','RNDR','HNT','AKT','AR','AIOZ','IO','GRASS','ATH','MOBILE']),
+  }),
+]);
 
 const SPOT_PROVIDERS = Object.freeze(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const CONTRACT_PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -76,6 +143,10 @@ const directoryCountByKey = new Map();
 const directoryRowsByKey = new Map();
 const directoryUpdatedAtByKey = new Map();
 const responseCache = new Map();
+let sectorSnapshotCache = null;
+let sectorSnapshotCacheAt = 0;
+let sectorSnapshotBuilds = 0;
+let sectorSnapshotReads = 0;
 
 const bitgetContractFundingBatch = {
   attempts: 0,
@@ -2009,6 +2080,323 @@ export function getMarketLightInternalSnapshot({ market = '', provider = '' } = 
   };
 }
 
+
+function sectorMedian(values) {
+  const sorted = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function sectorSpotRowBase(row) {
+  const explicit = compact(row?.base_asset);
+  if (explicit) return explicit;
+  const quote = compact(row?.quote_asset ?? row?.quote_symbol);
+  const symbol = compact(row?.symbol);
+  return quote && symbol.endsWith(quote) && symbol.length > quote.length
+    ? symbol.slice(0, -quote.length)
+    : '';
+}
+
+function sectorLeveragedBase(base) {
+  return /(2L|2S|3L|3S|5L|5S)$/.test(compact(base));
+}
+
+function sectorHealthySpotSnapshot(provider) {
+  const snapshot = getMarketLightInternalSnapshot({ market: 'spot', provider });
+  return snapshot?.ok === true &&
+    snapshot?.stale !== true &&
+    Number(snapshot?.row_count || 0) > 0 &&
+    Array.isArray(snapshot?.rows)
+      ? snapshot
+      : null;
+}
+
+function sectorDedupedUsdtRows(healthyByProvider) {
+  const byBase = new Map();
+  for (const provider of SECTOR_USDT_PROVIDERS) {
+    const snapshot = healthyByProvider.get(provider);
+    if (!snapshot) continue;
+    for (const row of snapshot.rows) {
+      if (compact(row?.quote_asset ?? row?.quote_symbol) !== 'USDT') continue;
+      const base = sectorSpotRowBase(row);
+      if (!base || sectorLeveragedBase(base)) continue;
+      const change = finite(row?.price_change_percent_24h);
+      const turnover = finite(row?.quote_volume_24h);
+      const price = positive(row?.last_price ?? row?.price);
+      if (change == null || turnover == null || turnover < 0 || price == null) continue;
+      const current = byBase.get(base);
+      if (!current ||
+          turnover > Number(current.quote_volume_24h || 0) ||
+          (turnover === Number(current.quote_volume_24h || 0) &&
+           String(provider).localeCompare(String(current.provider || '')) < 0)) {
+        byBase.set(base, {
+          provider,
+          market_type: 'spot',
+          symbol: compact(row?.symbol),
+          base_asset: base,
+          quote_asset: 'USDT',
+          last_price: price,
+          price_change_percent_24h: change,
+          quote_volume_24h: turnover,
+          source_time: row?.source_time ?? row?.cached_at ?? null,
+        });
+      }
+    }
+  }
+  return byBase;
+}
+
+function sectorUsdtVenuePresence(healthyByProvider) {
+  const byBase = new Map();
+  for (const provider of SECTOR_USDT_PROVIDERS) {
+    const snapshot = healthyByProvider.get(provider);
+    if (!snapshot) continue;
+    for (const row of snapshot.rows) {
+      if (compact(row?.quote_asset ?? row?.quote_symbol) !== 'USDT') continue;
+      const base = sectorSpotRowBase(row);
+      if (!base || sectorLeveragedBase(base)) continue;
+      if (!byBase.has(base)) byBase.set(base, new Set());
+      byBase.get(base).add(provider);
+    }
+  }
+  return byBase;
+}
+
+function sectorCoinbaseUsdBases(coinbaseSnapshot) {
+  const bases = new Set();
+  if (!coinbaseSnapshot) return bases;
+  for (const row of coinbaseSnapshot.rows) {
+    if (compact(row?.quote_asset ?? row?.quote_symbol) !== 'USD') continue;
+    const base = sectorSpotRowBase(row);
+    if (base && !sectorLeveragedBase(base)) bases.add(base);
+  }
+  return bases;
+}
+
+function buildSectorProfessionalSnapshot() {
+  const now = Date.now();
+  if (sectorSnapshotCache && now - sectorSnapshotCacheAt <= SECTOR_CACHE_TTL_MS) {
+    return {
+      ...sectorSnapshotCache,
+      cache_hit: true,
+      cache_age_ms: now - sectorSnapshotCacheAt,
+    };
+  }
+
+  sectorSnapshotBuilds += 1;
+  const healthyByProvider = new Map();
+  for (const provider of SPOT_PROVIDERS) {
+    const snapshot = sectorHealthySpotSnapshot(provider);
+    if (snapshot) healthyByProvider.set(provider, snapshot);
+  }
+
+  const healthyUsdtProviders = SECTOR_USDT_PROVIDERS.filter(
+    (provider) => healthyByProvider.has(provider),
+  );
+  const coinbaseSnapshot = healthyByProvider.get('coinbase') || null;
+  const representativeByBase = sectorDedupedUsdtRows(healthyByProvider);
+  const usdtVenuePresence = sectorUsdtVenuePresence(healthyByProvider);
+  const coinbaseUsdBases = sectorCoinbaseUsdBases(coinbaseSnapshot);
+  const allConfigured = new Set();
+  const sectors = [];
+
+  for (const definition of SECTOR_DEFINITIONS) {
+    const configured = [...new Set(definition.symbols.map(compact).filter(Boolean))];
+    configured.forEach((symbol) => allConfigured.add(symbol));
+    const members = [];
+    for (const base of configured) {
+      const row = representativeByBase.get(base);
+      if (!row) continue;
+      const turnover = Number(row.quote_volume_24h || 0);
+      const change = Number(row.price_change_percent_24h);
+      const usdtVenues = [...(usdtVenuePresence.get(base) || new Set())].sort();
+      members.push({
+        ...row,
+        rankable: turnover >= SECTOR_MIN_TURNOVER_USDT,
+        usdt_venue_count: usdtVenues.length,
+        usdt_venues: usdtVenues,
+        coinbase_usd_observed: coinbaseUsdBases.has(base),
+        six_venue_observed_count: usdtVenues.length + (coinbaseUsdBases.has(base) ? 1 : 0),
+        turnover_weight: 0,
+        turnover_weighted_contribution_pct_point: 0,
+      });
+    }
+
+    const totalTurnover = members.reduce(
+      (sum, row) => sum + Math.max(0, Number(row.quote_volume_24h || 0)),
+      0,
+    );
+    for (const member of members) {
+      const weight = totalTurnover > 0
+        ? Math.max(0, Number(member.quote_volume_24h || 0)) / totalTurnover
+        : 0;
+      member.turnover_weight = weight;
+      member.turnover_weighted_contribution_pct_point =
+        weight * Number(member.price_change_percent_24h || 0);
+    }
+
+    const changes = members.map((row) => Number(row.price_change_percent_24h));
+    const weightedChange = members.reduce(
+      (sum, row) => sum + Number(row.turnover_weighted_contribution_pct_point || 0),
+      0,
+    );
+    const equalChange = changes.length
+      ? changes.reduce((sum, value) => sum + value, 0) / changes.length
+      : null;
+    const medianChange = sectorMedian(changes);
+    const up = changes.filter((value) => value > 0.05).length;
+    const down = changes.filter((value) => value < -0.05).length;
+    const flat = changes.length - up - down;
+    const rankableMembers = members.filter((row) => row.rankable);
+    const movers = (rankableMembers.length ? rankableMembers : members)
+      .slice()
+      .sort((a, b) =>
+        Number(b.price_change_percent_24h || 0) -
+        Number(a.price_change_percent_24h || 0)
+      );
+    const byTurnover = members.slice().sort(
+      (a, b) => Number(b.quote_volume_24h || 0) - Number(a.quote_volume_24h || 0),
+    );
+    const top3Turnover = byTurnover
+      .slice(0, 3)
+      .reduce((sum, row) => sum + Number(row.quote_volume_24h || 0), 0);
+    const providerSet = new Set();
+    for (const base of configured) {
+      for (const provider of usdtVenuePresence.get(base) || []) {
+        providerSet.add(provider);
+      }
+    }
+    const coinbaseObservedCount = configured.filter((base) => coinbaseUsdBases.has(base)).length;
+
+    sectors.push({
+      key: definition.key,
+      name_zh: definition.zh,
+      name_en: definition.en,
+      basket_type: 'kaka_observational_sector_basket',
+      tradeable_index: false,
+      configured_member_count: configured.length,
+      observed_member_count: members.length,
+      rankable_member_count: rankableMembers.length,
+      coinbase_usd_member_count: coinbaseObservedCount,
+      usdt_provider_count: providerSet.size,
+      usdt_providers: [...providerSet].sort(),
+      six_venue_coverage_count: providerSet.size + (coinbaseObservedCount > 0 ? 1 : 0),
+      breadth: { up, flat, down },
+      equal_weight_change_24h_pct: equalChange,
+      median_change_24h_pct: medianChange,
+      turnover_weighted_change_24h_pct: members.length ? weightedChange : null,
+      total_quote_turnover_24h_usdt: totalTurnover,
+      top3_turnover_concentration_pct:
+        totalTurnover > 0 ? (top3Turnover / totalTurnover) * 100 : null,
+      leader: movers.length ? movers[0] : null,
+      laggard: movers.length ? movers[movers.length - 1] : null,
+      members: members
+        .slice()
+        .sort((a, b) =>
+          Number(b.quote_volume_24h || 0) - Number(a.quote_volume_24h || 0)
+        ),
+    });
+  }
+
+  const observedUnique = new Set(
+    sectors.flatMap((sector) =>
+      sector.members.map((member) => compact(member.base_asset)).filter(Boolean)
+    ),
+  );
+  const activeSectors = sectors.filter((sector) => sector.observed_member_count > 0);
+  const activeRankableSectors = sectors.filter((sector) => sector.rankable_member_count > 0);
+  const partialReady = healthyUsdtProviders.length >= 3 && activeSectors.length >= 5;
+  const coverageReady =
+    healthyUsdtProviders.length === SECTOR_USDT_PROVIDERS.length &&
+    activeRankableSectors.length >= 7;
+
+  const payload = {
+    ok: true,
+    version: STEP_VERSION,
+    data_version: 1032,
+    schema_version: 'step1032_crypto_sector_professional_v1',
+    implementation_revision: '1032_shared_market_light_sector_baskets_v1',
+    source: 'render_market_light_shared_memory_sector_derivation',
+    source_verified: partialReady,
+    partial_ready: partialReady,
+    coverage_ready: coverageReady,
+    sector_count: SECTOR_DEFINITIONS.length,
+    active_sector_count: activeSectors.length,
+    active_rankable_sector_count: activeRankableSectors.length,
+    configured_unique_asset_count: allConfigured.size,
+    observed_unique_asset_count: observedUnique.size,
+    healthy_usdt_providers: healthyUsdtProviders,
+    healthy_usdt_provider_count: healthyUsdtProviders.length,
+    coinbase_usd_healthy: Boolean(coinbaseSnapshot),
+    six_venue_healthy_count:
+      healthyUsdtProviders.length + (coinbaseSnapshot ? 1 : 0),
+    mover_min_turnover_usdt: SECTOR_MIN_TURNOVER_USDT,
+    quote_scope: 'five_venue_usdt_metrics_plus_coinbase_usd_presence_only',
+    cross_quote_aggregation: false,
+    coinbase_usd_metrics_mixed_into_usdt: false,
+    duplicate_asset_policy: 'highest_real_24h_usdt_turnover_venue_represents_asset',
+    leveraged_product_policy: 'exclude_2l_2s_3l_3s_5l_5s',
+    membership_overlap_allowed: true,
+    cross_sector_sum_valid: false,
+    tradeable_index: false,
+    fabricated_points: false,
+    exchange_requests_started: 0,
+    exchange_connections_started: 0,
+    user_read_upstream_requests: 0,
+    user_read_upstream_connections: 0,
+    reads_scale_with_users: false,
+    shared_market_light_round: round,
+    sectors,
+    generated_at: new Date(now).toISOString(),
+    timestamp_ms: now,
+    cache_hit: false,
+    cache_age_ms: 0,
+  };
+  sectorSnapshotCache = payload;
+  sectorSnapshotCacheAt = now;
+  return payload;
+}
+
+export function getCryptoSectorProfessionalHealth() {
+  const snapshot = buildSectorProfessionalSnapshot();
+  return {
+    ok: true,
+    version: STEP_VERSION,
+    data_version: 1032,
+    schema_version: 'step1032_crypto_sector_professional_v1',
+    snapshot_endpoint: SECTOR_SNAPSHOT_ROUTE,
+    health_endpoint: SECTOR_HEALTH_ROUTE,
+    source: snapshot.source,
+    source_verified: snapshot.source_verified,
+    partial_ready: snapshot.partial_ready,
+    coverage_ready: snapshot.coverage_ready,
+    sector_count: snapshot.sector_count,
+    active_sector_count: snapshot.active_sector_count,
+    active_rankable_sector_count: snapshot.active_rankable_sector_count,
+    observed_unique_asset_count: snapshot.observed_unique_asset_count,
+    healthy_usdt_providers: snapshot.healthy_usdt_providers,
+    healthy_usdt_provider_count: snapshot.healthy_usdt_provider_count,
+    coinbase_usd_healthy: snapshot.coinbase_usd_healthy,
+    six_venue_healthy_count: snapshot.six_venue_healthy_count,
+    cache_ttl_seconds: Math.round(SECTOR_CACHE_TTL_MS / 1000),
+    cache_age_ms: sectorSnapshotCacheAt > 0 ? Date.now() - sectorSnapshotCacheAt : null,
+    total_builds: sectorSnapshotBuilds,
+    total_reads: sectorSnapshotReads,
+    exchange_requests_started: 0,
+    exchange_connections_started: 0,
+    user_read_upstream_requests: 0,
+    user_read_upstream_connections: 0,
+    reads_scale_with_users: false,
+    cross_quote_aggregation: false,
+    tradeable_index: false,
+    fabricated_points: false,
+    time: new Date().toISOString(),
+  };
+}
+
 export function getMarketLightSnapshotHealth() {
   const providerCoverage = {};
   for (const provider of SPOT_PROVIDERS) providerCoverage[keyFor('spot', provider)] = providerMeta(provider, 'spot');
@@ -2039,6 +2427,7 @@ export function getMarketLightSnapshotHealth() {
     response_cache_entries: responseCache.size,
     response_cache_hits: responseCacheHits,
     response_cache_misses: responseCacheMisses,
+    crypto_sector_professional: getCryptoSectorProfessionalHealth(),
     snapshot_reads_start_exchange_requests: false,
     snapshot_reads_start_exchange_connections: false,
     snapshot_reads_scale_with_users: false,
@@ -2232,7 +2621,7 @@ function sendJson(res, status, payload) {
 }
 
 export async function handleMarketLightSnapshot(req, res, url) {
-  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE].includes(url.pathname)) return false;
+  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname)) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -2248,6 +2637,15 @@ export async function handleMarketLightSnapshot(req, res, url) {
   }
   if (url.pathname === HEALTH_ROUTE) {
     sendJson(res, 200, getMarketLightSnapshotHealth());
+    return true;
+  }
+  if (url.pathname === SECTOR_HEALTH_ROUTE) {
+    sendJson(res, 200, getCryptoSectorProfessionalHealth());
+    return true;
+  }
+  if (url.pathname === SECTOR_SNAPSHOT_ROUTE) {
+    sectorSnapshotReads += 1;
+    sendJson(res, 200, buildSectorProfessionalSnapshot());
     return true;
   }
   const market = String(url.searchParams.get('market_type') || url.searchParams.get('market') || '').trim().toLowerCase();
@@ -2270,6 +2668,16 @@ export async function handleMarketLightSnapshot(req, res, url) {
   sendJson(res, 200, snapshotPayload({ market, provider, includeRows, offset, limit }));
   return true;
 }
+
+export const __marketLightStep1032Test = Object.freeze({
+  sectorMedian,
+  sectorLeveragedBase,
+  sectorDedupedUsdtRows,
+  sectorCoinbaseUsdBases,
+  sectorUsdtVenuePresence,
+  sectorDefinitions: SECTOR_DEFINITIONS,
+  sectorMinTurnoverUsdt: SECTOR_MIN_TURNOVER_USDT,
+});
 
 export const __marketLightStep1001_6Test = Object.freeze({
   binanceSpotTicker24hRow,

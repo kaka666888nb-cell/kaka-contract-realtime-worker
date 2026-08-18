@@ -15,7 +15,7 @@ import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepShare
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.164';
+const VERSION = '650.8.15.165';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -32,6 +32,7 @@ const DECISION_POLICY = Object.freeze({
 });
 
 const CAPABILITIES = Object.freeze([
+  { provider: 'kaka_backend', market: 'shared', capability: 'crypto_sector_professional_baskets', official_available: true, official_scope: 'derived_from_verified_shared_spot_market_snapshots_only', transport: 'market_light_isolated_collector_shared_memory_plus_cached_read_route', batch_mode: 'nine_observational_sector_baskets_from_five_USDT_venues_plus_Coinbase_USD_presence', rate_limit_class: 'internal_shared_derivation_no_additional_exchange_request', collector: 'market-light-collector', target_layer: 'crypto_sector_professional', current_integration: 'ready_step1032', fallback_policy: 'last verified device/shared snapshot; missing stays null; no cross-quote or cross-provider price substitution', history_policy: 'current_only', source_url: 'internal_shared_market_light' },
   { provider: 'okx', market: 'option', capability: 'option_iv_greeks_summary', official_available: true, official_scope: 'current_public_option_summary_per_instrument_family', transport: 'official_public_REST_shared_background', batch_mode: 'bounded_official_instFamily_opt_summary', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1024', fallback_policy: 'official empty fields stay null; no derived Greeks', history_policy: 'current_only', source_url: 'https://www.okx.com/docs-v5/en/' },
   { provider: 'bybit', market: 'contract', capability: 'index_price_components_current_focus', official_available: true, official_scope: 'focus15_current_index_components', transport: 'official_public_REST_shared_background', batch_mode: 'one_index_component_request_per_focus_symbol_per_minute', rate_limit_class: 'slow_shared_governed', collector: 'bybit-advanced-slow-stats', target_layer: 'slow_stats', current_integration: 'ready_step1024', fallback_policy: 'last verified until stale then null', history_policy: 'current_only', source_url: 'https://bybit-exchange.github.io/docs/v5/market/index-components' },
   { provider: 'bybit', market: 'option', capability: 'option_historical_volatility', official_available: true, official_scope: 'official_baseCoin_and_live_option_quoteCoin_hourly_period_7', transport: 'official_public_REST_shared_background', batch_mode: 'one_hourly_cached_request_per_supported_baseCoin_and_directory_quoteCoin', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1024_2', fallback_policy: 'last verified exact-directory-quote official series until stale; no cross-quote or IV substitution', history_policy: 'source_native_hourly_rows', source_url: 'https://bybit-exchange.github.io/docs/v5/market/iv' },
@@ -204,6 +205,40 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
     runtime_market_light_version: health?.version || null,
     runtime_market_light_11_exact: allMarketExact,
     runtime_market_light_coverage: coverage,
+    step1032_crypto_sector_professional: {
+      ready:
+        health?.crypto_sector_professional?.coverage_ready === true &&
+        health?.crypto_sector_professional?.source_verified === true &&
+        Number(health?.crypto_sector_professional?.sector_count || 0) === 9 &&
+        Number(health?.crypto_sector_professional?.healthy_usdt_provider_count || 0) === 5 &&
+        health?.crypto_sector_professional?.coinbase_usd_healthy === true &&
+        Number(health?.crypto_sector_professional?.six_venue_healthy_count || 0) === 6 &&
+        Number(health?.crypto_sector_professional?.exchange_requests_started || 0) === 0 &&
+        Number(health?.crypto_sector_professional?.exchange_connections_started || 0) === 0 &&
+        Number(health?.crypto_sector_professional?.user_read_upstream_requests || 0) === 0 &&
+        Number(health?.crypto_sector_professional?.user_read_upstream_connections || 0) === 0 &&
+        health?.crypto_sector_professional?.reads_scale_with_users === false &&
+        health?.crypto_sector_professional?.cross_quote_aggregation === false &&
+        health?.crypto_sector_professional?.tradeable_index === false &&
+        health?.crypto_sector_professional?.fabricated_points === false,
+      version: health?.crypto_sector_professional?.version || null,
+      data_version: Number(health?.crypto_sector_professional?.data_version || 0),
+      schema_version: health?.crypto_sector_professional?.schema_version || null,
+      sector_count: Number(health?.crypto_sector_professional?.sector_count || 0),
+      active_sector_count: Number(health?.crypto_sector_professional?.active_sector_count || 0),
+      observed_unique_asset_count: Number(health?.crypto_sector_professional?.observed_unique_asset_count || 0),
+      healthy_usdt_provider_count: Number(health?.crypto_sector_professional?.healthy_usdt_provider_count || 0),
+      coinbase_usd_healthy: health?.crypto_sector_professional?.coinbase_usd_healthy === true,
+      six_venue_healthy_count: Number(health?.crypto_sector_professional?.six_venue_healthy_count || 0),
+      additional_exchange_requests: Number(health?.crypto_sector_professional?.exchange_requests_started || 0),
+      additional_exchange_connections: Number(health?.crypto_sector_professional?.exchange_connections_started || 0),
+      user_read_upstream_requests: Number(health?.crypto_sector_professional?.user_read_upstream_requests || 0),
+      user_read_upstream_connections: Number(health?.crypto_sector_professional?.user_read_upstream_connections || 0),
+      reads_scale_with_users: health?.crypto_sector_professional?.reads_scale_with_users === true,
+      cross_quote_aggregation: health?.crypto_sector_professional?.cross_quote_aggregation === true,
+      tradeable_index: health?.crypto_sector_professional?.tradeable_index === true,
+      fabricated_points: health?.crypto_sector_professional?.fabricated_points === true,
+    },
     binance_spot_step1001_7: {
       implementation_revision: 'step1031_2_stream_bootstrap_rest_independent',
       ready: health.binance_spot_ticker_shared_ws?.ready === true &&
@@ -1073,6 +1108,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.bybit_step995.ready &&
       payload.bybit_step1023.ready &&
       payload.step1024_official_capability_batch.ready &&
+      payload.step1032_crypto_sector_professional.ready &&
       payload.coinbase_step995.ready &&
       payload.bitget_step991.ready &&
       payload.bitget_step1000.ready &&

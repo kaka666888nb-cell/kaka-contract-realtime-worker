@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.164';
+const STEP_VERSION = '650.8.15.165';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -340,6 +340,10 @@ const server = http.createServer(async (req, res) => {
       market_light_current_snapshot: '/api/market-light/current-snapshot',
       market_light_health: '/api/market-light/health',
       market_light_state: getMarketLightSnapshotHealth(),
+      crypto_sector_professional_current_snapshot: '/api/crypto-sector-professional/current-snapshot',
+      crypto_sector_professional_health: '/api/crypto-sector-professional/health',
+      crypto_sector_professional_state:
+        getMarketLightSnapshotHealth()?.crypto_sector_professional || null,
       collector_isolation: getCollectorIsolationHealth(),
       collector_isolation_first_batch: getCollectorIsolationHealth(),
       source_capabilities_current_snapshot: '/api/source-capabilities/current-snapshot',
@@ -838,6 +842,15 @@ const server = http.createServer(async (req, res) => {
         data_page_spot_current_snapshot_targets_per_provider: 20,
         data_page_spot_current_snapshot_reads_open_exchange_request: false,
         data_page_spot_current_snapshot_scales_with_users: false,
+        step1032_crypto_sector_professional_shared_route: '/api/crypto-sector-professional/current-snapshot',
+        step1032_crypto_sector_derivation_reuses_market_light_only: true,
+        step1032_crypto_sector_additional_exchange_requests: 0,
+        step1032_crypto_sector_additional_exchange_connections: 0,
+        step1032_crypto_sector_reads_scale_with_users: false,
+        step1032_crypto_sector_quote_scope: 'five_venue_usdt_metrics_plus_coinbase_usd_presence_only',
+        step1032_crypto_sector_cross_quote_aggregation: false,
+        step1032_crypto_sector_tradeable_index: false,
+        step1032_crypto_sector_membership_overlap_allowed: true,
         spot_capital_shared_history_endpoint: '/api/spot-flow/history',
         spot_capital_shared_history_cache_ttl_seconds: 120,
         spot_capital_shared_history_stale_seconds: 900,
