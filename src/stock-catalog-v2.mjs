@@ -1,9 +1,9 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 
-const VERSION = '650.8.15.172';
+const VERSION = '650.8.15.173';
 const DATA_VERSION = 1035;
 const SCHEMA_VERSION = 'step1035_stock_catalog_v2';
-const IMPLEMENTATION_REVISION = '1035_4_coinbase_market_known_catalog_overlay_restart_stable_health_v1';
+const IMPLEMENTATION_REVISION = '1035_5_restore_reconcile_exact_shared_market_health_v1';
 const HEALTH_ROUTE = '/api/stock-catalog-v2/health';
 const CURRENT_ROUTE = '/api/stock-catalog-v2/current';
 const TICKERS_ROUTE = '/api/stock-catalog-v2/tickers';
@@ -56,6 +56,9 @@ let lastCoinbaseMarketError = '';
 let coinbaseMarketRefreshAttempts = 0;
 let coinbaseMarketRefreshSuccesses = 0;
 let coinbaseMarketRefreshFailures = 0;
+let coinbaseMarketRestoredReady = false;
+let restoredCoinbaseRows = 0;
+let restoredGateRows = 0;
 let refreshInflight = null;
 let lastRefreshStartedAt = '';
 let lastRefreshSucceededAt = '';
@@ -174,19 +177,45 @@ async function restoreProviderSharedRows(provider) {
   const rows = [];
   for (let offset = 0; offset < 20000; offset += 1000) {
     const response = await supabaseFetch(`kaka_exchange_asset_catalog?provider=eq.${encodeURIComponent(provider)}&asset_class=eq.equity_cash&source_verified=eq.true&select=${encodeURIComponent(select)}&order=asset_id.asc`, { headers: { range: `${offset}-${offset + 999}`, prefer: 'count=none' } });
-    if (!response.ok) throw new Error(`stock_restore_coinbase_${response.status}`);
+    if (!response.ok) throw new Error(`stock_restore_${provider}_${response.status}`);
     const page = await response.json(); if (!Array.isArray(page) || !page.length) break;
     rows.push(...page); if (page.length < 1000) break;
   }
+
+  // Identity must exist before a restored market overlay is applied. Step1035.4 did this in
+  // the opposite order, causing every restored Coinbase ticker to be skipped after restart.
+  for (const row of rows) {
+    sharedSecurityByKey.set(row.security_key || row.asset_id, row);
+    sharedRowByNative.set(`${provider}|${row.exchange_symbol}`, row);
+  }
+
   if (provider === 'coinbase') {
-    updateSharedCoinbaseMarketRows(rows);
+    restoredCoinbaseRows = rows.length;
+    lastCoinbaseProductRows = rows.length;
+    lastCoinbaseSecurities = new Set(rows.map(r => r.security_key || r.asset_id).filter(Boolean)).size;
+    lastCoinbasePricedRows = rows.filter(r => r.reference_price != null).length;
+    lastCoinbaseSessionRows = rows.filter(r => compact(r.current_session)).length;
+    lastCoinbaseZhNames = rows.filter(r => compact(r.display_name_zh)).length;
+
+    const marketTimes = rows.map(r => Date.parse(r.reference_market_fetched_at || '')).filter(Number.isFinite);
+    const newestMarketMs = marketTimes.length ? Math.max(...marketTimes) : NaN;
+    if (Number.isFinite(newestMarketMs)) {
+      const stateMarketMs = Date.parse(lastCoinbaseMarketSucceededAt || '');
+      if (!Number.isFinite(stateMarketMs) || newestMarketMs > stateMarketMs) lastCoinbaseMarketSucceededAt = new Date(newestMarketMs).toISOString();
+    }
+    const applied = updateSharedCoinbaseMarketRows(rows);
+    coinbaseMarketRestoredReady = applied >= Math.min(COINBASE_COMPLETE_MIN_PRODUCTS, rows.length) && lastCoinbasePricedRows >= 50 && lastCoinbaseSessionRows >= 100;
     const sample = rows.find(r => r.reference_price != null && r.display_symbol === 'AAPL') || rows.find(r => r.reference_price != null) || rows[0];
     if (sample) { lastCoinbaseSampleNative = compact(sample.exchange_symbol); lastCoinbaseSampleTicker = compact(sample.display_symbol); }
   } else if (provider === 'gate') {
+    restoredGateRows = rows.length;
+    lastGateRows = rows.length;
+    lastGateUs = rows.filter(r => lower(r?.provider_metadata?.exchange || r?.exchange_name) === 'us' || lower(r?.exchange_name).includes('us')).length || lastGateUs;
+    lastGateZhNames = rows.filter(r => compact(r.display_name_zh)).length;
     const sample = rows.find(r => r.display_symbol === 'AAPL') || rows[0];
     if (sample) lastGateSampleNative = compact(sample.exchange_symbol);
   }
-  for (const row of rows) { sharedSecurityByKey.set(row.security_key || row.asset_id, row); sharedRowByNative.set(`${provider}|${row.exchange_symbol}`, row); }
+  if (rows.length) sharedUpdatedAtMs = Date.now();
   return rows.length;
 }
 function gateRows(payload) {
@@ -608,8 +637,10 @@ async function restoreState() {
 }
 function healthPayload() {
   const lastOkMs = Date.parse(lastRefreshSucceededAt || '');
-  const ready = lastGateRows >= GATE_COMPLETE_MIN_ROWS && lastGateZhNames >= 40 && lastCoinbaseProductRows >= COINBASE_COMPLETE_MIN_PRODUCTS && lastCoinbaseSecurities >= COINBASE_COMPLETE_MIN_SECURITIES && lastCoinbasePricedRows >= 50 && lastCoinbaseSessionRows >= 100 && lastCoinbaseZhNames >= 30 && Number.isFinite(lastOkMs) && Date.now() - lastOkMs <= Math.max(24 * 60 * 60_000, REFRESH_MS * 3);
-  return { ok: true, version: VERSION, data_version: DATA_VERSION, schema_version: SCHEMA_VERSION, implementation_revision: IMPLEMENTATION_REVISION, coverage_ready: ready, refresh_interval_minutes: Math.round(REFRESH_MS / 60_000), coinbase_market_refresh_interval_minutes: Math.round(COINBASE_MARKET_REFRESH_MS / 60_000), gate_session_refresh_interval_minutes: Math.round(GATE_SESSION_REFRESH_MS / 60_000), background_shared_collector: true, user_reads_trigger_source_requests: false, reads_scale_with_users: false, direct_exchange_requests_from_user_reads: 0, direct_exchange_connections_from_user_reads: 0, user_read_source_requests: 0, user_read_source_connections: 0, supabase_configured: SUPABASE_CONFIGURED, coinbase_cdp_configured: COINBASE_CDP_CONFIGURED, last_refresh_started_at: lastRefreshStartedAt, last_refresh_succeeded_at: lastRefreshSucceededAt, last_refresh_error: lastRefreshError, last_refresh_id: lastRefreshId, catalog_thresholds: { gate_complete_min_rows: GATE_COMPLETE_MIN_ROWS, coinbase_complete_min_products: COINBASE_COMPLETE_MIN_PRODUCTS, coinbase_complete_min_securities: COINBASE_COMPLETE_MIN_SECURITIES }, coinbase_auth: { cdp_configured: COINBASE_CDP_CONFIGURED, list_products_path: COINBASE_PUBLIC_PRODUCTS_PATH, jwt_uri_excludes_query_string: true }, gate: { sample_native_symbol: lastGateSampleNative || null, rows: lastGateRows, us_rows: lastGateUs, hk_rows: lastGateHk, kr_rows: lastGateKr, chinese_name_rows: lastGateZhNames, full_pagination: true, page_size: GATE_PAGE_SIZE, hard_old_10_page_cap_removed: true, shared_session_refresh: true, session_refresh_interval_minutes: Math.round(GATE_SESSION_REFRESH_MS / 60_000), last_session_started_at: lastGateSessionStartedAt, last_session_succeeded_at: lastGateSessionSucceededAt, last_session_error: lastGateSessionError, session_refresh_attempts: gateSessionRefreshAttempts, session_refresh_successes: gateSessionRefreshSuccesses, session_refresh_failures: gateSessionRefreshFailures }, coinbase_market: { last_started_at: lastCoinbaseMarketStartedAt, last_succeeded_at: lastCoinbaseMarketSucceededAt, last_error: lastCoinbaseMarketError, refresh_attempts: coinbaseMarketRefreshAttempts, refresh_successes: coinbaseMarketRefreshSuccesses, refresh_failures: coinbaseMarketRefreshFailures, bounded_to_committed_catalog: true, full_metadata_duplication: false }, coinbase: { sample_native_symbol: lastCoinbaseSampleNative || null, sample_security_ticker: lastCoinbaseSampleTicker || null, product_rows: lastCoinbaseProductRows, distinct_securities: lastCoinbaseSecurities, priced_rows: lastCoinbasePricedRows, current_session_rows: lastCoinbaseSessionRows, chinese_name_rows: lastCoinbaseZhNames, full_cursor_pagination: true, hard_old_6_page_cap_removed: true, fallback_all_products_used: lastCoinbaseFallbackAllProductsUsed, kline_probe: lastCoinbaseKlineProbe }, source_requests: { gate_started: gateRequestsStarted, gate_succeeded: gateRequestsSucceeded, coinbase_started: coinbaseRequestsStarted, coinbase_succeeded: coinbaseRequestsSucceeded, failures: sourceRequestFailures }, persistence: { stage_rows_written: stageRowsWritten, commits_succeeded: commitsSucceeded, commits_failed: commitsFailed }, security_identity: { quote_variants_preserved: true, user_list_dedupes_by_security_key: true, exact_product_identity_preserved: true, coinbase_cik_preferred: true }, localization: { gate_official_i18n: true, curated_exact_ticker_fallback: true, chinese_search_aliases: true, canonical_commodity_aliases: true }, session_policy: { gate_dynamic_trade_status: true, gate_gt_lp_recognized: true, coinbase_current_session: true, cash_vs_tokenized_vs_derivative_not_merged: true }, user_reads: userReads, shared_market_map_entries: sharedTickerByNative.size, shared_identity_map_entries: sharedRowByNative.size, shared_map_age_ms: sharedUpdatedAtMs ? Date.now() - sharedUpdatedAtMs : null };
+  const marketCountsBounded = lastCoinbasePricedRows <= lastCoinbaseProductRows && lastCoinbaseSessionRows <= lastCoinbaseProductRows;
+  const coinbaseMarketReady = coinbaseMarketRefreshSuccesses > 0 || coinbaseMarketRestoredReady;
+  const ready = lastGateRows >= GATE_COMPLETE_MIN_ROWS && lastGateZhNames >= 40 && lastCoinbaseProductRows >= COINBASE_COMPLETE_MIN_PRODUCTS && lastCoinbaseSecurities >= COINBASE_COMPLETE_MIN_SECURITIES && lastCoinbasePricedRows >= 50 && lastCoinbaseSessionRows >= 100 && marketCountsBounded && coinbaseMarketReady && Number.isFinite(lastOkMs) && Date.now() - lastOkMs <= Math.max(24 * 60 * 60_000, REFRESH_MS * 3);
+  return { ok: true, version: VERSION, data_version: DATA_VERSION, schema_version: SCHEMA_VERSION, implementation_revision: IMPLEMENTATION_REVISION, coverage_ready: ready, refresh_interval_minutes: Math.round(REFRESH_MS / 60_000), coinbase_market_refresh_interval_minutes: Math.round(COINBASE_MARKET_REFRESH_MS / 60_000), gate_session_refresh_interval_minutes: Math.round(GATE_SESSION_REFRESH_MS / 60_000), background_shared_collector: true, user_reads_trigger_source_requests: false, reads_scale_with_users: false, direct_exchange_requests_from_user_reads: 0, direct_exchange_connections_from_user_reads: 0, user_read_source_requests: 0, user_read_source_connections: 0, supabase_configured: SUPABASE_CONFIGURED, coinbase_cdp_configured: COINBASE_CDP_CONFIGURED, last_refresh_started_at: lastRefreshStartedAt, last_refresh_succeeded_at: lastRefreshSucceededAt, last_refresh_error: lastRefreshError, last_refresh_id: lastRefreshId, catalog_thresholds: { gate_complete_min_rows: GATE_COMPLETE_MIN_ROWS, coinbase_complete_min_products: COINBASE_COMPLETE_MIN_PRODUCTS, coinbase_complete_min_securities: COINBASE_COMPLETE_MIN_SECURITIES }, coinbase_auth: { cdp_configured: COINBASE_CDP_CONFIGURED, list_products_path: COINBASE_PUBLIC_PRODUCTS_PATH, jwt_uri_excludes_query_string: true }, gate: { sample_native_symbol: lastGateSampleNative || null, rows: lastGateRows, us_rows: lastGateUs, hk_rows: lastGateHk, kr_rows: lastGateKr, chinese_name_rows: lastGateZhNames, full_pagination: true, page_size: GATE_PAGE_SIZE, hard_old_10_page_cap_removed: true, shared_session_refresh: true, session_refresh_interval_minutes: Math.round(GATE_SESSION_REFRESH_MS / 60_000), last_session_started_at: lastGateSessionStartedAt, last_session_succeeded_at: lastGateSessionSucceededAt, last_session_error: lastGateSessionError, session_refresh_attempts: gateSessionRefreshAttempts, session_refresh_successes: gateSessionRefreshSuccesses, session_refresh_failures: gateSessionRefreshFailures }, coinbase_market: { last_started_at: lastCoinbaseMarketStartedAt, last_succeeded_at: lastCoinbaseMarketSucceededAt, last_error: lastCoinbaseMarketError, refresh_attempts: coinbaseMarketRefreshAttempts, refresh_successes: coinbaseMarketRefreshSuccesses, refresh_failures: coinbaseMarketRefreshFailures, restored_verified_snapshot: coinbaseMarketRestoredReady, bounded_to_committed_catalog: true, counts_bounded_to_committed_catalog: marketCountsBounded, full_metadata_duplication: false }, coinbase: { sample_native_symbol: lastCoinbaseSampleNative || null, sample_security_ticker: lastCoinbaseSampleTicker || null, product_rows: lastCoinbaseProductRows, distinct_securities: lastCoinbaseSecurities, priced_rows: lastCoinbasePricedRows, current_session_rows: lastCoinbaseSessionRows, chinese_name_rows: lastCoinbaseZhNames, full_cursor_pagination: true, hard_old_6_page_cap_removed: true, fallback_all_products_used: lastCoinbaseFallbackAllProductsUsed, kline_probe: lastCoinbaseKlineProbe }, source_requests: { gate_started: gateRequestsStarted, gate_succeeded: gateRequestsSucceeded, coinbase_started: coinbaseRequestsStarted, coinbase_succeeded: coinbaseRequestsSucceeded, failures: sourceRequestFailures }, persistence: { stage_rows_written: stageRowsWritten, commits_succeeded: commitsSucceeded, commits_failed: commitsFailed, restored_coinbase_rows: restoredCoinbaseRows, restored_gate_rows: restoredGateRows }, security_identity: { quote_variants_preserved: true, user_list_dedupes_by_security_key: true, exact_product_identity_preserved: true, coinbase_cik_preferred: true }, localization: { gate_official_i18n: true, curated_exact_ticker_fallback: true, chinese_search_aliases: true, canonical_commodity_aliases: true }, session_policy: { gate_dynamic_trade_status: true, gate_gt_lp_recognized: true, coinbase_current_session: true, cash_vs_tokenized_vs_derivative_not_merged: true }, user_reads: userReads, shared_market_map_entries: sharedTickerByNative.size, shared_identity_map_entries: sharedRowByNative.size, shared_map_age_ms: sharedUpdatedAtMs ? Date.now() - sharedUpdatedAtMs : null };
 }
 export function getSharedStockCatalogTicker(provider, nativeSymbol) {
   const p = lower(provider); const native = compact(nativeSymbol); if (!p || !native) return null;
@@ -660,7 +691,10 @@ export function startStockCatalogV2Collector() {
     gateSessionStart.unref?.();
     gateSessionTimer = setInterval(() => refreshGateSessionMap('interval').catch(error => console.error('[Step1035 stock gate session] refresh failed', error?.message || error)), GATE_SESSION_REFRESH_MS);
     gateSessionTimer.unref?.();
-    const marketDelay = Math.max(30_000, Math.min(COINBASE_MARKET_REFRESH_MS, 90_000));
+    const restoredMarketAge = Date.now() - (Date.parse(lastCoinbaseMarketSucceededAt || '') || 0);
+    const marketDelay = coinbaseMarketRestoredReady && restoredMarketAge >= 0 && restoredMarketAge < COINBASE_MARKET_REFRESH_MS
+      ? Math.max(15_000, COINBASE_MARKET_REFRESH_MS - restoredMarketAge)
+      : 15_000;
     const marketStart = setTimeout(() => refreshCoinbaseMarketMap('startup').catch(error => console.error('[Step1035 stock market] refresh failed', error?.message || error)), marketDelay);
     marketStart.unref?.();
     coinbaseMarketTimer = setInterval(() => refreshCoinbaseMarketMap('interval').catch(error => console.error('[Step1035 stock market] refresh failed', error?.message || error)), COINBASE_MARKET_REFRESH_MS);
