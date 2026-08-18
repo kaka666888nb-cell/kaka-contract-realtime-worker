@@ -21,6 +21,7 @@ import {
   startBinanceContractKlineRelayValidation,
 } from './binance-contract-kline-relay.mjs';
 import { getBinanceRestGuardHealth } from './binance-rest-guard.mjs';
+import { fetchBinanceSpotWsApiKlines, getBinanceSpotWsApiHealth } from './binance-spot-ws-api.mjs';
 
 if (process.env.KAKA_DISABLE_BINANCE_MARKET_START !== '1') {
   startBinanceContractMarket();
@@ -3532,7 +3533,27 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
         const sourceMs = intervalMs(sourceInterval);
         const factor = Math.max(1, Math.ceil(targetMs / sourceMs));
         const sourceLimit = Math.min(5000, limit * factor + factor * 4);
-        const sourceRows = await fetchNativeMarketKlines(provider, market, symbol, sourceInterval, endBucket + step - 1, sourceLimit);
+        let sourceRows;
+        try {
+          const rawWsRows = await fetchBinanceSpotWsApiKlines({
+            symbol,
+            interval: sourceInterval,
+            endTime: endBucket + step - 1,
+            limit: sourceLimit,
+          });
+          sourceRows = (Array.isArray(rawWsRows) ? rawWsRows : [])
+            .map((a) => krow(provider, market, symbol, sourceInterval, [a[0], a[1], a[2], a[3], a[4], a[5], a[7], a[8]]))
+            .filter(Boolean)
+            .map((row) => ({
+              ...row,
+              source: 'binance_official_spot_ws_api_kline_shared',
+              transport: 'shared_websocket_api',
+            }));
+        } catch (_) {
+          // Step1032.2: keep the already-verified authenticated Edge relay only
+          // as a failure fallback. Render-direct Binance REST remains disabled.
+          sourceRows = await fetchNativeMarketKlines(provider, market, symbol, sourceInterval, endBucket + step - 1, sourceLimit);
+        }
         if (sourceInterval === interval) return sourceRows.slice(-limit);
         return aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
       },
@@ -3916,6 +3937,9 @@ export function getBinanceMarketRestHealth() {
   pruneBinanceSharedCache();
   return {
     spot_market_data_host: 'data-api.binance.vision',
+    binance_spot_ws_api: getBinanceSpotWsApiHealth(),
+    binance_spot_kline_primary_transport: 'one_shared_websocket_api_klines_exact_key_cache_inflight',
+    binance_spot_kline_rest_relay_fallback_only: true,
     binance_asset_quote_discovery_enabled: true,
     all_provider_asset_quote_discovery_enabled: true,
     bitget_contract_official_v2_only: true,

@@ -1,7 +1,8 @@
 import { tickers } from './market-rest.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
+import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.164';
+const VERSION = '650.8.15.167';
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 
 const CACHE_TTL_MS = 20_000;
@@ -36,6 +37,9 @@ const stats = {
   upstream_ticker_builds: 0,
   binance_market_light_reuse_builds: 0,
   binance_bridge_wait_retries: 0,
+  binance_isolated_market_light_fallback_reads: 0,
+  binance_isolated_market_light_fallback_hits: 0,
+  binance_isolated_market_light_fallback_failures: 0,
 };
 
 function providerKey(raw) {
@@ -198,8 +202,8 @@ async function buildExactTicker(provider, symbol) {
       ? shared.rows.filter((row) => symbolKey(row?.symbol) === symbol)
       : [];
     stats.binance_market_light_reuse_builds += 1;
-    for (let retry = 0; rows.length === 0 && retry < 3; retry += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    for (let retry = 0; rows.length === 0 && retry < 2; retry += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
       stats.binance_bridge_wait_retries += 1;
       shared = getMarketLightInternalSnapshot({
         market: 'spot',
@@ -208,6 +212,26 @@ async function buildExactTicker(provider, symbol) {
       rows = Array.isArray(shared?.rows)
         ? shared.rows.filter((row) => symbolKey(row?.symbol) === symbol)
         : [];
+    }
+    if (rows.length === 0) {
+      // Step1032.2: the parent bridge is a low-pressure projection and may be
+      // between polls immediately after navigation. Read the already-built
+      // isolated market-light snapshot once before declaring an exact symbol
+      // unavailable. This is localhost-only and starts zero exchange requests.
+      stats.binance_isolated_market_light_fallback_reads += 1;
+      try {
+        const isolated = await requestIsolatedJson(
+          'market-light',
+          '/api/market-light/current-snapshot?market_type=spot&provider=binance&include_rows=1&limit=5000',
+          5_000,
+        );
+        rows = Array.isArray(isolated?.rows)
+          ? isolated.rows.filter((row) => symbolKey(row?.symbol) === symbol)
+          : [];
+        if (rows.length > 0) stats.binance_isolated_market_light_fallback_hits += 1;
+      } catch (_) {
+        stats.binance_isolated_market_light_fallback_failures += 1;
+      }
     }
   } else {
     stats.upstream_ticker_builds += 1;
@@ -362,6 +386,8 @@ export function getSpotExactTickerHealth() {
     binance_exact_ticker_source: 'shared_market_light_websocket_snapshot',
     binance_exact_ticker_rest_requests: 0,
     binance_exact_ticker_user_scaled_requests: 0,
+    binance_exact_ticker_isolated_market_light_fallback_exchange_requests: 0,
+    binance_exact_ticker_parent_bridge_miss_uses_localhost_snapshot_once: true,
     empty_or_failed_build_never_overwrites_verified_stale_payload: true,
     app_no_longer_calls_spot_detail_ticker_edge: true,
     app_no_longer_uses_device_direct_spot_ticker_fallback_for_detail_first_paint: true,

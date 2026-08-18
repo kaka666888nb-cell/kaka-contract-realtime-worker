@@ -31,7 +31,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.166';
+const STEP_VERSION = '650.8.15.167';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -1086,5 +1086,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1031.2 Binance spot WebSocket market-light recovery + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + pre-landed all-asset Kline + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

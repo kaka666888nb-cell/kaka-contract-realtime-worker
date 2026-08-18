@@ -1,7 +1,8 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
+import { fetchBinanceSpotWsApiAggregateTrades, fetchBinanceSpotWsApiDepth, getBinanceSpotWsApiHealth } from './binance-spot-ws-api.mjs';
 
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.142';
+const STEP_VERSION = '650.8.15.167';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -2107,38 +2108,63 @@ coinbaseL2CleanupTimer.unref?.();
 async function loadSpotBinance(view, symbol, limit) {
   const native = providerSymbol('binance', symbol, 'spot');
   if (view === 'trades') {
-    // Spot only. This does not touch fapi or any Binance contract REST route.
-    const data = await fetchJson(
-      `https://data-api.binance.vision/api/v3/aggTrades?symbol=${encodeURIComponent(native)}&limit=${Math.min(limit, 100)}`,
-    );
+    let data;
+    let transport = 'shared_websocket_api_trades_aggregate';
+    let upstreamHost = 'ws-api.binance.com';
+    try {
+      data = await fetchBinanceSpotWsApiAggregateTrades({
+        symbol: native,
+        limit: Math.min(limit, 100),
+      });
+    } catch (_) {
+      // Step1032.2: keep official market-data REST only as a bounded failure
+      // fallback. Binance contract REST is not touched.
+      data = await fetchJson(
+        `https://data-api.binance.vision/api/v3/aggTrades?symbol=${encodeURIComponent(native)}&limit=${Math.min(limit, 100)}`,
+      );
+      transport = 'rest_public_spot_aggTrades_fallback';
+      upstreamHost = 'data-api.binance.vision';
+    }
     if (!Array.isArray(data)) throw new Error('binance_spot_trades_invalid');
     const items = data.map((row) => {
-      const price = positiveNumber(row?.p);
-      const quantity = positiveNumber(row?.q);
-      const timeMs = integerValue(row?.T);
-      // Binance m=true means buyer is maker, so the taker/aggressor side is sell.
-      const side = row?.m === true ? 'sell' : 'buy';
+      const price = positiveNumber(row?.p ?? row?.price);
+      const quantity = positiveNumber(row?.q ?? row?.qty);
+      const timeMs = integerValue(row?.T ?? row?.time);
+      const buyerMaker = row?.m ?? row?.isBuyerMaker;
+      const side = buyerMaker === true ? 'sell' : 'buy';
       if (price == null || quantity == null || timeMs <= 0) return null;
       return {
-        id: String(row?.a ?? `${timeMs}:${price}:${quantity}`),
+        id: String(row?.a ?? row?.id ?? `${timeMs}:${price}:${quantity}`),
         time_ms: timeMs,
         price,
         quantity,
-        quote_amount: price * quantity,
+        quote_amount: positiveNumber(row?.quoteQty) ?? price * quantity,
         side,
       };
     }).filter(Boolean);
     return {
       items,
       timestamp_ms: items[0]?.time_ms || Date.now(),
-      upstream_host: 'data-api.binance.vision',
+      upstream_host: upstreamHost,
       native_symbol: native,
-      transport: 'rest_public_spot_aggTrades',
+      transport,
     };
   }
-  const data = await fetchJson(
-    `https://data-api.binance.vision/api/v3/depth?symbol=${encodeURIComponent(native)}&limit=${Math.max(5, Math.min(limit, 20))}`,
-  );
+  let data;
+  let transport = 'shared_websocket_api_depth';
+  let upstreamHost = 'ws-api.binance.com';
+  try {
+    data = await fetchBinanceSpotWsApiDepth({
+      symbol: native,
+      limit: Math.max(5, Math.min(limit, 20)),
+    });
+  } catch (_) {
+    data = await fetchJson(
+      `https://data-api.binance.vision/api/v3/depth?symbol=${encodeURIComponent(native)}&limit=${Math.max(5, Math.min(limit, 20))}`,
+    );
+    transport = 'rest_public_spot_depth_fallback';
+    upstreamHost = 'data-api.binance.vision';
+  }
   const bids = normalizeLevels(data?.bids, { side: 'bid' }).slice(0, limit);
   const asks = normalizeLevels(data?.asks, { side: 'ask' }).slice(0, limit);
   if (!bids.length || !asks.length) throw new Error('binance_spot_orderbook_empty');
@@ -2146,9 +2172,9 @@ async function loadSpotBinance(view, symbol, limit) {
     bids,
     asks,
     timestamp_ms: Date.now(),
-    upstream_host: 'data-api.binance.vision',
+    upstream_host: upstreamHost,
     native_symbol: native,
-    transport: 'rest_public_spot_depth',
+    transport,
   };
 }
 
@@ -2409,7 +2435,11 @@ export function getContractDepthHealth() {
     bitget_contract_orderbook_429_cooldown_ms: BITGET_ORDERBOOK_RATE_LIMIT_COOLDOWN_MS,
     bitget_contract_orderbook_rate_limit_does_not_raise_request_cap: true,
     binance_contract_rest_disabled: true,
-    binance_spot_depth_transport: 'official_data_api_rest_with_endpoint_cache_inflight_and_circuit',
+    binance_spot_depth_transport: 'official_shared_websocket_api_depth_with_data_api_rest_failure_fallback',
+    binance_spot_trades_transport: 'official_shared_websocket_api_trades_aggregate_with_data_api_rest_failure_fallback',
+    binance_spot_ws_api: getBinanceSpotWsApiHealth(),
+    binance_spot_detail_user_reads_open_new_connections: false,
+    binance_spot_detail_same_exact_key_cache_inflight: true,
     fdusd_spot_identity_enabled: true,
     tusd_spot_identity_enabled: true,
     tusd_spot_identity_examples: {
