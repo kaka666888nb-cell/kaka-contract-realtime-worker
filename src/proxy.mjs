@@ -15,6 +15,7 @@ import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-s
 import { getMarketLightSnapshotHealth, startMarketLightBridge } from './market-light-bridge.mjs';
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
+import { getProjectFundamentalsHealth, handleProjectFundamentals, startProjectFundamentalsCollector } from './project-fundamentals.mjs';
 import {
   getBinanceAdvancedStatsHealth,
   getBitgetAdvancedStatsHealth,
@@ -31,7 +32,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.168';
+const STEP_VERSION = '650.8.15.169';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -41,6 +42,7 @@ startSlowStatsBridge();
 startContractFundingHistoryMaintainer();
 startSpotCurrentSnapshotScanner();
 startContractBasisScanner();
+startProjectFundamentalsCollector();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -346,6 +348,9 @@ const server = http.createServer(async (req, res) => {
         getMarketLightSnapshotHealth()?.crypto_sector_professional || null,
       crypto_sector_professional_history: '/api/crypto-sector-professional/history',
       crypto_sector_professional_history_health: '/api/crypto-sector-professional/history-health',
+      project_fundamentals_current: '/api/project-fundamentals/current',
+      project_fundamentals_health: '/api/project-fundamentals/health',
+      project_fundamentals_state: getProjectFundamentalsHealth(),
       crypto_sector_professional_history_state:
         getMarketLightSnapshotHealth()?.crypto_sector_history || null,
       collector_isolation: getCollectorIsolationHealth(),
@@ -857,6 +862,12 @@ const server = http.createServer(async (req, res) => {
         step1032_crypto_sector_membership_overlap_allowed: true,
         step1033_crypto_sector_history_route: '/api/crypto-sector-professional/history',
         step1033_crypto_sector_history_health_route: '/api/crypto-sector-professional/history-health',
+        step1034_project_fundamentals_route: '/api/project-fundamentals/current',
+        step1034_project_fundamentals_health_route: '/api/project-fundamentals/health',
+        step1034_project_fundamentals_exact_gecko_id_only: true,
+        step1034_project_fundamentals_user_reads_scale_upstream: false,
+        step1034_paid_supply_breakdown_used: false,
+        step1034_pro_unlocks_used: false,
         step1033_crypto_sector_archive_interval_minutes: 15,
         step1033_crypto_sector_history_retention_days: 30,
         step1033_crypto_sector_history_forward_archive_only: true,
@@ -1022,6 +1033,7 @@ const server = http.createServer(async (req, res) => {
     const handled = await runWithBinanceRequestSignal(requestAbortController.signal, async () => {
       if (await handleCmeExpirySharedCalendar(req, res, url)) return true;
       if (await handleSourceCapabilityRegistry(req, res, url)) return true;
+      if (await handleProjectFundamentals(req, res, url)) return true;
       if (await handleContractBasis(req, res, url)) return true;
       if (await handleSpotCurrentSnapshot(req, res, url)) return true;
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
@@ -1099,5 +1111,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

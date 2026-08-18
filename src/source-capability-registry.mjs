@@ -13,9 +13,10 @@ import { getContractDepthHealth } from './contract-depth.mjs';
 import { getContractLiquidationPersistenceHealth } from './liquidation-bridge.mjs';
 import { getContractFocusPoolHealth, getContractFlowHealth, getContractDeepSharedHealth, getDeepMarketBridgeHealth } from './deep-market-bridge.mjs';
 import { getCollectorIsolationHealth } from './collector-isolation.mjs';
+import { getProjectFundamentalsHealth } from './project-fundamentals.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.168';
+const VERSION = '650.8.15.169';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
@@ -32,6 +33,7 @@ const DECISION_POLICY = Object.freeze({
 });
 
 const CAPABILITIES = Object.freeze([
+  { provider: 'kaka_backend', market: 'shared', capability: 'project_protocol_fundamentals', official_available: true, official_scope: 'DefiLlama_public_protocol_TVL_fees_revenue_exact_unique_CoinGecko_gecko_id_mapping', transport: 'fixed_hourly_shared_backend_collector_plus_private_supabase_persistence', batch_mode: 'three_public_DefiLlama_catalog_requests_per_shared_refresh_not_per_user', rate_limit_class: 'hourly_reference_shared_background', collector: 'project-fundamentals-parent', target_layer: 'project_protocol_fundamentals', current_integration: 'candidate_step1034', fallback_policy: 'persisted_verified_snapshot; missing_or_ambiguous_gecko_id_stays_unavailable; no_symbol_or_name_match', history_policy: 'current_reference_snapshot_only', source_url: 'https://defillama.com/docs/api' },
   { provider: 'kaka_backend', market: 'shared', capability: 'crypto_sector_professional_baskets', official_available: true, official_scope: 'derived_from_verified_shared_spot_market_snapshots_only', transport: 'market_light_isolated_collector_shared_memory_plus_cached_read_route', batch_mode: 'nine_observational_sector_baskets_from_five_USDT_venues_plus_Coinbase_USD_presence', rate_limit_class: 'internal_shared_derivation_no_additional_exchange_request', collector: 'market-light-collector', target_layer: 'crypto_sector_professional', current_integration: 'ready_step1033_history_rotation', fallback_policy: 'last verified device/shared snapshot; missing stays null; no cross-quote or cross-provider price substitution', history_policy: 'persisted_15m_30d_forward_archive_no_bulk_backfill', source_url: 'internal_shared_market_light_plus_supabase_persisted_aggregate_history' },
   { provider: 'okx', market: 'option', capability: 'option_iv_greeks_summary', official_available: true, official_scope: 'current_public_option_summary_per_instrument_family', transport: 'official_public_REST_shared_background', batch_mode: 'bounded_official_instFamily_opt_summary', rate_limit_class: 'slow_shared_governed', collector: 'derivatives-public-slow-stats', target_layer: 'derivatives_public', current_integration: 'ready_step1024', fallback_policy: 'official empty fields stay null; no derived Greeks', history_policy: 'current_only', source_url: 'https://www.okx.com/docs-v5/en/' },
   { provider: 'bybit', market: 'contract', capability: 'index_price_components_current_focus', official_available: true, official_scope: 'focus15_current_index_components', transport: 'official_public_REST_shared_background', batch_mode: 'one_index_component_request_per_focus_symbol_per_minute', rate_limit_class: 'slow_shared_governed', collector: 'bybit-advanced-slow-stats', target_layer: 'slow_stats', current_integration: 'ready_step1024', fallback_policy: 'last verified until stale then null', history_policy: 'current_only', source_url: 'https://bybit-exchange.github.io/docs/v5/market/index-components' },
@@ -178,6 +180,7 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
   const slowStatsBridge = getSlowStatsBridgeHealth();
   const liquidationHistory = getContractLiquidationPersistenceHealth();
   const collectorIsolation = getCollectorIsolationHealth();
+  const projectFundamentals = getProjectFundamentalsHealth();
   const marketKeys = Object.keys(coverage);
   const allMarketExact = marketKeys.length === 11 && marketKeys.every((key) => coverage[key]?.exact === true);
   const binanceContract = coverage['contract:binance'] || {};
@@ -272,6 +275,44 @@ function registrySnapshot({ includeCapabilities = true } = {}) {
       reads_scale_with_users: health?.crypto_sector_history?.reads_scale_with_users === true,
       history_endpoint: health?.crypto_sector_history?.history_endpoint || '/api/crypto-sector-professional/history',
       history_health_endpoint: health?.crypto_sector_history?.health_endpoint || '/api/crypto-sector-professional/history-health',
+    },
+    step1034_project_fundamentals: {
+      ready:
+        projectFundamentals?.ready === true &&
+        projectFundamentals?.supabase_configured === true &&
+        projectFundamentals?.persistence_ready === true &&
+        Number(projectFundamentals?.mapped_project_count || 0) >= 20 &&
+        Number(projectFundamentals?.refresh_successes || 0) > 0 &&
+        !String(projectFundamentals?.last_refresh_error || '') &&
+        projectFundamentals?.user_reads_trigger_source_requests === false &&
+        projectFundamentals?.reads_scale_with_users === false &&
+        Number(projectFundamentals?.direct_exchange_requests || 0) === 0 &&
+        Number(projectFundamentals?.direct_exchange_connections || 0) === 0 &&
+        projectFundamentals?.paid_coingecko_supply_breakdown_used === false &&
+        projectFundamentals?.defillama_pro_unlocks_used === false &&
+        projectFundamentals?.token_value_equals_protocol_equity === false,
+      version: projectFundamentals?.version || null,
+      data_version: Number(projectFundamentals?.data_version || 0),
+      schema_version: projectFundamentals?.schema_version || null,
+      mapped_project_count: Number(projectFundamentals?.mapped_project_count || 0),
+      exact_unique_match_count: Number(projectFundamentals?.exact_unique_match_count || 0),
+      ambiguous_gecko_id_count: Number(projectFundamentals?.ambiguous_gecko_id_count || 0),
+      fee_rows_matched: Number(projectFundamentals?.fee_rows_matched || 0),
+      revenue_rows_matched: Number(projectFundamentals?.revenue_rows_matched || 0),
+      refresh_interval_minutes: Number(projectFundamentals?.refresh_interval_minutes || 0),
+      persistence_table: projectFundamentals?.persistence_table || null,
+      source_requests_started: Number(projectFundamentals?.source_requests_started || 0),
+      source_requests_succeeded: Number(projectFundamentals?.source_requests_succeeded || 0),
+      source_requests_failed: Number(projectFundamentals?.source_requests_failed || 0),
+      user_reads_trigger_source_requests: projectFundamentals?.user_reads_trigger_source_requests === true,
+      reads_scale_with_users: projectFundamentals?.reads_scale_with_users === true,
+      direct_exchange_requests: Number(projectFundamentals?.direct_exchange_requests || 0),
+      direct_exchange_connections: Number(projectFundamentals?.direct_exchange_connections || 0),
+      paid_coingecko_supply_breakdown_used: projectFundamentals?.paid_coingecko_supply_breakdown_used === true,
+      defillama_pro_unlocks_used: projectFundamentals?.defillama_pro_unlocks_used === true,
+      unlock_schedule_available: projectFundamentals?.unlock_schedule_available === true,
+      allocation_breakdown_available: projectFundamentals?.allocation_breakdown_available === true,
+      exact_match_policy: 'defillama_gecko_id_exact_unique_only',
     },
     binance_spot_step1001_7: {
       implementation_revision: 'step1031_2_stream_bootstrap_rest_independent',
@@ -1144,6 +1185,7 @@ export function getSourceCapabilityRegistryHealth() {
       payload.step1024_official_capability_batch.ready &&
       payload.step1032_crypto_sector_professional.ready &&
       payload.step1033_crypto_sector_history.ready &&
+      payload.step1034_project_fundamentals.ready &&
       payload.coinbase_step995.ready &&
       payload.bitget_step991.ready &&
       payload.bitget_step1000.ready &&
