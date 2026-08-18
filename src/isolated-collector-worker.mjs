@@ -93,7 +93,7 @@ if (ROLE === 'market-light') {
   const assetMarket = await import('./exchange-asset-market.mjs');
   const assetKline = await import('./exchange-asset-kline.mjs');
 
-  roleVersion = '650.8.15.162';
+  roleVersion = assetMarket.getAssetMarketHealth().version || '650.8.15.170';
   handleRoleRoute = async (req, res, url) => {
     const controller = new AbortController();
     const abortQueuedWork = () => {
