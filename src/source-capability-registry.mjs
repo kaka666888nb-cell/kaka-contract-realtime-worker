@@ -17,7 +17,7 @@ import { getProjectFundamentalsHealth } from './project-fundamentals.mjs';
 import { getStockCatalogV2Health } from './stock-catalog-v2.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, BUSINESS_SOURCE_RULES, validateBusinessSourceRules } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.173';
+const VERSION = '650.8.15.174';
 const SNAPSHOT_ROUTE = '/api/source-capabilities/current-snapshot';
 const HEALTH_ROUTE = '/api/source-capabilities/health';
 
