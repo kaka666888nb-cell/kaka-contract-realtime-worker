@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.188';
+const STEP_VERSION = '650.8.15.189';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -401,6 +401,7 @@ const server = http.createServer(async (req, res) => {
       asset_klines: '/api/asset-klines',
       asset_klines_health: '/api/asset-klines/health',
       asset_klines_self_test: '/api/asset-klines/self-test',
+      bitget_reality_reference_map: '/api/asset-klines/reality-map',
       asset_klines_state: exchangeAssetsState?.asset_klines || null,
       asset_market: '/api/asset-market',
       asset_market_tickers: '/api/asset-market/tickers',
@@ -797,8 +798,14 @@ const server = http.createServer(async (req, res) => {
         step1026_app_direct_exchange_requests: 0,
         step1026_gate_cash_equity_secondary_source_locked: true,
         step1026_coinbase_equity_secondary_source_locked: true,
-        step1035_19_coinbase_core_equity_official_candles: true,
+        step1035_19_coinbase_core_equity_official_candles: false,
         step1035_19_coinbase_non_core_equity_secondary_source_locked: true,
+        step1035_19_6_coinbase_cash_equity_candles_runtime_closed: true,
+        step1035_19_6_bitget_reality_reference_map: '/api/asset-klines/reality-map',
+        step1035_19_6_bitget_reality_catalog_background_all_online: true,
+        step1035_19_6_bitget_reality_catalog_user_reads_start_upstream: false,
+        step1035_19_6_bitget_reality_kline_exact_product_shared_cache: true,
+        step1035_19_6_cash_equity_reference_is_explicit_not_hidden_substitution: true,
         step1026_okx_event_sparse_bars_allowed: true,
         step1026_cross_provider_substitution: false,
         step1026_cross_product_substitution: false,
@@ -818,7 +825,7 @@ const server = http.createServer(async (req, res) => {
         step1026_gate_cash_stock_public_market_trades_unavailable: true,
         step1026_gate_cash_equity_kline_second_source_locked: true,
         step1026_coinbase_equity_kline_second_source_locked: true,
-        step1035_19_coinbase_core_equity_exact_product_only: true,
+        step1035_19_coinbase_core_equity_exact_product_only: false,
         step1026_3_coinbase_equity_v50_capability_policy_restored: true,
         step1026_3_coinbase_equity_per_asset_book_trades_not_assumed: true,
         step1026_3_coinbase_equity_realtime_price_not_proven: true,

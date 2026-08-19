@@ -1,22 +1,22 @@
-// Step1035.19.4: Coinbase cash-equity candle routing is resolved from the already-verified exact shared catalog row.
-// Detailed metadata hydration is optional only; it can never invalidate an exact opaque product_id + asset_id + ticker identity.
-// The public-market route uses that same row's official alias when present, otherwise its exact ticker+quote pair.
-// A bounded authenticated-canonical fallback is retained only for the same opaque product identity. No cross-product substitution.
-// already verified by the Step1025 shared product catalog.
-// This module never substitutes venue/product/ticker identities and never touches
-// the protected Binance contract REST path.
+// Step1035.19.6: Coinbase cash-equity candles were runtime-proven unavailable and are closed.
+ // Cash-equity chart fallback now uses an EXPLICITLY LABELLED Bitget Reality rToken
+ // reference product, never a hidden cross-product substitution.
+ // All currently-online Reality SPOT instruments are discovered by one background
+ // public instruments request per hour. User catalog reads never start exchange work.
+ // Exact rToken Klines continue through the existing per-key shared cache/singleflight.
+ // This module never touches the protected Binance contract REST path.
 
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { resolveCoinbaseEquityCandleRoute, getCoinbaseCoreKlineReplicaHealth } from './stock-catalog-v2.mjs';
 
-const VERSION = '650.8.15.188';
-const DATA_VERSION = 1035195;
+const VERSION = '650.8.15.189';
+const DATA_VERSION = 1035196;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
 const SELF_TEST_ENDPOINT = '/api/asset-klines/self-test';
 
-const PROVIDERS = new Set(['okx', 'bybit', 'bitget', 'gate', 'coinbase']);
+const PROVIDERS = new Set(['okx', 'bybit', 'bitget', 'gate']);
 const INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d']);
 const CACHE_MAX = 512;
 const NEGATIVE_CACHE_MAX = 256;
@@ -24,7 +24,7 @@ const BUILD_MAX_ACTIVE = 4; // global emergency ceiling retained from .161
 const BUILD_MAX_QUEUE = 80; // global emergency queue ceiling retained from .161
 const BUILD_PROVIDER_MAX_ACTIVE = 1;
 const BUILD_PROVIDER_MAX_QUEUE = 20;
-const BUILD_PROVIDER_ORDER = Object.freeze(['okx', 'bybit', 'bitget', 'gate', 'coinbase']);
+const BUILD_PROVIDER_ORDER = Object.freeze(['okx', 'bybit', 'bitget', 'gate']);
 const STALE_MS = 15 * 60_000;
 const NEGATIVE_TTL_MS = 45_000;
 const FETCH_TIMEOUT_MS = 15_000;
@@ -40,6 +40,38 @@ const COINBASE_CORE_EQUITY_TICKERS = new Set([
   'COST', 'JPM', 'BAC', 'V', 'MA', 'WMT', 'XOM', 'CVX', 'UNH',
   'JNJ', 'PG', 'HD', 'LLY', 'ABBV', 'COIN', 'PLTR', 'SPY', 'QQQ',
 ]);
+
+const BITGET_REALITY_MAP_ENDPOINT = '/api/asset-klines/reality-map';
+const BITGET_REALITY_CATALOG_URL =
+  'https://api.bitget.com/api/v3/market/instruments?category=SPOT';
+const BITGET_REALITY_CATALOG_REFRESH_MS = 60 * 60_000;
+const BITGET_REALITY_CATALOG_RETAIN_MS = 24 * 60 * 60_000;
+const BITGET_REALITY_MAP_MAX_LIMIT = 100;
+
+let bitgetRealityCatalogRows = [];
+let bitgetRealityByUnderlying = new Map();
+let bitgetRealityCatalogInflight = null;
+let bitgetRealityCatalogStarted = false;
+const bitgetRealityCatalogStats = {
+  refreshes_started: 0,
+  refreshes_succeeded: 0,
+  refreshes_failed: 0,
+  last_started_at: null,
+  last_success_at: null,
+  last_error: '',
+  last_row_count: 0,
+  last_online_count: 0,
+};
+
+// Explicit aliases are only used to identify the SAME underlying reference asset.
+// A candidate is accepted only if that Reality instrument actually exists in the
+// live Bitget catalog. Unknown names never guess a product.
+const BITGET_REALITY_CASH_TICKER_ALIASES = Object.freeze({
+  '000660': ['SKHY'],       // SK hynix (KRX 000660)
+  '000660.KS': ['SKHY'],
+  '005930': ['SMSN', 'SAMSUNG'], // Samsung candidates, only accepted if live catalog contains one.
+  '005930.KS': ['SMSN', 'SAMSUNG'],
+});
 
 const cache = new Map();
 const negativeCache = new Map();
@@ -74,6 +106,196 @@ const stats = {
 
 function text(raw) {
   return String(raw ?? '').trim();
+}
+
+function lower(raw) {
+  return text(raw).toLowerCase();
+}
+
+function upper(raw) {
+  return text(raw).toUpperCase();
+}
+
+function realityUnderlyingKey(raw) {
+  const value = upper(raw).replace(/\s+/g, '');
+  return value.replace(/[^A-Z0-9._-]/g, '').slice(0, 64);
+}
+
+function parseBitgetRealityInstrument(row) {
+  if (!row || typeof row !== 'object') return null;
+  if (lower(row.isReality) !== 'yes') return null;
+  if (upper(row.category || 'SPOT') !== 'SPOT') return null;
+  const status = lower(row.status);
+  if (status && status !== 'online' && status !== 'listed') return null;
+
+  const symbol = nativeSymbolKey(row.symbol);
+  const quote = upper(row.quoteCoin || 'USDT');
+  let base = text(row.baseCoin);
+  if (!symbol || !quote) return null;
+
+  let underlying = '';
+  if (/^r/i.test(base)) underlying = realityUnderlyingKey(base.slice(1));
+  if (!underlying && symbol.startsWith('R') && symbol.endsWith(quote) &&
+      symbol.length > quote.length + 1) {
+    underlying = realityUnderlyingKey(symbol.slice(1, -quote.length));
+  }
+  if (!underlying) return null;
+
+  return {
+    security_key: `bitget_reality:${underlying}:${quote}`,
+    asset_group: 'stocks',
+    security_type: 'equity_token',
+    asset_class: 'equity_token',
+    asset_class_zh: '股票代币',
+    asset_class_en: 'Equity token',
+    product_kind: 'reality_stock_token',
+    provider: 'bitget',
+    market_type: 'spot',
+    asset_id: `bitget|spot|${symbol}`,
+    exchange_symbol: symbol,
+    native_symbol: symbol,
+    display_symbol: underlying,
+    security_ticker: underlying,
+    display_name: underlying,
+    display_name_zh: '',
+    quote_asset: quote,
+    base_asset: text(row.baseCoin) || `r${underlying}`,
+    status: text(row.status),
+    is_reality: true,
+    reference_only_for_cash_equity: true,
+    underlying_identity_kind: 'reality_protocol_reference',
+    official_kline_capability: 'supported',
+    official_kline_source: 'bitget_public_reality_candlestick',
+    kline_intervals: ['1m', '5m', '15m', '1h', '4h', '1d'],
+    source: 'bitget_official_v3_market_instruments_isReality_yes',
+  };
+}
+
+function commitBitgetRealityCatalog(rows) {
+  const sorted = [...rows].sort((a, b) =>
+    `${a.security_ticker}|${a.quote_asset}|${a.exchange_symbol}`
+      .localeCompare(`${b.security_ticker}|${b.quote_asset}|${b.exchange_symbol}`));
+  const byUnderlying = new Map();
+  for (const row of sorted) {
+    const key = realityUnderlyingKey(row.security_ticker);
+    if (!key) continue;
+    const current = byUnderlying.get(key) || [];
+    current.push(row);
+    current.sort((a, b) => {
+      const rank = (x) => x.quote_asset === 'USDT' ? 0 : x.quote_asset === 'USDC' ? 1 : 2;
+      return rank(a) - rank(b) || a.exchange_symbol.localeCompare(b.exchange_symbol);
+    });
+    byUnderlying.set(key, current);
+  }
+  bitgetRealityCatalogRows = sorted;
+  bitgetRealityByUnderlying = byUnderlying;
+}
+
+async function refreshBitgetRealityCatalog() {
+  if (bitgetRealityCatalogInflight) return bitgetRealityCatalogInflight;
+  bitgetRealityCatalogInflight = (async () => {
+    bitgetRealityCatalogStats.refreshes_started += 1;
+    bitgetRealityCatalogStats.last_started_at = new Date().toISOString();
+    try {
+      const payload = await jsonFetch(BITGET_REALITY_CATALOG_URL, 'bitget');
+      if (String(payload?.code ?? '') !== '00000' || !Array.isArray(payload?.data)) {
+        throw new Error('bitget_reality_catalog_invalid_payload');
+      }
+      const parsed = payload.data.map(parseBitgetRealityInstrument).filter(Boolean);
+      if (!parsed.length) throw new Error('bitget_reality_catalog_empty');
+      commitBitgetRealityCatalog(parsed);
+      bitgetRealityCatalogStats.refreshes_succeeded += 1;
+      bitgetRealityCatalogStats.last_success_at = new Date().toISOString();
+      bitgetRealityCatalogStats.last_error = '';
+      bitgetRealityCatalogStats.last_row_count = parsed.length;
+      bitgetRealityCatalogStats.last_online_count = parsed.filter((row) =>
+        lower(row.status) === 'online' || lower(row.status) === 'listed').length;
+      return parsed.length;
+    } catch (error) {
+      bitgetRealityCatalogStats.refreshes_failed += 1;
+      bitgetRealityCatalogStats.last_error =
+        text(error?.message || error).replace(/\s+/g, ' ').slice(0, 240);
+      throw error;
+    } finally {
+      bitgetRealityCatalogInflight = null;
+    }
+  })();
+  return bitgetRealityCatalogInflight;
+}
+
+function startBitgetRealityCatalogCollector() {
+  if (bitgetRealityCatalogStarted) return;
+  bitgetRealityCatalogStarted = true;
+  const first = setTimeout(() => {
+    refreshBitgetRealityCatalog().catch(() => {});
+  }, 1_500);
+  first.unref?.();
+  const timer = setInterval(() => {
+    refreshBitgetRealityCatalog().catch(() => {});
+  }, BITGET_REALITY_CATALOG_REFRESH_MS);
+  timer.unref?.();
+}
+
+function realityNameCandidates(rawName) {
+  const name = text(rawName).toLowerCase();
+  if (!name) return [];
+  const out = [];
+  if (name.includes('sk hynix') || name.includes('sk hynix') || name.includes('海力士')) out.push('SKHY');
+  if (name.includes('sandisk') || name.includes('san disk') || name.includes('闪迪')) out.push('SNDK');
+  if (name.includes('samsung') || name.includes('三星')) out.push('SMSN', 'SAMSUNG');
+  if (name.includes('micron') || name.includes('美光')) out.push('MU');
+  return out;
+}
+
+function resolveBitgetRealityReference(securityTicker, displayName = '') {
+  const ticker = realityUnderlyingKey(securityTicker);
+  const candidates = [];
+  const seen = new Set();
+  const add = (value, mode) => {
+    const key = realityUnderlyingKey(value);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ key, mode });
+  };
+  add(ticker, 'exact_security_ticker');
+  for (const value of BITGET_REALITY_CASH_TICKER_ALIASES[ticker] || []) {
+    add(value, 'curated_underlying_alias');
+  }
+  for (const value of realityNameCandidates(displayName)) {
+    add(value, 'curated_underlying_name_alias');
+  }
+  for (const candidate of candidates) {
+    const rows = bitgetRealityByUnderlying.get(candidate.key);
+    if (Array.isArray(rows) && rows.length) {
+      return {
+        ...rows[0],
+        match_mode: candidate.mode,
+        requested_security_ticker: ticker,
+      };
+    }
+  }
+  return null;
+}
+
+function bitgetRealityCatalogHealth() {
+  const successMs = Date.parse(bitgetRealityCatalogStats.last_success_at || '');
+  const ageMs = Number.isFinite(successMs) ? Math.max(0, Date.now() - successMs) : null;
+  return {
+    mode: 'background_public_spot_instruments_isReality_dynamic_all',
+    endpoint: BITGET_REALITY_MAP_ENDPOINT,
+    source_endpoint: '/api/v3/market/instruments?category=SPOT',
+    ready: bitgetRealityCatalogRows.length > 0 &&
+      (ageMs === null || ageMs <= BITGET_REALITY_CATALOG_RETAIN_MS),
+    rows: bitgetRealityCatalogRows.length,
+    distinct_underlyings: bitgetRealityByUnderlying.size,
+    refresh_interval_minutes: Math.round(BITGET_REALITY_CATALOG_REFRESH_MS / 60_000),
+    user_map_reads_start_exchange_requests: false,
+    reads_scale_with_users: false,
+    one_catalog_request_per_refresh: true,
+    kline_build_mode: 'exact_rtoken_shared_cache_singleflight_on_demand',
+    supported_intervals: ['1m', '5m', '15m', '1h', '4h', '1d'],
+    ...bitgetRealityCatalogStats,
+  };
 }
 
 function base64Url(value) {
@@ -177,7 +399,11 @@ function exactScopeSupported({ provider, marketType, assetClass }) {
   if (!p || !market || !cls) return false;
 
   if (p === 'coinbase') {
-    return market === 'equity' && cls === 'equity_cash';
+    // Runtime Step1035.19.5 proved Coinbase EQUITY candles unavailable:
+    // public alias/pair returned invalid product_id and canonical auth returned empty.
+    // Keep cash-equity candles closed; the App may explicitly open a labelled
+    // Bitget Reality reference product instead.
+    return false;
   }
   if (p === 'bybit') {
     return /(equity|stock|commodity|metal)/.test(cls);
@@ -370,7 +596,7 @@ async function jsonFetch(url, provider, timeoutMs = FETCH_TIMEOUT_MS, headers = 
       method: 'GET',
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/Step1035.19.3-AssetKline',
+        'user-agent': 'KakaWeb3/Step1035.19.6-AssetKline',
         ...headers,
       },
       signal: controller.signal,
@@ -576,69 +802,8 @@ export function parseCoinbaseRows(payload, identity, source = 'coinbase_advanced
   }) : null), identity.limit);
 }
 
-async function fetchCoinbase(identity) {
-  if (!COINBASE_CDP_CONFIGURED) throw new Error('coinbase_cdp_credentials_not_configured');
-  if (!identity.securityTicker || !COINBASE_CORE_EQUITY_TICKERS.has(identity.securityTicker)) {
-    throw new Error('coinbase_equity_not_in_core_kline_pool');
-  }
-  if (!coinbaseCoreIdentityAllowed(identity)) {
-    throw new Error('coinbase_equity_exact_product_identity_mismatch');
-  }
-  const granularity = coinbaseGranularity(identity.interval);
-  if (!granularity) throw new Error('coinbase_equity_interval_not_supported');
-  const route = await resolveCoinbaseEquityCandleRoute(identity.nativeSymbol, identity.securityTicker, identity.assetId);
-  if (!route || route.identity_verified !== true || !Array.isArray(route.route_product_ids) || !route.route_product_ids.length) {
-    const reason = text(route?.reason || 'unresolved').slice(0, 120);
-    throw new Error(`coinbase_equity_exact_catalog_candle_route_not_ready:${reason}`);
-  }
-  const end = Math.floor(Date.now() / 1000);
-  const step = intervalSeconds(identity.interval);
-  const lookbackSeconds = Math.max(7 * 86400, step * Math.max(40, identity.limit) * 3);
-  const start = Math.max(0, end - lookbackSeconds);
-  const failures = [];
-
-  // First use the documented public-market route id derived from the SAME exact catalog row.
-  for (const routeProductId of route.route_product_ids) {
-    const path = `/api/v3/brokerage/market/products/${encodeURIComponent(routeProductId)}/candles`;
-    const url = new URL(`https://${COINBASE_HOST}${path}`);
-    url.searchParams.set('start', String(start));
-    url.searchParams.set('end', String(end));
-    url.searchParams.set('granularity', granularity);
-    url.searchParams.set('limit', String(Math.min(300, identity.limit)));
-    try {
-      const payload = await jsonFetch(url.toString(), 'coinbase', FETCH_TIMEOUT_MS, {
-        authorization: `Bearer ${coinbaseJwt(path)}`,
-      });
-      const rows = parseCoinbaseRows(payload, identity);
-      if (rows.length) return rows;
-      failures.push(`public:${routeProductId}:empty`);
-    } catch (error) {
-      failures.push(`public:${routeProductId}:${text(error?.message || error).slice(0, 150)}`);
-    }
-  }
-
-  // Coinbase's equity product APIs document canonical opaque product IDs. Keep one bounded
-  // authenticated candle attempt for that SAME canonical product only. This is not a ticker
-  // substitution and never crosses products/providers.
-  {
-    const path = `/api/v3/brokerage/products/${encodeURIComponent(identity.nativeSymbol)}/candles`;
-    const url = new URL(`https://${COINBASE_HOST}${path}`);
-    url.searchParams.set('start', String(start));
-    url.searchParams.set('end', String(end));
-    url.searchParams.set('granularity', granularity);
-    url.searchParams.set('limit', String(Math.min(300, identity.limit)));
-    try {
-      const payload = await jsonFetch(url.toString(), 'coinbase', FETCH_TIMEOUT_MS, {
-        authorization: `Bearer ${coinbaseJwt(path)}`,
-      });
-      const rows = parseCoinbaseRows(payload, identity, 'coinbase_advanced_trade_authenticated_canonical_equity_candle');
-      if (rows.length) return rows;
-      failures.push(`canonical_auth:${identity.nativeSymbol}:empty`);
-    } catch (error) {
-      failures.push(`canonical_auth:${identity.nativeSymbol}:${text(error?.message || error).slice(0, 150)}`);
-    }
-  }
-  throw new Error(`coinbase_equity_candle_routes_failed:${failures.join('|').slice(0, 720)}`);
+async function fetchCoinbase(_identity) {
+  throw new Error('coinbase_cash_equity_candles_closed_runtime_proven_unavailable');
 }
 
 async function fetchBybit(identity) {
@@ -886,6 +1051,59 @@ function parseIdentity(url) {
   return { provider, marketType, assetClass, assetId, nativeSymbol, securityTicker, interval, limit, sparse };
 }
 
+function realityMapPayload(url) {
+  const query = lower(url.searchParams.get('query'));
+  const requestedTicker = text(url.searchParams.get('security_ticker'));
+  const displayName = text(url.searchParams.get('display_name'));
+  const offsetRaw = Number(url.searchParams.get('offset') || 0);
+  const limitRaw = Number(url.searchParams.get('limit') || 50);
+  const offset = Number.isFinite(offsetRaw) ? Math.max(0, Math.trunc(offsetRaw)) : 0;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.max(1, Math.min(BITGET_REALITY_MAP_MAX_LIMIT, Math.trunc(limitRaw)))
+    : 50;
+
+  const filtered = query
+    ? bitgetRealityCatalogRows.filter((row) => {
+        const haystack = [
+          row.security_ticker,
+          row.exchange_symbol,
+          row.base_asset,
+          row.quote_asset,
+        ].map((v) => lower(v)).join('|');
+        return haystack.includes(query);
+      })
+    : bitgetRealityCatalogRows;
+  const match = requestedTicker || displayName
+    ? resolveBitgetRealityReference(requestedTicker, displayName)
+    : null;
+
+  return {
+    ok: true,
+    version: VERSION,
+    data_version: DATA_VERSION,
+    schema_version: 'step1035_19_6_bitget_reality_reference_v1',
+    read_only_shared: true,
+    background_catalog: true,
+    user_read_upstream_requests: 0,
+    user_read_upstream_connections: 0,
+    user_map_reads_start_exchange_requests: false,
+    reads_scale_with_users: false,
+    cross_provider_substitution: false,
+    hidden_cash_equity_substitution: false,
+    explicit_reference_product: true,
+    reference_provider: 'bitget',
+    reference_product_kind: 'reality_stock_token',
+    source: 'bitget_official_public_spot_instruments_isReality_yes',
+    total: filtered.length,
+    offset,
+    limit,
+    rows: filtered.slice(offset, offset + limit),
+    match,
+    catalog: bitgetRealityCatalogHealth(),
+    generated_at: new Date().toISOString(),
+  };
+}
+
 export function runAssetKlineSelfTest() {
   const sampleIdentity = {
     provider: 'bybit', marketType: 'spot', assetClass: 'equity_token',
@@ -913,14 +1131,22 @@ export function runAssetKlineSelfTest() {
     okx_sparse_zero_preserved: okx.length === 1 && okx[0].close === 0,
     gate_exact_symbol: gate.length === 1 && gate[0].native_symbol === 'CL_USDT',
     gate_cash_stock_blocked: exactScopeSupported({ provider: 'gate', marketType: 'spot', assetClass: 'equity_cash' }) === false,
-    coinbase_provider_supported: providerKey('coinbase') === 'coinbase',
+    coinbase_provider_closed_for_cash_kline: providerKey('coinbase') === '',
     coinbase_parser_supported: coinbase.length === 1 && coinbase[0].close === 201,
     coinbase_opaque_product_id_case_preserved: nativeSymbolKey('opaqueCaseId', { preserveCase: true }) === 'opaqueCaseId',
-    coinbase_cash_equity_scope_supported: exactScopeSupported({ provider: 'coinbase', marketType: 'equity', assetClass: 'equity_cash' }) === true,
+    coinbase_cash_equity_scope_closed: exactScopeSupported({ provider: 'coinbase', marketType: 'equity', assetClass: 'equity_cash' }) === false,
     coinbase_core_exact_identity_guard: coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:opaqueCaseId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === true && coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:otherId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === false,
-    coinbase_candle_route_uses_exact_catalog_resolver: String(fetchCoinbase).includes('resolveCoinbaseEquityCandleRoute'),
-    coinbase_isolated_process_replica_health_exposed: typeof getCoinbaseCoreKlineReplicaHealth === 'function',
-    coinbase_opaque_product_id_not_used_as_public_pair_route: !String(fetchCoinbase).includes('/brokerage/market/products/${encodeURIComponent(identity.nativeSymbol)}/candles') && String(fetchCoinbase).includes('/brokerage/products/${encodeURIComponent(identity.nativeSymbol)}/candles'),
+    coinbase_failed_candle_routes_removed_from_runtime: String(fetchCoinbase).includes('closed_runtime_proven_unavailable'),
+    bitget_reality_catalog_parser: parseBitgetRealityInstrument({
+      symbol: 'RAAPLUSDT', category: 'SPOT', baseCoin: 'rAAPL', quoteCoin: 'USDT',
+      isReality: 'yes', status: 'online',
+    })?.security_ticker === 'AAPL',
+    bitget_reality_catalog_rejects_non_reality: parseBitgetRealityInstrument({
+      symbol: 'BTCUSDT', category: 'SPOT', baseCoin: 'BTC', quoteCoin: 'USDT',
+      isReality: 'no', status: 'online',
+    }) === null,
+    bitget_reality_map_is_background_only: String(realityMapPayload).includes('user_read_upstream_requests: 0'),
+    bitget_reality_kline_uses_exact_native_symbol: String(fetchBitget).includes("url.searchParams.set('symbol', identity.nativeSymbol)"),
     coinbase_non_equity_scope_blocked: exactScopeSupported({ provider: 'coinbase', marketType: 'spot', assetClass: 'equity_cash' }) === false,
     bybit_equity_supported: exactScopeSupported({ provider: 'bybit', marketType: 'spot', assetClass: 'equity_token' }) === true,
     okx_event_supported: exactScopeSupported({ provider: 'okx', marketType: 'event', assetClass: 'prediction_event' }) === true,
@@ -957,15 +1183,14 @@ export function getAssetKlineHealth() {
     cross_product_substitution: false,
     cross_ticker_substitution: false,
     gate_cash_equity_secondary_source_still_locked: true,
-    coinbase_core_equity_official_candles_opened: true,
-    coinbase_candle_endpoint_path: '/api/v3/brokerage/market/products/{product_id}/candles',
-    coinbase_candle_endpoint_mode: 'advanced_trade_public_market_exact_shared_row_alias_or_pair_plus_same_canonical_auth_fallback',
-    coinbase_candle_route_identity: 'isolated_exchange_assets_core_supabase_read_replica_exact_identity_then_same_product_alias_or_pair',
-    coinbase_non_core_equity_secondary_source_still_locked: true, coinbase_catalog_refresh_atomic_memory_swap_required: true, coinbase_core_kline_replica: getCoinbaseCoreKlineReplicaHealth(),
-    coinbase_cdp_configured: COINBASE_CDP_CONFIGURED,
-    coinbase_exact_product_asset_id_guard: true,
-    coinbase_security_ticker_core_scope_required: true,
-    coinbase_core_tickers: [...COINBASE_CORE_EQUITY_TICKERS],
+    coinbase_core_equity_official_candles_opened: false,
+    coinbase_cash_equity_candles_closed_after_runtime_probe: true,
+    coinbase_runtime_probe_result:
+      'public_alias_and_pair_invalid_product_id; canonical_authenticated_empty',
+    cash_equity_reference_policy:
+      'explicit_labelled_reality_rtoken_reference_only_never_hidden_substitution',
+    bitget_reality_reference_map_endpoint: BITGET_REALITY_MAP_ENDPOINT,
+    bitget_reality_catalog: bitgetRealityCatalogHealth(),
     okx_event_sparse_bars_allowed: true,
     okx_latest_asset_window_endpoint: '/api/v5/market/candles',
     okx_history_candles_used_for_latest_asset_window: false,
@@ -990,6 +1215,8 @@ export function getAssetKlineHealth() {
   };
 }
 
+startBitgetRealityCatalogCollector();
+
 export async function handleAssetKline(req, res, url, signal = null) {
   if (url.pathname === HEALTH_ENDPOINT) {
     sendJson(res, 200, getAssetKlineHealth());
@@ -997,6 +1224,37 @@ export async function handleAssetKline(req, res, url, signal = null) {
   }
   if (url.pathname === SELF_TEST_ENDPOINT) {
     sendJson(res, 200, runAssetKlineSelfTest());
+    return true;
+  }
+  if (url.pathname === BITGET_REALITY_MAP_ENDPOINT) {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, OPTIONS',
+        'access-control-allow-headers': 'content-type',
+      });
+      res.end();
+      return true;
+    }
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { ok: false, version: VERSION, error: 'GET required' });
+      return true;
+    }
+    const health = bitgetRealityCatalogHealth();
+    if (!health.ready) {
+      sendJson(res, 503, {
+        ok: false,
+        version: VERSION,
+        data_version: DATA_VERSION,
+        schema_version: 'step1035_19_6_bitget_reality_reference_v1',
+        read_only_shared: true,
+        user_read_upstream_requests: 0,
+        error: 'bitget_reality_background_catalog_pending',
+        catalog: health,
+      });
+      return true;
+    }
+    sendJson(res, 200, realityMapPayload(url));
     return true;
   }
   if (url.pathname !== ENDPOINT) return false;
