@@ -7,9 +7,9 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.191.1';
-const DATA_VERSION = 1037001;
-const SCHEMA_VERSION = 'step1037_1_onchain_market_v2';
+const VERSION = '650.8.15.191.2';
+const DATA_VERSION = 1037002;
+const SCHEMA_VERSION = 'step1037_2_onchain_market_v2';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -367,7 +367,7 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
           // "key, key", which Moralis correctly rejects as an invalid token.
           // Send exactly one official authentication header.
           'X-API-Key': MORALIS_API_KEY,
-          'user-agent': 'KakaWeb3-Onchain-Shared/1037.1',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1037.2',
         },
       });
       const body = await response.text();
@@ -655,44 +655,91 @@ async function buildMoralisKlines(network, tokenAddress, pool, interval, limit, 
   };
 }
 
-function normalizeMoralisSwap(network, raw, tokenAddress, poolAddress) {
+function moralisPairTokenMeta(raw, amount, usdPrice) {
+  if (!raw || typeof raw !== 'object') return null;
+  const amountN = numberOrNull(amount);
+  const priceN = numberOrNull(usdPrice);
+  return {
+    address: text(raw.address),
+    name: text(raw.name),
+    symbol: text(raw.symbol),
+    decimals: numberOrNull(raw.decimals),
+    amount: amountN,
+    usd_price: priceN,
+    usd_amount: amountN !== null && priceN !== null ? amountN * priceN : null,
+  };
+}
+
+function normalizeMoralisPairSwap(network, raw, tokenAddress, pairMeta) {
   if (!raw) return null;
-  const pair = text(raw.pairAddress || poolAddress);
-  if (pair && !exactAddressEqual(network, pair, poolAddress)) return null;
-  const bought = raw.bought && typeof raw.bought === 'object' ? raw.bought : null;
-  const sold = raw.sold && typeof raw.sold === 'object' ? raw.sold : null;
-  const txType = lower(raw.transactionType);
+  const poolAddress = text(pairMeta?.pairAddress);
+  const rowPair = text(raw.pairAddress);
+  if (rowPair && poolAddress && !exactAddressEqual(network, rowPair, poolAddress)) {
+    return null;
+  }
+
+  const base = moralisPairTokenMeta(
+    pairMeta?.baseToken,
+    raw.baseTokenAmount,
+    raw.baseTokenPriceUsd,
+  );
+  const quote = moralisPairTokenMeta(
+    pairMeta?.quoteToken,
+    raw.quoteTokenAmount,
+    raw.quoteTokenPriceUsd,
+  );
+  const requestedIsBase = Boolean(
+    base?.address && exactAddressEqual(network, base.address, tokenAddress),
+  );
+  const requestedIsQuote = Boolean(
+    quote?.address && exactAddressEqual(network, quote.address, tokenAddress),
+  );
+  if (!requestedIsBase && !requestedIsQuote) return null;
+
+  const sourceType = lower(raw.transactionType);
+  let bought = null;
+  let sold = null;
+  // Moralis Pair Swaps defines buy/sell relative to the pair's base token.
+  // Preserve the source type and only derive bought/sold from the exact pair orientation.
+  if (sourceType === 'buy') {
+    bought = base;
+    sold = quote;
+  } else if (sourceType === 'sell') {
+    bought = quote;
+    sold = base;
+  }
+
+  const requestedSide =
+    sourceType === 'buy'
+      ? (requestedIsBase ? 'buy' : requestedIsQuote ? 'sell' : null)
+      : sourceType === 'sell'
+        ? (requestedIsBase ? 'sell' : requestedIsQuote ? 'buy' : null)
+        : sourceType || null;
+
   return {
     transaction_hash: text(raw.transactionHash),
     transaction_index: numberOrNull(raw.transactionIndex),
     block_number: numberOrNull(raw.blockNumber),
     block_timestamp: text(raw.blockTimestamp),
-    transaction_type: txType || null,
+    source_transaction_type: sourceType || null,
+    requested_token_side: requestedSide,
+    sub_category: text(raw.subCategory) || null,
     wallet_address: text(raw.walletAddress),
-    pair_address: pair || poolAddress,
-    pair_label: text(raw.pairLabel),
-    exchange_name: text(raw.exchangeName),
-    bought: bought ? {
-      address: text(bought.address),
-      name: text(bought.name),
-      symbol: text(bought.symbol),
-      amount: numberOrNull(bought.amount),
-      usd_price: numberOrNull(bought.usdPrice),
-      usd_amount: numberOrNull(bought.usdAmount),
-    } : null,
-    sold: sold ? {
-      address: text(sold.address),
-      name: text(sold.name),
-      symbol: text(sold.symbol),
-      amount: numberOrNull(sold.amount),
-      usd_price: numberOrNull(sold.usdPrice),
-      usd_amount: numberOrNull(sold.usdAmount),
-    } : null,
+    pair_address: rowPair || poolAddress,
+    pair_label: text(pairMeta?.pairLabel),
+    exchange_name: text(pairMeta?.exchangeName),
+    base_token: base,
+    quote_token: quote,
+    bought,
+    sold,
+    base_quote_price: numberOrNull(raw.baseQuotePrice),
     total_value_usd: numberOrNull(raw.totalValueUsd),
-    requested_token_in_trade:
-      [bought?.address, sold?.address].some((x) => x && exactAddressEqual(network, x, tokenAddress)),
+    requested_token_in_trade: true,
+    requested_token_is_base: requestedIsBase,
+    requested_token_is_quote: requestedIsQuote,
   };
 }
+
 function moralisTradesUrl(network, poolAddress, limit) {
   if (network === 'solana') {
     const u = new URL(`https://solana-gateway.moralis.io/token/mainnet/pairs/${encodeURIComponent(poolAddress)}/swaps`);
@@ -745,10 +792,34 @@ async function buildMoralisTrades(network, tokenAddress, pool, limit) {
     priority: 10,
     label: `trades:${network}:${pool.pool_address}`,
   });
+
+  const returnedPair = text(payload?.pairAddress);
+  if (returnedPair && !exactAddressEqual(network, returnedPair, pool.pool_address)) {
+    throw new Error('moralis_trade_pair_identity_mismatch');
+  }
+
+  const baseAddress = text(payload?.baseToken?.address);
+  const quoteAddress = text(payload?.quoteToken?.address);
+  const moralisPairContainsRequestedToken =
+    (baseAddress && exactAddressEqual(network, baseAddress, tokenAddress)) ||
+    (quoteAddress && exactAddressEqual(network, quoteAddress, tokenAddress));
+
+  if ((baseAddress || quoteAddress) && !moralisPairContainsRequestedToken) {
+    throw new Error('moralis_trade_token_identity_mismatch');
+  }
+
   const rawRows = Array.isArray(payload?.result) ? payload.result : [];
+  const pairMeta = {
+    pairAddress: returnedPair || pool.pool_address,
+    pairLabel: payload?.pairLabel,
+    exchangeName: payload?.exchangeName,
+    baseToken: payload?.baseToken,
+    quoteToken: payload?.quoteToken,
+  };
+
   return rawRows
-    .map((row) => normalizeMoralisSwap(network, row, tokenAddress, pool.pool_address))
-    .filter((row) => row && row.requested_token_in_trade !== false)
+    .map((row) => normalizeMoralisPairSwap(network, row, tokenAddress, pairMeta))
+    .filter(Boolean)
     .slice(0, limit);
 }
 
@@ -1074,6 +1145,10 @@ function healthPayload() {
       max_rows: TRADE_MAX_ROWS,
       cache_entries: tradeCache.size,
       moralis_cu_per_upstream_call: MORALIS_TRADES_CU,
+      response_schema: 'pair_level_base_quote_metadata_plus_row_base_quote_amounts',
+      token_swaps_bought_sold_schema_not_assumed: true,
+      exact_moralis_pair_identity_checked: true,
+      exact_requested_token_in_pair_checked_when_metadata_present: true,
     },
     new_pools: {
       opened: true,
@@ -1138,6 +1213,7 @@ function runSelfTest() {
   t('moralis_budget_below_free_reference', MORALIS_DAILY_CU_BUDGET < 40_000);
   t('moralis_secret_never_exposed', healthPayload().sources.moralis.api_key_exposed === false);
   t('moralis_single_auth_header_only', healthPayload().sources.moralis.auth_header_count_per_request === 1 && healthPayload().sources.moralis.duplicate_case_variant_headers === false);
+  t('moralis_pair_swap_schema_not_token_swap_schema', healthPayload().recent_trades.token_swaps_bought_sold_schema_not_assumed === true);
   t('moralis_15m_same_pool_derivation_only', MORALIS_TIMEFRAME['15m'] === '5min');
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
