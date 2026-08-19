@@ -1,4 +1,4 @@
-// Step1035.19.3: Coinbase cash-equity candle routing is resolved from the already-verified exact shared catalog row.
+// Step1035.19.4: Coinbase cash-equity candle routing is resolved from the already-verified exact shared catalog row.
 // Detailed metadata hydration is optional only; it can never invalidate an exact opaque product_id + asset_id + ticker identity.
 // The public-market route uses that same row's official alias when present, otherwise its exact ticker+quote pair.
 // A bounded authenticated-canonical fallback is retained only for the same opaque product identity. No cross-product substitution.
@@ -9,8 +9,8 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { resolveCoinbaseEquityCandleRoute } from './stock-catalog-v2.mjs';
 
-const VERSION = '650.8.15.186';
-const DATA_VERSION = 1035193;
+const VERSION = '650.8.15.187';
+const DATA_VERSION = 1035194;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
@@ -960,7 +960,7 @@ export function getAssetKlineHealth() {
     coinbase_candle_endpoint_path: '/api/v3/brokerage/market/products/{product_id}/candles',
     coinbase_candle_endpoint_mode: 'advanced_trade_public_market_exact_shared_row_alias_or_pair_plus_same_canonical_auth_fallback',
     coinbase_candle_route_identity: 'exact_shared_catalog_row_guard_then_alias_or_same_row_ticker_quote_no_metadata_dependency',
-    coinbase_non_core_equity_secondary_source_still_locked: true,
+    coinbase_non_core_equity_secondary_source_still_locked: true, coinbase_catalog_refresh_atomic_memory_swap_required: true,
     coinbase_cdp_configured: COINBASE_CDP_CONFIGURED,
     coinbase_exact_product_asset_id_guard: true,
     coinbase_security_ticker_core_scope_required: true,
