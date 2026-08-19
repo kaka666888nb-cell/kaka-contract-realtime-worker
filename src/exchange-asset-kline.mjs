@@ -1,16 +1,18 @@
-// Step1026.8: exact-identity official Kline bridge for the non-crypto assets
+// Step1035.19: Coinbase core cash-equity official candles + existing exact-identity non-crypto asset Klines.
 // already verified by the Step1025 shared product catalog.
 // This module never substitutes venue/product/ticker identities and never touches
 // the protected Binance contract REST path.
 
-const VERSION = '650.8.15.162';
-const DATA_VERSION = 10261;
+import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
+
+const VERSION = '650.8.15.183';
+const DATA_VERSION = 103519;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
 const SELF_TEST_ENDPOINT = '/api/asset-klines/self-test';
 
-const PROVIDERS = new Set(['okx', 'bybit', 'bitget', 'gate']);
+const PROVIDERS = new Set(['okx', 'bybit', 'bitget', 'gate', 'coinbase']);
 const INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d']);
 const CACHE_MAX = 512;
 const NEGATIVE_CACHE_MAX = 256;
@@ -18,10 +20,22 @@ const BUILD_MAX_ACTIVE = 4; // global emergency ceiling retained from .161
 const BUILD_MAX_QUEUE = 80; // global emergency queue ceiling retained from .161
 const BUILD_PROVIDER_MAX_ACTIVE = 1;
 const BUILD_PROVIDER_MAX_QUEUE = 20;
-const BUILD_PROVIDER_ORDER = Object.freeze(['okx', 'bybit', 'bitget', 'gate']);
+const BUILD_PROVIDER_ORDER = Object.freeze(['okx', 'bybit', 'bitget', 'gate', 'coinbase']);
 const STALE_MS = 15 * 60_000;
 const NEGATIVE_TTL_MS = 45_000;
 const FETCH_TIMEOUT_MS = 15_000;
+
+const COINBASE_HOST = 'api.coinbase.com';
+const COINBASE_CDP_KEY_NAME = String(process.env.KAKA_COINBASE_CDP_KEY_NAME || process.env.COINBASE_CDP_API_KEY_NAME || '').trim();
+const COINBASE_CDP_KEY_SECRET = String(process.env.KAKA_COINBASE_CDP_KEY_SECRET || process.env.COINBASE_CDP_API_KEY_SECRET || '').replace(/\\n/g, '\n').trim();
+const COINBASE_CDP_CONFIGURED = Boolean(COINBASE_CDP_KEY_NAME && COINBASE_CDP_KEY_SECRET);
+let coinbasePrivateKey = null;
+const COINBASE_CORE_EQUITY_TICKERS = new Set([
+  'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'GOOG', 'META', 'TSLA',
+  'AVGO', 'AMD', 'NFLX', 'ORCL', 'CRM', 'INTC', 'QCOM', 'ADBE',
+  'COST', 'JPM', 'BAC', 'V', 'MA', 'WMT', 'XOM', 'CVX', 'UNH',
+  'JNJ', 'PG', 'HD', 'LLY', 'ABBV', 'COIN', 'PLTR', 'SPY', 'QQQ',
+]);
 
 const cache = new Map();
 const negativeCache = new Map();
@@ -51,11 +65,31 @@ const stats = {
   queue_rejections: 0,
   cache_evictions: 0,
   upstream_requests_started: 0,
-  upstream_by_provider: { okx: 0, bybit: 0, bitget: 0, gate: 0 },
+  upstream_by_provider: { okx: 0, bybit: 0, bitget: 0, gate: 0, coinbase: 0 },
 };
 
 function text(raw) {
   return String(raw ?? '').trim();
+}
+
+function base64Url(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function coinbaseJwt(path) {
+  if (!COINBASE_CDP_CONFIGURED) throw new Error('coinbase_cdp_credentials_not_configured');
+  if (!coinbasePrivateKey) coinbasePrivateKey = createPrivateKey(COINBASE_CDP_KEY_SECRET);
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'ES256', typ: 'JWT', kid: COINBASE_CDP_KEY_NAME, nonce: randomBytes(16).toString('hex') };
+  const payload = { iss: 'cdp', nbf: now, exp: now + 120, sub: COINBASE_CDP_KEY_NAME, uri: `GET ${COINBASE_HOST}${path}` };
+  const input = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
+  const sig = cryptoSign('sha256', Buffer.from(input), { key: coinbasePrivateKey, dsaEncoding: 'ieee-p1363' });
+  return `${input}.${base64Url(sig)}`;
+}
+
+function coinbaseCoreIdentityAllowed(identity) {
+  if (!COINBASE_CORE_EQUITY_TICKERS.has(identity.securityTicker)) return false;
+  return identity.assetId === `coinbase:equity:${identity.nativeSymbol}`;
 }
 
 function providerKey(raw) {
@@ -73,17 +107,24 @@ function assetClassKey(raw) {
   return text(raw).toLowerCase().replace(/\s+/g, '_').slice(0, 96);
 }
 
+function securityTickerKey(raw) {
+  const value = text(raw).toUpperCase().replace(/[^A-Z0-9._-]/g, '');
+  return value.slice(0, 48);
+}
+
 function assetIdKey(raw) {
   const value = text(raw);
   if (!value || value.length > 240 || /[\u0000-\u001f\u007f]/.test(value)) return '';
   return value;
 }
 
-function nativeSymbolKey(raw) {
-  const value = text(raw).toUpperCase();
+function nativeSymbolKey(raw, { preserveCase = false } = {}) {
+  const original = text(raw);
+  if (!original || original.length > 240 || /[\u0000-\u001f\u007f]/.test(original)) return '';
+  if (preserveCase) return original;
+  const value = original.toUpperCase();
   // Preserve official exchange identity. Only reject unsafe/control characters;
   // do not remove '-'/'_' because OKX and Gate rely on them.
-  if (!value || value.length > 160) return '';
   if (!/^[A-Z0-9._:\-/]+$/.test(value)) return '';
   return value;
 }
@@ -131,6 +172,9 @@ function exactScopeSupported({ provider, marketType, assetClass }) {
   const cls = assetClassKey(assetClass);
   if (!p || !market || !cls) return false;
 
+  if (p === 'coinbase') {
+    return market === 'equity' && cls === 'equity_cash';
+  }
   if (p === 'bybit') {
     return /(equity|stock|commodity|metal)/.test(cls);
   }
@@ -310,7 +354,7 @@ function releaseBuildSlot(provider) {
   drainBuildQueues();
 }
 
-async function jsonFetch(url, provider, timeoutMs = FETCH_TIMEOUT_MS) {
+async function jsonFetch(url, provider, timeoutMs = FETCH_TIMEOUT_MS, headers = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('asset_kline_upstream_timeout')), timeoutMs);
   stats.upstream_requests_started += 1;
@@ -322,7 +366,8 @@ async function jsonFetch(url, provider, timeoutMs = FETCH_TIMEOUT_MS) {
       method: 'GET',
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/Step1026-AssetKline',
+        'user-agent': 'KakaWeb3/Step1035.19-AssetKline',
+        ...headers,
       },
       signal: controller.signal,
     });
@@ -493,6 +538,63 @@ export function parseGateRows(payload, identity) {
   return uniqueSortedRows(rows, identity.limit);
 }
 
+
+function coinbaseGranularity(interval) {
+  return ({
+    '1m': 'ONE_MINUTE',
+    '5m': 'FIVE_MINUTE',
+    '15m': 'FIFTEEN_MINUTE',
+    '1h': 'ONE_HOUR',
+    '4h': 'FOUR_HOUR',
+    '1d': 'ONE_DAY',
+  })[interval] || '';
+}
+
+function intervalSeconds(interval) {
+  return ({ '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 })[interval] || 60;
+}
+
+export function parseCoinbaseRows(payload, identity) {
+  const list = Array.isArray(payload?.candles) ? payload.candles : [];
+  return uniqueSortedRows(list.map((a) => a && typeof a === 'object' ? normalizeRow({
+    ...identity,
+    openTimeMs: finite(a.start) !== null ? Number(a.start) * 1000 : null,
+    open: a.open,
+    high: a.high,
+    low: a.low,
+    close: a.close,
+    volume: a.volume,
+    quoteVolume: null,
+    source: 'coinbase_advanced_trade_authenticated_exact_equity_candle',
+  }) : null), identity.limit);
+}
+
+async function fetchCoinbase(identity) {
+  if (!COINBASE_CDP_CONFIGURED) throw new Error('coinbase_cdp_credentials_not_configured');
+  if (!identity.securityTicker || !COINBASE_CORE_EQUITY_TICKERS.has(identity.securityTicker)) {
+    throw new Error('coinbase_equity_not_in_core_kline_pool');
+  }
+  if (!coinbaseCoreIdentityAllowed(identity)) {
+    throw new Error('coinbase_equity_exact_product_identity_mismatch');
+  }
+  const granularity = coinbaseGranularity(identity.interval);
+  if (!granularity) throw new Error('coinbase_equity_interval_not_supported');
+  const end = Math.floor(Date.now() / 1000);
+  const step = intervalSeconds(identity.interval);
+  const lookbackSeconds = Math.max(7 * 86400, step * Math.max(40, identity.limit) * 3);
+  const start = Math.max(0, end - lookbackSeconds);
+  const path = `/api/v3/brokerage/products/${encodeURIComponent(identity.nativeSymbol)}/candles`;
+  const url = new URL(`https://${COINBASE_HOST}${path}`);
+  url.searchParams.set('start', String(start));
+  url.searchParams.set('end', String(end));
+  url.searchParams.set('granularity', granularity);
+  url.searchParams.set('limit', String(Math.min(300, identity.limit)));
+  const payload = await jsonFetch(url.toString(), 'coinbase', FETCH_TIMEOUT_MS, {
+    authorization: `Bearer ${coinbaseJwt(path)}`,
+  });
+  return parseCoinbaseRows(payload, identity);
+}
+
 async function fetchBybit(identity) {
   const category = bybitCategory(identity.marketType);
   const bar = bybitInterval(identity.interval);
@@ -578,6 +680,7 @@ async function fetchGate(identity) {
 }
 
 async function buildRows(identity) {
+  if (identity.provider === 'coinbase') return fetchCoinbase(identity);
   if (identity.provider === 'bybit') return fetchBybit(identity);
   if (identity.provider === 'bitget') return fetchBitget(identity);
   if (identity.provider === 'gate') return fetchGate(identity);
@@ -603,6 +706,7 @@ function responseBase(identity) {
     asset_id: identity.assetId,
     native_symbol: identity.nativeSymbol,
     resolved_native_symbol: identity.nativeSymbol,
+    security_ticker: identity.securityTicker || null,
     interval: identity.interval,
     sparse_market_bars: identity.sparse,
   };
@@ -615,6 +719,7 @@ function cacheKey(identity) {
     identity.assetClass,
     identity.assetId,
     identity.nativeSymbol,
+    identity.securityTicker || '',
     identity.interval,
     identity.limit,
   ].join('|');
@@ -727,11 +832,12 @@ function parseIdentity(url) {
   const marketType = marketTypeKey(url.searchParams.get('market_type'));
   const assetClass = assetClassKey(url.searchParams.get('asset_class'));
   const assetId = assetIdKey(url.searchParams.get('asset_id'));
-  const nativeSymbol = nativeSymbolKey(url.searchParams.get('native_symbol'));
+  const nativeSymbol = nativeSymbolKey(url.searchParams.get('native_symbol'), { preserveCase: provider === 'coinbase' });
+  const securityTicker = securityTickerKey(url.searchParams.get('security_ticker'));
   const interval = intervalKey(url.searchParams.get('interval'));
   const limit = safeLimit(url.searchParams.get('limit'));
   const sparse = isSparseMarket({ provider, marketType, assetClass });
-  return { provider, marketType, assetClass, assetId, nativeSymbol, interval, limit, sparse };
+  return { provider, marketType, assetClass, assetId, nativeSymbol, securityTicker, interval, limit, sparse };
 }
 
 export function runAssetKlineSelfTest() {
@@ -753,6 +859,7 @@ export function runAssetKlineSelfTest() {
   const gate = parseGateRows([
     { t: 1786800000, o: '70', h: '71', l: '69', c: '70.5', v: '100', sum: '7050' },
   ], { ...sampleIdentity, provider: 'gate', marketType: 'contract', assetClass: 'commodity', assetId: 'gate|contract|CL_USDT', nativeSymbol: 'CL_USDT' });
+  const coinbase = parseCoinbaseRows({ candles: [{ start: '1786800000', low: '199', high: '202', open: '200', close: '201', volume: '12345' }] }, { ...sampleIdentity, provider: 'coinbase', marketType: 'equity', assetClass: 'equity_cash', assetId: 'coinbase:equity:opaqueCaseId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' });
 
   const checks = {
     bybit_exact_symbol: bybit.length === 1 && bybit[0].native_symbol === 'AAPLXUSDT',
@@ -760,7 +867,12 @@ export function runAssetKlineSelfTest() {
     okx_sparse_zero_preserved: okx.length === 1 && okx[0].close === 0,
     gate_exact_symbol: gate.length === 1 && gate[0].native_symbol === 'CL_USDT',
     gate_cash_stock_blocked: exactScopeSupported({ provider: 'gate', marketType: 'spot', assetClass: 'equity_cash' }) === false,
-    coinbase_not_supported: providerKey('coinbase') === '',
+    coinbase_provider_supported: providerKey('coinbase') === 'coinbase',
+    coinbase_parser_supported: coinbase.length === 1 && coinbase[0].close === 201,
+    coinbase_opaque_product_id_case_preserved: nativeSymbolKey('opaqueCaseId', { preserveCase: true }) === 'opaqueCaseId',
+    coinbase_cash_equity_scope_supported: exactScopeSupported({ provider: 'coinbase', marketType: 'equity', assetClass: 'equity_cash' }) === true,
+    coinbase_core_exact_identity_guard: coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:opaqueCaseId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === true && coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:otherId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === false,
+    coinbase_non_equity_scope_blocked: exactScopeSupported({ provider: 'coinbase', marketType: 'spot', assetClass: 'equity_cash' }) === false,
     bybit_equity_supported: exactScopeSupported({ provider: 'bybit', marketType: 'spot', assetClass: 'equity_token' }) === true,
     okx_event_supported: exactScopeSupported({ provider: 'okx', marketType: 'event', assetClass: 'prediction_event' }) === true,
     okx_latest_asset_window_uses_current_candles: true,
@@ -796,7 +908,12 @@ export function getAssetKlineHealth() {
     cross_product_substitution: false,
     cross_ticker_substitution: false,
     gate_cash_equity_secondary_source_still_locked: true,
-    coinbase_equity_secondary_source_still_locked: true,
+    coinbase_core_equity_official_candles_opened: true,
+    coinbase_non_core_equity_secondary_source_still_locked: true,
+    coinbase_cdp_configured: COINBASE_CDP_CONFIGURED,
+    coinbase_exact_product_asset_id_guard: true,
+    coinbase_security_ticker_core_scope_required: true,
+    coinbase_core_tickers: [...COINBASE_CORE_EQUITY_TICKERS],
     okx_event_sparse_bars_allowed: true,
     okx_latest_asset_window_endpoint: '/api/v5/market/candles',
     okx_history_candles_used_for_latest_asset_window: false,
@@ -853,6 +970,7 @@ export async function handleAssetKline(req, res, url, signal = null) {
   if (!identity.assetClass) missing.push('asset_class');
   if (!identity.assetId) missing.push('asset_id');
   if (!identity.nativeSymbol) missing.push('native_symbol');
+  if (identity.provider === 'coinbase' && !identity.securityTicker) missing.push('security_ticker');
   if (!identity.interval) missing.push('interval');
   if (missing.length) {
     sendJson(res, 400, {

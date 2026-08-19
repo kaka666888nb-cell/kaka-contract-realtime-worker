@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.182';
+const STEP_VERSION = '650.8.15.183';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -797,6 +797,8 @@ const server = http.createServer(async (req, res) => {
         step1026_app_direct_exchange_requests: 0,
         step1026_gate_cash_equity_secondary_source_locked: true,
         step1026_coinbase_equity_secondary_source_locked: true,
+        step1035_19_coinbase_core_equity_official_candles: true,
+        step1035_19_coinbase_non_core_equity_secondary_source_locked: true,
         step1026_okx_event_sparse_bars_allowed: true,
         step1026_cross_provider_substitution: false,
         step1026_cross_product_substitution: false,
@@ -816,6 +818,7 @@ const server = http.createServer(async (req, res) => {
         step1026_gate_cash_stock_public_market_trades_unavailable: true,
         step1026_gate_cash_equity_kline_second_source_locked: true,
         step1026_coinbase_equity_kline_second_source_locked: true,
+        step1035_19_coinbase_core_equity_exact_product_only: true,
         step1026_3_coinbase_equity_v50_capability_policy_restored: true,
         step1026_3_coinbase_equity_per_asset_book_trades_not_assumed: true,
         step1026_3_coinbase_equity_realtime_price_not_proven: true,
