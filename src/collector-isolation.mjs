@@ -5,12 +5,14 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.166';
+const VERSION = '650.8.15.190';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
 const SLOW_STATS_PORT = Number(process.env.KAKA_SLOW_STATS_COLLECTOR_PORT || 10014);
 const EXCHANGE_ASSETS_PORT = Number(process.env.KAKA_EXCHANGE_ASSETS_COLLECTOR_PORT || 10015);
+const ONCHAIN_MARKET_PORT = Number(process.env.KAKA_ONCHAIN_MARKET_COLLECTOR_PORT || 10016);
+const ONCHAIN_MARKET_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_ONCHAIN_MARKET_WORKER_MAX_OLD_MB || 160));
 const DEEP_MARKET_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_DEEP_MARKET_WORKER_MAX_OLD_MB || 144));
 const SLOW_STATS_MAX_OLD_MB = Math.max(64, Number(process.env.KAKA_SLOW_STATS_WORKER_MAX_OLD_MB || 144));
 const RESTART_BASE_MS = Math.max(1_000, Number(process.env.KAKA_COLLECTOR_RESTART_BASE_MS || 2_000));
@@ -60,6 +62,9 @@ function sharedResponsePolicy(pathname) {
   if (path === '/api/bybit-advanced/current-snapshot') return { freshMs: 2_000, staleMs: 20_000, cdnSMaxAgeSec: 2 };
   if (path === '/api/derivatives-public/current-snapshot') return { freshMs: 15_000, staleMs: 60_000, cdnSMaxAgeSec: 15 };
   if (path === '/api/history-lifecycle/current-snapshot') return { freshMs: 30_000, staleMs: 120_000, cdnSMaxAgeSec: 30 };
+  if (path === '/api/onchain/trending') return { freshMs: 5_000, staleMs: 60_000, cdnSMaxAgeSec: 5 };
+  if (path === '/api/onchain/search') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
+  if (path === '/api/onchain/token' || path === '/api/onchain/pools') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
   return null;
 }
 
@@ -256,6 +261,7 @@ const ROLES = Object.freeze({
     max_old_generation_size_mb: SLOW_STATS_MAX_OLD_MB,
   }),
   'exchange-assets': Object.freeze({ port: EXCHANGE_ASSETS_PORT, runtime: 'child_process' }),
+  'onchain-market': Object.freeze({ port: ONCHAIN_MARKET_PORT, runtime: 'child_process', max_old_generation_size_mb: ONCHAIN_MARKET_MAX_OLD_MB }),
 });
 
 const INSTANCE_ID = randomUUID();
@@ -326,7 +332,10 @@ function onRoleExit(role, info, code, signal = '') {
 }
 
 function spawnChildProcessRole(role, info) {
-  const child = spawn(process.execPath, ['src/isolated-collector-worker.mjs'], {
+  const nodeArgs = Number(info.max_old_generation_size_mb || 0) > 0
+    ? [`--max-old-space-size=${Math.floor(Number(info.max_old_generation_size_mb))}`, 'src/isolated-collector-worker.mjs']
+    : ['src/isolated-collector-worker.mjs'];
+  const child = spawn(process.execPath, nodeArgs, {
     env: {
       ...process.env,
       KAKA_ISOLATED_COLLECTOR_ROLE: role,
@@ -416,6 +425,7 @@ export function collectorRoleForPath(pathname) {
     path.startsWith('/api/crypto-sector-professional')
   ) return 'market-light';
   if (path.startsWith('/api/asset-market') || path.startsWith('/api/asset-klines')) return 'exchange-assets';
+  if (path.startsWith('/api/onchain/')) return 'onchain-market';
   if (path.startsWith('/api/contract-liquidation')) return 'liquidation';
   if (
     path.startsWith('/api/contract-focus-pool') ||

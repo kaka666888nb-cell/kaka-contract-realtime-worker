@@ -8,7 +8,7 @@ const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT
 process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
 process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
 if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
-const VERSION = '650.8.15.162';
+const VERSION = '650.8.15.190';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -127,6 +127,29 @@ if (ROLE === 'market-light') {
     provider_governor: getProviderGovernorHealth(),
     asset_market: assetMarket.getAssetMarketHealth(),
     asset_klines: assetKline.getAssetKlineHealth(),
+    timestamp_ms: Date.now(),
+  });
+} else if (ROLE === 'onchain-market') {
+  const module = await import('./onchain-market.mjs');
+  module.startOnchainMarketCollector();
+  roleVersion = module.getOnchainMarketHealth().version || null;
+  handleRoleRoute = module.handleOnchainMarket;
+  internalState = () => ({
+    ok: true,
+    collector_role: ROLE,
+    collector_version: VERSION,
+    module_version: module.getOnchainMarketHealth().version || null,
+    runtime: 'child_process',
+    pid: process.pid,
+    thread_id: null,
+    ppid: process.ppid,
+    uptime_seconds: Math.round(process.uptime()),
+    memory_usage: {
+      rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+      heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    },
+    provider_governor: getProviderGovernorHealth(),
+    onchain_market: module.getOnchainMarketHealth(),
     timestamp_ms: Date.now(),
   });
 } else if (ROLE === 'deep-market') {

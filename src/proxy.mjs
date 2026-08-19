@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.189';
+const STEP_VERSION = '650.8.15.190';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -313,6 +313,12 @@ const server = http.createServer(async (req, res) => {
       asset_market: null,
       asset_klines: null,
     }));
+    const onchainMarketState = await requestIsolatedJson('onchain-market', '/_isolated/state', 750).catch((error) => ({
+      ok: false,
+      collector_role: 'onchain-market',
+      error: String(error?.message || error),
+      onchain_market: null,
+    }));
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     res.end(JSON.stringify({
       ok: true,
@@ -408,6 +414,13 @@ const server = http.createServer(async (req, res) => {
       asset_market_health: '/api/asset-market/health',
       asset_market_self_test: '/api/asset-market/self-test',
       asset_market_state: exchangeAssetsState?.asset_market || null,
+      onchain_market: '/api/onchain/trending',
+      onchain_market_health: '/api/onchain/health',
+      onchain_market_self_test: '/api/onchain/self-test',
+      onchain_search: '/api/onchain/search',
+      onchain_token: '/api/onchain/token',
+      onchain_pools: '/api/onchain/pools',
+      onchain_market_state: onchainMarketState?.onchain_market || null,
       all_market_second_history_end_time_pagination: true,
       all_market_second_history_latest_audit_cases: 11,
       all_market_second_history_older_target_cases: 11,
@@ -1128,5 +1141,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1036 isolated onchain recent-hot/search/pools foundation + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
