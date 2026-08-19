@@ -1,12 +1,13 @@
-// Step1035.19.1: Coinbase core cash-equity official candles use the documented Advanced Trade PUBLIC market candles path; existing exact-identity non-crypto asset Klines unchanged.
+// Step1035.19.2: Coinbase cash-equity candles resolve the documented public-market route id from the same exact catalog product's official alias/base+quote identity; no cross-product substitution.
 // already verified by the Step1025 shared product catalog.
 // This module never substitutes venue/product/ticker identities and never touches
 // the protected Binance contract REST path.
 
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
+import { resolveCoinbaseEquityCandleRoute } from './stock-catalog-v2.mjs';
 
-const VERSION = '650.8.15.184';
-const DATA_VERSION = 1035191;
+const VERSION = '650.8.15.185';
+const DATA_VERSION = 1035192;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
@@ -366,7 +367,7 @@ async function jsonFetch(url, provider, timeoutMs = FETCH_TIMEOUT_MS, headers = 
       method: 'GET',
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/Step1035.19.1-AssetKline',
+        'user-agent': 'KakaWeb3/Step1035.19.2-AssetKline',
         ...headers,
       },
       signal: controller.signal,
@@ -579,20 +580,34 @@ async function fetchCoinbase(identity) {
   }
   const granularity = coinbaseGranularity(identity.interval);
   if (!granularity) throw new Error('coinbase_equity_interval_not_supported');
+  const route = await resolveCoinbaseEquityCandleRoute(identity.nativeSymbol, identity.securityTicker, identity.assetId);
+  if (!route || !Array.isArray(route.route_product_ids) || !route.route_product_ids.length) {
+    throw new Error('coinbase_equity_exact_catalog_candle_route_not_ready');
+  }
   const end = Math.floor(Date.now() / 1000);
   const step = intervalSeconds(identity.interval);
   const lookbackSeconds = Math.max(7 * 86400, step * Math.max(40, identity.limit) * 3);
   const start = Math.max(0, end - lookbackSeconds);
-  const path = `/api/v3/brokerage/market/products/${encodeURIComponent(identity.nativeSymbol)}/candles`;
-  const url = new URL(`https://${COINBASE_HOST}${path}`);
-  url.searchParams.set('start', String(start));
-  url.searchParams.set('end', String(end));
-  url.searchParams.set('granularity', granularity);
-  url.searchParams.set('limit', String(Math.min(300, identity.limit)));
-  const payload = await jsonFetch(url.toString(), 'coinbase', FETCH_TIMEOUT_MS, {
-    authorization: `Bearer ${coinbaseJwt(path)}`,
-  });
-  return parseCoinbaseRows(payload, identity);
+  const failures = [];
+  for (const routeProductId of route.route_product_ids) {
+    const path = `/api/v3/brokerage/market/products/${encodeURIComponent(routeProductId)}/candles`;
+    const url = new URL(`https://${COINBASE_HOST}${path}`);
+    url.searchParams.set('start', String(start));
+    url.searchParams.set('end', String(end));
+    url.searchParams.set('granularity', granularity);
+    url.searchParams.set('limit', String(Math.min(300, identity.limit)));
+    try {
+      const payload = await jsonFetch(url.toString(), 'coinbase', FETCH_TIMEOUT_MS, {
+        authorization: `Bearer ${coinbaseJwt(path)}`,
+      });
+      const rows = parseCoinbaseRows(payload, identity);
+      if (rows.length) return rows;
+      failures.push(`${routeProductId}:empty`);
+    } catch (error) {
+      failures.push(`${routeProductId}:${text(error?.message || error).slice(0, 96)}`);
+    }
+  }
+  throw new Error(`coinbase_equity_candle_routes_failed:${failures.join('|').slice(0, 360)}`);
 }
 
 async function fetchBybit(identity) {
@@ -872,6 +887,8 @@ export function runAssetKlineSelfTest() {
     coinbase_opaque_product_id_case_preserved: nativeSymbolKey('opaqueCaseId', { preserveCase: true }) === 'opaqueCaseId',
     coinbase_cash_equity_scope_supported: exactScopeSupported({ provider: 'coinbase', marketType: 'equity', assetClass: 'equity_cash' }) === true,
     coinbase_core_exact_identity_guard: coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:opaqueCaseId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === true && coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:otherId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === false,
+    coinbase_candle_route_uses_exact_catalog_resolver: String(fetchCoinbase).includes('resolveCoinbaseEquityCandleRoute'),
+    coinbase_opaque_product_id_not_direct_candle_route: !String(fetchCoinbase).includes('encodeURIComponent(identity.nativeSymbol)}/candles'),
     coinbase_non_equity_scope_blocked: exactScopeSupported({ provider: 'coinbase', marketType: 'spot', assetClass: 'equity_cash' }) === false,
     bybit_equity_supported: exactScopeSupported({ provider: 'bybit', marketType: 'spot', assetClass: 'equity_token' }) === true,
     okx_event_supported: exactScopeSupported({ provider: 'okx', marketType: 'event', assetClass: 'prediction_event' }) === true,
@@ -910,7 +927,8 @@ export function getAssetKlineHealth() {
     gate_cash_equity_secondary_source_still_locked: true,
     coinbase_core_equity_official_candles_opened: true,
     coinbase_candle_endpoint_path: '/api/v3/brokerage/market/products/{product_id}/candles',
-    coinbase_candle_endpoint_mode: 'advanced_trade_public_market_exact_product',
+    coinbase_candle_endpoint_mode: 'advanced_trade_public_market_same_exact_product_alias_or_base_quote',
+    coinbase_candle_route_identity: 'exact_catalog_product_id_guard_plus_official_alias_or_same_product_base_quote',
     coinbase_non_core_equity_secondary_source_still_locked: true,
     coinbase_cdp_configured: COINBASE_CDP_CONFIGURED,
     coinbase_exact_product_asset_id_guard: true,
