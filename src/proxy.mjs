@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.190';
+const STEP_VERSION = '650.8.15.191';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -420,6 +420,9 @@ const server = http.createServer(async (req, res) => {
       onchain_search: '/api/onchain/search',
       onchain_token: '/api/onchain/token',
       onchain_pools: '/api/onchain/pools',
+      onchain_klines: '/api/onchain/klines',
+      onchain_recent_trades: '/api/onchain/trades',
+      onchain_new_pools: '/api/onchain/new-pools',
       onchain_market_state: onchainMarketState?.onchain_market || null,
       all_market_second_history_end_time_pagination: true,
       all_market_second_history_latest_audit_cases: 11,
@@ -1141,5 +1144,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1036 isolated onchain recent-hot/search/pools foundation + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1037 exact-pool onchain OHLCV/history/recent-trades + Step1036 recent-hot/search/pools foundation + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });

@@ -1,13 +1,15 @@
-// Step1036 / Render 650.8.15.190
-// Kaka Web3 on-chain market foundation (phase 1): DEX Screener commercial-use API only.
-// Scope: Solana + BNB Chain + Base + Ethereum; shared recent-hot discovery, CA/name search,
-// exact token snapshot and pool list. No trading, no wallet signing, no DB writes, no App-direct
-// upstream. Historical pool OHLCV is intentionally NOT opened in Step1036 until a production-safe
-// source is locked; Step1037 owns Kline/history rather than shipping a non-commercial data source.
+// Step1037 / Render 650.8.15.191
+// Kaka Web3 on-chain market phase 2.
+// Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
+// recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
+// CU budget ledger, cache + singleflight, exact chain/token/pool preflight and no user-scale
+// upstream amplification. No trading, wallet signing or database writes.
 
-const VERSION = '650.8.15.190';
-const DATA_VERSION = 1036000;
-const SCHEMA_VERSION = 'step1036_onchain_market_v1';
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+
+const VERSION = '650.8.15.191';
+const DATA_VERSION = 1037000;
+const SCHEMA_VERSION = 'step1037_onchain_market_v2';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -15,6 +17,9 @@ const TRENDING_ROUTE = '/api/onchain/trending';
 const SEARCH_ROUTE = '/api/onchain/search';
 const TOKEN_ROUTE = '/api/onchain/token';
 const POOLS_ROUTE = '/api/onchain/pools';
+const KLINES_ROUTE = '/api/onchain/klines';
+const TRADES_ROUTE = '/api/onchain/trades';
+const NEW_POOLS_ROUTE = '/api/onchain/new-pools';
 
 const DEX_BASE = 'https://api.dexscreener.com';
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
@@ -28,6 +33,49 @@ const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 30;
 const CACHE_MAX_ENTRIES = 512;
 const NEGATIVE_CACHE_MAX_ENTRIES = 256;
 const MAX_RESPONSE_ROWS = 100;
+
+// Step1037 Moralis production guard.
+// Current official pricing: pair candlesticks=150 CU, pair swaps=50 CU.
+// Free plan currently includes 40,000 CU/day; Kaka reserves headroom and fails closed at 30,000 CU/day.
+// The API key exists only in Render Environment. It is never returned to App/health/logs.
+const MORALIS_API_KEY = String(process.env.MORALIS_API_KEY || '').trim();
+const MORALIS_MIN_GAP_MS = Math.max(750, Number(process.env.KAKA_MORALIS_MIN_GAP_MS || 1_200));
+const MORALIS_MAX_QUEUE = Math.max(8, Math.min(80, Number(process.env.KAKA_MORALIS_MAX_QUEUE || 40)));
+const MORALIS_TIMEOUT_MS = Math.max(5_000, Math.min(30_000, Number(process.env.KAKA_MORALIS_TIMEOUT_MS || 15_000)));
+const MORALIS_DAILY_CU_BUDGET = Math.max(3_000, Math.min(38_000, Number(process.env.KAKA_MORALIS_DAILY_CU_BUDGET || 30_000)));
+const MORALIS_KLINE_CU = 150;
+const MORALIS_TRADES_CU = 50;
+const MORALIS_LEDGER_PATH = process.env.KAKA_MORALIS_LEDGER_PATH || '/tmp/kaka_onchain_moralis_budget_v1.json';
+const KLINE_CACHE_MAX_ENTRIES = 96;
+const TRADE_CACHE_MAX_ENTRIES = 96;
+const IDENTITY_PROOF_MAX_ENTRIES = 256;
+const KLINE_MAX_ROWS = 300;
+const TRADE_MAX_ROWS = 50;
+const IDENTITY_PROOF_TTL_MS = 24 * 60 * 60_000;
+
+const MORALIS_EVM_CHAIN = Object.freeze({
+  ethereum: 'eth',
+  bsc: 'bsc',
+  base: 'base',
+});
+const MORALIS_TIMEFRAME = Object.freeze({
+  '1m': '1min',
+  '5m': '5min',
+  '15m': '5min',
+  '30m': '30min',
+  '1h': '1h',
+  '4h': '4h',
+  '1d': '1d',
+});
+const INTERVAL_MS = Object.freeze({
+  '1m': 60_000,
+  '5m': 5 * 60_000,
+  '15m': 15 * 60_000,
+  '30m': 30 * 60_000,
+  '1h': 60 * 60_000,
+  '4h': 4 * 60 * 60_000,
+  '1d': 24 * 60 * 60_000,
+});
 
 const NETWORKS = Object.freeze({
   ethereum: Object.freeze({ key: 'ethereum', dex: 'ethereum', chain_id: 1, family: 'evm', zh: '以太坊', en: 'Ethereum' }),
@@ -54,11 +102,30 @@ const stats = {
   negative_hits: 0,
   inflight_hits: 0,
   queue_rejections: 0,
+  moralis_upstream_started: 0,
+  moralis_upstream_succeeded: 0,
+  moralis_upstream_failed: 0,
+  moralis_budget_rejections: 0,
+  moralis_key_missing_rejections: 0,
+  kline_cache_fresh_hits: 0,
+  kline_cache_stale_hits: 0,
+  kline_cache_misses: 0,
+  kline_inflight_hits: 0,
+  kline_identity_exact_proofs: 0,
+  kline_identity_price_match_proofs: 0,
+  kline_identity_rejections: 0,
+  trades_cache_hits: 0,
+  trades_cache_misses: 0,
 };
 
 const cache = new Map();
 const negativeCache = new Map();
 const inflight = new Map();
+const klineCache = new Map();
+const klineInflight = new Map();
+const tradeCache = new Map();
+const tradeInflight = new Map();
+const identityProofCache = new Map();
 let discoveryStarted = false;
 let discoveryInflight = null;
 let trendingSnapshot = [];
@@ -201,6 +268,508 @@ async function dexFetchJson(url, { priority = 0, label = '' } = {}) {
       throw error;
     } finally { clearTimeout(timer); }
   }, { priority, label });
+}
+
+
+function utcBudgetDay() {
+  return new Date().toISOString().slice(0, 10);
+}
+function loadMoralisLedger() {
+  const fallback = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, updated_at: null };
+  try {
+    const parsed = JSON.parse(readFileSync(MORALIS_LEDGER_PATH, 'utf8'));
+    if (!parsed || parsed.day !== utcBudgetDay()) return fallback;
+    return {
+      day: parsed.day,
+      used_cu: Math.max(0, Number(parsed.used_cu || 0)),
+      calls: Math.max(0, Number(parsed.calls || 0)),
+      kline_calls: Math.max(0, Number(parsed.kline_calls || 0)),
+      trade_calls: Math.max(0, Number(parsed.trade_calls || 0)),
+      updated_at: parsed.updated_at || null,
+    };
+  } catch {
+    return fallback;
+  }
+}
+let moralisLedger = loadMoralisLedger();
+
+function refreshMoralisBudgetDay() {
+  if (moralisLedger.day === utcBudgetDay()) return;
+  moralisLedger = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, updated_at: null };
+  persistMoralisLedger();
+}
+function persistMoralisLedger() {
+  const next = `${MORALIS_LEDGER_PATH}.${process.pid}.tmp`;
+  try {
+    writeFileSync(next, JSON.stringify(moralisLedger), 'utf8');
+    renameSync(next, MORALIS_LEDGER_PATH);
+  } catch {
+    // Budget protection still stays in-memory if /tmp is unavailable.
+  }
+}
+function moralisBudgetState() {
+  refreshMoralisBudgetDay();
+  return {
+    day_utc: moralisLedger.day,
+    used_cu: moralisLedger.used_cu,
+    remaining_cu: Math.max(0, MORALIS_DAILY_CU_BUDGET - moralisLedger.used_cu),
+    hard_budget_cu: MORALIS_DAILY_CU_BUDGET,
+    provider_free_plan_reference_cu_per_day: 40_000,
+    calls: moralisLedger.calls,
+    kline_calls: moralisLedger.kline_calls,
+    trade_calls: moralisLedger.trade_calls,
+    ledger_path_kind: 'local_ephemeral_process_restart_persistent_tmp',
+    database_write: false,
+  };
+}
+function reserveMoralisBudget(cu, kind) {
+  refreshMoralisBudgetDay();
+  if (moralisLedger.used_cu + cu > MORALIS_DAILY_CU_BUDGET) {
+    stats.moralis_budget_rejections += 1;
+    const error = new Error('moralis_daily_cu_budget_exhausted');
+    error.statusCode = 503;
+    throw error;
+  }
+  moralisLedger.used_cu += cu;
+  moralisLedger.calls += 1;
+  if (kind === 'kline') moralisLedger.kline_calls += 1;
+  if (kind === 'trade') moralisLedger.trade_calls += 1;
+  moralisLedger.updated_at = new Date().toISOString();
+  persistMoralisLedger();
+}
+
+const moralisScheduler = createScheduler({
+  name: 'moralis',
+  minGapMs: MORALIS_MIN_GAP_MS,
+  maxQueue: MORALIS_MAX_QUEUE,
+});
+
+async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
+  if (!MORALIS_API_KEY) {
+    stats.moralis_key_missing_rejections += 1;
+    const error = new Error('moralis_api_key_not_configured');
+    error.statusCode = 503;
+    throw error;
+  }
+  return moralisScheduler.enqueue(async () => {
+    reserveMoralisBudget(cu, kind);
+    stats.moralis_upstream_started += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MORALIS_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json',
+          'X-API-Key': MORALIS_API_KEY,
+          'X-Api-Key': MORALIS_API_KEY,
+          'user-agent': 'KakaWeb3-Onchain-Shared/1037',
+        },
+      });
+      const body = await response.text();
+      if (!response.ok) {
+        const error = new Error(`moralis_http_${response.status}:${body.slice(0, 220)}`);
+        error.statusCode = response.status;
+        throw error;
+      }
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { throw new Error('moralis_invalid_json'); }
+      stats.moralis_upstream_succeeded += 1;
+      return parsed;
+    } catch (error) {
+      stats.moralis_upstream_failed += 1;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }, { priority, label });
+}
+
+function exactAddressEqual(network, a, b) {
+  if (network === 'solana') return text(a) === text(b);
+  return lower(a) === lower(b);
+}
+function pairContainsToken(network, pair, tokenAddress) {
+  return [pair?.base_token?.address, pair?.quote_token?.address]
+    .some((candidate) => exactAddressEqual(network, candidate, tokenAddress));
+}
+async function exactPoolPreflight(network, tokenAddress, poolAddress) {
+  const result = await cachedBuild(
+    `token_pairs:${network}:${lower(tokenAddress)}`,
+    { freshMs: 20_000, staleMs: 5 * 60_000 },
+    () => buildDexTokenPairs(network, tokenAddress),
+  );
+  const pool = (result.value || []).find((row) =>
+    exactAddressEqual(network, row?.pool_address, poolAddress) &&
+    pairContainsToken(network, row, tokenAddress)
+  ) || null;
+  if (!pool) {
+    const error = new Error('pool_not_owned_by_exact_token_on_network');
+    error.statusCode = 400;
+    throw error;
+  }
+  return pool;
+}
+
+function intervalPolicy(interval, endTimeMs = null) {
+  const now = Date.now();
+  const step = INTERVAL_MS[interval] || 60_000;
+  const historical = Number.isFinite(Number(endTimeMs)) && Number(endTimeMs) < now - step * 4;
+  if (historical) return { freshMs: 6 * 60 * 60_000, staleMs: 7 * 24 * 60 * 60_000 };
+  if (interval === '1m') return { freshMs: 15_000, staleMs: 5 * 60_000 };
+  if (interval === '5m' || interval === '15m' || interval === '30m') return { freshMs: 30_000, staleMs: 15 * 60_000 };
+  if (interval === '1h') return { freshMs: 60_000, staleMs: 60 * 60_000 };
+  if (interval === '4h') return { freshMs: 3 * 60_000, staleMs: 6 * 60 * 60_000 };
+  return { freshMs: 15 * 60_000, staleMs: 24 * 60 * 60_000 };
+}
+function pruneSimpleCache(map, max) {
+  if (map.size <= max) return;
+  const entries = [...map.entries()].sort((a, b) => Number(a[1]?.storedAt || 0) - Number(b[1]?.storedAt || 0));
+  while (entries.length > max) map.delete(entries.shift()[0]);
+}
+
+async function cachedKlineBuild(key, policy, builder) {
+  const now = Date.now();
+  const cached = klineCache.get(key);
+  const age = cached ? now - cached.storedAt : Number.POSITIVE_INFINITY;
+  if (cached && age <= policy.freshMs) {
+    stats.kline_cache_fresh_hits += 1;
+    return { value: cached.value, cache_status: 'fresh_hit' };
+  }
+  if (cached && age <= policy.staleMs) {
+    stats.kline_cache_stale_hits += 1;
+    if (!klineInflight.has(key)) {
+      const pending = Promise.resolve().then(builder).then((value) => {
+        if (value?.rows?.length) {
+          klineCache.set(key, { value, storedAt: Date.now() });
+          pruneSimpleCache(klineCache, KLINE_CACHE_MAX_ENTRIES);
+        }
+        return value;
+      }).finally(() => klineInflight.delete(key));
+      klineInflight.set(key, pending);
+    }
+    return { value: cached.value, cache_status: 'stale_hit' };
+  }
+  let pending = klineInflight.get(key);
+  if (pending) {
+    stats.kline_inflight_hits += 1;
+  } else {
+    stats.kline_cache_misses += 1;
+    pending = Promise.resolve().then(builder).then((value) => {
+      if (value?.rows?.length) {
+        klineCache.set(key, { value, storedAt: Date.now() });
+        pruneSimpleCache(klineCache, KLINE_CACHE_MAX_ENTRIES);
+      }
+      return value;
+    }).finally(() => klineInflight.delete(key));
+    klineInflight.set(key, pending);
+  }
+  return { value: await pending, cache_status: 'miss' };
+}
+
+function normalizeMoralisCandle(raw) {
+  if (!raw) return null;
+  const timestampMs = Date.parse(text(raw.timestamp));
+  const open = numberOrNull(raw.open);
+  const high = numberOrNull(raw.high);
+  const low = numberOrNull(raw.low);
+  const close = numberOrNull(raw.close);
+  const volume = numberOrNull(raw.volume) ?? 0;
+  const trades = numberOrNull(raw.trades);
+  if (!Number.isFinite(timestampMs) || timestampMs <= 0 ||
+      open === null || high === null || low === null || close === null ||
+      open <= 0 || high <= 0 || low <= 0 || close <= 0) return null;
+  return {
+    open_time_ms: timestampMs,
+    open,
+    high,
+    low,
+    close,
+    volume,
+    quote_volume: volume,
+    trades,
+  };
+}
+function aggregate15m(rows) {
+  const buckets = new Map();
+  for (const row of rows) {
+    const bucket = Math.floor(row.open_time_ms / INTERVAL_MS['15m']) * INTERVAL_MS['15m'];
+    let item = buckets.get(bucket);
+    if (!item) {
+      item = {
+        open_time_ms: bucket,
+        open: row.open,
+        high: row.high,
+        low: row.low,
+        close: row.close,
+        volume: row.volume || 0,
+        quote_volume: row.quote_volume || row.volume || 0,
+        trades: row.trades == null ? null : 0,
+        source_parts: 0,
+      };
+      buckets.set(bucket, item);
+    }
+    if (row.open_time_ms < (item._first_time ?? Number.POSITIVE_INFINITY)) {
+      item._first_time = row.open_time_ms;
+      item.open = row.open;
+    }
+    if (row.open_time_ms >= (item._last_time ?? 0)) {
+      item._last_time = row.open_time_ms;
+      item.close = row.close;
+    }
+    item.high = Math.max(item.high, row.high);
+    item.low = Math.min(item.low, row.low);
+    if (item.source_parts > 0) {
+      item.volume += row.volume || 0;
+      item.quote_volume += row.quote_volume || row.volume || 0;
+    }
+    if (row.trades != null) item.trades = (item.trades || 0) + row.trades;
+    item.source_parts += 1;
+  }
+  return [...buckets.values()]
+    .filter((item) => item.source_parts >= 1)
+    .map(({ _first_time, _last_time, ...item }) => item)
+    .sort((a, b) => a.open_time_ms - b.open_time_ms);
+}
+function klineRange(interval, limit, endTimeMs = null) {
+  const sourceInterval = MORALIS_TIMEFRAME[interval];
+  const sourceStep = interval === '15m' ? INTERVAL_MS['5m'] : INTERVAL_MS[interval];
+  const sourceLimit = Math.min(1000, interval === '15m' ? limit * 3 + 6 : limit + 3);
+  const toMs = Number.isFinite(Number(endTimeMs)) && Number(endTimeMs) > 0
+    ? Number(endTimeMs)
+    : Date.now();
+  const fromMs = Math.max(0, toMs - sourceStep * (sourceLimit + 4));
+  return { sourceInterval, sourceLimit, fromMs, toMs };
+}
+function moralisKlineUrl(network, poolAddress, interval, limit, endTimeMs) {
+  const range = klineRange(interval, limit, endTimeMs);
+  if (network === 'solana') {
+    const u = new URL(`https://solana-gateway.moralis.io/token/mainnet/pairs/${encodeURIComponent(poolAddress)}/ohlcv`);
+    u.searchParams.set('timeframe', range.sourceInterval);
+    u.searchParams.set('currency', 'usd');
+    u.searchParams.set('fromDate', new Date(range.fromMs).toISOString());
+    u.searchParams.set('toDate', new Date(range.toMs).toISOString());
+    u.searchParams.set('limit', String(range.sourceLimit));
+    return { url: u.toString(), ...range };
+  }
+  const chain = MORALIS_EVM_CHAIN[network];
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/pairs/${encodeURIComponent(poolAddress)}/ohlcv`);
+  u.searchParams.set('chain', chain);
+  u.searchParams.set('timeframe', range.sourceInterval);
+  u.searchParams.set('currency', 'usd');
+  u.searchParams.set('fromDate', new Date(range.fromMs).toISOString());
+  u.searchParams.set('toDate', new Date(range.toMs).toISOString());
+  u.searchParams.set('limit', String(range.sourceLimit));
+  return { url: u.toString(), ...range };
+}
+
+function proofKey(network, tokenAddress, poolAddress) {
+  return `${network}:${lower(tokenAddress)}:${lower(poolAddress)}`;
+}
+function getIdentityProof(network, tokenAddress, poolAddress) {
+  const key = proofKey(network, tokenAddress, poolAddress);
+  const proof = identityProofCache.get(key);
+  if (!proof) return null;
+  if (Date.now() - proof.storedAt > IDENTITY_PROOF_TTL_MS) {
+    identityProofCache.delete(key);
+    return null;
+  }
+  return proof;
+}
+function setIdentityProof(network, tokenAddress, poolAddress, kind, detail = {}) {
+  identityProofCache.set(proofKey(network, tokenAddress, poolAddress), {
+    kind,
+    detail,
+    storedAt: Date.now(),
+  });
+  pruneSimpleCache(identityProofCache, IDENTITY_PROOF_MAX_ENTRIES);
+}
+function priceIdentityCompatible(dexPrice, closePrice) {
+  const a = Number(dexPrice);
+  const b = Number(closePrice);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return false;
+  const ratio = b / a;
+  return ratio >= 0.40 && ratio <= 2.50;
+}
+
+async function buildMoralisKlines(network, tokenAddress, pool, interval, limit, endTimeMs) {
+  const poolAddress = pool.pool_address;
+  const spec = moralisKlineUrl(network, poolAddress, interval, limit, endTimeMs);
+  const payload = await moralisFetchJson(spec.url, {
+    cu: MORALIS_KLINE_CU,
+    kind: 'kline',
+    priority: endTimeMs ? 5 : 20,
+    label: `kline:${network}:${poolAddress}:${interval}`,
+  });
+  if (!exactAddressEqual(network, payload?.pairAddress, poolAddress)) {
+    stats.kline_identity_rejections += 1;
+    throw new Error('moralis_pair_identity_mismatch');
+  }
+  let rows = Array.isArray(payload?.result)
+    ? payload.result.map(normalizeMoralisCandle).filter(Boolean).sort((a, b) => a.open_time_ms - b.open_time_ms)
+    : [];
+  if (interval === '15m') rows = aggregate15m(rows);
+  rows = rows.slice(-limit);
+  if (!rows.length) return {
+    rows: [],
+    source_token_address: text(payload?.tokenAddress),
+    source_pair_address: text(payload?.pairAddress),
+    source_timeframe: text(payload?.timeframe),
+    derived_15m_from_5m: interval === '15m',
+    identity_proof: getIdentityProof(network, tokenAddress, poolAddress)?.kind || null,
+  };
+
+  const returnedToken = text(payload?.tokenAddress);
+  let proof = getIdentityProof(network, tokenAddress, poolAddress);
+  if (returnedToken && exactAddressEqual(network, returnedToken, tokenAddress)) {
+    setIdentityProof(network, tokenAddress, poolAddress, 'moralis_exact_token_address');
+    stats.kline_identity_exact_proofs += 1;
+    proof = getIdentityProof(network, tokenAddress, poolAddress);
+  } else if (!proof && !endTimeMs) {
+    const latestClose = rows[rows.length - 1]?.close;
+    if (priceIdentityCompatible(pool.price_usd, latestClose)) {
+      setIdentityProof(network, tokenAddress, poolAddress, 'latest_close_matches_exact_dex_token_price', {
+        dex_price_usd: pool.price_usd,
+        moralis_close_usd: latestClose,
+      });
+      stats.kline_identity_price_match_proofs += 1;
+      proof = getIdentityProof(network, tokenAddress, poolAddress);
+    }
+  }
+  if (!proof) {
+    stats.kline_identity_rejections += 1;
+    throw new Error('moralis_ohlcv_token_identity_not_proven');
+  }
+
+  return {
+    rows,
+    source_token_address: returnedToken || null,
+    source_pair_address: text(payload?.pairAddress),
+    source_timeframe: text(payload?.timeframe) || spec.sourceInterval,
+    derived_15m_from_5m: interval === '15m',
+    identity_proof: proof.kind,
+  };
+}
+
+function normalizeMoralisSwap(network, raw, tokenAddress, poolAddress) {
+  if (!raw) return null;
+  const pair = text(raw.pairAddress || poolAddress);
+  if (pair && !exactAddressEqual(network, pair, poolAddress)) return null;
+  const bought = raw.bought && typeof raw.bought === 'object' ? raw.bought : null;
+  const sold = raw.sold && typeof raw.sold === 'object' ? raw.sold : null;
+  const txType = lower(raw.transactionType);
+  return {
+    transaction_hash: text(raw.transactionHash),
+    transaction_index: numberOrNull(raw.transactionIndex),
+    block_number: numberOrNull(raw.blockNumber),
+    block_timestamp: text(raw.blockTimestamp),
+    transaction_type: txType || null,
+    wallet_address: text(raw.walletAddress),
+    pair_address: pair || poolAddress,
+    pair_label: text(raw.pairLabel),
+    exchange_name: text(raw.exchangeName),
+    bought: bought ? {
+      address: text(bought.address),
+      name: text(bought.name),
+      symbol: text(bought.symbol),
+      amount: numberOrNull(bought.amount),
+      usd_price: numberOrNull(bought.usdPrice),
+      usd_amount: numberOrNull(bought.usdAmount),
+    } : null,
+    sold: sold ? {
+      address: text(sold.address),
+      name: text(sold.name),
+      symbol: text(sold.symbol),
+      amount: numberOrNull(sold.amount),
+      usd_price: numberOrNull(sold.usdPrice),
+      usd_amount: numberOrNull(sold.usdAmount),
+    } : null,
+    total_value_usd: numberOrNull(raw.totalValueUsd),
+    requested_token_in_trade:
+      [bought?.address, sold?.address].some((x) => x && exactAddressEqual(network, x, tokenAddress)),
+  };
+}
+function moralisTradesUrl(network, poolAddress, limit) {
+  if (network === 'solana') {
+    const u = new URL(`https://solana-gateway.moralis.io/token/mainnet/pairs/${encodeURIComponent(poolAddress)}/swaps`);
+    u.searchParams.set('limit', String(limit));
+    return u.toString();
+  }
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/pairs/${encodeURIComponent(poolAddress)}/swaps`);
+  u.searchParams.set('chain', MORALIS_EVM_CHAIN[network]);
+  u.searchParams.set('limit', String(limit));
+  return u.toString();
+}
+async function cachedTradeBuild(key, builder) {
+  const now = Date.now();
+  const cached = tradeCache.get(key);
+  if (cached && now - cached.storedAt <= 15_000) {
+    stats.trades_cache_hits += 1;
+    return { value: cached.value, cache_status: 'fresh_hit' };
+  }
+  if (cached && now - cached.storedAt <= 2 * 60_000) {
+    stats.trades_cache_hits += 1;
+    if (!tradeInflight.has(key)) {
+      const pending = Promise.resolve().then(builder).then((value) => {
+        tradeCache.set(key, { value, storedAt: Date.now() });
+        pruneSimpleCache(tradeCache, TRADE_CACHE_MAX_ENTRIES);
+        return value;
+      }).finally(() => tradeInflight.delete(key));
+      tradeInflight.set(key, pending);
+    }
+    return { value: cached.value, cache_status: 'stale_hit' };
+  }
+  let pending = tradeInflight.get(key);
+  if (!pending) {
+    stats.trades_cache_misses += 1;
+    pending = Promise.resolve().then(builder).then((value) => {
+      tradeCache.set(key, { value, storedAt: Date.now() });
+      pruneSimpleCache(tradeCache, TRADE_CACHE_MAX_ENTRIES);
+      return value;
+    }).finally(() => tradeInflight.delete(key));
+    tradeInflight.set(key, pending);
+  } else {
+    stats.trades_cache_hits += 1;
+  }
+  return { value: await pending, cache_status: 'miss' };
+}
+
+async function buildMoralisTrades(network, tokenAddress, pool, limit) {
+  const payload = await moralisFetchJson(moralisTradesUrl(network, pool.pool_address, limit), {
+    cu: MORALIS_TRADES_CU,
+    kind: 'trade',
+    priority: 10,
+    label: `trades:${network}:${pool.pool_address}`,
+  });
+  const rawRows = Array.isArray(payload?.result) ? payload.result : [];
+  return rawRows
+    .map((row) => normalizeMoralisSwap(network, row, tokenAddress, pool.pool_address))
+    .filter((row) => row && row.requested_token_in_trade !== false)
+    .slice(0, limit);
+}
+
+function recentCandidatePools(network, limit) {
+  const seen = new Set();
+  const rows = [];
+  for (const tokenRow of trendingSnapshot) {
+    if (network !== 'all' && tokenRow.network !== network) continue;
+    const pool = tokenRow.best_pool;
+    if (!pool?.pool_address || !pool.pool_created_at) continue;
+    const key = `${tokenRow.network}:${lower(pool.pool_address)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({
+      network: tokenRow.network,
+      token: tokenRow.token,
+      pool,
+      created_at: pool.pool_created_at,
+      recent_hot_score: tokenRow.recent_hot_score,
+      discovery_scope: 'profile_and_boost_candidate_pool_not_exhaustive_chain_scan',
+    });
+  }
+  rows.sort((a, b) => Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0));
+  return rows.slice(0, limit);
 }
 
 async function cachedBuild(key, { freshMs, staleMs, negativeMs = 45_000 }, builder) {
@@ -445,6 +1014,20 @@ function healthPayload() {
         backend_global_min_gap_ms: DEX_MIN_GAP_MS,
         backend_global_max_starts_per_minute: Math.floor(60_000 / DEX_MIN_GAP_MS),
       },
+      moralis: {
+        docs_evm_ohlcv: 'https://docs.moralis.com/data-api/evm/price/ohlc',
+        docs_solana_ohlcv: 'https://docs.moralis.com/data-api/solana/price/ohlc',
+        docs_pricing: 'https://docs.moralis.com/data-api/pricing',
+        terms: 'https://moralis.com/terms/',
+        role: 'exact_pool_ohlcv_history_plus_recent_pair_swaps',
+        api_key_configured: Boolean(MORALIS_API_KEY),
+        api_key_exposed: false,
+        backend_only_secret: true,
+        pair_candlestick_cu: MORALIS_KLINE_CU,
+        pair_swap_cu: MORALIS_TRADES_CU,
+        scheduler: moralisScheduler.state(),
+        budget: moralisBudgetState(),
+      },
     },
     discovery: {
       ready: trendingSnapshot.length > 0 && (ageMs === null || ageMs <= DISCOVERY_RETAIN_MS),
@@ -459,9 +1042,39 @@ function healthPayload() {
       max_candidates_per_chain: DISCOVERY_MAX_CANDIDATES_PER_CHAIN,
     },
     kline: {
-      opened: false,
-      planned_step: 1037,
-      reason: 'do_not_ship_noncommercial_or_unlicensed_ohlcv_source',
+      opened: true,
+      route: KLINES_ROUTE,
+      source: 'moralis_official_data_api_pair_ohlcv',
+      api_key_configured: Boolean(MORALIS_API_KEY),
+      app_direct_moralis_requests: 0,
+      exact_chain_token_pool_preflight: true,
+      historical_pages_require_identity_proof: true,
+      supported_intervals: Object.keys(MORALIS_TIMEFRAME),
+      derived_15m_from_same_pool_5m: true,
+      max_rows_per_response: KLINE_MAX_ROWS,
+      cache_entries: klineCache.size,
+      cache_max_entries: KLINE_CACHE_MAX_ENTRIES,
+      inflight: klineInflight.size,
+      identity_proof_entries: identityProofCache.size,
+      identity_proof_ttl_ms: IDENTITY_PROOF_TTL_MS,
+      moralis_cu_per_upstream_call: MORALIS_KLINE_CU,
+    },
+    recent_trades: {
+      opened: true,
+      route: TRADES_ROUTE,
+      source: 'moralis_official_data_api_pair_swaps',
+      api_key_configured: Boolean(MORALIS_API_KEY),
+      exact_chain_token_pool_preflight: true,
+      max_rows: TRADE_MAX_ROWS,
+      cache_entries: tradeCache.size,
+      moralis_cu_per_upstream_call: MORALIS_TRADES_CU,
+    },
+    new_pools: {
+      opened: true,
+      route: NEW_POOLS_ROUTE,
+      source: 'dexscreener_step1036_shared_candidate_snapshot',
+      exhaustive_chain_scan: false,
+      user_reads_start_upstream: false,
     },
     bounded_user_builds: {
       exact_search_and_token_pool_may_enqueue_bounded_build: true,
@@ -470,8 +1083,24 @@ function healthPayload() {
       queue_overflow_rejected_not_amplified: true,
       direct_app_upstream: false,
     },
-    caches: { entries: cache.size, max_entries: CACHE_MAX_ENTRIES, negative_entries: negativeCache.size, negative_max_entries: NEGATIVE_CACHE_MAX_ENTRIES, inflight: inflight.size },
+    caches: {
+      entries: cache.size,
+      max_entries: CACHE_MAX_ENTRIES,
+      negative_entries: negativeCache.size,
+      negative_max_entries: NEGATIVE_CACHE_MAX_ENTRIES,
+      inflight: inflight.size,
+      kline_entries: klineCache.size,
+      kline_max_entries: KLINE_CACHE_MAX_ENTRIES,
+      kline_inflight: klineInflight.size,
+      trade_entries: tradeCache.size,
+      trade_max_entries: TRADE_CACHE_MAX_ENTRIES,
+      trade_inflight: tradeInflight.size,
+      identity_proof_entries: identityProofCache.size,
+      identity_proof_max_entries: IDENTITY_PROOF_MAX_ENTRIES,
+    },
     scheduler: dexScheduler.state(),
+    moralis_scheduler: moralisScheduler.state(),
+    moralis_budget: moralisBudgetState(),
     stats: { ...stats },
     memory_usage: { rss_mb: Math.round(process.memoryUsage().rss / 1048576), heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576) },
   });
@@ -496,7 +1125,13 @@ function runSelfTest() {
   t('cache_bounded', CACHE_MAX_ENTRIES <= 1024);
   t('negative_cache_bounded', NEGATIVE_CACHE_MAX_ENTRIES <= 512);
   t('response_rows_bounded', MAX_RESPONSE_ROWS <= 100);
-  t('kline_not_opened_without_safe_source', healthPayload().kline.opened === false);
+  t('kline_opened_with_backend_secret_source', healthPayload().kline.opened === true);
+  t('kline_app_direct_moralis_zero', healthPayload().kline.app_direct_moralis_requests === 0);
+  t('kline_limit_bounded', KLINE_MAX_ROWS <= 300);
+  t('kline_cache_bounded', KLINE_CACHE_MAX_ENTRIES <= 128);
+  t('moralis_budget_below_free_reference', MORALIS_DAILY_CU_BUDGET < 40_000);
+  t('moralis_secret_never_exposed', healthPayload().sources.moralis.api_key_exposed === false);
+  t('moralis_15m_same_pool_derivation_only', MORALIS_TIMEFRAME['15m'] === '5min');
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
@@ -505,7 +1140,7 @@ function runSelfTest() {
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -556,5 +1191,141 @@ export async function handleOnchainMarket(req, res, url) {
     } catch (error) { sendJson(res, 503, responseBase({ ok: false, error: text(error?.message || error), network, address })); }
     return true;
   }
+
+  if (path === NEW_POOLS_ROUTE) {
+    if (!network) { sendJson(res, 400, responseBase({ ok: false, error: 'invalid_network', rows: [] })); return true; }
+    const rows = recentCandidatePools(network, limit);
+    sendJson(res, 200, responseBase({
+      network,
+      rows,
+      row_count: rows.length,
+      cache_status: 'step1036_background_shared',
+      coverage: 'discovered_candidate_pools_not_exhaustive_chain_scan',
+      user_read_upstream_requests: 0,
+    }));
+    return true;
+  }
+
+  if (path === KLINES_ROUTE || path === TRADES_ROUTE) {
+    if (!network || network === 'all') {
+      sendJson(res, 400, responseBase({ ok: false, error: 'exact_network_required' }));
+      return true;
+    }
+    const tokenAddress = text(url.searchParams.get('address') || url.searchParams.get('token_address'));
+    const poolAddress = text(url.searchParams.get('pool_address'));
+    if (!validAddressForNetwork(network, tokenAddress)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'invalid_contract_address', network }));
+      return true;
+    }
+    if (!validAddressForNetwork(network, poolAddress)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'invalid_pool_address', network }));
+      return true;
+    }
+    if (!MORALIS_API_KEY) {
+      sendJson(res, 503, responseBase({
+        ok: false,
+        error: 'onchain_history_source_not_configured',
+        setup_required: 'Render Environment MORALIS_API_KEY',
+        api_key_exposed: false,
+      }));
+      return true;
+    }
+
+    try {
+      const pool = await exactPoolPreflight(network, tokenAddress, poolAddress);
+
+      if (path === TRADES_ROUTE) {
+        const tradeLimit = intRange(url.searchParams.get('limit'), 1, TRADE_MAX_ROWS, 30);
+        const key = `trades:${network}:${lower(tokenAddress)}:${lower(poolAddress)}:${tradeLimit}`;
+        const result = await cachedTradeBuild(
+          key,
+          () => buildMoralisTrades(network, tokenAddress, pool, tradeLimit),
+        );
+        sendJson(res, 200, responseBase({
+          network,
+          address: tokenAddress,
+          pool_address: poolAddress,
+          dex_id: pool.dex_id,
+          rows: result.value || [],
+          row_count: (result.value || []).length,
+          cache_status: result.cache_status,
+          source: 'moralis_official_data_api_pair_swaps',
+          moralis_cu_if_upstream_build: MORALIS_TRADES_CU,
+          user_read_direct_moralis_requests: 0,
+        }));
+        return true;
+      }
+
+      const interval = text(url.searchParams.get('interval')) || '1h';
+      if (!Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, interval)) {
+        sendJson(res, 400, responseBase({ ok: false, error: 'unsupported_interval', supported_intervals: Object.keys(MORALIS_TIMEFRAME) }));
+        return true;
+      }
+      const klineLimit = intRange(url.searchParams.get('limit'), 1, KLINE_MAX_ROWS, 240);
+      const endRaw = text(url.searchParams.get('end_time') || url.searchParams.get('end_time_ms'));
+      const endTimeMs = endRaw ? Number(endRaw) : null;
+      if (endRaw && (!Number.isFinite(endTimeMs) || endTimeMs <= 0)) {
+        sendJson(res, 400, responseBase({ ok: false, error: 'invalid_end_time' }));
+        return true;
+      }
+      // Round latest cache keys by natural short TTL. Explicit historical end_time remains exact.
+      const endKey = endTimeMs ? String(Math.floor(endTimeMs)) : 'latest';
+      const key = `kline:${network}:${lower(tokenAddress)}:${lower(poolAddress)}:${interval}:${klineLimit}:${endKey}`;
+      const result = await cachedKlineBuild(
+        key,
+        intervalPolicy(interval, endTimeMs),
+        () => buildMoralisKlines(network, tokenAddress, pool, interval, klineLimit, endTimeMs),
+      );
+      const built = result.value || { rows: [] };
+      const rows = (built.rows || []).map((row) => ({
+        ...row,
+        network,
+        token_address: tokenAddress,
+        pool_address: poolAddress,
+        dex_id: pool.dex_id,
+        interval,
+        source: 'moralis_official_data_api_pair_ohlcv',
+      }));
+      sendJson(res, 200, responseBase({
+        network,
+        address: tokenAddress,
+        token: tokenAddressInPair(pool, tokenAddress),
+        pool_address: poolAddress,
+        dex_id: pool.dex_id,
+        pair: {
+          base_token: pool.base_token,
+          quote_token: pool.quote_token,
+        },
+        interval,
+        source_interval: built.source_timeframe || MORALIS_TIMEFRAME[interval],
+        source: 'moralis_official_data_api_pair_ohlcv',
+        source_pair_address: built.source_pair_address || poolAddress,
+        source_token_address: built.source_token_address || null,
+        identity_proof: built.identity_proof || null,
+        exact_chain_token_pool_preflight: true,
+        derived_15m_from_5m: built.derived_15m_from_5m === true,
+        rows,
+        row_count: rows.length,
+        cache_status: result.cache_status,
+        same_exact_key_reads_share_cache_and_inflight: true,
+        user_read_direct_moralis_requests: 0,
+        moralis_cu_if_upstream_build: MORALIS_KLINE_CU,
+        historical_end_time_ms: endTimeMs,
+      }));
+    } catch (error) {
+      const status = Number(error?.statusCode || 0);
+      const code = text(error?.message || error);
+      const httpStatus = status === 400 || code.includes('pool_not_owned') ? 400 : 503;
+      sendJson(res, httpStatus, responseBase({
+        ok: false,
+        error: code,
+        network,
+        address: tokenAddress,
+        pool_address: poolAddress,
+      }));
+    }
+    return true;
+  }
+
   return false;
 }
