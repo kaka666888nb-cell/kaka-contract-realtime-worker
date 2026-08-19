@@ -1,12 +1,12 @@
-// Step1035.19: Coinbase core cash-equity official candles + existing exact-identity non-crypto asset Klines.
+// Step1035.19.1: Coinbase core cash-equity official candles use the documented Advanced Trade PUBLIC market candles path; existing exact-identity non-crypto asset Klines unchanged.
 // already verified by the Step1025 shared product catalog.
 // This module never substitutes venue/product/ticker identities and never touches
 // the protected Binance contract REST path.
 
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 
-const VERSION = '650.8.15.183';
-const DATA_VERSION = 103519;
+const VERSION = '650.8.15.184';
+const DATA_VERSION = 1035191;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
@@ -366,7 +366,7 @@ async function jsonFetch(url, provider, timeoutMs = FETCH_TIMEOUT_MS, headers = 
       method: 'GET',
       headers: {
         accept: 'application/json',
-        'user-agent': 'KakaWeb3/Step1035.19-AssetKline',
+        'user-agent': 'KakaWeb3/Step1035.19.1-AssetKline',
         ...headers,
       },
       signal: controller.signal,
@@ -565,7 +565,7 @@ export function parseCoinbaseRows(payload, identity) {
     close: a.close,
     volume: a.volume,
     quoteVolume: null,
-    source: 'coinbase_advanced_trade_authenticated_exact_equity_candle',
+    source: 'coinbase_advanced_trade_public_exact_equity_candle',
   }) : null), identity.limit);
 }
 
@@ -583,7 +583,7 @@ async function fetchCoinbase(identity) {
   const step = intervalSeconds(identity.interval);
   const lookbackSeconds = Math.max(7 * 86400, step * Math.max(40, identity.limit) * 3);
   const start = Math.max(0, end - lookbackSeconds);
-  const path = `/api/v3/brokerage/products/${encodeURIComponent(identity.nativeSymbol)}/candles`;
+  const path = `/api/v3/brokerage/market/products/${encodeURIComponent(identity.nativeSymbol)}/candles`;
   const url = new URL(`https://${COINBASE_HOST}${path}`);
   url.searchParams.set('start', String(start));
   url.searchParams.set('end', String(end));
@@ -909,6 +909,8 @@ export function getAssetKlineHealth() {
     cross_ticker_substitution: false,
     gate_cash_equity_secondary_source_still_locked: true,
     coinbase_core_equity_official_candles_opened: true,
+    coinbase_candle_endpoint_path: '/api/v3/brokerage/market/products/{product_id}/candles',
+    coinbase_candle_endpoint_mode: 'advanced_trade_public_market_exact_product',
     coinbase_non_core_equity_secondary_source_still_locked: true,
     coinbase_cdp_configured: COINBASE_CDP_CONFIGURED,
     coinbase_exact_product_asset_id_guard: true,

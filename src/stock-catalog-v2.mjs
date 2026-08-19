@@ -1,10 +1,10 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 
-const VERSION = '650.8.15.183';
+const VERSION = '650.8.15.184';
 const DATA_VERSION = 1035;
 const SCHEMA_VERSION = 'step1035_stock_catalog_v2';
-const IMPLEMENTATION_REVISION = '1035_19_coinbase_core_equity_official_candles_v1';
+const IMPLEMENTATION_REVISION = '1035_19_1_coinbase_public_market_equity_candles_path_fix';
 const RUNTIME_INSTANCE_ID = randomBytes(8).toString('hex');
 const RUNTIME_STARTED_AT = new Date().toISOString();
 const HEALTH_ROUTE = '/api/stock-catalog-v2/health';
@@ -713,7 +713,7 @@ function coinbaseAssetRow(row, fetchedAt, klineReady) {
     search_aliases: [...aliases].filter(Boolean), security_key: securityKey, security_type: securityType,
     base_asset: ticker, quote_asset: quote, settle_asset: quote, status, exchange_name: safeText(row?.product_venue, 80) || 'Coinbase Capital Markets', product_venue: safeText(row?.product_venue, 80), symbol_type: securityType,
     is_reality: false, is_rwa: false, rule_type: 'coinbase_equity', group_id: compact(row?.alias),
-    official_kline_capability: COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker) ? 'supported' : 'unavailable', official_kline_source: COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker) ? 'coinbase_advanced_trade_exact_product_candles' : '', official_kline_identity: 'cash_equity_exact_product_id', secondary_kline_source_required: !(COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker)), secondary_source_status: COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker) ? 'official_exact_product_candles_core_pool_route_enabled' : (klineReady ? 'official_exact_candles_probe_ready_non_core_locked' : 'official_equity_candles_not_proven'), sparse_market_bars: false,
+    official_kline_capability: COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker) ? 'supported' : 'unavailable', official_kline_source: COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker) ? 'coinbase_advanced_trade_public_exact_product_candles' : '', official_kline_identity: 'cash_equity_exact_product_id', secondary_kline_source_required: !(COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker)), secondary_source_status: COINBASE_CDP_CONFIGURED && COINBASE_CORE_EQUITY_TICKERS.has(ticker) ? 'official_exact_product_candles_core_pool_route_enabled' : (klineReady ? 'official_exact_candles_probe_ready_non_core_locked' : 'official_equity_candles_not_proven'), sparse_market_bars: false,
     official_depth: false, official_rpi_depth: false, access: 'public_product_metadata_and_shared_exact_market', source_verified: true, source_cached_at: fetchedAt,
     current_session: currentSession, session_policy: 'coinbase_official_equity_dynamic_24_5_eligible_symbols', supports_24_7: false, supports_24_5: coinbaseSupports24_5(eq),
     trade_status: currentSession || status, trade_mode: null, order_fill_timing: null, trading_halted: tradingHalted,
@@ -726,13 +726,13 @@ async function probeCoinbaseEquityKline(productId) {
   const id = compact(productId);
   if (!id || !COINBASE_CDP_CONFIGURED) return { ready: false, reason: 'cdp_credentials_not_configured', rows: 0, http_mode: 'none' };
   const end = Math.floor(Date.now() / 1000); const start = end - 3 * 24 * 3600;
-  const path = `/api/v3/brokerage/products/${encodeURIComponent(id)}/candles`;
+  const path = `/api/v3/brokerage/market/products/${encodeURIComponent(id)}/candles`;
   const query = `?start=${start}&end=${end}&granularity=ONE_HOUR&limit=5`;
   try {
     const payload = await timedFetchJson(`https://${COINBASE_HOST}${path}${query}`, { provider: 'coinbase', headers: { authorization: `Bearer ${coinbaseJwt(path)}` } });
     const rows = Array.isArray(payload?.candles) ? payload.candles.length : 0;
-    return { ready: rows > 0, reason: rows > 0 ? '' : 'no_candles', rows, http_mode: 'authenticated_exact_product' };
-  } catch (error) { return { ready: false, reason: safeText(error?.message || error, 180), rows: 0, http_mode: 'authenticated_exact_product' }; }
+    return { ready: rows > 0, reason: rows > 0 ? '' : 'no_candles', rows, http_mode: 'public_market_exact_product' };
+  } catch (error) { return { ready: false, reason: safeText(error?.message || error, 180), rows: 0, http_mode: 'public_market_exact_product' }; }
 }
 function coinbaseRawSecurityCount(rows) {
   const keys = new Set();
