@@ -1,10 +1,10 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 
-const VERSION = '650.8.15.185';
+const VERSION = '650.8.15.186';
 const DATA_VERSION = 1035;
 const SCHEMA_VERSION = 'step1035_stock_catalog_v2';
-const IMPLEMENTATION_REVISION = '1035_19_2_coinbase_equity_candle_route_alias_fix';
+const IMPLEMENTATION_REVISION = '1035_19_3_coinbase_exact_shared_row_candle_route_fix';
 const RUNTIME_INSTANCE_ID = randomBytes(8).toString('hex');
 const RUNTIME_STARTED_AT = new Date().toISOString();
 const HEALTH_ROUTE = '/api/stock-catalog-v2/health';
@@ -1160,27 +1160,50 @@ export async function resolveCoinbaseEquityCandleRoute(nativeSymbol, securityTic
   const native = compact(nativeSymbol);
   const ticker = normalizeTicker(securityTicker);
   const exactAssetId = compact(assetId);
-  if (!native || !ticker || !exactAssetId) return null;
-  let row = sharedRowByNative.get(`coinbase|${native}`) || null;
-  if (!row || lower(row?.provider) !== 'coinbase' || lower(row?.asset_class) !== 'equity_cash') return null;
-  if (compact(row?.asset_id) !== exactAssetId || normalizeTicker(row?.display_symbol || row?.base_asset) !== ticker) return null;
-  row = await loadCoinbaseExactMetadata(native);
-  if (!row || compact(row?.asset_id) !== exactAssetId || compact(row?.exchange_symbol) !== native || normalizeTicker(row?.display_symbol || row?.base_asset) !== ticker) return null;
-  const quote = upper(row?.quote_asset || row?.quote_currency_symbol || 'USD');
-  const alias = compact(row?.provider_metadata?.alias);
+  if (!native || !ticker || !exactAssetId) return { identity_verified:false, reason:'missing_identity', route_product_ids:[] };
+
+  const current = sharedRowByNative.get(`coinbase|${native}`) || null;
+  if (!current) return { identity_verified:false, reason:'shared_exact_row_missing', route_product_ids:[] };
+  if (lower(current?.provider) !== 'coinbase' || lower(current?.asset_class) !== 'equity_cash') {
+    return { identity_verified:false, reason:'shared_exact_scope_mismatch', route_product_ids:[] };
+  }
+  if (compact(current?.asset_id) !== exactAssetId) {
+    return { identity_verified:false, reason:'shared_exact_asset_id_mismatch', route_product_ids:[] };
+  }
+  if (normalizeTicker(current?.display_symbol || current?.base_asset) !== ticker) {
+    return { identity_verified:false, reason:'shared_exact_ticker_mismatch', route_product_ids:[] };
+  }
+
+  // The exact shared row already proves product identity. Detailed metadata is optional and
+  // may be restored lazily; a hydration miss/failure must not erase an already-proven identity.
+  let detailed = current;
+  try {
+    const hydrated = await loadCoinbaseExactMetadata(native);
+    if (hydrated && compact(hydrated?.asset_id) === exactAssetId && compact(hydrated?.exchange_symbol) === native && normalizeTicker(hydrated?.display_symbol || hydrated?.base_asset) === ticker) {
+      detailed = hydrated;
+    }
+  } catch { /* exact shared identity remains authoritative */ }
+
+  const quote = upper(detailed?.quote_asset || current?.quote_asset || detailed?.quote_currency_symbol || current?.quote_currency_symbol || 'USD') || 'USD';
+  const alias = compact(detailed?.provider_metadata?.alias || current?.provider_metadata?.alias);
   const routeProductIds = [];
-  if (alias) routeProductIds.push(alias);
+  if (alias && alias !== native) routeProductIds.push(alias);
   if (ticker && quote) routeProductIds.push(`${ticker}-${quote}`);
+
   return {
+    identity_verified: true,
+    reason: '',
     native_symbol: native,
     asset_id: exactAssetId,
     security_ticker: ticker,
     quote_asset: quote,
     official_alias: alias || null,
     route_product_ids: [...new Set(routeProductIds.filter(Boolean))],
-    identity_source: 'same_exact_coinbase_catalog_product_metadata',
+    canonical_product_id: native,
+    identity_source: 'already_verified_shared_coinbase_catalog_row_optional_metadata_only',
   };
 }
+
 export function getSharedStockCatalogTicker(provider, nativeSymbol) {
   const p = lower(provider); const native = compact(nativeSymbol); if (!p || !native) return null;
   const row = sharedTickerByNative.get(`${p}|${native}`); return row ? JSON.parse(JSON.stringify(row)) : null;
