@@ -7,9 +7,9 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.191.2';
-const DATA_VERSION = 1037002;
-const SCHEMA_VERSION = 'step1037_2_onchain_market_v2';
+const VERSION = '650.8.15.191.3';
+const DATA_VERSION = 1037003;
+const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -367,7 +367,7 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
           // "key, key", which Moralis correctly rejects as an invalid token.
           // Send exactly one official authentication header.
           'X-API-Key': MORALIS_API_KEY,
-          'user-agent': 'KakaWeb3-Onchain-Shared/1037.2',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1037.3',
         },
       });
       const body = await response.text();
@@ -949,9 +949,77 @@ function poolScore(row) {
 }
 function sortBestPools(rows) { return [...rows].sort((a, b) => poolScore(b) - poolScore(a)); }
 
+function tokenMatchesText(token, query) {
+  const q = lower(query);
+  if (!q) return false;
+  return [token?.address, token?.symbol, token?.name]
+    .map((value) => lower(value))
+    .some((value) => value && (value === q || value.includes(q)));
+}
+function tokenOrientationInPair(pair, tokenAddress) {
+  if (lower(pair?.base_token?.address) === lower(tokenAddress)) return 'base';
+  if (lower(pair?.quote_token?.address) === lower(tokenAddress)) return 'quote';
+  return '';
+}
+function nullPriceChange() {
+  return { m5: null, h1: null, h6: null, h24: null };
+}
+function tokenCentricRow(pair, token, extra = {}) {
+  const orientation = tokenOrientationInPair(pair, token?.address);
+  if (!orientation) return null;
+  // Fail closed: pair-level price/change/FDV/market-cap are only bound to
+  // the exact baseToken identity. A quoteToken never inherits those fields.
+  const baseVerified = orientation === 'base';
+  return {
+    network: pair.network,
+    chain_id: pair.chain_id,
+    token: { ...token },
+    best_pool: pair,
+    token_orientation: orientation,
+    token_market_fields_verified: baseVerified,
+    price_usd: baseVerified ? pair.price_usd : null,
+    liquidity_usd: pair.liquidity_usd,
+    market_cap_usd: baseVerified ? pair.market_cap_usd : null,
+    fdv_usd: baseVerified ? pair.fdv_usd : null,
+    volume_usd: pair.volume_usd,
+    price_change_pct: baseVerified ? pair.price_change_pct : nullPriceChange(),
+    txns: pair.txns,
+    pool_created_at: pair.pool_created_at,
+    source: 'dexscreener_public_api_token_centric',
+    ...extra,
+  };
+}
+function chooseBetterTokenRow(current, candidate) {
+  if (!current) return candidate;
+  if (candidate.token_market_fields_verified && !current.token_market_fields_verified) return candidate;
+  if (!candidate.token_market_fields_verified && current.token_market_fields_verified) return current;
+  return poolScore(candidate.best_pool) > poolScore(current.best_pool) ? candidate : current;
+}
+function tokenCentricSearchRows(query, pairs) {
+  const byToken = new Map();
+  for (const pair of pairs || []) {
+    for (const token of [pair.base_token, pair.quote_token]) {
+      if (!token?.address || !tokenMatchesText(token, query)) continue;
+      const row = tokenCentricRow(pair, token, { search_query: text(query) });
+      if (!row) continue;
+      const key = `${pair.network}|${lower(token.address)}`;
+      byToken.set(key, chooseBetterTokenRow(byToken.get(key), row));
+    }
+  }
+  return [...byToken.values()]
+    .sort((a, b) => {
+      if (a.token_market_fields_verified !== b.token_market_fields_verified) {
+        return a.token_market_fields_verified ? -1 : 1;
+      }
+      return poolScore(b.best_pool) - poolScore(a.best_pool);
+    })
+    .slice(0, MAX_RESPONSE_ROWS);
+}
+
 async function buildDexSearch(query) {
   const payload = await dexFetchJson(`${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`, { priority: 10, label: 'search' });
-  return sortBestPools(dedupePools(normalizeDexPairs(payload))).slice(0, MAX_RESPONSE_ROWS);
+  const pairs = sortBestPools(dedupePools(normalizeDexPairs(payload))).slice(0, MAX_RESPONSE_ROWS);
+  return tokenCentricSearchRows(query, pairs);
 }
 async function buildDexTokenPairs(network, address) {
   const meta = networkMeta(network);
@@ -999,42 +1067,43 @@ async function fetchDiscoveryCandidatePairs() {
     for (const pair of normalized) {
       const match = list.find((x) => lower(pair.base_token.address) === lower(x.address) || lower(pair.quote_token.address) === lower(x.address));
       if (!match) continue;
-      pairs.push({ ...pair, candidate_sources: match.candidate_sources, candidate_boost_amount: match.amount, candidate_total_boost_amount: match.total_amount });
+      pairs.push({
+        ...pair,
+        candidate_token_address: match.address,
+        candidate_sources: match.candidate_sources,
+        candidate_boost_amount: match.amount,
+        candidate_total_boost_amount: match.total_amount,
+      });
     }
   }
   return pairs;
 }
 function recentHotTokenRows(pairs) {
   const byToken = new Map();
-  for (const pair of pairs) {
-    const candidates = [pair.base_token, pair.quote_token];
-    for (const token of candidates) {
-      if (!token?.address) continue;
-      const key = `${pair.network}|${lower(token.address)}`;
-      const current = byToken.get(key);
-      const score = poolScore(pair);
-      if (!current || score > current.recent_hot_score) {
-        byToken.set(key, {
-          network: pair.network,
-          chain_id: pair.chain_id,
-          token: { ...token },
-          best_pool: pair,
-          price_usd: pair.price_usd,
-          liquidity_usd: pair.liquidity_usd,
-          market_cap_usd: pair.market_cap_usd,
-          fdv_usd: pair.fdv_usd,
-          volume_usd: pair.volume_usd,
-          price_change_pct: pair.price_change_pct,
-          txns: pair.txns,
-          pool_created_at: pair.pool_created_at,
-          recent_hot_score: score,
-          candidate_sources: pair.candidate_sources || [],
-          source: 'dexscreener_public_api_market_activity_rescore',
-        });
-      }
-    }
+  for (const pair of pairs || []) {
+    const candidateAddress = text(pair.candidate_token_address);
+    if (!candidateAddress) continue;
+    const token = tokenAddressInPair(pair, candidateAddress);
+    if (!token?.address) continue;
+    const row = tokenCentricRow(pair, token, {
+      recent_hot_score: poolScore(pair),
+      candidate_sources: pair.candidate_sources || [],
+      candidate_boost_amount: pair.candidate_boost_amount ?? null,
+      candidate_total_boost_amount: pair.candidate_total_boost_amount ?? null,
+      source: 'dexscreener_public_api_exact_discovery_token_rescore',
+    });
+    if (!row) continue;
+    const key = `${pair.network}|${lower(token.address)}`;
+    byToken.set(key, chooseBetterTokenRow(byToken.get(key), row));
   }
-  return [...byToken.values()].sort((a, b) => b.recent_hot_score - a.recent_hot_score).slice(0, MAX_RESPONSE_ROWS);
+  return [...byToken.values()]
+    .sort((a, b) => {
+      if (a.token_market_fields_verified !== b.token_market_fields_verified) {
+        return a.token_market_fields_verified ? -1 : 1;
+      }
+      return Number(b.recent_hot_score || 0) - Number(a.recent_hot_score || 0);
+    })
+    .slice(0, MAX_RESPONSE_ROWS);
 }
 
 async function refreshDiscovery() {
@@ -1109,6 +1178,10 @@ function healthPayload() {
     discovery: {
       ready: trendingSnapshot.length > 0 && (ageMs === null || ageMs <= DISCOVERY_RETAIN_MS),
       name: 'recent_hot',
+      token_centric_results: true,
+      exact_discovered_candidate_token_only: true,
+      both_sides_of_pair_are_not_automatically_listed: true,
+      quote_token_never_inherits_base_token_market_fields: true,
       basis: 'latest_profile_plus_top_boost_candidates_rescored_by_liquidity_volume_and_transactions',
       paid_boost_rank_not_used_as_final_rank: true,
       retained_if_refresh_fails: true,
@@ -1159,6 +1232,8 @@ function healthPayload() {
     },
     bounded_user_builds: {
       exact_search_and_token_pool_may_enqueue_bounded_build: true,
+      search_returns_token_centric_rows: true,
+      quote_token_market_fields_fail_closed: true,
       fixed_backend_rate_independent_of_user_count: true,
       same_key_cache_singleflight: true,
       queue_overflow_rejected_not_amplified: true,
@@ -1199,6 +1274,31 @@ function runSelfTest() {
   t('bad_address_rejected', !looksEvmAddress('not-a-contract') && !looksSolanaAddress('not-a-contract'));
   const dex = normalizeDexPair({ chainId: 'base', dexId: 'uniswap', pairAddress: '0x1111111111111111111111111111111111111111', baseToken: { address: '0x2222222222222222222222222222222222222222', symbol: 'AAA', name: 'A' }, quoteToken: { address: '0x3333333333333333333333333333333333333333', symbol: 'USDC', name: 'USD Coin' }, priceUsd: '1.2', liquidity: { usd: 10 }, volume: { h24: 20 }, priceChange: { h24: 3 } });
   t('dex_pair_parser', dex?.network === 'base' && dex?.price_usd === 1.2 && dex?.liquidity_usd === 10);
+  const quoteSynthetic = tokenCentricRow(
+    {
+      network: 'base',
+      chain_id: 'base',
+      base_token: { address: '0x0000000000000000000000000000000000000001', symbol: 'BASE', name: 'Base' },
+      quote_token: { address: '0x0000000000000000000000000000000000000002', symbol: 'QUOTE', name: 'Quote' },
+      price_usd: 9.99,
+      market_cap_usd: 999,
+      fdv_usd: 1111,
+      liquidity_usd: 100,
+      volume_usd: { h24: 50 },
+      price_change_pct: { h24: 88 },
+      txns: {},
+      pool_created_at: null,
+      pool_address: '0x0000000000000000000000000000000000000003',
+      dex_id: 'test',
+    },
+    { address: '0x0000000000000000000000000000000000000002', symbol: 'QUOTE', name: 'Quote' },
+  );
+  t('quote_token_market_fields_fail_closed',
+    quoteSynthetic?.token_market_fields_verified === false &&
+    quoteSynthetic?.price_usd === null &&
+    quoteSynthetic?.market_cap_usd === null &&
+    quoteSynthetic?.fdv_usd === null &&
+    quoteSynthetic?.price_change_pct?.h24 === null);
   t('cross_chain_substitution_false', responseBase().cross_chain_substitution === false);
   t('cross_token_substitution_false', responseBase().cross_token_substitution === false);
   t('direct_app_upstream_zero', responseBase().app_direct_upstream_requests === 0);
@@ -1269,7 +1369,20 @@ export async function handleOnchainMarket(req, res, url) {
       } else {
         const best = rows[0] || null;
         const token = best ? tokenAddressInPair(best, address) : null;
-        sendJson(res, 200, responseBase({ network, address, token, best_pool: best, pool_count: rows.length, pools_preview: rows.slice(0, 6), cache_status: result.cache_status }));
+        const tokenMarket = best && token
+          ? tokenCentricRow(best, token, { source: 'dexscreener_public_api_exact_token' })
+          : null;
+        sendJson(res, 200, responseBase({
+          network,
+          address,
+          token,
+          best_pool: best,
+          token_market: tokenMarket,
+          token_market_fields_verified: tokenMarket?.token_market_fields_verified === true,
+          pool_count: rows.length,
+          pools_preview: rows.slice(0, 6),
+          cache_status: result.cache_status,
+        }));
       }
     } catch (error) { sendJson(res, 503, responseBase({ ok: false, error: text(error?.message || error), network, address })); }
     return true;
