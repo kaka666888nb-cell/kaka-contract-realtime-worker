@@ -1,10 +1,10 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 
-const VERSION = '650.8.15.187';
+const VERSION = '650.8.15.188';
 const DATA_VERSION = 1035;
 const SCHEMA_VERSION = 'step1035_stock_catalog_v2';
-const IMPLEMENTATION_REVISION = '1035_19_4_coinbase_atomic_catalog_swap_real_candle_probe';
+const IMPLEMENTATION_REVISION = '1035_19_5_exchange_assets_isolated_core_catalog_replica';
 const RUNTIME_INSTANCE_ID = randomBytes(8).toString('hex');
 const RUNTIME_STARTED_AT = new Date().toISOString();
 const HEALTH_ROUTE = '/api/stock-catalog-v2/health';
@@ -135,6 +135,20 @@ let stageCleanupFailures = 0;
 let lastStageCleanupError = '';
 const coinbaseExactMetadataLoaded = new Set();
 const coinbaseExactMetadataInflight = new Map();
+// Step1035.19.5: /api/asset-klines lives in the isolated exchange-assets child process,
+// while the full stock-catalog collector lives in the parent process. Module memory is not
+// shared across those processes. Keep a tiny Supabase-backed read replica for only the fixed
+// Coinbase core-equity Kline pool inside the isolated process. This replica never calls
+// Coinbase, is singleflight, and is refreshed on a long TTL so user reads do not scale DB or
+// exchange upstream work.
+const COINBASE_CORE_KLINE_REPLICA_TTL_MS = Math.max(30 * 60_000, Number(process.env.KAKA_COINBASE_CORE_KLINE_REPLICA_TTL_MS || 6 * 60 * 60_000));
+const COINBASE_CORE_KLINE_REPLICA_MIN_ROWS = 20;
+let coinbaseCoreKlineReplicaInflight = null;
+let coinbaseCoreKlineReplicaLoadedAtMs = 0;
+let coinbaseCoreKlineReplicaRows = 0;
+let coinbaseCoreKlineReplicaLoads = 0;
+let coinbaseCoreKlineReplicaFailures = 0;
+let coinbaseCoreKlineReplicaLastError = '';
 let refreshInflight = null;
 let lastRefreshStartedAt = '';
 let lastRefreshSucceededAt = '';
@@ -1165,40 +1179,139 @@ function healthPayload() {
   const ready = lastGateRows >= GATE_COMPLETE_MIN_ROWS && lastGateZhNames >= 40 && lastCoinbaseProductRows >= COINBASE_COMPLETE_MIN_PRODUCTS && lastCoinbaseSecurities >= COINBASE_COMPLETE_MIN_SECURITIES && committedCatalogIntegrityReady && lastCoinbasePricedRows >= 50 && lastCoinbaseSessionRows >= 100 && marketCountsBounded && coinbaseMarketReady && Number.isFinite(lastOkMs) && Date.now() - lastOkMs <= Math.max(24 * 60 * 60_000, REFRESH_MS * 3);
   return { ok: true, version: VERSION, data_version: DATA_VERSION, schema_version: SCHEMA_VERSION, implementation_revision: IMPLEMENTATION_REVISION, runtime_instance_id: RUNTIME_INSTANCE_ID, runtime_started_at: RUNTIME_STARTED_AT, process_uptime_seconds: Math.floor(process.uptime()), coverage_ready: ready, refresh_interval_minutes: Math.round(REFRESH_MS / 60_000), coinbase_market_refresh_interval_minutes: Math.round(COINBASE_MARKET_REFRESH_MS / 60_000), gate_session_refresh_interval_minutes: Math.round(GATE_SESSION_REFRESH_MS / 60_000), background_shared_collector: true, user_reads_trigger_source_requests: false, reads_scale_with_users: false, direct_exchange_requests_from_user_reads: 0, direct_exchange_connections_from_user_reads: 0, user_read_source_requests: 0, user_read_source_connections: 0, coinbase_catalog_refresh_atomic_memory_swap: true, coinbase_catalog_refresh_zero_shared_gap: true, supabase_configured: SUPABASE_CONFIGURED, coinbase_cdp_configured: COINBASE_CDP_CONFIGURED, last_refresh_started_at: lastRefreshStartedAt, last_refresh_succeeded_at: lastRefreshSucceededAt, last_refresh_error: lastRefreshError, last_refresh_id: lastRefreshId, catalog_thresholds: { gate_complete_min_rows: GATE_COMPLETE_MIN_ROWS, coinbase_complete_min_products: COINBASE_COMPLETE_MIN_PRODUCTS, coinbase_complete_min_securities: COINBASE_COMPLETE_MIN_SECURITIES }, coinbase_auth: { cdp_configured: COINBASE_CDP_CONFIGURED, list_products_path: COINBASE_PUBLIC_PRODUCTS_PATH, authenticated_products_path: COINBASE_AUTH_PRODUCTS_PATH, jwt_uri_excludes_query_string: true }, gate: { sample_native_symbol: lastGateSampleNative || null, rows: lastGateRows, us_rows: lastGateUs, hk_rows: lastGateHk, kr_rows: lastGateKr, chinese_name_rows: lastGateZhNames, full_pagination: true, page_size: GATE_PAGE_SIZE, hard_old_10_page_cap_removed: true, shared_session_refresh: true, session_refresh_interval_minutes: Math.round(GATE_SESSION_REFRESH_MS / 60_000), last_session_started_at: lastGateSessionStartedAt, last_session_succeeded_at: lastGateSessionSucceededAt, last_session_error: lastGateSessionError, session_refresh_attempts: gateSessionRefreshAttempts, session_refresh_successes: gateSessionRefreshSuccesses, session_refresh_failures: gateSessionRefreshFailures }, coinbase_market: { last_started_at: lastCoinbaseMarketStartedAt, last_succeeded_at: lastCoinbaseMarketSucceededAt, last_error: lastCoinbaseMarketError, refresh_attempts: coinbaseMarketRefreshAttempts, refresh_successes: coinbaseMarketRefreshSuccesses, refresh_failures: coinbaseMarketRefreshFailures, restored_verified_snapshot: coinbaseMarketRestoredReady, bounded_to_committed_catalog: true, counts_bounded_to_committed_catalog: marketCountsBounded, full_metadata_duplication: false, persisted_compact_snapshot: true, snapshot_rows: coinbaseMarketSnapshotRows, snapshot_fetched_at: coinbaseMarketSnapshotFetchedAt || null, snapshot_gzip_bytes: coinbaseMarketSnapshotGzipB64 ? Math.floor(coinbaseMarketSnapshotGzipB64.length * 0.75) : 0, snapshot_restore_successes: coinbaseMarketSnapshotRestoreSuccesses, snapshot_restore_failures: coinbaseMarketSnapshotRestoreFailures, snapshot_last_error: coinbaseMarketSnapshotLastError, snapshot_persist_successes: coinbaseMarketSnapshotPersistSuccesses, snapshot_persist_failures: coinbaseMarketSnapshotPersistFailures, snapshot_persist_last_error: lastStatePersistError, pagination_mode: lastCoinbaseMarketPaginationMode, effective_page_size: lastCoinbaseMarketEffectivePageSize, pages_fetched: lastCoinbaseMarketPagesFetched, matched_rows: lastCoinbaseMarketMatchedRows, match_ratio: marketMatchRatio, cursor_page_limit: COINBASE_MARKET_PROBE_LIMIT, min_match_ratio: COINBASE_MARKET_MIN_MATCH_RATIO, catalog_market_mutual_exclusion: true, deferred_due_catalog_count: coinbaseMarketDeferredDueCatalog, deferred_retry_scheduled: Boolean(coinbaseMarketDeferredTimer), overlap_violations: catalogMarketOverlapViolations, streaming_pages: lastCoinbaseMarketStreamingPages, retained_full_product_rows: lastCoinbaseMarketRetainedFullProductRows }, coinbase: { sample_native_symbol: lastCoinbaseSampleNative || null, sample_security_ticker: lastCoinbaseSampleTicker || null, product_rows: lastCoinbaseProductRows, distinct_securities: lastCoinbaseSecurities, priced_rows: lastCoinbasePricedRows, current_session_rows: lastCoinbaseSessionRows, chinese_name_rows: lastCoinbaseZhNames, core_kline_pool: { enabled: COINBASE_CDP_CONFIGURED, configured_tickers: [...COINBASE_CORE_EQUITY_TICKERS], matched_count: coreKlineProducts.length, items: coreKlineProducts }, full_cursor_pagination: true, hard_old_6_page_cap_removed: true, fallback_all_products_used: lastCoinbaseFallbackAllProductsUsed, kline_probe: lastCoinbaseKlineProbe, catalog_integrity: { highwater_rows: coinbaseCatalogHighWaterRows, highwater_securities: coinbaseCatalogHighWaterSecurities, highwater_at: coinbaseCatalogHighWaterAt || null, highwater_fresh: coinbaseCatalogHighWaterFresh(), min_ratio: COINBASE_CATALOG_HIGHWATER_MIN_RATIO, committed_rows_ratio: committedCatalogRatioRows, committed_securities_ratio: committedCatalogRatioSecurities, committed_integrity_ready: committedCatalogIntegrityReady, fetch_mode: lastCoinbaseCatalogFetchMode, cursor_rows: lastCoinbaseCatalogCursorRows, cursor_securities: lastCoinbaseCatalogCursorSecurities, offset_rows: lastCoinbaseCatalogOffsetRows, offset_securities: lastCoinbaseCatalogOffsetSecurities, pages_fetched: lastCoinbaseCatalogPagesFetched, effective_page_size: lastCoinbaseCatalogEffectivePageSize, candidate_rows: lastCoinbaseCatalogCandidateRows, candidate_securities: lastCoinbaseCatalogCandidateSecurities, candidate_highwater_ratio: lastCoinbaseCatalogHighWaterRatio, public_list_cursor_rows: lastCoinbaseCatalogPublicCursorRows, authenticated_list_cursor_rows: lastCoinbaseCatalogAuthCursorRows, undefined_sort_cursor_rows: lastCoinbaseCatalogUndefinedSortRows, cursor_pages_fetched: lastCoinbaseCatalogCursorPages, synthesized_cursor_uses: lastCoinbaseCatalogSynthCursorUses, cursor_termination: lastCoinbaseCatalogCursorTermination, last_integrity_error: lastCoinbaseCatalogIntegrityError, incomplete_catalog_never_committed: true, highwater_updates_only_after_db_commit: true, offset_runtime_proven_ignored_not_used_for_catalog_or_market: true, streaming_stage_mode: true, streaming_pages: lastCoinbaseCatalogStreamingPages, streaming_stage_writes: lastCoinbaseCatalogStreamingStageWrites, peak_page_rows: lastCoinbaseCatalogPeakPageRows, retained_full_product_rows: lastCoinbaseCatalogRetainedFullProductRows } }, coinbase_known_catalog_bootstrap: { mode: lastCoinbaseKnownCatalogBootstrapMode, attempts: coinbaseKnownCatalogBootstrapAttempts, successes: coinbaseKnownCatalogBootstrapSuccesses, failures: coinbaseKnownCatalogBootstrapFailures, rows: lastCoinbaseKnownCatalogBootstrapRows, last_error: lastCoinbaseKnownCatalogBootstrapError, market_refresh_self_hydrates_when_memory_catalog_missing: true }, source_requests: { gate_started: gateRequestsStarted, gate_succeeded: gateRequestsSucceeded, coinbase_started: coinbaseRequestsStarted, coinbase_succeeded: coinbaseRequestsSucceeded, failures: sourceRequestFailures }, persistence: { stage_rows_written: stageRowsWritten, commits_succeeded: commitsSucceeded, commits_failed: commitsFailed, restored_coinbase_rows: restoredCoinbaseRows, restored_gate_rows: restoredGateRows, restore_attempts: restoreAttempts, restore_successes: restoreSuccesses, restore_failures: restoreFailures, last_restore_error: lastRestoreError, coinbase_restore_mode: lastCoinbaseRestoreMode, stage_cleanup_successes: stageCleanupSuccesses, stage_cleanup_failures: stageCleanupFailures, stage_cleanup_last_error: lastStageCleanupError, commit_contract: 'delete_provider_slice_plus_plain_insert_then_async_stage_cleanup', coinbase_commit_started_at: lastCoinbaseCommitStartedAt || null, coinbase_commit_succeeded_at: lastCoinbaseCommitSucceededAt || null, coinbase_commit_duration_ms: lastCoinbaseCommitDurationMs, coinbase_commit_last_error: lastCoinbaseCommitError, catalog_refresh_inflight: Boolean(refreshInflight), catalog_waited_for_market_inflight: catalogWaitedForMarketInflight, catalog_market_overlap_violations: catalogMarketOverlapViolations }, exact_metadata_cache: { mode: 'supabase_exact_on_demand_no_exchange_request', db_reads: exactMetadataDbReads, cache_entries: coinbaseExactMetadataLoaded.size, inflight: coinbaseExactMetadataInflight.size }, security_identity: { quote_variants_preserved: true, user_list_dedupes_by_security_key: true, exact_product_identity_preserved: true, coinbase_cik_preferred: true }, localization: { gate_official_i18n: true, curated_exact_ticker_fallback: true, chinese_search_aliases: true, canonical_commodity_aliases: true }, session_policy: { gate_dynamic_trade_status: true, gate_gt_lp_recognized: true, coinbase_current_session: true, cash_vs_tokenized_vs_derivative_not_merged: true }, user_reads: userReads, shared_market_map_entries: sharedTickerByNative.size, shared_identity_map_entries: sharedRowByNative.size, shared_map_age_ms: sharedUpdatedAtMs ? Date.now() - sharedUpdatedAtMs : null };
 }
+function coinbaseCoreReplicaRowCount() {
+  let count = 0;
+  for (const row of sharedRowByNative.values()) {
+    if (lower(row?.provider) !== 'coinbase' || lower(row?.asset_class) !== 'equity_cash') continue;
+    const ticker = normalizeTicker(row?.display_symbol || row?.base_asset);
+    if (COINBASE_CORE_EQUITY_TICKERS.has(ticker) && compact(row?.exchange_symbol) && compact(row?.asset_id)) count += 1;
+  }
+  return count;
+}
+
+export function getCoinbaseCoreKlineReplicaHealth() {
+  const currentRows = coinbaseCoreReplicaRowCount();
+  const ageMs = coinbaseCoreKlineReplicaLoadedAtMs > 0 ? Date.now() - coinbaseCoreKlineReplicaLoadedAtMs : null;
+  return {
+    mode: 'isolated_exchange_assets_supabase_core_pool_read_replica',
+    process_role: compact(process.env.KAKA_ISOLATED_COLLECTOR_ROLE) || 'parent',
+    ready: currentRows >= COINBASE_CORE_KLINE_REPLICA_MIN_ROWS,
+    current_rows: currentRows,
+    last_loaded_rows: coinbaseCoreKlineReplicaRows,
+    ttl_ms: COINBASE_CORE_KLINE_REPLICA_TTL_MS,
+    age_ms: ageMs,
+    inflight: Boolean(coinbaseCoreKlineReplicaInflight),
+    loads: coinbaseCoreKlineReplicaLoads,
+    failures: coinbaseCoreKlineReplicaFailures,
+    last_error: coinbaseCoreKlineReplicaLastError || null,
+    exchange_requests_per_load: 0,
+    user_reads_scale_db_requests: false,
+  };
+}
+
+export async function ensureCoinbaseCoreKlineReplica({ force = false } = {}) {
+  const currentRows = coinbaseCoreReplicaRowCount();
+  const fresh = coinbaseCoreKlineReplicaLoadedAtMs > 0 && Date.now() - coinbaseCoreKlineReplicaLoadedAtMs < COINBASE_CORE_KLINE_REPLICA_TTL_MS;
+  // In the parent process the full catalog is already present; never duplicate its DB work.
+  if (!force && currentRows >= COINBASE_CORE_KLINE_REPLICA_MIN_ROWS && (fresh || compact(process.env.KAKA_ISOLATED_COLLECTOR_ROLE) !== 'exchange-assets')) {
+    return currentRows;
+  }
+  if (coinbaseCoreKlineReplicaInflight) return coinbaseCoreKlineReplicaInflight;
+  coinbaseCoreKlineReplicaInflight = (async () => {
+    coinbaseCoreKlineReplicaLastError = '';
+    try {
+      if (!SUPABASE_CONFIGURED) throw new Error('supabase_service_role_not_configured');
+      const select = 'asset_id,provider,market_type,product_kind,asset_class,asset_group,exchange_symbol,display_symbol,display_name,display_name_zh,security_key,security_type,base_asset,quote_asset,settle_asset,status,exchange_name,product_venue,symbol_type,official_kline_capability,official_kline_source,official_kline_identity,secondary_kline_source_required,secondary_source_status,sparse_market_bars,source_verified,source_cached_at,current_session,session_policy,supports_24_7,supports_24_5,trade_status,trade_mode,trading_halted,quote_currency_symbol,provider_metadata';
+      const tickerFilter = [...COINBASE_CORE_EQUITY_TICKERS].map(t => t.replace(/[^A-Z0-9._-]/g, '')).join(',');
+      const response = await supabaseFetch(`kaka_exchange_asset_catalog?provider=eq.coinbase&asset_class=eq.equity_cash&source_verified=eq.true&display_symbol=in.(${tickerFilter})&select=${encodeURIComponent(select)}&order=asset_id.asc`, { headers: { prefer: 'count=none' } });
+      if (!response.ok) throw new Error(`coinbase_core_kline_replica_http_${response.status}:${safeText(await response.text(), 220)}`);
+      const rows = await response.json();
+      if (!Array.isArray(rows)) throw new Error('coinbase_core_kline_replica_invalid_payload');
+      let applied = 0;
+      for (const raw of rows) {
+        const native = compact(raw?.exchange_symbol);
+        const asset = compact(raw?.asset_id);
+        const ticker = normalizeTicker(raw?.display_symbol || raw?.base_asset);
+        if (!native || !asset || !COINBASE_CORE_EQUITY_TICKERS.has(ticker)) continue;
+        if (asset !== `coinbase:equity:${native}`) continue;
+        const row = { ...raw, provider: 'coinbase', provider_metadata: raw?.provider_metadata && typeof raw.provider_metadata === 'object' ? raw.provider_metadata : {} };
+        sharedRowByNative.set(`coinbase|${native}`, row);
+        sharedSecurityByKey.set(row.security_key || row.asset_id, row);
+        // provider_metadata is already included in this tiny 34-row replica, so mark the exact
+        // metadata as hydrated and avoid a per-symbol DB read when the first Kline user arrives.
+        coinbaseExactMetadataLoaded.add(native);
+        applied += 1;
+      }
+      if (applied < COINBASE_CORE_KLINE_REPLICA_MIN_ROWS) throw new Error(`coinbase_core_kline_replica_too_small:${applied}`);
+      coinbaseCoreKlineReplicaLoadedAtMs = Date.now();
+      coinbaseCoreKlineReplicaRows = applied;
+      coinbaseCoreKlineReplicaLoads += 1;
+      coinbaseCoreKlineReplicaLastError = '';
+      sharedUpdatedAtMs = Date.now();
+      return applied;
+    } catch (error) {
+      coinbaseCoreKlineReplicaFailures += 1;
+      coinbaseCoreKlineReplicaLastError = safeText(error?.message || error, 320);
+      throw error;
+    } finally {
+      coinbaseCoreKlineReplicaInflight = null;
+    }
+  })();
+  return coinbaseCoreKlineReplicaInflight;
+}
+
+// Prewarm only inside the isolated exchange-assets child. It reads 34 fixed core identities
+// from Supabase once per long TTL; it does not start the full stock collector or any Coinbase
+// catalog request in this process.
+if (compact(process.env.KAKA_ISOLATED_COLLECTOR_ROLE) === 'exchange-assets') {
+  const timer = setTimeout(() => ensureCoinbaseCoreKlineReplica().catch(() => {}), 250);
+  timer.unref?.();
+}
+
+function coinbaseEquityCandleRouteFromRow(current, native, ticker, exactAssetId) {
+  if (!current) return { identity_verified:false, reason:'shared_exact_row_missing', route_product_ids:[] };
+  if (lower(current?.provider) !== 'coinbase' || lower(current?.asset_class) !== 'equity_cash') return { identity_verified:false, reason:'shared_exact_scope_mismatch', route_product_ids:[] };
+  if (compact(current?.asset_id) !== exactAssetId) return { identity_verified:false, reason:'shared_exact_asset_id_mismatch', route_product_ids:[] };
+  if (normalizeTicker(current?.display_symbol || current?.base_asset) !== ticker) return { identity_verified:false, reason:'shared_exact_ticker_mismatch', route_product_ids:[] };
+  const quote = upper(current?.quote_asset || current?.quote_currency_symbol || 'USD') || 'USD';
+  const alias = compact(current?.provider_metadata?.alias);
+  const routeProductIds = [];
+  if (alias && alias !== native) routeProductIds.push(alias);
+  if (ticker && quote) routeProductIds.push(`${ticker}-${quote}`);
+  return { identity_verified:true, reason:'', quote, alias:alias || null, route_product_ids:[...new Set(routeProductIds.filter(Boolean))] };
+}
+
 export async function resolveCoinbaseEquityCandleRoute(nativeSymbol, securityTicker, assetId) {
   const native = compact(nativeSymbol);
   const ticker = normalizeTicker(securityTicker);
   const exactAssetId = compact(assetId);
   if (!native || !ticker || !exactAssetId) return { identity_verified:false, reason:'missing_identity', route_product_ids:[] };
 
-  const current = sharedRowByNative.get(`coinbase|${native}`) || null;
-  if (!current) return { identity_verified:false, reason:'shared_exact_row_missing', route_product_ids:[] };
-  if (lower(current?.provider) !== 'coinbase' || lower(current?.asset_class) !== 'equity_cash') {
-    return { identity_verified:false, reason:'shared_exact_scope_mismatch', route_product_ids:[] };
+  let current = sharedRowByNative.get(`coinbase|${native}`) || null;
+  // In the isolated exchange-assets process the parent catalog map is a different address
+  // space. Warm the fixed core read replica before declaring the exact row missing.
+  if (!current && COINBASE_CORE_EQUITY_TICKERS.has(ticker)) {
+    try { await ensureCoinbaseCoreKlineReplica(); } catch { /* reason below stays explicit */ }
+    current = sharedRowByNative.get(`coinbase|${native}`) || null;
   }
-  if (compact(current?.asset_id) !== exactAssetId) {
-    return { identity_verified:false, reason:'shared_exact_asset_id_mismatch', route_product_ids:[] };
-  }
-  if (normalizeTicker(current?.display_symbol || current?.base_asset) !== ticker) {
-    return { identity_verified:false, reason:'shared_exact_ticker_mismatch', route_product_ids:[] };
-  }
+  const baseRoute = coinbaseEquityCandleRouteFromRow(current, native, ticker, exactAssetId);
+  if (baseRoute.identity_verified !== true) return baseRoute;
 
-  // The exact shared row already proves product identity. Detailed metadata is optional and
-  // may be restored lazily; a hydration miss/failure must not erase an already-proven identity.
+  // Detailed metadata is optional. The core replica already includes provider_metadata for
+  // only 34 rows, but a parent-process exact metadata hit may still enrich it without ever
+  // becoming a hard dependency.
   let detailed = current;
   try {
     const hydrated = await loadCoinbaseExactMetadata(native);
-    if (hydrated && compact(hydrated?.asset_id) === exactAssetId && compact(hydrated?.exchange_symbol) === native && normalizeTicker(hydrated?.display_symbol || hydrated?.base_asset) === ticker) {
-      detailed = hydrated;
-    }
-  } catch { /* exact shared identity remains authoritative */ }
+    if (hydrated && compact(hydrated?.asset_id) === exactAssetId && compact(hydrated?.exchange_symbol) === native && normalizeTicker(hydrated?.display_symbol || hydrated?.base_asset) === ticker) detailed = hydrated;
+  } catch { /* exact replicated identity remains authoritative */ }
 
-  const quote = upper(detailed?.quote_asset || current?.quote_asset || detailed?.quote_currency_symbol || current?.quote_currency_symbol || 'USD') || 'USD';
-  const alias = compact(detailed?.provider_metadata?.alias || current?.provider_metadata?.alias);
-  const routeProductIds = [];
-  if (alias && alias !== native) routeProductIds.push(alias);
-  if (ticker && quote) routeProductIds.push(`${ticker}-${quote}`);
-
+  const detailedRoute = coinbaseEquityCandleRouteFromRow(detailed, native, ticker, exactAssetId);
+  const routeProductIds = detailedRoute.identity_verified === true && detailedRoute.route_product_ids.length
+    ? detailedRoute.route_product_ids
+    : baseRoute.route_product_ids;
+  const quote = detailedRoute.identity_verified === true ? detailedRoute.quote : baseRoute.quote;
+  const alias = detailedRoute.identity_verified === true ? detailedRoute.alias : baseRoute.alias;
   return {
     identity_verified: true,
     reason: '',
@@ -1207,9 +1320,11 @@ export async function resolveCoinbaseEquityCandleRoute(nativeSymbol, securityTic
     security_ticker: ticker,
     quote_asset: quote,
     official_alias: alias || null,
-    route_product_ids: [...new Set(routeProductIds.filter(Boolean))],
+    route_product_ids: routeProductIds,
     canonical_product_id: native,
-    identity_source: 'already_verified_shared_coinbase_catalog_row_optional_metadata_only',
+    identity_source: compact(process.env.KAKA_ISOLATED_COLLECTOR_ROLE) === 'exchange-assets'
+      ? 'isolated_exchange_assets_core_supabase_read_replica_exact_identity'
+      : 'parent_shared_coinbase_catalog_exact_identity',
   };
 }
 
@@ -1338,6 +1453,9 @@ export function runStockCatalogV2SelfTest() {
     ['coinbase_market_provider_metadata_not_deep_cloned', !String(coinbaseMarketOverlayRow).includes('...(old.provider_metadata')],
     ['coinbase_catalog_postcommit_restores_light_rows', String(refreshNow).includes("restoreProviderSharedRows('coinbase', { atomicReplace: true })")],
     ['coinbase_catalog_postcommit_atomic_shared_swap', String(refreshNow).includes("restoreProviderSharedRows('coinbase', { atomicReplace: true })") && !String(refreshNow).includes("clearSharedProviderRows('coinbase')")],
+    ['coinbase_exchange_assets_isolation_core_replica_available', typeof ensureCoinbaseCoreKlineReplica === 'function' && typeof getCoinbaseCoreKlineReplicaHealth === 'function'],
+    ['coinbase_exchange_assets_replica_is_supabase_only', String(ensureCoinbaseCoreKlineReplica).includes('supabaseFetch') && !String(ensureCoinbaseCoreKlineReplica).includes('timedFetchJson') && !String(ensureCoinbaseCoreKlineReplica).includes('COINBASE_HOST')],
+    ['coinbase_isolated_resolver_warms_replica_before_missing', String(resolveCoinbaseEquityCandleRoute).includes('ensureCoinbaseCoreKlineReplica')],
     ['coinbase_market_stream_retains_no_full_products', String(fetchCoinbaseKnownMarketFast).includes('lastCoinbaseMarketRetainedFullProductRows = 0')],
     ['coinbase_catalog_highwater_updates_only_after_commit', true],
     ['startup_forces_refresh_on_catalog_integrity_gap', true],

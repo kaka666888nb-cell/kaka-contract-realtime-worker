@@ -7,10 +7,10 @@
 // the protected Binance contract REST path.
 
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
-import { resolveCoinbaseEquityCandleRoute } from './stock-catalog-v2.mjs';
+import { resolveCoinbaseEquityCandleRoute, getCoinbaseCoreKlineReplicaHealth } from './stock-catalog-v2.mjs';
 
-const VERSION = '650.8.15.187';
-const DATA_VERSION = 1035194;
+const VERSION = '650.8.15.188';
+const DATA_VERSION = 1035195;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
@@ -919,6 +919,7 @@ export function runAssetKlineSelfTest() {
     coinbase_cash_equity_scope_supported: exactScopeSupported({ provider: 'coinbase', marketType: 'equity', assetClass: 'equity_cash' }) === true,
     coinbase_core_exact_identity_guard: coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:opaqueCaseId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === true && coinbaseCoreIdentityAllowed({ assetId: 'coinbase:equity:otherId', nativeSymbol: 'opaqueCaseId', securityTicker: 'AAPL' }) === false,
     coinbase_candle_route_uses_exact_catalog_resolver: String(fetchCoinbase).includes('resolveCoinbaseEquityCandleRoute'),
+    coinbase_isolated_process_replica_health_exposed: typeof getCoinbaseCoreKlineReplicaHealth === 'function',
     coinbase_opaque_product_id_not_used_as_public_pair_route: !String(fetchCoinbase).includes('/brokerage/market/products/${encodeURIComponent(identity.nativeSymbol)}/candles') && String(fetchCoinbase).includes('/brokerage/products/${encodeURIComponent(identity.nativeSymbol)}/candles'),
     coinbase_non_equity_scope_blocked: exactScopeSupported({ provider: 'coinbase', marketType: 'spot', assetClass: 'equity_cash' }) === false,
     bybit_equity_supported: exactScopeSupported({ provider: 'bybit', marketType: 'spot', assetClass: 'equity_token' }) === true,
@@ -959,8 +960,8 @@ export function getAssetKlineHealth() {
     coinbase_core_equity_official_candles_opened: true,
     coinbase_candle_endpoint_path: '/api/v3/brokerage/market/products/{product_id}/candles',
     coinbase_candle_endpoint_mode: 'advanced_trade_public_market_exact_shared_row_alias_or_pair_plus_same_canonical_auth_fallback',
-    coinbase_candle_route_identity: 'exact_shared_catalog_row_guard_then_alias_or_same_row_ticker_quote_no_metadata_dependency',
-    coinbase_non_core_equity_secondary_source_still_locked: true, coinbase_catalog_refresh_atomic_memory_swap_required: true,
+    coinbase_candle_route_identity: 'isolated_exchange_assets_core_supabase_read_replica_exact_identity_then_same_product_alias_or_pair',
+    coinbase_non_core_equity_secondary_source_still_locked: true, coinbase_catalog_refresh_atomic_memory_swap_required: true, coinbase_core_kline_replica: getCoinbaseCoreKlineReplicaHealth(),
     coinbase_cdp_configured: COINBASE_CDP_CONFIGURED,
     coinbase_exact_product_asset_id_guard: true,
     coinbase_security_ticker_core_scope_required: true,
