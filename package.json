@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.191.2",
+  "version": "650.8.15.191.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Render 650.8.15.191.2 / Step1037.2 Moralis Pair Swaps response-schema parser fix"
+  "description": "KakaWeb3 Render 650.8.15.191.3 / Step1037.3 token-centric onchain trending/search identity fix"
 }
