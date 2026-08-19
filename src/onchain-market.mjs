@@ -7,9 +7,9 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.191';
-const DATA_VERSION = 1037000;
-const SCHEMA_VERSION = 'step1037_onchain_market_v2';
+const VERSION = '650.8.15.191.1';
+const DATA_VERSION = 1037001;
+const SCHEMA_VERSION = 'step1037_1_onchain_market_v2';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -362,9 +362,12 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
         signal: controller.signal,
         headers: {
           accept: 'application/json',
+          // Step1037.1: HTTP header names are case-insensitive. Sending both
+          // X-API-Key and X-Api-Key can be coalesced by the HTTP client into
+          // "key, key", which Moralis correctly rejects as an invalid token.
+          // Send exactly one official authentication header.
           'X-API-Key': MORALIS_API_KEY,
-          'X-Api-Key': MORALIS_API_KEY,
-          'user-agent': 'KakaWeb3-Onchain-Shared/1037',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1037.1',
         },
       });
       const body = await response.text();
@@ -1023,6 +1026,9 @@ function healthPayload() {
         api_key_configured: Boolean(MORALIS_API_KEY),
         api_key_exposed: false,
         backend_only_secret: true,
+        auth_header_name: 'X-API-Key',
+        auth_header_count_per_request: 1,
+        duplicate_case_variant_headers: false,
         pair_candlestick_cu: MORALIS_KLINE_CU,
         pair_swap_cu: MORALIS_TRADES_CU,
         scheduler: moralisScheduler.state(),
@@ -1131,6 +1137,7 @@ function runSelfTest() {
   t('kline_cache_bounded', KLINE_CACHE_MAX_ENTRIES <= 128);
   t('moralis_budget_below_free_reference', MORALIS_DAILY_CU_BUDGET < 40_000);
   t('moralis_secret_never_exposed', healthPayload().sources.moralis.api_key_exposed === false);
+  t('moralis_single_auth_header_only', healthPayload().sources.moralis.auth_header_count_per_request === 1 && healthPayload().sources.moralis.duplicate_case_variant_headers === false);
   t('moralis_15m_same_pool_derivation_only', MORALIS_TIMEFRAME['15m'] === '5min');
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
