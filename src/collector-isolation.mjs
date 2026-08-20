@@ -69,6 +69,8 @@ function sharedResponsePolicy(pathname) {
   if (path === '/api/onchain/trades') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/onchain/new-pools') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
   if (path === '/api/onchain/fx-reference') return { freshMs: 60_000, staleMs: 10 * 60_000, cdnSMaxAgeSec: 60 };
+  if (path === '/api/onchain/holders') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };
+  if (path === '/api/onchain/security') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };
   return null;
 }
 

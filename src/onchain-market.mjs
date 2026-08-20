@@ -1,4 +1,4 @@
-// Step1037.5 / Render 650.8.15.192
+// Step1038 / Render 650.8.15.193
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,9 +7,10 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.192';
-const DATA_VERSION = 1037005;
+const VERSION = '650.8.15.193';
+const DATA_VERSION = 1038000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
+const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -21,6 +22,8 @@ const KLINES_ROUTE = '/api/onchain/klines';
 const TRADES_ROUTE = '/api/onchain/trades';
 const NEW_POOLS_ROUTE = '/api/onchain/new-pools';
 const FX_REFERENCE_ROUTE = '/api/onchain/fx-reference';
+const HOLDERS_ROUTE = '/api/onchain/holders';
+const SECURITY_ROUTE = '/api/onchain/security';
 
 const DEX_BASE = 'https://api.dexscreener.com';
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
@@ -59,6 +62,21 @@ const IDENTITY_PROOF_MAX_ENTRIES = 256;
 const KLINE_MAX_ROWS = 300;
 const TRADE_MAX_ROWS = 50;
 const IDENTITY_PROOF_TTL_MS = 24 * 60 * 60_000;
+// Step1038 holder concentration + contract/security facts. These are on-demand backend builds,
+// never App-direct upstream calls. Cache/singleflight and bounded provider lanes cap user-scale load.
+const MORALIS_HOLDER_METRICS_CU = 50;
+const MORALIS_TOP_HOLDERS_CU = 50;
+const HOLDER_FRESH_MS = 15 * 60_000;
+const HOLDER_STALE_MS = 6 * 60 * 60_000;
+const HOLDER_NEGATIVE_MS = 2 * 60_000;
+const GOPLUS_MIN_GAP_MS = Math.max(2_050, Number(process.env.KAKA_GOPLUS_MIN_GAP_MS || 2_100));
+const GOPLUS_MAX_QUEUE = Math.max(6, Math.min(40, Number(process.env.KAKA_GOPLUS_MAX_QUEUE || 24)));
+const GOPLUS_TIMEOUT_MS = Math.max(5_000, Math.min(25_000, Number(process.env.KAKA_GOPLUS_TIMEOUT_MS || 12_000)));
+const GOPLUS_ACCESS_TOKEN = String(process.env.GOPLUS_ACCESS_TOKEN || '').trim();
+const SECURITY_FRESH_MS = 30 * 60_000;
+const SECURITY_STALE_MS = 24 * 60 * 60_000;
+const SECURITY_NEGATIVE_MS = 2 * 60_000;
+const EVM_GOPLUS_CHAIN_ID = Object.freeze({ ethereum: '1', bsc: '56', base: '8453' });
 
 const MORALIS_EVM_CHAIN = Object.freeze({
   ethereum: 'eth',
@@ -129,6 +147,13 @@ const stats = {
   kline_identity_rejections: 0,
   trades_cache_hits: 0,
   trades_cache_misses: 0,
+  holder_builds: 0,
+  holder_build_failures: 0,
+  security_builds: 0,
+  security_build_failures: 0,
+  goplus_upstream_started: 0,
+  goplus_upstream_succeeded: 0,
+  goplus_upstream_failed: 0,
 };
 
 const cache = new Map();
@@ -293,7 +318,7 @@ function utcBudgetDay() {
   return new Date().toISOString().slice(0, 10);
 }
 function loadMoralisLedger() {
-  const fallback = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, updated_at: null };
+  const fallback = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, updated_at: null };
   try {
     const parsed = JSON.parse(readFileSync(MORALIS_LEDGER_PATH, 'utf8'));
     if (!parsed || parsed.day !== utcBudgetDay()) return fallback;
@@ -303,6 +328,7 @@ function loadMoralisLedger() {
       calls: Math.max(0, Number(parsed.calls || 0)),
       kline_calls: Math.max(0, Number(parsed.kline_calls || 0)),
       trade_calls: Math.max(0, Number(parsed.trade_calls || 0)),
+      holder_calls: Math.max(0, Number(parsed.holder_calls || 0)),
       updated_at: parsed.updated_at || null,
     };
   } catch {
@@ -313,7 +339,7 @@ let moralisLedger = loadMoralisLedger();
 
 function refreshMoralisBudgetDay() {
   if (moralisLedger.day === utcBudgetDay()) return;
-  moralisLedger = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, updated_at: null };
+  moralisLedger = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, updated_at: null };
   persistMoralisLedger();
 }
 function persistMoralisLedger() {
@@ -336,6 +362,7 @@ function moralisBudgetState() {
     calls: moralisLedger.calls,
     kline_calls: moralisLedger.kline_calls,
     trade_calls: moralisLedger.trade_calls,
+    holder_calls: moralisLedger.holder_calls,
     ledger_path_kind: 'local_ephemeral_process_restart_persistent_tmp',
     database_write: false,
   };
@@ -352,6 +379,7 @@ function reserveMoralisBudget(cu, kind) {
   moralisLedger.calls += 1;
   if (kind === 'kline') moralisLedger.kline_calls += 1;
   if (kind === 'trade') moralisLedger.trade_calls += 1;
+  if (kind === 'holder') moralisLedger.holder_calls += 1;
   moralisLedger.updated_at = new Date().toISOString();
   persistMoralisLedger();
 }
@@ -405,6 +433,384 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
       clearTimeout(timer);
     }
   }, { priority, label });
+}
+
+
+const goplusScheduler = createScheduler({
+  name: 'goplus',
+  minGapMs: GOPLUS_MIN_GAP_MS,
+  maxQueue: GOPLUS_MAX_QUEUE,
+});
+async function goplusFetchJson(url, { priority = 0, label = '' } = {}) {
+  return goplusScheduler.enqueue(async () => {
+    stats.goplus_upstream_started += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GOPLUS_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const headers = {
+        accept: 'application/json',
+        'user-agent': 'KakaWeb3-Onchain-Shared/1038',
+      };
+      if (GOPLUS_ACCESS_TOKEN) headers.authorization = `Bearer ${GOPLUS_ACCESS_TOKEN}`;
+      const response = await fetch(url, { signal: controller.signal, headers });
+      const body = await response.text();
+      if (!response.ok) {
+        const error = new Error(`goplus_http_${response.status}:${body.slice(0, 220)}`);
+        error.statusCode = response.status;
+        throw error;
+      }
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { throw new Error('goplus_invalid_json'); }
+      if (Number(parsed?.code) !== 1 || !parsed?.result || typeof parsed.result !== 'object') {
+        throw new Error(`goplus_bad_response:${text(parsed?.message || parsed?.code || '')}`);
+      }
+      stats.goplus_upstream_succeeded += 1;
+      return parsed;
+    } catch (error) {
+      stats.goplus_upstream_failed += 1;
+      throw error;
+    } finally { clearTimeout(timer); }
+  }, { priority, label });
+}
+
+function bool01(value) {
+  if (value === true || value === 1 || value === '1') return true;
+  if (value === false || value === 0 || value === '0') return false;
+  return null;
+}
+function percentFractionToPct(value) {
+  const n = numberOrNull(value);
+  return n === null ? null : n * 100;
+}
+function normalizeHolderSupplyEntry(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    supply: numberOrNull(raw.supply),
+    supply_percent: numberOrNull(raw.supplyPercent ?? raw.supply_percent),
+  };
+}
+function normalizeHolderMetrics(raw) {
+  const supply = raw?.holderSupply || raw?.holder_supply || {};
+  const change = raw?.holderChange || raw?.holder_change || {};
+  return {
+    total_holders: numberOrNull(raw?.totalHolders ?? raw?.total_holders),
+    concentration: {
+      top10: normalizeHolderSupplyEntry(supply.top10),
+      top25: normalizeHolderSupplyEntry(supply.top25),
+      top50: normalizeHolderSupplyEntry(supply.top50),
+      top100: normalizeHolderSupplyEntry(supply.top100),
+    },
+    holder_change: {
+      h1: numberOrNull(change?.['1h']?.changePercent ?? change?.['1h']?.change_percent),
+      h6: numberOrNull(change?.['6h']?.changePercent ?? change?.['6h']?.change_percent),
+      h24: numberOrNull(change?.['24h']?.changePercent ?? change?.['24h']?.change_percent),
+      d7: numberOrNull(change?.['7d']?.changePercent ?? change?.['7d']?.change_percent),
+    },
+    holder_distribution: raw?.holderDistribution && typeof raw.holderDistribution === 'object'
+      ? raw.holderDistribution
+      : null,
+    holders_by_acquisition: raw?.holdersByAcquisition && typeof raw.holdersByAcquisition === 'object'
+      ? raw.holdersByAcquisition
+      : null,
+  };
+}
+function normalizeEvmTopHolder(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const address = text(raw.owner_address || raw.address);
+  if (!looksEvmAddress(address)) return null;
+  return {
+    address,
+    label: text(raw.owner_address_label || raw.entity || raw.tag) || null,
+    entity: text(raw.entity) || null,
+    entity_logo: text(raw.entity_logo) || null,
+    balance: numberOrNull(raw.balance_formatted ?? raw.balance),
+    usd_value: numberOrNull(raw.usd_value),
+    percent: numberOrNull(raw.percentage_relative_to_total_supply ?? raw.percent),
+    is_contract: raw.is_contract === true || raw.is_contract === '1',
+  };
+}
+function exactTopPercent(rows, count) {
+  const values = rows.slice(0, count).map((row) => numberOrNull(row?.percent)).filter((x) => x !== null);
+  return values.length === Math.min(count, rows.length) && values.length ? values.reduce((a, b) => a + b, 0) : null;
+}
+function moralisHolderMetricsUrl(network, address) {
+  if (network === 'solana') {
+    return `https://solana-gateway.moralis.io/token/mainnet/holders/${encodeURIComponent(address)}`;
+  }
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/erc20/${encodeURIComponent(address)}/holders`);
+  u.searchParams.set('chain', MORALIS_EVM_CHAIN[network]);
+  return u.toString();
+}
+function moralisTopHoldersUrl(network, address, limit = 50) {
+  if (network === 'solana') return null; // Deprecated by Moralis after 2026-07-31; do not build new dependency on it.
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/erc20/${encodeURIComponent(address)}/owners`);
+  u.searchParams.set('chain', MORALIS_EVM_CHAIN[network]);
+  u.searchParams.set('limit', String(Math.max(1, Math.min(100, limit))));
+  u.searchParams.set('order', 'DESC');
+  return u.toString();
+}
+async function buildHolderAnalysis(network, address) {
+  stats.holder_builds += 1;
+  try {
+    const metricsPayload = await moralisFetchJson(moralisHolderMetricsUrl(network, address), {
+      cu: MORALIS_HOLDER_METRICS_CU,
+      kind: 'holder',
+      priority: 8,
+      label: `holder_metrics:${network}:${address}`,
+    });
+    const metrics = normalizeHolderMetrics(metricsPayload);
+    let topHolders = [];
+    let exactTop20 = null;
+    let exactTop10 = null;
+    let exactTop50 = null;
+    const ownersUrl = moralisTopHoldersUrl(network, address, 50);
+    if (ownersUrl) {
+      try {
+        const ownersPayload = await moralisFetchJson(ownersUrl, {
+          cu: MORALIS_TOP_HOLDERS_CU,
+          kind: 'holder',
+          priority: 7,
+          label: `top_holders:${network}:${address}`,
+        });
+        topHolders = (Array.isArray(ownersPayload?.result) ? ownersPayload.result : [])
+          .map(normalizeEvmTopHolder).filter(Boolean).slice(0, 50);
+        exactTop10 = exactTopPercent(topHolders, Math.min(10, topHolders.length));
+        exactTop20 = topHolders.length >= 20 ? exactTopPercent(topHolders, 20) : null;
+        exactTop50 = topHolders.length >= 50 ? exactTopPercent(topHolders, 50) : null;
+      } catch {
+        // Holder summary remains valid if the optional top-holder list is temporarily unavailable.
+      }
+    }
+    return {
+      source: 'moralis_official_data_api_holder_analytics',
+      source_scope: network === 'solana'
+        ? 'holder_metrics_only_top_holder_list_not_used_because_moralis_endpoint_deprecated_2026_07_31'
+        : 'holder_metrics_plus_exact_top50_owner_list',
+      total_holders: metrics.total_holders,
+      concentration: {
+        top10_percent: exactTop10 ?? metrics.concentration.top10?.supply_percent ?? null,
+        top20_percent: exactTop20,
+        top25_percent: metrics.concentration.top25?.supply_percent ?? null,
+        top50_percent: exactTop50 ?? metrics.concentration.top50?.supply_percent ?? null,
+      },
+      holder_change: metrics.holder_change,
+      holder_distribution: metrics.holder_distribution,
+      holders_by_acquisition: metrics.holders_by_acquisition,
+      top_holders: topHolders,
+      exact_top20_available: exactTop20 !== null,
+      top_holder_list_available: topHolders.length > 0,
+    };
+  } catch (error) {
+    if (network === 'solana') {
+      try {
+        const securityResult = await cachedBuild(
+          `step1038:security:${network}:${lower(address)}`,
+          { freshMs: SECURITY_FRESH_MS, staleMs: SECURITY_STALE_MS, negativeMs: SECURITY_NEGATIVE_MS },
+          () => buildGoPlusSecurity(network, address),
+        );
+        const security = securityResult.value;
+        if (security) {
+          return {
+            source: 'goplus_solana_token_security_holder_fallback',
+            source_scope: 'top10_and_holder_count_only_when_deprecated_moralis_solana_holder_metrics_unavailable',
+            total_holders: numberOrNull(security.holder_count),
+            concentration: {
+              top10_percent: numberOrNull(security.top10_percent_reported),
+              top20_percent: null,
+              top25_percent: null,
+              top50_percent: null,
+            },
+            holder_change: { h1: null, h6: null, h24: null, d7: null },
+            holder_distribution: null,
+            holders_by_acquisition: null,
+            top_holders: Array.isArray(security.holders_top10) ? security.holders_top10 : [],
+            exact_top20_available: false,
+            top_holder_list_available: Array.isArray(security.holders_top10) && security.holders_top10.length > 0,
+          };
+        }
+      } catch {
+        // Preserve original Moralis error below if both exact sources are unavailable.
+      }
+    }
+    stats.holder_build_failures += 1;
+    throw error;
+  }
+}
+
+function resultByExactAddress(network, result, address) {
+  if (!result || typeof result !== 'object') return null;
+  for (const [key, value] of Object.entries(result)) {
+    if (exactAddressEqual(network, key, address)) return value && typeof value === 'object' ? value : null;
+  }
+  return null;
+}
+function normalizeGoPlusHolder(raw, network) {
+  if (!raw || typeof raw !== 'object') return null;
+  const address = text(raw.address || raw.token_account);
+  if (!validAddressForNetwork(network, address)) return null;
+  return {
+    address,
+    tag: text(raw.tag) || null,
+    balance: numberOrNull(raw.balance),
+    percent: percentFractionToPct(raw.percent),
+    is_locked: bool01(raw.is_locked ?? raw.locked),
+    is_contract: bool01(raw.is_contract),
+    locked_detail: Array.isArray(raw.locked_detail) ? raw.locked_detail.slice(0, 8) : [],
+  };
+}
+function normalizedPercentSum(rows) {
+  const vals = rows.map((row) => numberOrNull(row?.percent)).filter((x) => x !== null);
+  return vals.length ? vals.reduce((a, b) => a + b, 0) : null;
+}
+function normalizeGoPlusEvm(raw, network, address) {
+  const holders = (Array.isArray(raw?.holders) ? raw.holders : []).map((x) => normalizeGoPlusHolder(x, network)).filter(Boolean).slice(0, 10);
+  const lpHolders = (Array.isArray(raw?.lp_holders) ? raw.lp_holders : []).map((x) => normalizeGoPlusHolder(x, network)).filter(Boolean).slice(0, 10);
+  const lockedLpPct = normalizedPercentSum(lpHolders.filter((x) => x.is_locked === true));
+  return {
+    network, address,
+    token_name: text(raw?.token_name) || null,
+    token_symbol: text(raw?.token_symbol) || null,
+    holder_count: numberOrNull(raw?.holder_count),
+    total_supply: numberOrNull(raw?.total_supply),
+    holders_top10: holders,
+    top10_percent_reported: normalizedPercentSum(holders),
+    creator: {
+      address: text(raw?.creator_address) || null,
+      balance: numberOrNull(raw?.creator_balance),
+      percent: percentFractionToPct(raw?.creator_percent),
+    },
+    owner: {
+      address: text(raw?.owner_address) || null,
+      balance: numberOrNull(raw?.owner_balance),
+      percent: percentFractionToPct(raw?.owner_percent),
+    },
+    lp: {
+      holder_count: numberOrNull(raw?.lp_holder_count),
+      total_supply: numberOrNull(raw?.lp_total_supply),
+      holders_top10: lpHolders,
+      top10_percent_reported: normalizedPercentSum(lpHolders),
+      locked_percent_reported: lockedLpPct,
+    },
+    contract_facts: {
+      is_open_source: bool01(raw?.is_open_source),
+      is_proxy: bool01(raw?.is_proxy),
+      is_mintable: bool01(raw?.is_mintable),
+      hidden_owner: bool01(raw?.hidden_owner),
+      can_take_back_ownership: bool01(raw?.can_take_back_ownership),
+      owner_change_balance: bool01(raw?.owner_change_balance),
+      selfdestruct: bool01(raw?.selfdestruct),
+      external_call: bool01(raw?.external_call),
+    },
+    trading_facts: {
+      is_honeypot: bool01(raw?.is_honeypot),
+      cannot_buy: bool01(raw?.cannot_buy),
+      cannot_sell_all: bool01(raw?.cannot_sell_all),
+      is_blacklisted: bool01(raw?.is_blacklisted),
+      is_whitelisted: bool01(raw?.is_whitelisted),
+      transfer_pausable: bool01(raw?.transfer_pausable),
+      trading_cooldown: bool01(raw?.trading_cooldown),
+      slippage_modifiable: bool01(raw?.slippage_modifiable),
+      is_anti_whale: bool01(raw?.is_anti_whale),
+      anti_whale_modifiable: bool01(raw?.anti_whale_modifiable),
+      buy_tax_percent: percentFractionToPct(raw?.buy_tax),
+      sell_tax_percent: percentFractionToPct(raw?.sell_tax),
+      transfer_tax_percent: percentFractionToPct(raw?.transfer_tax),
+      is_in_dex: bool01(raw?.is_in_dex),
+    },
+    trust_facts: {
+      trust_list: bool01(raw?.trust_list),
+      is_airdrop_scam: bool01(raw?.is_airdrop_scam),
+      other_potential_risks: text(raw?.other_potential_risks) || null,
+      note: text(raw?.note) || null,
+    },
+  };
+}
+function solanaAuthority(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'object') {
+    return text(raw.address || raw.authority || raw.value || raw.owner) || null;
+  }
+  return text(raw) || null;
+}
+function normalizeGoPlusSolana(raw, network, address) {
+  const holders = (Array.isArray(raw?.holders) ? raw.holders : []).map((x) => normalizeGoPlusHolder(x, network)).filter(Boolean).slice(0, 10);
+  const creators = (Array.isArray(raw?.creator) ? raw.creator : []).map((x) => ({
+    address: text(x?.address) || null,
+    malicious_address: bool01(x?.malicious_address),
+  })).filter((x) => x.address);
+  const dexRows = (Array.isArray(raw?.dex) ? raw.dex : Array.isArray(raw?.dex_info) ? raw.dex_info : []).slice(0, 12);
+  const lpHolders = [];
+  for (const dex of dexRows) {
+    for (const h of (Array.isArray(dex?.lp_holders) ? dex.lp_holders : [])) {
+      const row = normalizeGoPlusHolder(h, network);
+      if (row && !lpHolders.some((x) => exactAddressEqual(network, x.address, row.address))) lpHolders.push(row);
+      if (lpHolders.length >= 10) break;
+    }
+    if (lpHolders.length >= 10) break;
+  }
+  const metadataMutable = raw?.metadata_mutable;
+  const mintable = raw?.mintable;
+  const transferHook = raw?.transfer_hook;
+  return {
+    network, address,
+    token_name: text(raw?.metadata?.name) || null,
+    token_symbol: text(raw?.metadata?.symbol) || null,
+    holder_count: numberOrNull(raw?.holder_count),
+    total_supply: numberOrNull(raw?.total_supply),
+    holders_top10: holders,
+    top10_percent_reported: normalizedPercentSum(holders),
+    creators,
+    lp: {
+      holders_top10: lpHolders,
+      top10_percent_reported: normalizedPercentSum(lpHolders),
+      locked_percent_reported: normalizedPercentSum(lpHolders.filter((x) => x.is_locked === true)),
+      dex_pool_count: dexRows.length,
+      tvl_usd: dexRows.reduce((sum, d) => sum + (numberOrNull(d?.tvl) || 0), 0) || null,
+    },
+    solana_facts: {
+      default_account_state: numberOrNull(raw?.default_account_state),
+      non_transferable: bool01(raw?.non_transferable),
+      trusted_token: bool01(raw?.trusted_token),
+      mintable: typeof mintable === 'object' ? bool01(mintable?.status ?? mintable?.value ?? mintable?.is_mintable) : bool01(mintable),
+      mint_authority: solanaAuthority(typeof mintable === 'object' ? mintable : raw?.mint_authority),
+      metadata_mutable: typeof metadataMutable === 'object' ? bool01(metadataMutable?.status ?? metadataMutable?.value ?? metadataMutable?.is_mutable) : bool01(metadataMutable),
+      metadata_upgrade_authority: solanaAuthority(typeof metadataMutable === 'object' ? metadataMutable : raw?.metadata_upgrade_authority),
+      transfer_hook_address: solanaAuthority(transferHook),
+      transfer_hook_malicious: typeof transferHook === 'object' ? bool01(transferHook?.malicious_address) : null,
+      transfer_hook_upgradable: bool01(raw?.transfer_hook_upgradable),
+      transfer_fee: raw?.transfer_fee && typeof raw.transfer_fee === 'object' ? raw.transfer_fee : null,
+    },
+  };
+}
+function goplusSecurityUrl(network, address) {
+  if (network === 'solana') {
+    const u = new URL('https://api.gopluslabs.io/api/v1/solana/token_security');
+    u.searchParams.set('contract_addresses', address);
+    return u.toString();
+  }
+  const chainId = EVM_GOPLUS_CHAIN_ID[network];
+  const u = new URL(`https://api.gopluslabs.io/api/v1/token_security/${chainId}`);
+  u.searchParams.set('contract_addresses', address);
+  return u.toString();
+}
+async function buildGoPlusSecurity(network, address) {
+  stats.security_builds += 1;
+  try {
+    const payload = await goplusFetchJson(goplusSecurityUrl(network, address), {
+      priority: 10,
+      label: `token_security:${network}:${address}`,
+    });
+    const raw = resultByExactAddress(network, payload.result, address);
+    if (!raw) throw new Error('goplus_exact_token_not_found');
+    return network === 'solana'
+      ? normalizeGoPlusSolana(raw, network, address)
+      : normalizeGoPlusEvm(raw, network, address);
+  } catch (error) {
+    stats.security_build_failures += 1;
+    throw error;
+  }
 }
 
 function exactAddressEqual(network, a, b) {
@@ -1389,7 +1795,7 @@ function healthPayload() {
         docs_solana_ohlcv: 'https://docs.moralis.com/data-api/solana/price/ohlc',
         docs_pricing: 'https://docs.moralis.com/data-api/pricing',
         terms: 'https://moralis.com/terms/',
-        role: 'exact_pool_ohlcv_history_plus_recent_pair_swaps',
+        role: 'exact_pool_ohlcv_history_plus_recent_pair_swaps_plus_holder_analytics',
         api_key_configured: Boolean(MORALIS_API_KEY),
         api_key_exposed: false,
         backend_only_secret: true,
@@ -1398,9 +1804,43 @@ function healthPayload() {
         duplicate_case_variant_headers: false,
         pair_candlestick_cu: MORALIS_KLINE_CU,
         pair_swap_cu: MORALIS_TRADES_CU,
+        holder_metrics_cu: MORALIS_HOLDER_METRICS_CU,
+        evm_top_holders_cu: MORALIS_TOP_HOLDERS_CU,
         scheduler: moralisScheduler.state(),
         budget: moralisBudgetState(),
       },
+      goplus: {
+        docs_evm_security: 'https://docs.gopluslabs.io/reference/tokensecurityusingget_1',
+        docs_solana_security: 'https://docs.gopluslabs.io/reference/solanatokensecurityusingget',
+        docs_response_evm: 'https://docs.gopluslabs.io/reference/response-details',
+        docs_response_solana: 'https://docs.gopluslabs.io/reference/response-detail-1',
+        role: 'token_contract_security_creator_owner_lp_and_reported_holder_facts',
+        access_token_configured: Boolean(GOPLUS_ACCESS_TOKEN),
+        access_token_exposed: false,
+        backend_global_min_gap_ms: GOPLUS_MIN_GAP_MS,
+        backend_global_max_starts_per_minute: Math.floor(60_000 / GOPLUS_MIN_GAP_MS),
+        scheduler: goplusScheduler.state(),
+      },
+    },
+    step1038_holder_security: {
+      opened: true,
+      feature_schema_version: STEP1038_FEATURE_SCHEMA_VERSION,
+      holders_route: HOLDERS_ROUTE,
+      security_route: SECURITY_ROUTE,
+      supported_networks: Object.keys(NETWORKS),
+      exact_chain_token_identity_required: true,
+      cross_chain_substitution: false,
+      cross_token_substitution: false,
+      holder_cache_fresh_ms: HOLDER_FRESH_MS,
+      holder_cache_stale_ms: HOLDER_STALE_MS,
+      security_cache_fresh_ms: SECURITY_FRESH_MS,
+      security_cache_stale_ms: SECURITY_STALE_MS,
+      evm_exact_top20_from_owner_list: true,
+      solana_top20_not_fabricated: true,
+      solana_moralis_top_holder_endpoint_not_used_because_deprecated_after_2026_07_31: true,
+      no_composite_security_score_generated: true,
+      creator_owner_labels_are_source_facts_not_dev_inference: true,
+      user_reads_direct_upstream_requests: 0,
     },
     current_market_refresh: {
       ready: trendingSnapshot.length > 0 && (marketAgeMs === null || marketAgeMs <= MARKET_RETAIN_MS),
@@ -1501,9 +1941,11 @@ function healthPayload() {
       trade_inflight: tradeInflight.size,
       identity_proof_entries: identityProofCache.size,
       identity_proof_max_entries: IDENTITY_PROOF_MAX_ENTRIES,
+      step1038_shared_generic_cache_entries: cache.size,
     },
     scheduler: dexScheduler.state(),
     moralis_scheduler: moralisScheduler.state(),
+    goplus_scheduler: goplusScheduler.state(),
     moralis_budget: moralisBudgetState(),
     stats: { ...stats },
     memory_usage: { rss_mb: Math.round(process.memoryUsage().rss / 1048576), heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576) },
@@ -1569,6 +2011,13 @@ function runSelfTest() {
   t('ecb_fx_cross_rate_math', Math.abs(fxSynthetic.usd_to.CNY - (7.8197 / 1.1605)) < 1e-9 && Math.abs(fxSynthetic.usd_to.EUR - (1 / 1.1605)) < 1e-9);
   t('market_refresh_fixed_background', MARKET_REFRESH_MS >= 30_000 && MARKET_REFRESH_MS < DISCOVERY_REFRESH_MS);
   t('fx_user_reads_do_not_start_upstream', healthPayload().fx_reference.user_reads_start_upstream === false);
+  const holderSynthetic = normalizeHolderMetrics({ totalHolders: 1000, holderSupply: { top10: { supply: '100', supplyPercent: 10 }, top25: { supply: '200', supplyPercent: 20 }, top50: { supply: '300', supplyPercent: 30 } } });
+  t('step1038_holder_metrics_parser', holderSynthetic.total_holders === 1000 && holderSynthetic.concentration.top10.supply_percent === 10 && holderSynthetic.concentration.top50.supply_percent === 30);
+  const gpSynthetic = normalizeGoPlusEvm({ token_name: 'T', token_symbol: 'T', is_honeypot: '0', is_open_source: '1', creator_address: '0x0000000000000000000000000000000000000001', creator_percent: '0.025', holders: [{ address: '0x0000000000000000000000000000000000000002', percent: '0.1', balance: '10', is_locked: '0' }] }, 'ethereum', '0x0000000000000000000000000000000000000003');
+  t('step1038_goplus_evm_parser', gpSynthetic.contract_facts.is_open_source === true && gpSynthetic.trading_facts.is_honeypot === false && Math.abs(gpSynthetic.creator.percent - 2.5) < 1e-9 && Math.abs(gpSynthetic.top10_percent_reported - 10) < 1e-9);
+  t('step1038_goplus_rate_below_30_per_min', 60_000 / GOPLUS_MIN_GAP_MS < 30);
+  t('step1038_no_composite_security_score', healthPayload().step1038_holder_security.no_composite_security_score_generated === true);
+  t('step1038_solana_top20_fail_closed', healthPayload().step1038_holder_security.solana_top20_not_fabricated === true);
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
@@ -1577,7 +2026,7 @@ function runSelfTest() {
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -1594,6 +2043,74 @@ export async function handleOnchainMarket(req, res, url) {
 
   const network = normalizeNetwork(url.searchParams.get('network'));
   const limit = intRange(url.searchParams.get('limit'), 1, MAX_RESPONSE_ROWS, 50);
+
+  if (path === HOLDERS_ROUTE || path === SECURITY_ROUTE) {
+    if (!network || network === 'all') {
+      sendJson(res, 400, responseBase({ ok: false, error: 'exact_network_required', feature_schema_version: STEP1038_FEATURE_SCHEMA_VERSION }));
+      return true;
+    }
+    const address = text(url.searchParams.get('address') || url.searchParams.get('token_address'));
+    if (!validAddressForNetwork(network, address)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'invalid_contract_address', network, feature_schema_version: STEP1038_FEATURE_SCHEMA_VERSION }));
+      return true;
+    }
+    try {
+      if (path === HOLDERS_ROUTE) {
+        const key = `step1038:holders:${network}:${lower(address)}`;
+        const result = await cachedBuild(key, { freshMs: HOLDER_FRESH_MS, staleMs: HOLDER_STALE_MS, negativeMs: HOLDER_NEGATIVE_MS }, () => buildHolderAnalysis(network, address));
+        const value = result.value;
+        if (!value) throw new Error('holder_analysis_not_ready');
+        sendJson(res, 200, responseBase({
+          feature_schema_version: STEP1038_FEATURE_SCHEMA_VERSION,
+          network,
+          address,
+          source: value.source,
+          source_scope: value.source_scope,
+          total_holders: value.total_holders,
+          concentration: value.concentration,
+          holder_change: value.holder_change,
+          holder_distribution: value.holder_distribution,
+          holders_by_acquisition: value.holders_by_acquisition,
+          top_holders: value.top_holders,
+          top_holder_list_available: value.top_holder_list_available,
+          exact_top20_available: value.exact_top20_available,
+          cache_status: result.cache_status,
+          user_read_direct_moralis_requests: 0,
+          moralis_cu_if_full_evm_upstream_build: MORALIS_HOLDER_METRICS_CU + MORALIS_TOP_HOLDERS_CU,
+          moralis_cu_if_solana_metrics_build: MORALIS_HOLDER_METRICS_CU,
+          no_deprecated_solana_top_holder_call: true,
+        }));
+        return true;
+      }
+      const key = `step1038:security:${network}:${lower(address)}`;
+      const result = await cachedBuild(key, { freshMs: SECURITY_FRESH_MS, staleMs: SECURITY_STALE_MS, negativeMs: SECURITY_NEGATIVE_MS }, () => buildGoPlusSecurity(network, address));
+      const value = result.value;
+      if (!value) throw new Error('security_analysis_not_ready');
+      sendJson(res, 200, responseBase({
+        feature_schema_version: STEP1038_FEATURE_SCHEMA_VERSION,
+        network,
+        address,
+        source: network === 'solana' ? 'goplus_solana_token_security_beta' : 'goplus_token_security',
+        security: value,
+        cache_status: result.cache_status,
+        no_composite_security_score: true,
+        source_facts_only: true,
+        creator_owner_are_direct_source_fields_not_dev_inference: true,
+        user_read_direct_goplus_requests: 0,
+      }));
+      return true;
+    } catch (error) {
+      sendJson(res, 503, responseBase({
+        ok: false,
+        feature_schema_version: STEP1038_FEATURE_SCHEMA_VERSION,
+        error: text(error?.message || error),
+        network,
+        address,
+        no_cross_chain_or_token_fallback: true,
+      }));
+      return true;
+    }
+  }
 
   if (path === TRENDING_ROUTE) {
     if (!network) { sendJson(res, 400, responseBase({ ok: false, error: 'invalid_network' })); return true; }
