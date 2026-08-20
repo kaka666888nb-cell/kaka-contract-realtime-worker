@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.193.3",
+  "version": "650.8.15.194",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Render 650.8.15.193.3 / Step1038.2.2 Solana Helius DAS exact-mint holder index + Step1038 security shared layer"
+  "description": "Kaka Web3 Step1039 onchain wallet intelligence: early buyers, large holders, wallet Quickview, EVM realized PnL/win-rate semantics and transparent Smart Money candidates"
 }
