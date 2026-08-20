@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196.1';
-const DATA_VERSION = 1041001;
+const VERSION = '650.8.15.196.3';
+const DATA_VERSION = 1041003;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
@@ -33,6 +33,30 @@ const RELATIONS_ROUTE = '/api/onchain/relations';
 const OVERVIEW_ROUTE = '/api/onchain/overview';
 
 const DEX_BASE = 'https://api.dexscreener.com';
+// Step1041.4 objective hot discovery. GeckoTerminal trending-pool feeds are used only by the
+// fixed 5-minute backend discovery cycle; App reads never call GeckoTerminal directly.
+// Paid DEX Screener boosts/ads/CTO remain supplemental identity discovery only and never
+// participate in the hot rank score.
+const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
+const GECKO_MIN_GAP_MS = Math.max(6_200, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 6_500));
+const GECKO_MAX_QUEUE = Math.max(6, Math.min(32, Number(process.env.KAKA_GECKO_MAX_QUEUE || 20)));
+const GECKO_TIMEOUT_MS = Math.max(6_000, Math.min(25_000, Number(process.env.KAKA_GECKO_TIMEOUT_MS || 15_000)));
+const GECKO_NETWORK = Object.freeze({ ethereum: 'eth', bsc: 'bsc', base: 'base', solana: 'solana' });
+// Step1041.5: Kaka's public "热门" order follows Binance Wallet's official Trending board
+// while the app is young and has insufficient first-party search/view traffic to build a mature
+// proprietary ranking. Binance rank only determines order; Kaka still re-verifies exact
+// chain+contract identity and chooses the highest-liquidity exact pool for market/K-line data.
+// If the Binance feed is temporarily unavailable or yields fewer than 50 verifiable identities,
+// objective Gecko/DEX discovery may append fallback rows after all Binance-ranked rows.
+const HOT_RULE_VERSION = 'kaka_step1041_5_binance_wallet_trending_order_primary_exact_market_verified_v1';
+const HOT_DISCOVERY_RULE_VERSION = 'kaka_step1041_5_binance_wallet_trending_1h_plus_objective_fallback_v1';
+const BINANCE_WALLET_TRENDING_URL = 'https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/unified/rank/list/ai';
+const BINANCE_WALLET_TRENDING_PERIOD = 30; // official token-rank period code: 30 = 1h
+const BINANCE_WALLET_TRENDING_SIZE = 200; // official endpoint max; gives room after chain/identity verification
+const BINANCE_WALLET_TIMEOUT_MS = 12_000;
+const BINANCE_WALLET_MIN_GAP_MS = Math.max(1_200, Number(process.env.KAKA_BINANCE_WALLET_MIN_GAP_MS || 1_500));
+const BINANCE_ALPHA_LIST_URL = 'https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list';
+const BINANCE_ALPHA_REFRESH_MS = 10 * 60_000;
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
 // One global 1.2s lane caps the whole on-chain module at <=50 upstream starts/min regardless of users.
 const DEX_MIN_GAP_MS = 1_200;
@@ -48,7 +72,7 @@ const ECB_FX_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xm
 const DISCOVERY_RETAIN_MS = 30 * 60_000;
 const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 90;
 const DEX_TOKEN_BATCH_MAX = 30;
-const STEP1041_CANDIDATE_FEED_COUNT = 5;
+const STEP1041_CANDIDATE_FEED_COUNT = 8;
 const CACHE_MAX_ENTRIES = 512;
 const NEGATIVE_CACHE_MAX_ENTRIES = 256;
 const MAX_RESPONSE_ROWS = 100;
@@ -210,6 +234,20 @@ const stats = {
   dex_upstream_started: 0,
   dex_upstream_succeeded: 0,
   dex_upstream_failed: 0,
+  gecko_upstream_started: 0,
+  gecko_upstream_succeeded: 0,
+  gecko_upstream_failed: 0,
+  gecko_discovery_cycles: 0,
+  gecko_discovery_candidates: 0,
+  binance_wallet_rank_started: 0,
+  binance_wallet_rank_succeeded: 0,
+  binance_wallet_rank_failed: 0,
+  binance_wallet_rank_rows: 0,
+  binance_wallet_rank_last_success_at: null,
+  binance_wallet_rank_last_error: '',
+  binance_alpha_refresh_started: 0,
+  binance_alpha_refresh_succeeded: 0,
+  binance_alpha_refresh_failed: 0,
   cache_fresh_hits: 0,
   cache_stale_hits: 0,
   cache_misses: 0,
@@ -409,6 +447,199 @@ async function dexFetchJson(url, { priority = 0, label = '' } = {}) {
       throw error;
     } finally { clearTimeout(timer); }
   }, { priority, label });
+}
+
+
+const geckoScheduler = createScheduler({ name: 'geckoterminal', minGapMs: GECKO_MIN_GAP_MS, maxQueue: GECKO_MAX_QUEUE });
+async function geckoFetchJson(url, { priority = 0, label = '' } = {}) {
+  return geckoScheduler.enqueue(async () => {
+    stats.gecko_upstream_started += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GECKO_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: { accept: 'application/json', 'user-agent': 'KakaWeb3-Onchain-Shared/1041.5' },
+      });
+      const body = await response.text();
+      if (!response.ok) throw new Error(`geckoterminal_http_${response.status}:${body.slice(0, 220)}`);
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { throw new Error('geckoterminal_invalid_json'); }
+      stats.gecko_upstream_succeeded += 1;
+      return parsed;
+    } catch (error) {
+      stats.gecko_upstream_failed += 1;
+      throw error;
+    } finally { clearTimeout(timer); }
+  }, { priority, label });
+}
+
+let binanceWalletLastCycleSucceeded = false;
+const binanceWalletScheduler = createScheduler({ name: 'binance-wallet-public-rank', minGapMs: BINANCE_WALLET_MIN_GAP_MS, maxQueue: 8 });
+function binanceWalletTrendingRowsFromPayload(payload) {
+  const rows = payload?.data?.tokens;
+  return Array.isArray(rows) ? rows : [];
+}
+async function fetchBinanceWalletTrendingCandidates() {
+  stats.binance_wallet_rank_started += 1;
+  try {
+    const payload = await binanceWalletScheduler.enqueue(async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), BINANCE_WALLET_TIMEOUT_MS);
+      timer.unref?.();
+      try {
+        // Mirrors Binance's public crypto-market-rank/token-rank Trending defaults.
+        // rankType=10 is Trending; period=30 is 1h; sortBy=0 preserves the board's default order.
+        const body = {
+          rankType: 10,
+          period: BINANCE_WALLET_TRENDING_PERIOD,
+          sortBy: 0,
+          orderAsc: false,
+          page: 1,
+          size: BINANCE_WALLET_TRENDING_SIZE,
+          countMin: 10,
+          launchTimeMin: 15,
+          liquidityMin: 5000,
+          uniqueTraderMin: 10,
+          volumeMin: 10000,
+          tagFilter: [1, 2, 3],
+        };
+        const response = await fetch(BINANCE_WALLET_TRENDING_URL, {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json',
+            'accept-encoding': 'identity',
+            'user-agent': 'KakaWeb3-Onchain-Shared/1041.5',
+          },
+          body: JSON.stringify(body),
+        });
+        const raw = await response.text();
+        if (!response.ok) throw new Error(`binance_wallet_trending_http_${response.status}:${raw.slice(0, 220)}`);
+        let decoded;
+        try { decoded = JSON.parse(raw); } catch { throw new Error('binance_wallet_trending_invalid_json'); }
+        const code = text(decoded?.code);
+        if (code && code !== '000000') throw new Error(`binance_wallet_trending_code_${code}:${text(decoded?.message || decoded?.msg).slice(0, 160)}`);
+        return decoded;
+      } finally { clearTimeout(timer); }
+    }, { priority: -50, label: 'background_binance_wallet_trending_1h' });
+
+    const rows = binanceWalletTrendingRowsFromPayload(payload);
+    const candidates = [];
+    const seen = new Set();
+    for (let index = 0; index < rows.length; index += 1) {
+      const item = rows[index];
+      const network = alphaNetworkFromChainId(item?.chainId ?? item?.chain_id);
+      const address = text(item?.contractAddress ?? item?.contract_address ?? item?.address);
+      if (!network || !validAddressForNetwork(network, address)) continue;
+      const key = `${network}|${lower(address)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({
+        network,
+        address,
+        source: 'binance_wallet_public_trending_1h',
+        token_profile: null,
+        amount: 0,
+        total_amount: 0,
+        binance_wallet_rank: index + 1,
+        binance_wallet_rank_period: '1h',
+        binance_wallet_rank_period_code: BINANCE_WALLET_TRENDING_PERIOD,
+        binance_wallet_rank_type: 10,
+        binance_wallet_symbol: text(item?.symbol),
+        binance_wallet_icon: text(item?.icon),
+        binance_wallet_price_usd: numberOrNull(item?.price),
+        binance_wallet_market_cap_usd: numberOrNull(item?.marketCap),
+        binance_wallet_liquidity_usd: numberOrNull(item?.liquidity),
+        binance_wallet_holders: numberOrNull(item?.holders),
+        binance_wallet_alpha_info: item?.alphaInfo && typeof item.alphaInfo === 'object' ? item.alphaInfo : null,
+      });
+    }
+    binanceWalletLastCycleSucceeded = candidates.length > 0;
+    stats.binance_wallet_rank_succeeded += 1;
+    stats.binance_wallet_rank_rows = candidates.length;
+    stats.binance_wallet_rank_last_success_at = new Date().toISOString();
+    stats.binance_wallet_rank_last_error = '';
+    return { candidates, succeeded: true, upstream_rows: rows.length };
+  } catch (error) {
+    binanceWalletLastCycleSucceeded = false;
+    stats.binance_wallet_rank_failed += 1;
+    stats.binance_wallet_rank_last_error = text(error?.message || error).slice(0, 400);
+    return { candidates: [], succeeded: false, upstream_rows: 0 };
+  }
+}
+
+let binanceAlphaRegistry = new Map();
+let binanceAlphaUpdatedAt = 0;
+function alphaNetworkFromChainId(raw) {
+  const key = String(raw ?? '').trim().toLowerCase();
+  if (key === '56' || key === 'bsc') return 'bsc';
+  if (key === '1' || key === 'eth' || key === 'ethereum') return 'ethereum';
+  if (key === '8453' || key === 'base') return 'base';
+  if (key === '501' || key === 'solana' || key.includes('501')) return 'solana';
+  return '';
+}
+function alphaRowsFromPayload(payload) {
+  const data = payload?.data;
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.list)) return data.list;
+  if (Array.isArray(data?.tokens)) return data.tokens;
+  if (Array.isArray(payload?.list)) return payload.list;
+  return [];
+}
+async function refreshBinanceAlphaRegistry({ force = false } = {}) {
+  if (!force && binanceAlphaUpdatedAt && Date.now() - binanceAlphaUpdatedAt < BINANCE_ALPHA_REFRESH_MS) return binanceAlphaRegistry.size;
+  stats.binance_alpha_refresh_started += 1;
+  try {
+    const raw = await geckoScheduler.enqueue(async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), GECKO_TIMEOUT_MS);
+      timer.unref?.();
+      try {
+        const response = await fetch(BINANCE_ALPHA_LIST_URL, {
+          signal: controller.signal,
+          headers: { accept: 'application/json', 'user-agent': 'KakaWeb3-Onchain-Shared/1041.5' },
+        });
+        const body = await response.text();
+        if (!response.ok) throw new Error(`binance_alpha_http_${response.status}:${body.slice(0, 180)}`);
+        return JSON.parse(body);
+      } finally { clearTimeout(timer); }
+    }, { priority: -40, label: 'binance_alpha_registry' });
+    const next = new Map();
+    for (const item of alphaRowsFromPayload(raw)) {
+      const network = alphaNetworkFromChainId(item?.chainId ?? item?.chain_id);
+      const address = text(item?.contractAddress ?? item?.contract_address ?? item?.address);
+      if (!network || !validAddressForNetwork(network, address)) continue;
+      next.set(`${network}|${lower(address)}`, {
+        key: 'binance_alpha', label: 'α', title_zh: '币安 Alpha', title_en: 'Binance Alpha',
+        type: 'platform', source: 'binance_official_alpha_token_list', confidence: 'fact',
+      });
+    }
+    if (next.size > 0) binanceAlphaRegistry = next;
+    binanceAlphaUpdatedAt = Date.now();
+    stats.binance_alpha_refresh_succeeded += 1;
+    return binanceAlphaRegistry.size;
+  } catch (error) {
+    stats.binance_alpha_refresh_failed += 1;
+    if (!binanceAlphaUpdatedAt) binanceAlphaUpdatedAt = Date.now();
+    return binanceAlphaRegistry.size;
+  }
+}
+function productBadgesForToken(pair, token) {
+  const badges = [];
+  const identity = `${pair?.network || ''}|${lower(token?.address)}`;
+  const alpha = binanceAlphaRegistry.get(identity);
+  if (alpha) badges.push({ ...alpha });
+  const dexId = lower(pair?.dex_id);
+  if (dexId.includes('pump')) {
+    badges.push({ key: 'pump_ecosystem', label: 'P', title_zh: 'Pump 生态', title_en: 'Pump ecosystem', type: 'launchpad', source: 'exact_pool_dex_id', confidence: 'fact' });
+  }
+  if (dexId.includes('four') && dexId.includes('meme')) {
+    badges.push({ key: 'four_meme', label: '4', title_zh: 'Four.meme', title_en: 'Four.meme', type: 'launchpad', source: 'exact_pool_dex_id', confidence: 'fact' });
+  }
+  return badges.slice(0, 3);
 }
 
 
@@ -2385,6 +2616,89 @@ async function buildMoralisKlines(network, tokenAddress, pool, interval, limit, 
   };
 }
 
+
+function geckoKlineSpec(interval) {
+  switch (interval) {
+    case '1m': return { timeframe: 'minute', aggregate: 1 };
+    case '5m': return { timeframe: 'minute', aggregate: 5 };
+    case '15m': return { timeframe: 'minute', aggregate: 15 };
+    case '30m': return { timeframe: 'minute', aggregate: 30 };
+    case '1h': return { timeframe: 'hour', aggregate: 1 };
+    case '4h': return { timeframe: 'hour', aggregate: 4 };
+    case '1d': return { timeframe: 'day', aggregate: 1 };
+    default: return null;
+  }
+}
+function normalizeGeckoCandle(raw) {
+  if (!Array.isArray(raw) || raw.length < 6) return null;
+  const ts = Number(raw[0]);
+  const open = Number(raw[1]);
+  const high = Number(raw[2]);
+  const low = Number(raw[3]);
+  const close = Number(raw[4]);
+  const volume = Number(raw[5]);
+  if (!Number.isFinite(ts) || ![open, high, low, close].every((x) => Number.isFinite(x) && x > 0)) return null;
+  return {
+    open_time_ms: Math.round(ts * 1000), open, high, low, close,
+    volume: Number.isFinite(volume) && volume >= 0 ? volume : 0,
+    quote_volume: Number.isFinite(volume) && volume >= 0 ? volume : 0,
+    trades: null,
+  };
+}
+async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs) {
+  const gtNetwork = GECKO_NETWORK[network];
+  const spec = geckoKlineSpec(interval);
+  if (!gtNetwork || !spec) throw new Error('geckoterminal_interval_not_supported');
+  const orientation = tokenOrientationInPair(pool, tokenAddress);
+  if (!orientation) throw new Error('geckoterminal_token_not_in_exact_pool');
+  const poolAddress = text(pool.pool_address);
+  const u = new URL(`${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/pools/${encodeURIComponent(poolAddress)}/ohlcv/${spec.timeframe}`);
+  u.searchParams.set('aggregate', String(spec.aggregate));
+  u.searchParams.set('limit', String(Math.min(1000, Math.max(1, limit))));
+  u.searchParams.set('currency', 'usd');
+  u.searchParams.set('token', orientation);
+  if (endTimeMs) u.searchParams.set('before_timestamp', String(Math.floor(Number(endTimeMs) / 1000)));
+  const payload = await geckoFetchJson(u.toString(), { priority: endTimeMs ? 4 : 18, label: `kline_fallback:${network}:${poolAddress}:${interval}` });
+  const id = text(payload?.data?.id);
+  if (id) {
+    const returnedPool = id.includes('_') ? id.slice(id.indexOf('_') + 1) : id;
+    if (!exactAddressEqual(network, returnedPool, poolAddress)) throw new Error('geckoterminal_pool_identity_mismatch');
+  }
+  const list = Array.isArray(payload?.data?.attributes?.ohlcv_list) ? payload.data.attributes.ohlcv_list : [];
+  const rows = list.map(normalizeGeckoCandle).filter(Boolean).sort((a, b) => a.open_time_ms - b.open_time_ms).slice(-limit);
+  if (!rows.length) throw new Error('geckoterminal_exact_pool_ohlcv_empty');
+  setIdentityProof(network, tokenAddress, poolAddress, 'geckoterminal_exact_pool_token_orientation', { token_orientation: orientation });
+  return {
+    rows,
+    source_token_address: tokenAddress,
+    source_pair_address: poolAddress,
+    source_timeframe: `${spec.timeframe}:${spec.aggregate}`,
+    derived_15m_from_5m: false,
+    identity_proof: 'geckoterminal_exact_pool_token_orientation',
+    source: 'geckoterminal_keyless_public_exact_pool_ohlcv_fallback',
+    fallback_from: 'moralis_pair_ohlcv_unavailable_or_empty',
+  };
+}
+async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, limit, endTimeMs) {
+  let moralisError = '';
+  try {
+    const primary = await buildMoralisKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
+    if (Array.isArray(primary?.rows) && primary.rows.length > 0) {
+      return { ...primary, source: 'moralis_official_data_api_pair_ohlcv', fallback_used: false };
+    }
+    moralisError = 'moralis_exact_pool_ohlcv_empty';
+  } catch (error) {
+    moralisError = text(error?.message || error).slice(0, 240);
+  }
+  try {
+    return { ...(await buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs)), fallback_used: true, primary_error: moralisError };
+  } catch (fallbackError) {
+    const error = new Error(`exact_pool_kline_unavailable:primary=${moralisError};fallback=${text(fallbackError?.message || fallbackError).slice(0, 220)}`);
+    error.statusCode = 503;
+    throw error;
+  }
+}
+
 function moralisPairTokenMeta(raw, amount, usdPrice) {
   if (!raw || typeof raw !== 'object') return null;
   const amountN = numberOrNull(amount);
@@ -2568,7 +2882,7 @@ function recentCandidatePools(network, limit) {
       discovery_mode: 'new_pool_observation',
       pool_age_ms: ageMs,
       pool_created_at: pool.pool_created_at,
-      discovery_scope: 'newest_pool_among_current_profile_boost_candidate_tokens_not_token_contract_creation_and_not_exhaustive_chain_scan',
+      discovery_scope: 'newest_pool_among_current_objective_and_supplemental_candidate_tokens_not_token_contract_creation_and_not_exhaustive_chain_scan',
     });
   }
   rows.sort((a, b) => Date.parse(b.pool_created_at || 0) - Date.parse(a.pool_created_at || 0));
@@ -2749,14 +3063,39 @@ function tokenAddressInPair(row, tokenAddress) {
   if (lower(row?.quote_token?.address) === a) return row.quote_token;
   return null;
 }
-function poolScore(row) {
-  const liq = Math.log10(Math.max(1, Number(row.liquidity_usd || 0)));
-  const vol = Math.log10(Math.max(1, Number(row?.volume_usd?.h24 || 0)));
-  const h1tx = Number(row?.txns?.h1?.buys || 0) + Number(row?.txns?.h1?.sells || 0);
-  const m5tx = Number(row?.txns?.m5?.buys || 0) + Number(row?.txns?.m5?.sells || 0);
-  return liq * 4 + vol * 2 + Math.log10(1 + h1tx) * 1.5 + Math.log10(1 + m5tx) * 2;
+function poolLiquidity(row) { return Math.max(0, Number(row?.liquidity_usd || 0)); }
+function poolVolume24h(row) { return Math.max(0, Number(row?.volume_usd?.h24 || 0)); }
+function poolActivity(row, period) {
+  return Math.max(0, Number(row?.txns?.[period]?.buys || 0) + Number(row?.txns?.[period]?.sells || 0));
 }
-function sortBestPools(rows) { return [...rows].sort((a, b) => poolScore(b) - poolScore(a)); }
+function poolScore(row) {
+  // Legacy quality helper. Pool *selection* is no longer based on this score.
+  const liq = Math.log10(1 + poolLiquidity(row));
+  const vol = Math.log10(1 + poolVolume24h(row));
+  return liq * 2 + vol * 2 + Math.log10(1 + poolActivity(row, 'h1')) * 1.5 + Math.log10(1 + poolActivity(row, 'm5'));
+}
+function hotScoreComponents(rows) {
+  const pools = Array.isArray(rows) ? rows : [];
+  const liquidity = pools.reduce((sum, row) => sum + poolLiquidity(row), 0);
+  const volume24h = pools.reduce((sum, row) => sum + poolVolume24h(row), 0);
+  const h1tx = pools.reduce((sum, row) => sum + poolActivity(row, 'h1'), 0);
+  const m5tx = pools.reduce((sum, row) => sum + poolActivity(row, 'm5'), 0);
+  // "Hot" = current real trading attention, not paid promotion and not price direction.
+  // 24h turnover and short-window transaction activity dominate; liquidity is a quality floor.
+  const score = Math.log10(1 + volume24h) * 4
+    + Math.log10(1 + h1tx) * 3
+    + Math.log10(1 + m5tx) * 2
+    + Math.log10(1 + liquidity) * 1.5;
+  return { score, volume_24h_usd: volume24h, liquidity_usd: liquidity, h1_transactions: h1tx, m5_transactions: m5tx };
+}
+function sortBestPools(rows) {
+  return [...rows].sort((a, b) =>
+    poolLiquidity(b) - poolLiquidity(a)
+    || poolVolume24h(b) - poolVolume24h(a)
+    || poolActivity(b, 'h1') - poolActivity(a, 'h1')
+    || String(a?.pool_address || '').localeCompare(String(b?.pool_address || ''))
+  );
+}
 
 function tokenMatchesText(token, query) {
   const q = lower(query);
@@ -2795,6 +3134,7 @@ function tokenCentricRow(pair, token, extra = {}) {
     txns: pair.txns,
     pool_created_at: pair.pool_created_at,
     token_profile: extra.token_profile || tokenProfileForIdentity(pair.network, token?.address) || null,
+    product_badges: Array.isArray(extra.product_badges) ? extra.product_badges : productBadgesForToken(pair, token),
     source: 'dexscreener_public_api_token_centric',
     ...extra,
   };
@@ -2803,7 +3143,7 @@ function chooseBetterTokenRow(current, candidate) {
   if (!current) return candidate;
   if (candidate.token_market_fields_verified && !current.token_market_fields_verified) return candidate;
   if (!candidate.token_market_fields_verified && current.token_market_fields_verified) return current;
-  return poolScore(candidate.best_pool) > poolScore(current.best_pool) ? candidate : current;
+  return poolLiquidity(candidate.best_pool) > poolLiquidity(current.best_pool) ? candidate : current;
 }
 function tokenCentricSearchRows(query, pairs) {
   const byToken = new Map();
@@ -2912,12 +3252,60 @@ function candidateRows(payload, source) {
     };
   }).filter(Boolean);
 }
+
+function geckoAddressFromRelationship(network, relation) {
+  const id = text(relation?.data?.id);
+  if (!id) return '';
+  const prefix = `${GECKO_NETWORK[network] || ''}_`;
+  if (prefix && lower(id).startsWith(lower(prefix))) return id.slice(prefix.length);
+  const idx = id.indexOf('_');
+  return idx >= 0 ? id.slice(idx + 1) : id;
+}
+async function fetchGeckoTrendingCandidates() {
+  const candidates = [];
+  let succeeded = 0;
+  function appendPoolResources(network, payload, source) {
+    for (const resource of Array.isArray(payload?.data) ? payload.data : []) {
+      const address = geckoAddressFromRelationship(network, resource?.relationships?.base_token);
+      if (!validAddressForNetwork(network, address)) continue;
+      candidates.push({ network, address, source, token_profile: null, amount: 0, total_amount: 0 });
+    }
+  }
+  for (const network of Object.keys(NETWORKS)) {
+    const gtNetwork = GECKO_NETWORK[network];
+    if (!gtNetwork) continue;
+    try {
+      const trending = await geckoFetchJson(
+        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/trending_pools?page=1`,
+        { priority: -30, label: `background_gt_trending_${network}` },
+      );
+      appendPoolResources(network, trending, 'geckoterminal_trending_pool_candidate');
+      succeeded += 1;
+    } catch (_) {}
+    try {
+      // Top 24h-volume pools widen the objective universe toward actively traded, deeper
+      // pools (often stable-quote markets) instead of relying on launch/native-quote feeds.
+      const topVolume = await geckoFetchJson(
+        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/pools?page=1&sort=h24_volume_usd_desc`,
+        { priority: -32, label: `background_gt_top_volume_${network}` },
+      );
+      appendPoolResources(network, topVolume, 'geckoterminal_top_volume_pool_candidate');
+      succeeded += 1;
+    } catch (_) {}
+  }
+  stats.gecko_discovery_cycles += 1;
+  stats.gecko_discovery_candidates = candidates.length;
+  return { candidates, succeeded };
+}
+
+
 async function fetchDiscoveryCandidatePairs() {
-  // Step1041.1: top/latest boosts + latest profiles alone can legitimately yield fewer
-  // than 50 unique tokens on the four supported chains. Expand only the backend discovery
-  // candidate pool with two additional DEX Screener *identity* feeds. Paid/CTO presence is
-  // never used as the final rank: every candidate is re-read through the exact-token market
-  // endpoint and rescored only by current pool liquidity/volume/activity.
+  // Step1041.5: Binance Wallet public Trending (1h) is the primary mature ranking source.
+  // GeckoTerminal + DEX Screener feeds are fallback/recall only. Every candidate — including
+  // Binance-ranked tokens — is re-read through DEX Screener's exact token endpoint before
+  // publication, so external rank never overrides Kaka's exact chain+contract identity rules.
+  const binanceWalletRank = await fetchBinanceWalletTrendingCandidates();
+  const gecko = await fetchGeckoTrendingCandidates();
   const feedSpecs = [
     { path: '/token-boosts/top/v1', source: 'top_boost_candidate', label: 'background_boost_top_candidates' },
     { path: '/token-boosts/latest/v1', source: 'latest_boost_candidate', label: 'background_boost_latest_candidates' },
@@ -2933,9 +3321,18 @@ async function fetchDiscoveryCandidatePairs() {
       return { ...spec, payload: [], ok: false, error: text(error?.message || error).slice(0, 160) };
     }
   }));
-  if (!settled.some((x) => x.ok)) throw new Error('dexscreener_all_candidate_feeds_failed');
+  const dexFeedReady = settled.some((x) => x.ok);
+  if (!binanceWalletRank.candidates.length && !gecko.candidates.length && !dexFeedReady) {
+    throw new Error('all_hot_candidate_sources_failed');
+  }
 
-  const candidates = settled.flatMap((feed) => candidateRows(feed.payload, feed.source));
+  // Insertion order matters: Binance-ranked identities enter each chain bucket first and keep
+  // their official relative order. Supplemental identities can only fill remaining capacity.
+  const candidates = [
+    ...binanceWalletRank.candidates,
+    ...gecko.candidates,
+    ...settled.flatMap((feed) => candidateRows(feed.payload, feed.source)),
+  ];
   const byIdentity = new Map();
   for (const row of candidates) {
     const key = `${row.network}|${lower(row.address)}`;
@@ -2944,6 +3341,17 @@ async function fetchDiscoveryCandidatePairs() {
     cur.amount = Math.max(Number(cur.amount || 0), Number(row.amount || 0));
     cur.total_amount = Math.max(Number(cur.total_amount || 0), Number(row.total_amount || 0));
     cur.token_profile = mergeTokenProfile(cur.token_profile, row.token_profile);
+    const incomingRank = Number(row.binance_wallet_rank || 0);
+    const currentRank = Number(cur.binance_wallet_rank || 0);
+    if (incomingRank > 0 && (currentRank <= 0 || incomingRank < currentRank)) {
+      cur.binance_wallet_rank = incomingRank;
+      cur.binance_wallet_rank_period = row.binance_wallet_rank_period || '1h';
+      cur.binance_wallet_rank_period_code = row.binance_wallet_rank_period_code || BINANCE_WALLET_TRENDING_PERIOD;
+      cur.binance_wallet_rank_type = row.binance_wallet_rank_type || 10;
+      cur.binance_wallet_symbol = row.binance_wallet_symbol || '';
+      cur.binance_wallet_icon = row.binance_wallet_icon || '';
+      cur.binance_wallet_alpha_info = row.binance_wallet_alpha_info || null;
+    }
     byIdentity.set(key, cur);
   }
 
@@ -2978,6 +3386,11 @@ async function fetchDiscoveryCandidatePairs() {
           candidate_boost_amount: match.amount,
           candidate_total_boost_amount: match.total_amount,
           candidate_token_profile: match.token_profile || null,
+          candidate_binance_wallet_rank: match.binance_wallet_rank || null,
+          candidate_binance_wallet_rank_period: match.binance_wallet_rank_period || null,
+          candidate_binance_wallet_rank_period_code: match.binance_wallet_rank_period_code || null,
+          candidate_binance_wallet_rank_type: match.binance_wallet_rank_type || null,
+          candidate_binance_wallet_alpha_info: match.binance_wallet_alpha_info || null,
         });
       }
     }
@@ -2985,30 +3398,72 @@ async function fetchDiscoveryCandidatePairs() {
   return pairs;
 }
 function recentHotTokenRows(pairs) {
-  const byToken = new Map();
+  const groups = new Map();
   for (const pair of pairs || []) {
     const candidateAddress = text(pair.candidate_token_address);
     if (!candidateAddress) continue;
     const token = tokenAddressInPair(pair, candidateAddress);
     if (!token?.address) continue;
-    const row = tokenCentricRow(pair, token, {
-      recent_hot_score: poolScore(pair),
-      candidate_sources: pair.candidate_sources || [],
-      candidate_boost_amount: pair.candidate_boost_amount ?? null,
-      candidate_total_boost_amount: pair.candidate_total_boost_amount ?? null,
-      token_profile: pair.candidate_token_profile || null,
-      source: 'dexscreener_public_api_exact_discovery_token_rescore',
-    });
-    if (!row) continue;
+    // Published hot rows require exact base-token market fields. Quote-side pools remain
+    // available in the pool list, but cannot lend the base token's price/change fields.
+    if (tokenOrientationInPair(pair, candidateAddress) !== 'base') continue;
     const key = `${pair.network}|${lower(token.address)}`;
-    byToken.set(key, chooseBetterTokenRow(byToken.get(key), row));
+    let group = groups.get(key);
+    if (!group) {
+      group = { token, network: pair.network, pairs: [], candidate_sources: [], token_profile: null, binance_wallet_rank: null, binance_wallet_alpha_info: null };
+      groups.set(key, group);
+    }
+    group.pairs.push(pair);
+    for (const source of Array.isArray(pair.candidate_sources) ? pair.candidate_sources : []) {
+      if (!group.candidate_sources.includes(source)) group.candidate_sources.push(source);
+    }
+    group.token_profile = mergeTokenProfile(group.token_profile, pair.candidate_token_profile || null);
+    const rank = Number(pair.candidate_binance_wallet_rank || 0);
+    if (rank > 0 && (!Number(group.binance_wallet_rank || 0) || rank < Number(group.binance_wallet_rank))) {
+      group.binance_wallet_rank = rank;
+      group.binance_wallet_alpha_info = pair.candidate_binance_wallet_alpha_info || null;
+    }
   }
-  return [...byToken.values()]
+
+  const rows = [];
+  for (const group of groups.values()) {
+    const pools = sortBestPools(dedupePools(group.pairs));
+    const bestPool = pools[0];
+    if (!bestPool) continue;
+    const components = hotScoreComponents(pools);
+    const row = tokenCentricRow(bestPool, group.token, {
+      recent_hot_score: components.score,
+      hot_score: components.score,
+      hot_score_components: components,
+      hot_rule_version: HOT_RULE_VERSION,
+      hot_discovery_rule_version: HOT_DISCOVERY_RULE_VERSION,
+      hot_rank_source: Number(group.binance_wallet_rank || 0) > 0 ? 'binance_wallet_public_trending_1h' : 'objective_market_fallback_after_binance',
+      binance_wallet_rank: Number(group.binance_wallet_rank || 0) > 0 ? Number(group.binance_wallet_rank) : null,
+      binance_wallet_rank_period: Number(group.binance_wallet_rank || 0) > 0 ? '1h' : null,
+      binance_wallet_rank_type: Number(group.binance_wallet_rank || 0) > 0 ? 10 : null,
+      binance_wallet_alpha_info: group.binance_wallet_alpha_info || null,
+      paid_promotion_affects_hot_score: false,
+      candidate_sources: group.candidate_sources,
+      candidate_boost_amount: null,
+      candidate_total_boost_amount: null,
+      token_profile: group.token_profile,
+      product_badges: productBadgesForToken(bestPool, group.token),
+      source: Number(group.binance_wallet_rank || 0) > 0
+        ? 'binance_wallet_trending_order_plus_exact_token_market'
+        : 'objective_candidate_exact_token_market_fallback',
+    });
+    if (row?.token_market_fields_verified === true) rows.push(row);
+  }
+  return rows
     .sort((a, b) => {
-      if (a.token_market_fields_verified !== b.token_market_fields_verified) {
-        return a.token_market_fields_verified ? -1 : 1;
-      }
-      return Number(b.recent_hot_score || 0) - Number(a.recent_hot_score || 0);
+      const ar = Number(a.binance_wallet_rank || 0);
+      const br = Number(b.binance_wallet_rank || 0);
+      const aOfficial = ar > 0;
+      const bOfficial = br > 0;
+      if (aOfficial && bOfficial && ar !== br) return ar - br;
+      if (aOfficial !== bOfficial) return aOfficial ? -1 : 1;
+      return Number(b.hot_score || 0) - Number(a.hot_score || 0)
+        || poolLiquidity(b.best_pool) - poolLiquidity(a.best_pool);
     })
     .slice(0, STEP1041_HOT_MAX_ROWS);
 }
@@ -3025,6 +3480,13 @@ function currentCandidateMetadata() {
       candidate_boost_amount: row.candidate_boost_amount ?? null,
       candidate_total_boost_amount: row.candidate_total_boost_amount ?? null,
       token_profile: row.token_profile || null,
+      product_badges: Array.isArray(row.product_badges) ? row.product_badges : [],
+      hot_score: row.hot_score ?? row.recent_hot_score ?? null,
+      hot_score_components: row.hot_score_components || null,
+      binance_wallet_rank: row.binance_wallet_rank ?? null,
+      binance_wallet_rank_period: row.binance_wallet_rank_period ?? null,
+      binance_wallet_rank_type: row.binance_wallet_rank_type ?? null,
+      binance_wallet_alpha_info: row.binance_wallet_alpha_info || null,
     });
   }
   return byKey;
@@ -3063,6 +3525,11 @@ async function refreshCurrentMarketFields() {
               candidate_boost_amount: match.candidate_boost_amount,
               candidate_total_boost_amount: match.candidate_total_boost_amount,
               candidate_token_profile: match.token_profile,
+              candidate_product_badges: match.product_badges || [],
+              candidate_binance_wallet_rank: match.binance_wallet_rank || null,
+              candidate_binance_wallet_rank_period: match.binance_wallet_rank_period || null,
+              candidate_binance_wallet_rank_type: match.binance_wallet_rank_type || null,
+              candidate_binance_wallet_alpha_info: match.binance_wallet_alpha_info || null,
             });
           }
         }
@@ -3143,8 +3610,17 @@ async function refreshDiscovery() {
     stats.last_background_started_at = new Date().toISOString();
     try {
       const pairs = await fetchDiscoveryCandidatePairs();
+      await refreshBinanceAlphaRegistry();
       const rows = recentHotTokenRows(pairs);
-      if (!rows.length) throw new Error('dexscreener_recent_hot_discovery_empty');
+      if (!rows.length) throw new Error('onchain_recent_hot_discovery_empty');
+      // A transient Binance Wallet rank outage must not silently reorder an already-good
+      // Binance-ranked snapshot into Kaka fallback order. The 30s exact-market refresher keeps
+      // current prices/liquidity fresh while the previous mature rank is retained.
+      const previousOfficialRows = trendingSnapshot.filter((row) => Number(row?.binance_wallet_rank || 0) > 0).length;
+      const previousAgeMs = discoveryUpdatedAt ? Math.max(0, Date.now() - discoveryUpdatedAt) : Number.POSITIVE_INFINITY;
+      if (!binanceWalletLastCycleSucceeded && previousOfficialRows > 0 && previousAgeMs <= DISCOVERY_RETAIN_MS) {
+        throw new Error('binance_wallet_trending_temporarily_unavailable_retain_previous_rank');
+      }
       trendingSnapshot = rows;
       discoveryUpdatedAt = Date.now();
       marketUpdatedAt = discoveryUpdatedAt;
@@ -3352,7 +3828,7 @@ function healthPayload() {
       feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION,
       hot_max_rows: STEP1041_HOT_MAX_ROWS,
       new_max_rows: STEP1041_NEW_MAX_ROWS,
-      expected_self_test_min: 60,
+      expected_self_test_min: 65,
       discovery_candidate_feed_count: STEP1041_CANDIDATE_FEED_COUNT,
       exact_market_batch_max: DEX_TOKEN_BATCH_MAX,
       new_pool_max_age_ms: STEP1041_NEW_POOL_MAX_AGE_MS,
@@ -3366,6 +3842,24 @@ function healthPayload() {
       pressure_contract: { users: [10, 100, 1000], routes: [TRENDING_ROUTE, NEW_POOLS_ROUTE, OVERVIEW_ROUTE, HEALTH_ROUTE], direct_upstream_amplification_coefficient: 0 },
       hot_and_new_are_background_snapshot_reads: true,
       new_pool_is_not_token_contract_creation: true,
+      hot_rule_version: HOT_RULE_VERSION,
+      hot_discovery_rule_version: HOT_DISCOVERY_RULE_VERSION,
+      primary_hot_rank_source: 'binance_wallet_public_token_rank_trending_rankType10_period1h',
+      primary_hot_rank_period: '1h',
+      primary_hot_rank_order_preserved: true,
+      primary_hot_rank_requires_exact_chain_contract_market_verification: true,
+      first_party_user_search_or_view_heat_used_for_rank: false,
+      first_party_heat_future_ready_when_user_scale_is_sufficient: true,
+      fallback_rank_source: 'objective_volume_activity_liquidity_after_all_verified_binance_ranked_rows',
+      binance_wallet_rank_background_only: true,
+      binance_wallet_rank_last_cycle_succeeded: binanceWalletLastCycleSucceeded,
+      binance_wallet_rank_failure_retains_previous_rank_snapshot: true,
+      binance_wallet_rank_user_reads_trigger_upstream: false,
+      binance_wallet_rank_stats: { started: stats.binance_wallet_rank_started, succeeded: stats.binance_wallet_rank_succeeded, failed: stats.binance_wallet_rank_failed, rows: stats.binance_wallet_rank_rows, last_success_at: stats.binance_wallet_rank_last_success_at, last_error: stats.binance_wallet_rank_last_error },
+      paid_boost_ad_cto_affects_rank: false,
+      default_pool_order: 'liquidity_usd_desc_then_volume_then_activity',
+      geckoterminal_objective_discovery: true,
+      binance_alpha_badge_source: 'binance_official_alpha_token_list_exact_chain_contract',
     },
     current_market_refresh: {
       ready: trendingSnapshot.length > 0 && (marketAgeMs === null || marketAgeMs <= MARKET_RETAIN_MS),
@@ -3394,7 +3888,7 @@ function healthPayload() {
       exact_discovered_candidate_token_only: true,
       both_sides_of_pair_are_not_automatically_listed: true,
       quote_token_never_inherits_base_token_market_fields: true,
-      basis: 'latest_profile_plus_top_and_latest_boost_candidates_rescored_by_liquidity_volume_and_transactions',
+      basis: 'binance_wallet_official_trending_1h_order_primary_then_exact_chain_contract_market_verification_with_objective_fallback',
       token_profile_metadata_preserved: true,
       paid_boost_rank_not_used_as_final_rank: true,
       retained_if_refresh_fails: true,
@@ -3405,8 +3899,11 @@ function healthPayload() {
       max_candidates_per_chain: DISCOVERY_MAX_CANDIDATES_PER_CHAIN,
       exact_market_batch_max: DEX_TOKEN_BATCH_MAX,
       candidate_feed_count: STEP1041_CANDIDATE_FEED_COUNT,
-      candidate_feeds: ['top_boost','latest_boost','latest_profile','community_takeover','latest_ad'],
+      candidate_feeds: ['binance_wallet_trending_1h','geckoterminal_trending','geckoterminal_top_24h_volume','top_boost','latest_boost','latest_profile','community_takeover','latest_ad'],
       paid_or_cto_presence_not_used_as_final_rank: true,
+      binance_wallet_trending_rank_preserved_for_verified_rows: true,
+      binance_wallet_trending_endpoint_public_no_user_auth: true,
+      binance_wallet_trending_period_code: BINANCE_WALLET_TRENDING_PERIOD,
       final_hot_rows_require_verified_token_market_identity: true,
     },
     kline: {
@@ -3474,6 +3971,21 @@ function healthPayload() {
       step1038_shared_generic_cache_entries: cache.size,
     },
     scheduler: dexScheduler.state(),
+    geckoterminal_scheduler: geckoScheduler.state(),
+    geckoterminal_stats: {
+      started: stats.gecko_upstream_started,
+      succeeded: stats.gecko_upstream_succeeded,
+      failed: stats.gecko_upstream_failed,
+      discovery_cycles: stats.gecko_discovery_cycles,
+      discovery_candidates: stats.gecko_discovery_candidates,
+    },
+    binance_alpha_registry: {
+      rows: binanceAlphaRegistry.size,
+      updated_at: binanceAlphaUpdatedAt ? new Date(binanceAlphaUpdatedAt).toISOString() : null,
+      refresh_started: stats.binance_alpha_refresh_started,
+      refresh_succeeded: stats.binance_alpha_refresh_succeeded,
+      refresh_failed: stats.binance_alpha_refresh_failed,
+    },
     moralis_scheduler: moralisScheduler.state(),
     goplus_scheduler: goplusScheduler.state(),
     helius_scheduler: heliusScheduler.state(),
@@ -3591,9 +4103,21 @@ function runSelfTest() {
   t('step1041_overview_shared_only', finalOverview.no_user_upstream_build === true && finalOverview.volume_liquidity_are_sample_sums_not_whole_chain_totals === true);
   t('step1041_new_pool_semantics_fail_closed', STEP1041_NEW_POOL_MAX_AGE_MS === 7 * 24 * 60 * 60_000);
   t('step1041_pressure_contract_10_100_1000', JSON.stringify(healthPayload().step1041_final_productization.pressure_contract.users) === JSON.stringify([10,100,1000]));
-  t('step1041_candidate_feed_expansion_5', STEP1041_CANDIDATE_FEED_COUNT === 5);
+  t('step1041_4_pool_order_liquidity_first', sortBestPools([{pool_address:'a',liquidity_usd:10,volume_usd:{h24:999999}},{pool_address:'b',liquidity_usd:20,volume_usd:{h24:1}}])[0].pool_address === 'b');
+  t('step1041_5_hot_rank_excludes_paid_amount', HOT_RULE_VERSION.includes('binance_wallet_trending') && healthPayload().step1041_final_productization.paid_boost_ad_cto_affects_rank === false);
+  t('step1041_4_gecko_exact_interval_map', geckoKlineSpec('15m')?.timeframe === 'minute' && geckoKlineSpec('15m')?.aggregate === 15 && geckoKlineSpec('4h')?.aggregate === 4);
+  t('step1041_4_badges_fact_only', productBadgesForToken({network:'bsc',dex_id:'pumpswap'}, {address:'0x0000000000000000000000000000000000000001'}).every((x)=>x.confidence === 'fact'));
+  t('step1041_4_hot_score_components_finite', Number.isFinite(hotScoreComponents([{liquidity_usd:1000,volume_usd:{h24:5000},txns:{h1:{buys:10,sells:5},m5:{buys:3,sells:2}}}]).score));
+  t('step1041_candidate_feed_expansion_8', STEP1041_CANDIDATE_FEED_COUNT === 8);
   t('step1041_exact_market_batches_bounded_30', DEX_TOKEN_BATCH_MAX === 30 && DISCOVERY_MAX_CANDIDATES_PER_CHAIN <= 90);
   t('step1041_hot_rows_verified_only', healthPayload().discovery.final_hot_rows_require_verified_token_market_identity === true);
+  t('step1041_5_binance_wallet_trending_primary', healthPayload().step1041_final_productization.primary_hot_rank_source.includes('binance_wallet_public_token_rank_trending'));
+  t('step1041_5_binance_wallet_period_1h', BINANCE_WALLET_TRENDING_PERIOD === 30 && healthPayload().step1041_final_productization.primary_hot_rank_period === '1h');
+  t('step1041_5_binance_rank_preserved_before_fallback', recentHotTokenRows([
+    {...normalizeDexPair({chainId:'bsc',dexId:'x',pairAddress:'0x0000000000000000000000000000000000000101',baseToken:{address:'0x0000000000000000000000000000000000000001',symbol:'A',name:'A'},quoteToken:{address:'0x00000000000000000000000000000000000000f1',symbol:'USDT',name:'USDT'},priceUsd:'1',liquidity:{usd:1000},volume:{h24:1000},txns:{h1:{buys:1,sells:1},m5:{buys:1,sells:0}}}),candidate_token_address:'0x0000000000000000000000000000000000000001',candidate_sources:['binance_wallet_public_trending_1h'],candidate_binance_wallet_rank:2},
+    {...normalizeDexPair({chainId:'bsc',dexId:'x',pairAddress:'0x0000000000000000000000000000000000000102',baseToken:{address:'0x0000000000000000000000000000000000000002',symbol:'B',name:'B'},quoteToken:{address:'0x00000000000000000000000000000000000000f1',symbol:'USDT',name:'USDT'},priceUsd:'1',liquidity:{usd:1},volume:{h24:1},txns:{h1:{buys:1,sells:0},m5:{buys:0,sells:0}}}),candidate_token_address:'0x0000000000000000000000000000000000000002',candidate_sources:['binance_wallet_public_trending_1h'],candidate_binance_wallet_rank:1},
+  ].filter(Boolean))[0]?.binance_wallet_rank === 1);
+  t('step1041_5_user_heat_not_used_yet', healthPayload().step1041_final_productization.first_party_user_search_or_view_heat_used_for_rank === false);
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
@@ -3849,6 +4373,7 @@ export async function handleOnchainMarket(req, res, url) {
           best_pool: best,
           token_market: tokenMarket,
           token_profile: tokenMarket?.token_profile || tokenProfileForIdentity(network, address) || null,
+          product_badges: tokenMarket?.product_badges || (best && token ? productBadgesForToken(best, token) : []),
           token_market_fields_verified: tokenMarket?.token_market_fields_verified === true,
           pool_count: rows.length,
           pools_preview: rows.slice(0, 6),
@@ -3870,7 +4395,7 @@ export async function handleOnchainMarket(req, res, url) {
       row_count: rows.length,
       max_rows: STEP1041_NEW_MAX_ROWS,
       cache_status: 'background_shared',
-      coverage: 'newest_pool_among_current_profile_boost_candidate_tokens_not_token_contract_creation_and_not_exhaustive_chain_scan',
+      coverage: 'newest_pool_among_current_objective_and_supplemental_candidate_tokens_not_token_contract_creation_and_not_exhaustive_chain_scan',
       new_pool_max_age_ms: STEP1041_NEW_POOL_MAX_AGE_MS,
       user_read_upstream_requests: 0,
     }));
@@ -3945,7 +4470,7 @@ export async function handleOnchainMarket(req, res, url) {
       const result = await cachedKlineBuild(
         key,
         intervalPolicy(interval, endTimeMs),
-        () => buildMoralisKlines(network, tokenAddress, pool, interval, klineLimit, endTimeMs),
+        () => buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, klineLimit, endTimeMs),
       );
       const built = result.value || { rows: [] };
       const rows = (built.rows || []).map((row) => ({
@@ -3955,7 +4480,7 @@ export async function handleOnchainMarket(req, res, url) {
         pool_address: poolAddress,
         dex_id: pool.dex_id,
         interval,
-        source: 'moralis_official_data_api_pair_ohlcv',
+        source: built.source || 'moralis_official_data_api_pair_ohlcv',
       }));
       sendJson(res, 200, responseBase({
         network,
@@ -3969,8 +4494,11 @@ export async function handleOnchainMarket(req, res, url) {
         },
         interval,
         source_interval: built.source_timeframe || MORALIS_TIMEFRAME[interval],
-        source: 'moralis_official_data_api_pair_ohlcv',
+        source: built.source || 'moralis_official_data_api_pair_ohlcv',
         source_pair_address: built.source_pair_address || poolAddress,
+        fallback_used: built.fallback_used === true,
+        fallback_from: built.fallback_from || null,
+        primary_error: built.primary_error || null,
         source_token_address: built.source_token_address || null,
         identity_proof: built.identity_proof || null,
         exact_chain_token_pool_preflight: true,
