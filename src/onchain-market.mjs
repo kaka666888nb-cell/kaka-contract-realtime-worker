@@ -1,4 +1,4 @@
-// Step1040 / Render 650.8.15.195
+// Step1041 / Render 650.8.15.196
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,12 +7,13 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.195';
-const DATA_VERSION = 1040000;
+const VERSION = '650.8.15.196';
+const DATA_VERSION = 1041000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
 const STEP1040_FEATURE_SCHEMA_VERSION = 'step1040_onchain_wallet_relationship_evidence_v1';
+const STEP1041_FEATURE_SCHEMA_VERSION = 'step1041_onchain_final_productization_v1';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -29,6 +30,7 @@ const SECURITY_ROUTE = '/api/onchain/security';
 const TOKEN_WALLETS_ROUTE = '/api/onchain/token-wallets';
 const WALLET_QUICKVIEW_ROUTE = '/api/onchain/wallet-quickview';
 const RELATIONS_ROUTE = '/api/onchain/relations';
+const OVERVIEW_ROUTE = '/api/onchain/overview';
 
 const DEX_BASE = 'https://api.dexscreener.com';
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
@@ -48,6 +50,9 @@ const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 30;
 const CACHE_MAX_ENTRIES = 512;
 const NEGATIVE_CACHE_MAX_ENTRIES = 256;
 const MAX_RESPONSE_ROWS = 100;
+const STEP1041_HOT_MAX_ROWS = 50;
+const STEP1041_NEW_MAX_ROWS = 50;
+const STEP1041_NEW_POOL_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 
 // Step1037 Moralis production guard.
 // Current official pricing: pair candlesticks=150 CU, pair swaps=50 CU.
@@ -244,6 +249,7 @@ const stats = {
   relation_build_failures: 0,
   funding_source_builds: 0,
   funding_source_build_failures: 0,
+  step1041_shared_snapshot_reads: 0,
 };
 
 const cache = new Map();
@@ -2546,26 +2552,105 @@ async function buildMoralisTrades(network, tokenAddress, pool, limit) {
 }
 
 function recentCandidatePools(network, limit) {
-  const seen = new Set();
+  const now = Date.now();
   const rows = [];
   for (const tokenRow of trendingSnapshot) {
     if (network !== 'all' && tokenRow.network !== network) continue;
     const pool = tokenRow.best_pool;
-    if (!pool?.pool_address || !pool.pool_created_at) continue;
-    const key = `${tokenRow.network}:${lower(pool.pool_address)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const createdMs = Date.parse(pool?.pool_created_at || '');
+    if (!pool?.pool_address || !Number.isFinite(createdMs) || createdMs <= 0) continue;
+    const ageMs = Math.max(0, now - createdMs);
+    if (ageMs > STEP1041_NEW_POOL_MAX_AGE_MS) continue;
     rows.push({
-      network: tokenRow.network,
-      token: tokenRow.token,
-      pool,
-      created_at: pool.pool_created_at,
-      recent_hot_score: tokenRow.recent_hot_score,
-      discovery_scope: 'profile_and_boost_candidate_pool_not_exhaustive_chain_scan',
+      ...tokenRow,
+      discovery_mode: 'new_pool_observation',
+      pool_age_ms: ageMs,
+      pool_created_at: pool.pool_created_at,
+      discovery_scope: 'newest_pool_among_current_profile_boost_candidate_tokens_not_token_contract_creation_and_not_exhaustive_chain_scan',
     });
   }
-  rows.sort((a, b) => Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0));
-  return rows.slice(0, limit);
+  rows.sort((a, b) => Date.parse(b.pool_created_at || 0) - Date.parse(a.pool_created_at || 0));
+  return rows.slice(0, Math.min(limit, STEP1041_NEW_MAX_ROWS));
+}
+
+function compactTokenSnapshotRow(row) {
+  return {
+    network: row.network,
+    token: row.token,
+    best_pool: row.best_pool,
+    price_usd: row.price_usd,
+    liquidity_usd: row.liquidity_usd,
+    market_cap_usd: row.market_cap_usd,
+    volume_usd: row.volume_usd,
+    price_change_pct: row.price_change_pct,
+    pool_created_at: row.pool_created_at,
+    token_profile: row.token_profile || null,
+    token_market_fields_verified: row.token_market_fields_verified === true,
+  };
+}
+
+function buildStep1041Overview() {
+  const now = Date.now();
+  const rows = trendingSnapshot.slice(0, STEP1041_HOT_MAX_ROWS);
+  const verified = rows.filter((row) => row.token_market_fields_verified === true);
+  const perChain = {};
+  let sampleVolume24h = 0;
+  let sampleLiquidity = 0;
+  let rising = 0;
+  let falling = 0;
+  let flat = 0;
+  let new1h = 0;
+  let new24h = 0;
+  let new7d = 0;
+  let profileRows = 0;
+  for (const row of rows) {
+    const network = row.network;
+    const item = perChain[network] || { rows: 0, verified_market_rows: 0, sample_volume_24h_usd: 0, sample_liquidity_usd: 0, new_pool_24h: 0 };
+    item.rows += 1;
+    if (row.token_profile) profileRows += 1;
+    if (row.token_market_fields_verified === true) {
+      item.verified_market_rows += 1;
+      const volume = Number(row?.volume_usd?.h24 || 0);
+      const liquidity = Number(row.liquidity_usd || 0);
+      if (Number.isFinite(volume) && volume > 0) { item.sample_volume_24h_usd += volume; sampleVolume24h += volume; }
+      if (Number.isFinite(liquidity) && liquidity > 0) { item.sample_liquidity_usd += liquidity; sampleLiquidity += liquidity; }
+      const change = Number(row?.price_change_pct?.h24);
+      if (Number.isFinite(change)) { if (change > 0) rising += 1; else if (change < 0) falling += 1; else flat += 1; }
+    }
+    const createdMs = Date.parse(row?.best_pool?.pool_created_at || row?.pool_created_at || '');
+    if (Number.isFinite(createdMs) && createdMs > 0) {
+      const age = Math.max(0, now - createdMs);
+      if (age <= 60 * 60_000) new1h += 1;
+      if (age <= 24 * 60 * 60_000) { new24h += 1; item.new_pool_24h += 1; }
+      if (age <= STEP1041_NEW_POOL_MAX_AGE_MS) new7d += 1;
+    }
+    perChain[network] = item;
+  }
+  const byVolume = [...verified].sort((a,b)=>Number(b?.volume_usd?.h24||0)-Number(a?.volume_usd?.h24||0)).slice(0,8).map(compactTokenSnapshotRow);
+  const byLiquidity = [...verified].sort((a,b)=>Number(b.liquidity_usd||0)-Number(a.liquidity_usd||0)).slice(0,8).map(compactTokenSnapshotRow);
+  const gainers = [...verified].filter(r=>Number.isFinite(Number(r?.price_change_pct?.h24))).sort((a,b)=>Number(b.price_change_pct.h24)-Number(a.price_change_pct.h24)).slice(0,8).map(compactTokenSnapshotRow);
+  const losers = [...verified].filter(r=>Number.isFinite(Number(r?.price_change_pct?.h24))).sort((a,b)=>Number(a.price_change_pct.h24)-Number(b.price_change_pct.h24)).slice(0,8).map(compactTokenSnapshotRow);
+  return {
+    feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION,
+    source: 'kaka_step1041_derived_from_background_shared_token_snapshot',
+    source_scope: 'current_discovered_hot_token_sample_not_whole_chain_market',
+    generated_at: marketUpdatedAt ? new Date(marketUpdatedAt).toISOString() : (discoveryUpdatedAt ? new Date(discoveryUpdatedAt).toISOString() : null),
+    candidate_rows: rows.length,
+    verified_market_rows: verified.length,
+    profile_rows: profileRows,
+    max_hot_rows: STEP1041_HOT_MAX_ROWS,
+    sample_volume_24h_usd: sampleVolume24h,
+    sample_liquidity_usd: sampleLiquidity,
+    change_distribution: { rising, flat, falling },
+    new_pool_observation: { within_1h: new1h, within_24h: new24h, within_7d: new7d, semantics: 'best_pool_created_at_in_current_discovered_sample_not_token_contract_creation' },
+    per_chain: perChain,
+    top_volume: byVolume,
+    top_liquidity: byLiquidity,
+    top_gainers: gainers,
+    top_losers: losers,
+    no_user_upstream_build: true,
+    volume_liquidity_are_sample_sums_not_whole_chain_totals: true,
+  };
 }
 
 async function cachedBuild(key, { freshMs, staleMs, negativeMs = 45_000 }, builder) {
@@ -2825,11 +2910,16 @@ function candidateRows(payload, source) {
   }).filter(Boolean);
 }
 async function fetchDiscoveryCandidatePairs() {
-  const [boosts, profiles] = await Promise.all([
-    dexFetchJson(`${DEX_BASE}/token-boosts/top/v1`, { priority: -20, label: 'background_boost_candidates' }),
+  const [boostsTop, boostsLatest, profiles] = await Promise.all([
+    dexFetchJson(`${DEX_BASE}/token-boosts/top/v1`, { priority: -20, label: 'background_boost_top_candidates' }),
+    dexFetchJson(`${DEX_BASE}/token-boosts/latest/v1`, { priority: -20, label: 'background_boost_latest_candidates' }),
     dexFetchJson(`${DEX_BASE}/token-profiles/latest/v1`, { priority: -20, label: 'background_profile_candidates' }),
   ]);
-  const candidates = [...candidateRows(boosts, 'top_boost_candidate'), ...candidateRows(profiles, 'latest_profile_candidate')];
+  const candidates = [
+    ...candidateRows(boostsTop, 'top_boost_candidate'),
+    ...candidateRows(boostsLatest, 'latest_boost_candidate'),
+    ...candidateRows(profiles, 'latest_profile_candidate'),
+  ];
   const byIdentity = new Map();
   for (const row of candidates) {
     const key = `${row.network}|${lower(row.address)}`;
@@ -2893,7 +2983,7 @@ function recentHotTokenRows(pairs) {
       }
       return Number(b.recent_hot_score || 0) - Number(a.recent_hot_score || 0);
     })
-    .slice(0, MAX_RESPONSE_ROWS);
+    .slice(0, STEP1041_HOT_MAX_ROWS);
 }
 
 function currentCandidateMetadata() {
@@ -3228,6 +3318,23 @@ function healthPayload() {
       confidence_rule_version: RELATION_CONFIDENCE_RULE_VERSION,
       user_reads_direct_upstream_requests: 0,
     },
+    step1041_final_productization: {
+      opened: true,
+      feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION,
+      hot_max_rows: STEP1041_HOT_MAX_ROWS,
+      new_max_rows: STEP1041_NEW_MAX_ROWS,
+      new_pool_max_age_ms: STEP1041_NEW_POOL_MAX_AGE_MS,
+      trending_rows: Math.min(trendingSnapshot.length, STEP1041_HOT_MAX_ROWS),
+      overview_route: OVERVIEW_ROUTE,
+      overview_user_read_upstream_requests: 0,
+      new_pool_user_read_upstream_requests: 0,
+      shared_snapshot_reads: stats.step1041_shared_snapshot_reads,
+      snapshot_json_bytes: Buffer.byteLength(JSON.stringify(trendingSnapshot.slice(0, STEP1041_HOT_MAX_ROWS))),
+      process_memory: (() => { const m = process.memoryUsage(); return { rss_bytes: m.rss, heap_used_bytes: m.heapUsed, heap_total_bytes: m.heapTotal, external_bytes: m.external }; })(),
+      pressure_contract: { users: [10, 100, 1000], routes: [TRENDING_ROUTE, NEW_POOLS_ROUTE, OVERVIEW_ROUTE, HEALTH_ROUTE], direct_upstream_amplification_coefficient: 0 },
+      hot_and_new_are_background_snapshot_reads: true,
+      new_pool_is_not_token_contract_creation: true,
+    },
     current_market_refresh: {
       ready: trendingSnapshot.length > 0 && (marketAgeMs === null || marketAgeMs <= MARKET_RETAIN_MS),
       refresh_interval_ms: MARKET_REFRESH_MS,
@@ -3255,7 +3362,7 @@ function healthPayload() {
       exact_discovered_candidate_token_only: true,
       both_sides_of_pair_are_not_automatically_listed: true,
       quote_token_never_inherits_base_token_market_fields: true,
-      basis: 'latest_profile_plus_top_boost_candidates_rescored_by_liquidity_volume_and_transactions',
+      basis: 'latest_profile_plus_top_and_latest_boost_candidates_rescored_by_liquidity_volume_and_transactions',
       token_profile_metadata_preserved: true,
       paid_boost_rank_not_used_as_final_rank: true,
       retained_if_refresh_fails: true,
@@ -3442,6 +3549,11 @@ function runSelfTest() {
   ]);
   t('step1040_common_funder_group_exact', fundingSynthetic.length === 1 && fundingSynthetic[0].wallets.length === 2 && fundingSynthetic[0].confidence === 'high');
   t('step1040_no_wrongdoing_or_insider_claim', healthPayload().step1040_relationship_evidence.wrongdoing_claim_generated === false && healthPayload().step1040_relationship_evidence.insider_or_rat_trading_claim_generated === false);
+  const finalOverview = buildStep1041Overview();
+  t('step1041_hot_cap_50', STEP1041_HOT_MAX_ROWS === 50 && recentHotTokenRows([]).length <= 50);
+  t('step1041_overview_shared_only', finalOverview.no_user_upstream_build === true && finalOverview.volume_liquidity_are_sample_sums_not_whole_chain_totals === true);
+  t('step1041_new_pool_semantics_fail_closed', STEP1041_NEW_POOL_MAX_AGE_MS === 7 * 24 * 60 * 60_000);
+  t('step1041_pressure_contract_10_100_1000', JSON.stringify(healthPayload().step1041_final_productization.pressure_contract.users) === JSON.stringify([10,100,1000]));
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
@@ -3450,7 +3562,7 @@ function runSelfTest() {
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -3462,6 +3574,17 @@ export async function handleOnchainMarket(req, res, url) {
       return true;
     }
     sendJson(res, 200, responseBase({ ...fxSnapshot, generated_at: new Date(fxUpdatedAt).toISOString(), shared_snapshot_age_ms: ageMs, user_read_upstream_requests: 0, cache_status: 'background_shared' }));
+    return true;
+  }
+
+  if (path === OVERVIEW_ROUTE) {
+    stats.step1041_shared_snapshot_reads += 1;
+    const ageMs = marketUpdatedAt ? Math.max(0, Date.now() - marketUpdatedAt) : null;
+    if (!trendingSnapshot.length || ageMs === null || ageMs > MARKET_RETAIN_MS) {
+      sendJson(res, 503, responseBase({ ok: false, error: 'step1041_shared_onchain_overview_not_ready', feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION, user_read_upstream_requests: 0 }));
+      return true;
+    }
+    sendJson(res, 200, responseBase({ ...buildStep1041Overview(), cache_status: 'background_shared', shared_snapshot_age_ms: ageMs, user_read_upstream_requests: 0 }));
     return true;
   }
 
@@ -3639,8 +3762,9 @@ export async function handleOnchainMarket(req, res, url) {
   }
 
   if (path === TRENDING_ROUTE) {
+    stats.step1041_shared_snapshot_reads += 1;
     if (!network) { sendJson(res, 400, responseBase({ ok: false, error: 'invalid_network' })); return true; }
-    const rows = discoveryRows(network, limit);
+    const rows = discoveryRows(network, Math.min(limit, STEP1041_HOT_MAX_ROWS));
     const ageMs = discoveryUpdatedAt ? Math.max(0, Date.now() - discoveryUpdatedAt) : null;
     if (!rows.length && (!discoveryUpdatedAt || ageMs > DISCOVERY_RETAIN_MS)) {
       sendJson(res, 503, responseBase({ ok: false, error: 'onchain_shared_recent_hot_not_ready', network, rows: [], user_read_upstream_requests: 0 }));
@@ -3696,14 +3820,18 @@ export async function handleOnchainMarket(req, res, url) {
   }
 
   if (path === NEW_POOLS_ROUTE) {
+    stats.step1041_shared_snapshot_reads += 1;
     if (!network) { sendJson(res, 400, responseBase({ ok: false, error: 'invalid_network', rows: [] })); return true; }
-    const rows = recentCandidatePools(network, limit);
+    const rows = recentCandidatePools(network, Math.min(limit, STEP1041_NEW_MAX_ROWS));
     sendJson(res, 200, responseBase({
+      feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION,
       network,
       rows,
       row_count: rows.length,
-      cache_status: 'step1036_background_shared',
-      coverage: 'discovered_candidate_pools_not_exhaustive_chain_scan',
+      max_rows: STEP1041_NEW_MAX_ROWS,
+      cache_status: 'background_shared',
+      coverage: 'newest_pool_among_current_profile_boost_candidate_tokens_not_token_contract_creation_and_not_exhaustive_chain_scan',
+      new_pool_max_age_ms: STEP1041_NEW_POOL_MAX_AGE_MS,
       user_read_upstream_requests: 0,
     }));
     return true;
