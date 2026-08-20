@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.196",
+  "version": "650.8.15.196.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Step1040 evidence-backed wallet relationships: bounded original-funder analysis, suspected early-sniper timing signals, creator/owner association evidence and wallet clusters without identity or wrongdoing claims"
+  "description": "Kaka Web3 Step1041.1 verified 50-token onchain discovery expansion and rollout-safe final pressure gate"
 }
