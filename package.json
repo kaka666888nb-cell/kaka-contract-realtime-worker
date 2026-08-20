@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15.193.1",
+  "version": "650.8.15.193.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "KakaWeb3 Render 650.8.15.193.1 / Step1038 onchain holder concentration + creator/owner + LP + token security shared layer"
+  "description": "KakaWeb3 Render 650.8.15.193.2 / Step1038 onchain holder concentration + creator/owner + LP + token security shared layer"
 }
