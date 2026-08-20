@@ -1,4 +1,4 @@
-// Step1038 / Render 650.8.15.193
+// Step1038.1 / Render 650.8.15.193.1
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.193';
-const DATA_VERSION = 1038000;
+const VERSION = '650.8.15.193.1';
+const DATA_VERSION = 1038001;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 
@@ -491,10 +491,18 @@ function normalizeHolderSupplyEntry(raw) {
   };
 }
 function normalizeHolderMetrics(raw) {
-  const supply = raw?.holderSupply || raw?.holder_supply || {};
-  const change = raw?.holderChange || raw?.holder_change || {};
+  // Moralis documents the holder metrics fields at the top level. Be tolerant of a
+  // single object wrapper as well so a gateway/SDK envelope cannot silently turn
+  // valid production facts into nulls. Arrays are never accepted as a metrics root.
+  const root = raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data)
+    ? raw.data
+    : raw?.result && typeof raw.result === 'object' && !Array.isArray(raw.result)
+      ? raw.result
+      : raw;
+  const supply = root?.holderSupply || root?.holder_supply || {};
+  const change = root?.holderChange || root?.holder_change || {};
   return {
-    total_holders: numberOrNull(raw?.totalHolders ?? raw?.total_holders),
+    total_holders: numberOrNull(root?.totalHolders ?? root?.total_holders),
     concentration: {
       top10: normalizeHolderSupplyEntry(supply.top10),
       top25: normalizeHolderSupplyEntry(supply.top25),
@@ -507,12 +515,16 @@ function normalizeHolderMetrics(raw) {
       h24: numberOrNull(change?.['24h']?.changePercent ?? change?.['24h']?.change_percent),
       d7: numberOrNull(change?.['7d']?.changePercent ?? change?.['7d']?.change_percent),
     },
-    holder_distribution: raw?.holderDistribution && typeof raw.holderDistribution === 'object'
-      ? raw.holderDistribution
-      : null,
-    holders_by_acquisition: raw?.holdersByAcquisition && typeof raw.holdersByAcquisition === 'object'
-      ? raw.holdersByAcquisition
-      : null,
+    holder_distribution: root?.holderDistribution && typeof root.holderDistribution === 'object'
+      ? root.holderDistribution
+      : root?.holder_distribution && typeof root.holder_distribution === 'object'
+        ? root.holder_distribution
+        : null,
+    holders_by_acquisition: root?.holdersByAcquisition && typeof root.holdersByAcquisition === 'object'
+      ? root.holdersByAcquisition
+      : root?.holders_by_acquisition && typeof root.holders_by_acquisition === 'object'
+        ? root.holders_by_acquisition
+        : null,
   };
 }
 function normalizeEvmTopHolder(raw) {
@@ -552,6 +564,8 @@ function moralisTopHoldersUrl(network, address, limit = 50) {
 }
 async function buildHolderAnalysis(network, address) {
   stats.holder_builds += 1;
+  let metrics = normalizeHolderMetrics(null);
+  let metricsError = null;
   try {
     const metricsPayload = await moralisFetchJson(moralisHolderMetricsUrl(network, address), {
       cu: MORALIS_HOLDER_METRICS_CU,
@@ -559,83 +573,135 @@ async function buildHolderAnalysis(network, address) {
       priority: 8,
       label: `holder_metrics:${network}:${address}`,
     });
-    const metrics = normalizeHolderMetrics(metricsPayload);
-    let topHolders = [];
-    let exactTop20 = null;
-    let exactTop10 = null;
-    let exactTop50 = null;
-    const ownersUrl = moralisTopHoldersUrl(network, address, 50);
-    if (ownersUrl) {
-      try {
-        const ownersPayload = await moralisFetchJson(ownersUrl, {
-          cu: MORALIS_TOP_HOLDERS_CU,
-          kind: 'holder',
-          priority: 7,
-          label: `top_holders:${network}:${address}`,
-        });
-        topHolders = (Array.isArray(ownersPayload?.result) ? ownersPayload.result : [])
-          .map(normalizeEvmTopHolder).filter(Boolean).slice(0, 50);
-        exactTop10 = exactTopPercent(topHolders, Math.min(10, topHolders.length));
-        exactTop20 = topHolders.length >= 20 ? exactTopPercent(topHolders, 20) : null;
-        exactTop50 = topHolders.length >= 50 ? exactTopPercent(topHolders, 50) : null;
-      } catch {
-        // Holder summary remains valid if the optional top-holder list is temporarily unavailable.
-      }
-    }
-    return {
-      source: 'moralis_official_data_api_holder_analytics',
-      source_scope: network === 'solana'
-        ? 'holder_metrics_only_top_holder_list_not_used_because_moralis_endpoint_deprecated_2026_07_31'
-        : 'holder_metrics_plus_exact_top50_owner_list',
-      total_holders: metrics.total_holders,
-      concentration: {
-        top10_percent: exactTop10 ?? metrics.concentration.top10?.supply_percent ?? null,
-        top20_percent: exactTop20,
-        top25_percent: metrics.concentration.top25?.supply_percent ?? null,
-        top50_percent: exactTop50 ?? metrics.concentration.top50?.supply_percent ?? null,
-      },
-      holder_change: metrics.holder_change,
-      holder_distribution: metrics.holder_distribution,
-      holders_by_acquisition: metrics.holders_by_acquisition,
-      top_holders: topHolders,
-      exact_top20_available: exactTop20 !== null,
-      top_holder_list_available: topHolders.length > 0,
-    };
+    metrics = normalizeHolderMetrics(metricsPayload);
   } catch (error) {
-    if (network === 'solana') {
-      try {
-        const securityResult = await cachedBuild(
-          `step1038:security:${network}:${lower(address)}`,
-          { freshMs: SECURITY_FRESH_MS, staleMs: SECURITY_STALE_MS, negativeMs: SECURITY_NEGATIVE_MS },
-          () => buildGoPlusSecurity(network, address),
-        );
-        const security = securityResult.value;
-        if (security) {
-          return {
-            source: 'goplus_solana_token_security_holder_fallback',
-            source_scope: 'top10_and_holder_count_only_when_deprecated_moralis_solana_holder_metrics_unavailable',
-            total_holders: numberOrNull(security.holder_count),
-            concentration: {
-              top10_percent: numberOrNull(security.top10_percent_reported),
-              top20_percent: null,
-              top25_percent: null,
-              top50_percent: null,
-            },
-            holder_change: { h1: null, h6: null, h24: null, d7: null },
-            holder_distribution: null,
-            holders_by_acquisition: null,
-            top_holders: Array.isArray(security.holders_top10) ? security.holders_top10 : [],
-            exact_top20_available: false,
-            top_holder_list_available: Array.isArray(security.holders_top10) && security.holders_top10.length > 0,
-          };
-        }
-      } catch {
-        // Preserve original Moralis error below if both exact sources are unavailable.
-      }
-    }
-    stats.holder_build_failures += 1;
-    throw error;
+    metricsError = error;
   }
+
+  let topHolders = [];
+  let ownersError = null;
+  let exactTop20 = null;
+  let exactTop10 = null;
+  let exactTop50 = null;
+  const ownersUrl = moralisTopHoldersUrl(network, address, 50);
+  if (ownersUrl) {
+    try {
+      const ownersPayload = await moralisFetchJson(ownersUrl, {
+        cu: MORALIS_TOP_HOLDERS_CU,
+        kind: 'holder',
+        priority: 7,
+        label: `top_holders:${network}:${address}`,
+      });
+      topHolders = (Array.isArray(ownersPayload?.result) ? ownersPayload.result : [])
+        .map(normalizeEvmTopHolder).filter(Boolean).slice(0, 50);
+      exactTop10 = topHolders.length >= 10 ? exactTopPercent(topHolders, 10) : null;
+      exactTop20 = topHolders.length >= 20 ? exactTopPercent(topHolders, 20) : null;
+      exactTop50 = topHolders.length >= 50 ? exactTopPercent(topHolders, 50) : null;
+    } catch (error) {
+      ownersError = error;
+    }
+  }
+
+  // Some exact ERC20s can return an otherwise valid holder/top-owner payload while
+  // totalHolders is temporarily absent. GoPlus Token Security directly reports
+  // holder_count for the exact same contract, so use that field only as a protected
+  // fallback. Concentration is still Moralis/exact-owner based whenever available.
+  let holderFallback = null;
+  const needsGoPlusHolderFact = network === 'solana'
+    ? metrics.total_holders === null || metrics.concentration.top10?.supply_percent == null
+    : metrics.total_holders === null;
+  if (needsGoPlusHolderFact) {
+    try {
+      const securityResult = await cachedBuild(
+        `step1038:security:${network}:${lower(address)}`,
+        { freshMs: SECURITY_FRESH_MS, staleMs: SECURITY_STALE_MS, negativeMs: SECURITY_NEGATIVE_MS },
+        () => buildGoPlusSecurity(network, address),
+      );
+      holderFallback = securityResult.value || null;
+    } catch {
+      holderFallback = null;
+    }
+  }
+
+  const totalHolders = metrics.total_holders ?? numberOrNull(holderFallback?.holder_count);
+  const top10 = exactTop10
+    ?? metrics.concentration.top10?.supply_percent
+    ?? numberOrNull(holderFallback?.top10_percent_reported);
+  const top25 = metrics.concentration.top25?.supply_percent ?? null;
+  const top50 = exactTop50 ?? metrics.concentration.top50?.supply_percent ?? null;
+
+  if (network === 'solana' && metricsError && holderFallback) {
+    return {
+      source: 'goplus_solana_token_security_holder_fallback',
+      source_scope: 'top10_and_holder_count_only_when_moralis_solana_holder_metrics_unavailable',
+      total_holders: totalHolders,
+      concentration: {
+        top10_percent: top10,
+        top20_percent: null,
+        top25_percent: null,
+        top50_percent: null,
+      },
+      holder_change: { h1: null, h6: null, h24: null, d7: null },
+      holder_distribution: null,
+      holders_by_acquisition: null,
+      top_holders: Array.isArray(holderFallback.holders_top10) ? holderFallback.holders_top10 : [],
+      exact_top20_available: false,
+      top_holder_list_available: Array.isArray(holderFallback.holders_top10) && holderFallback.holders_top10.length > 0,
+      field_sources: {
+        total_holders: totalHolders !== null ? 'goplus_token_security_holder_count' : null,
+        top10_percent: top10 !== null ? 'goplus_token_security_top10_holders' : null,
+        top20_percent: null, top25_percent: null, top50_percent: null,
+      },
+    };
+  }
+
+  const anyUsable = totalHolders !== null || top10 !== null || exactTop20 !== null || top25 !== null || top50 !== null || topHolders.length > 0;
+  if (!anyUsable) {
+    stats.holder_build_failures += 1;
+    throw metricsError || ownersError || new Error('holder_analysis_no_usable_facts');
+  }
+
+  const usedGoPlusTotal = metrics.total_holders === null && totalHolders !== null;
+  return {
+    source: usedGoPlusTotal
+      ? 'moralis_holder_analytics_plus_goplus_holder_count_fallback'
+      : 'moralis_official_data_api_holder_analytics',
+    source_scope: network === 'solana'
+      ? 'moralis_holder_metrics_only_no_deprecated_solana_top_holder_dependency'
+      : usedGoPlusTotal
+        ? 'moralis_exact_owner_concentration_plus_goplus_exact_contract_holder_count'
+        : 'moralis_holder_metrics_plus_exact_top50_owner_list',
+    total_holders: totalHolders,
+    concentration: {
+      top10_percent: top10,
+      top20_percent: exactTop20,
+      top25_percent: top25,
+      top50_percent: top50,
+    },
+    holder_change: metrics.holder_change,
+    holder_distribution: metrics.holder_distribution,
+    holders_by_acquisition: metrics.holders_by_acquisition,
+    top_holders: topHolders,
+    exact_top20_available: exactTop20 !== null,
+    top_holder_list_available: topHolders.length > 0,
+    field_sources: {
+      total_holders: metrics.total_holders !== null
+        ? 'moralis_holder_metrics'
+        : totalHolders !== null ? 'goplus_token_security_holder_count' : null,
+      top10_percent: exactTop10 !== null
+        ? 'moralis_exact_top_owners'
+        : metrics.concentration.top10?.supply_percent != null
+          ? 'moralis_holder_metrics'
+          : top10 !== null ? 'goplus_token_security_top10_holders' : null,
+      top20_percent: exactTop20 !== null ? 'moralis_exact_top_owners' : null,
+      top25_percent: top25 !== null ? 'moralis_holder_metrics' : null,
+      top50_percent: exactTop50 !== null ? 'moralis_exact_top_owners' : top50 !== null ? 'moralis_holder_metrics' : null,
+    },
+    upstream_partial_errors: {
+      moralis_metrics: metricsError ? String(metricsError.message || metricsError).slice(0, 180) : null,
+      moralis_top_holders: ownersError ? String(ownersError.message || ownersError).slice(0, 180) : null,
+    },
+  };
 }
 
 function resultByExactAddress(network, result, address) {
@@ -2013,6 +2079,8 @@ function runSelfTest() {
   t('fx_user_reads_do_not_start_upstream', healthPayload().fx_reference.user_reads_start_upstream === false);
   const holderSynthetic = normalizeHolderMetrics({ totalHolders: 1000, holderSupply: { top10: { supply: '100', supplyPercent: 10 }, top25: { supply: '200', supplyPercent: 20 }, top50: { supply: '300', supplyPercent: 30 } } });
   t('step1038_holder_metrics_parser', holderSynthetic.total_holders === 1000 && holderSynthetic.concentration.top10.supply_percent === 10 && holderSynthetic.concentration.top50.supply_percent === 30);
+  const holderWrappedSynthetic = normalizeHolderMetrics({ data: { totalHolders: '321', holderSupply: { top10: { supplyPercent: '12.5' } } } });
+  t('step1038_holder_metrics_wrapper_parser', holderWrappedSynthetic.total_holders === 321 && holderWrappedSynthetic.concentration.top10.supply_percent === 12.5);
   const gpSynthetic = normalizeGoPlusEvm({ token_name: 'T', token_symbol: 'T', is_honeypot: '0', is_open_source: '1', creator_address: '0x0000000000000000000000000000000000000001', creator_percent: '0.025', holders: [{ address: '0x0000000000000000000000000000000000000002', percent: '0.1', balance: '10', is_locked: '0' }] }, 'ethereum', '0x0000000000000000000000000000000000000003');
   t('step1038_goplus_evm_parser', gpSynthetic.contract_facts.is_open_source === true && gpSynthetic.trading_facts.is_honeypot === false && Math.abs(gpSynthetic.creator.percent - 2.5) < 1e-9 && Math.abs(gpSynthetic.top10_percent_reported - 10) < 1e-9);
   t('step1038_goplus_rate_below_30_per_min', 60_000 / GOPLUS_MIN_GAP_MS < 30);
@@ -2074,6 +2142,8 @@ export async function handleOnchainMarket(req, res, url) {
           top_holders: value.top_holders,
           top_holder_list_available: value.top_holder_list_available,
           exact_top20_available: value.exact_top20_available,
+          field_sources: value.field_sources || null,
+          upstream_partial_errors: value.upstream_partial_errors || null,
           cache_status: result.cache_status,
           user_read_direct_moralis_requests: 0,
           moralis_cu_if_full_evm_upstream_build: MORALIS_HOLDER_METRICS_CU + MORALIS_TOP_HOLDERS_CU,
