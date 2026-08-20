@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196';
-const DATA_VERSION = 1041000;
+const VERSION = '650.8.15.196.1';
+const DATA_VERSION = 1041001;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
@@ -46,7 +46,9 @@ const FX_REFRESH_MS = 6 * 60 * 60_000;
 const FX_RETAIN_MS = 96 * 60 * 60_000;
 const ECB_FX_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml';
 const DISCOVERY_RETAIN_MS = 30 * 60_000;
-const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 30;
+const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 90;
+const DEX_TOKEN_BATCH_MAX = 30;
+const STEP1041_CANDIDATE_FEED_COUNT = 5;
 const CACHE_MAX_ENTRIES = 512;
 const NEGATIVE_CACHE_MAX_ENTRIES = 256;
 const MAX_RESPONSE_ROWS = 100;
@@ -2815,6 +2817,7 @@ function tokenCentricSearchRows(query, pairs) {
     }
   }
   return [...byToken.values()]
+    .filter((row) => row.token_market_fields_verified === true)
     .sort((a, b) => {
       if (a.token_market_fields_verified !== b.token_market_fields_verified) {
         return a.token_market_fields_verified ? -1 : 1;
@@ -2910,16 +2913,29 @@ function candidateRows(payload, source) {
   }).filter(Boolean);
 }
 async function fetchDiscoveryCandidatePairs() {
-  const [boostsTop, boostsLatest, profiles] = await Promise.all([
-    dexFetchJson(`${DEX_BASE}/token-boosts/top/v1`, { priority: -20, label: 'background_boost_top_candidates' }),
-    dexFetchJson(`${DEX_BASE}/token-boosts/latest/v1`, { priority: -20, label: 'background_boost_latest_candidates' }),
-    dexFetchJson(`${DEX_BASE}/token-profiles/latest/v1`, { priority: -20, label: 'background_profile_candidates' }),
-  ]);
-  const candidates = [
-    ...candidateRows(boostsTop, 'top_boost_candidate'),
-    ...candidateRows(boostsLatest, 'latest_boost_candidate'),
-    ...candidateRows(profiles, 'latest_profile_candidate'),
+  // Step1041.1: top/latest boosts + latest profiles alone can legitimately yield fewer
+  // than 50 unique tokens on the four supported chains. Expand only the backend discovery
+  // candidate pool with two additional DEX Screener *identity* feeds. Paid/CTO presence is
+  // never used as the final rank: every candidate is re-read through the exact-token market
+  // endpoint and rescored only by current pool liquidity/volume/activity.
+  const feedSpecs = [
+    { path: '/token-boosts/top/v1', source: 'top_boost_candidate', label: 'background_boost_top_candidates' },
+    { path: '/token-boosts/latest/v1', source: 'latest_boost_candidate', label: 'background_boost_latest_candidates' },
+    { path: '/token-profiles/latest/v1', source: 'latest_profile_candidate', label: 'background_profile_candidates' },
+    { path: '/community-takeovers/latest/v1', source: 'latest_community_takeover_candidate', label: 'background_cto_candidates' },
+    { path: '/ads/latest/v1', source: 'latest_ad_candidate', label: 'background_ad_candidates' },
   ];
+  const settled = await Promise.all(feedSpecs.map(async (spec) => {
+    try {
+      const payload = await dexFetchJson(`${DEX_BASE}${spec.path}`, { priority: -20, label: spec.label });
+      return { ...spec, payload, ok: true };
+    } catch (error) {
+      return { ...spec, payload: [], ok: false, error: text(error?.message || error).slice(0, 160) };
+    }
+  }));
+  if (!settled.some((x) => x.ok)) throw new Error('dexscreener_all_candidate_feeds_failed');
+
+  const candidates = settled.flatMap((feed) => candidateRows(feed.payload, feed.source));
   const byIdentity = new Map();
   for (const row of candidates) {
     const key = `${row.network}|${lower(row.address)}`;
@@ -2930,29 +2946,40 @@ async function fetchDiscoveryCandidatePairs() {
     cur.token_profile = mergeTokenProfile(cur.token_profile, row.token_profile);
     byIdentity.set(key, cur);
   }
+
   const grouped = new Map(Object.keys(NETWORKS).map((key) => [key, []]));
   for (const row of byIdentity.values()) {
     const list = grouped.get(row.network);
     if (list && list.length < DISCOVERY_MAX_CANDIDATES_PER_CHAIN) list.push(row);
   }
+
   const pairs = [];
   for (const [network, list] of grouped) {
     if (!list.length) continue;
     const meta = networkMeta(network);
-    const addresses = list.map((x) => x.address).slice(0, 30);
-    const payload = await dexFetchJson(`${DEX_BASE}/tokens/v1/${encodeURIComponent(meta.dex)}/${addresses.map(encodeURIComponent).join(',')}`, { priority: -15, label: `background_batch_${network}` });
-    const normalized = normalizeDexPairs(payload).filter((row) => row.network === network);
-    for (const pair of normalized) {
-      const match = list.find((x) => lower(pair.base_token.address) === lower(x.address) || lower(pair.quote_token.address) === lower(x.address));
-      if (!match) continue;
-      pairs.push({
-        ...pair,
-        candidate_token_address: match.address,
-        candidate_sources: match.candidate_sources,
-        candidate_boost_amount: match.amount,
-        candidate_total_boost_amount: match.total_amount,
-        candidate_token_profile: match.token_profile || null,
-      });
+    for (let offset = 0; offset < list.length; offset += DEX_TOKEN_BATCH_MAX) {
+      const batch = list.slice(offset, offset + DEX_TOKEN_BATCH_MAX);
+      const byAddress = new Map(batch.map((x) => [lower(x.address), x]));
+      const addresses = batch.map((x) => x.address);
+      const payload = await dexFetchJson(
+        `${DEX_BASE}/tokens/v1/${encodeURIComponent(meta.dex)}/${addresses.map(encodeURIComponent).join(',')}`,
+        { priority: -15, label: `background_batch_${network}_${Math.floor(offset / DEX_TOKEN_BATCH_MAX) + 1}` },
+      );
+      const normalized = normalizeDexPairs(payload).filter((row) => row.network === network);
+      for (const pair of normalized) {
+        const baseMatch = byAddress.get(lower(pair.base_token.address));
+        const quoteMatch = byAddress.get(lower(pair.quote_token.address));
+        const match = baseMatch || quoteMatch;
+        if (!match) continue;
+        pairs.push({
+          ...pair,
+          candidate_token_address: match.address,
+          candidate_sources: match.candidate_sources,
+          candidate_boost_amount: match.amount,
+          candidate_total_boost_amount: match.total_amount,
+          candidate_token_profile: match.token_profile || null,
+        });
+      }
     }
   }
   return pairs;
@@ -3010,32 +3037,34 @@ async function refreshCurrentMarketFields() {
     const grouped = new Map(Object.keys(NETWORKS).map((key) => [key, []]));
     for (const row of candidates.values()) {
       const list = grouped.get(row.network);
-      if (list && list.length < DISCOVERY_MAX_CANDIDATES_PER_CHAIN) list.push(row);
+      if (list && list.length < STEP1041_HOT_MAX_ROWS) list.push(row);
     }
     try {
       const refreshedPairs = [];
       for (const [network, list] of grouped) {
         if (!list.length) continue;
         const meta = networkMeta(network);
-        const addresses = list.map((x) => x.address).slice(0, DISCOVERY_MAX_CANDIDATES_PER_CHAIN);
-        const payload = await dexFetchJson(
-          `${DEX_BASE}/tokens/v1/${encodeURIComponent(meta.dex)}/${addresses.map(encodeURIComponent).join(',')}`,
-          { priority: -10, label: `background_market_refresh_${network}` },
-        );
-        const normalized = normalizeDexPairs(payload).filter((row) => row.network === network);
-        for (const pair of normalized) {
-          const match = list.find((x) =>
-            lower(pair.base_token.address) === lower(x.address) ||
-            lower(pair.quote_token.address) === lower(x.address));
-          if (!match) continue;
-          refreshedPairs.push({
-            ...pair,
-            candidate_token_address: match.address,
-            candidate_sources: match.candidate_sources,
-            candidate_boost_amount: match.candidate_boost_amount,
-            candidate_total_boost_amount: match.candidate_total_boost_amount,
-            candidate_token_profile: match.token_profile,
-          });
+        for (let offset = 0; offset < list.length; offset += DEX_TOKEN_BATCH_MAX) {
+          const batch = list.slice(offset, offset + DEX_TOKEN_BATCH_MAX);
+          const byAddress = new Map(batch.map((x) => [lower(x.address), x]));
+          const addresses = batch.map((x) => x.address);
+          const payload = await dexFetchJson(
+            `${DEX_BASE}/tokens/v1/${encodeURIComponent(meta.dex)}/${addresses.map(encodeURIComponent).join(',')}`,
+            { priority: -10, label: `background_market_refresh_${network}_${Math.floor(offset / DEX_TOKEN_BATCH_MAX) + 1}` },
+          );
+          const normalized = normalizeDexPairs(payload).filter((row) => row.network === network);
+          for (const pair of normalized) {
+            const match = byAddress.get(lower(pair.base_token.address)) || byAddress.get(lower(pair.quote_token.address));
+            if (!match) continue;
+            refreshedPairs.push({
+              ...pair,
+              candidate_token_address: match.address,
+              candidate_sources: match.candidate_sources,
+              candidate_boost_amount: match.candidate_boost_amount,
+              candidate_total_boost_amount: match.candidate_total_boost_amount,
+              candidate_token_profile: match.token_profile,
+            });
+          }
         }
       }
       const rows = recentHotTokenRows(refreshedPairs);
@@ -3323,6 +3352,9 @@ function healthPayload() {
       feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION,
       hot_max_rows: STEP1041_HOT_MAX_ROWS,
       new_max_rows: STEP1041_NEW_MAX_ROWS,
+      expected_self_test_min: 60,
+      discovery_candidate_feed_count: STEP1041_CANDIDATE_FEED_COUNT,
+      exact_market_batch_max: DEX_TOKEN_BATCH_MAX,
       new_pool_max_age_ms: STEP1041_NEW_POOL_MAX_AGE_MS,
       trending_rows: Math.min(trendingSnapshot.length, STEP1041_HOT_MAX_ROWS),
       overview_route: OVERVIEW_ROUTE,
@@ -3371,6 +3403,11 @@ function healthPayload() {
       age_ms: ageMs,
       rows: trendingSnapshot.length,
       max_candidates_per_chain: DISCOVERY_MAX_CANDIDATES_PER_CHAIN,
+      exact_market_batch_max: DEX_TOKEN_BATCH_MAX,
+      candidate_feed_count: STEP1041_CANDIDATE_FEED_COUNT,
+      candidate_feeds: ['top_boost','latest_boost','latest_profile','community_takeover','latest_ad'],
+      paid_or_cto_presence_not_used_as_final_rank: true,
+      final_hot_rows_require_verified_token_market_identity: true,
     },
     kline: {
       opened: true,
@@ -3554,6 +3591,9 @@ function runSelfTest() {
   t('step1041_overview_shared_only', finalOverview.no_user_upstream_build === true && finalOverview.volume_liquidity_are_sample_sums_not_whole_chain_totals === true);
   t('step1041_new_pool_semantics_fail_closed', STEP1041_NEW_POOL_MAX_AGE_MS === 7 * 24 * 60 * 60_000);
   t('step1041_pressure_contract_10_100_1000', JSON.stringify(healthPayload().step1041_final_productization.pressure_contract.users) === JSON.stringify([10,100,1000]));
+  t('step1041_candidate_feed_expansion_5', STEP1041_CANDIDATE_FEED_COUNT === 5);
+  t('step1041_exact_market_batches_bounded_30', DEX_TOKEN_BATCH_MAX === 30 && DISCOVERY_MAX_CANDIDATES_PER_CHAIN <= 90);
+  t('step1041_hot_rows_verified_only', healthPayload().discovery.final_hot_rows_require_verified_token_market_identity === true);
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
