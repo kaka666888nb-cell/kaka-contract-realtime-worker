@@ -744,7 +744,7 @@ async function buildCoinbaseEquity(identity) {
     trading_disabled: bool(meta.trading_disabled), auction_mode: bool(meta.auction_mode),
     equity_product_details: {
       equity_subtype: safeText(meta.equity_subtype), fractionable: bool(meta.fractionable), liquidate_only: null,
-      ticker: shared.display_symbol, description: null, short_name: shared.display_name, cik: safeText(meta.cik), company_description: null, company_website: null,
+      ticker: shared.display_symbol, description: safeText(meta.description || meta.about_description, 1000), short_name: safeText(meta.short_name || shared.display_name, 300), cik: safeText(meta.cik), company_description: safeText(meta.company_description || meta.about_description, 1000), company_website: safeText(meta.company_website, 800),
       trading_halted: shared.trading_halted, trading_halted_start_time: null, trading_halted_end_time: null,
       fractional_notional_min_size: null, current_session: shared.current_session, opol: null,
       trading_day_info: meta.trading_day_info || null, recent_trading_days: meta.recent_trading_days || null,

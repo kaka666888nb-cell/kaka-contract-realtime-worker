@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.191';
+const VERSION = '650.8.15.192';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -68,6 +68,7 @@ function sharedResponsePolicy(pathname) {
   if (path === '/api/onchain/klines') return { freshMs: 5_000, staleMs: 60_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/onchain/trades') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/onchain/new-pools') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
+  if (path === '/api/onchain/fx-reference') return { freshMs: 60_000, staleMs: 10 * 60_000, cdnSMaxAgeSec: 60 };
   return null;
 }
 

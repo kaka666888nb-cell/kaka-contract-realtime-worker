@@ -1,4 +1,4 @@
-// Step1037 / Render 650.8.15.191
+// Step1037.5 / Render 650.8.15.192
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.191.3';
-const DATA_VERSION = 1037003;
+const VERSION = '650.8.15.192';
+const DATA_VERSION = 1037005;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 
 const HEALTH_ROUTE = '/api/onchain/health';
@@ -20,6 +20,7 @@ const POOLS_ROUTE = '/api/onchain/pools';
 const KLINES_ROUTE = '/api/onchain/klines';
 const TRADES_ROUTE = '/api/onchain/trades';
 const NEW_POOLS_ROUTE = '/api/onchain/new-pools';
+const FX_REFERENCE_ROUTE = '/api/onchain/fx-reference';
 
 const DEX_BASE = 'https://api.dexscreener.com';
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
@@ -28,6 +29,12 @@ const DEX_MIN_GAP_MS = 1_200;
 const DEX_MAX_QUEUE = 80;
 const UPSTREAM_TIMEOUT_MS = 12_000;
 const DISCOVERY_REFRESH_MS = 5 * 60_000;
+// Step1037.5: discovery/profile remains slow; exact market fields refresh on a separate fixed backend lane.
+const MARKET_REFRESH_MS = 30_000;
+const MARKET_RETAIN_MS = 5 * 60_000;
+const FX_REFRESH_MS = 6 * 60 * 60_000;
+const FX_RETAIN_MS = 96 * 60 * 60_000;
+const ECB_FX_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml';
 const DISCOVERY_RETAIN_MS = 30 * 60_000;
 const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 30;
 const CACHE_MAX_ENTRIES = 512;
@@ -90,6 +97,12 @@ const stats = {
   background_cycles_started: 0,
   background_cycles_succeeded: 0,
   background_cycles_failed: 0,
+  market_refresh_started: 0,
+  market_refresh_succeeded: 0,
+  market_refresh_failed: 0,
+  fx_refresh_started: 0,
+  fx_refresh_succeeded: 0,
+  fx_refresh_failed: 0,
   last_background_started_at: null,
   last_background_success_at: null,
   last_background_error: '',
@@ -130,6 +143,11 @@ let discoveryStarted = false;
 let discoveryInflight = null;
 let trendingSnapshot = [];
 let discoveryUpdatedAt = 0;
+let marketRefreshInflight = null;
+let marketUpdatedAt = 0;
+let fxRefreshInflight = null;
+let fxSnapshot = null;
+let fxUpdatedAt = 0;
 
 function text(value) { return String(value ?? '').trim(); }
 function lower(value) { return text(value).toLowerCase(); }
@@ -985,6 +1003,7 @@ function tokenCentricRow(pair, token, extra = {}) {
     price_change_pct: baseVerified ? pair.price_change_pct : nullPriceChange(),
     txns: pair.txns,
     pool_created_at: pair.pool_created_at,
+    token_profile: extra.token_profile || tokenProfileForIdentity(pair.network, token?.address) || null,
     source: 'dexscreener_public_api_token_centric',
     ...extra,
   };
@@ -1028,13 +1047,77 @@ async function buildDexTokenPairs(network, address) {
   const exact = normalizeDexPairs(payload).filter((row) => row.network === network && tokenAddressInPair(row, address));
   return sortBestPools(dedupePools(exact)).slice(0, MAX_RESPONSE_ROWS);
 }
+function normalizePublicLink(item) {
+  if (!item || typeof item !== 'object') return null;
+  const url = text(item.url);
+  if (!/^https?:\/\//i.test(url)) return null;
+  const type = text(item.type || item.platform || item.label).slice(0, 80);
+  const label = text(item.label || item.type || item.platform).slice(0, 120);
+  return { type, label, url: url.slice(0, 1000) };
+}
+function normalizeCandidateProfile(item) {
+  if (!item || typeof item !== 'object') return null;
+  const iconUrl = text(item.icon);
+  const headerUrl = text(item.header);
+  const profileUrl = text(item.url);
+  const description = text(item.description).replace(/\s+/g, ' ').slice(0, 1200);
+  const links = Array.isArray(item.links)
+    ? item.links.map(normalizePublicLink).filter(Boolean).slice(0, 12)
+    : [];
+  if (!iconUrl && !headerUrl && !profileUrl && !description && !links.length) return null;
+  return {
+    icon_url: /^https:\/\//i.test(iconUrl) ? iconUrl.slice(0, 1000) : '',
+    header_url: /^https:\/\//i.test(headerUrl) ? headerUrl.slice(0, 1000) : '',
+    profile_url: /^https?:\/\//i.test(profileUrl) ? profileUrl.slice(0, 1000) : '',
+    description,
+    links,
+    source: 'dexscreener_public_token_profile',
+  };
+}
+function mergeTokenProfile(left, right) {
+  if (!left) return right || null;
+  if (!right) return left || null;
+  const links = [];
+  const seen = new Set();
+  for (const item of [...(left.links || []), ...(right.links || [])]) {
+    const key = lower(item?.url);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    links.push(item);
+    if (links.length >= 12) break;
+  }
+  return {
+    icon_url: text(right.icon_url) || text(left.icon_url),
+    header_url: text(right.header_url) || text(left.header_url),
+    profile_url: text(right.profile_url) || text(left.profile_url),
+    description: text(right.description) || text(left.description),
+    links,
+    source: 'dexscreener_public_token_profile',
+  };
+}
+function tokenProfileForIdentity(network, address) {
+  const key = `${network}|${lower(address)}`;
+  for (const row of trendingSnapshot) {
+    if (`${row.network}|${lower(row?.token?.address)}` === key && row.token_profile) {
+      return row.token_profile;
+    }
+  }
+  return null;
+}
 function candidateRows(payload, source) {
   const raw = Array.isArray(payload) ? payload : payload && typeof payload === 'object' ? [payload] : [];
   return raw.map((item) => {
     const network = DEX_TO_NETWORK[lower(item?.chainId)] || '';
     const address = text(item?.tokenAddress);
     if (!network || !validAddressForNetwork(network, address)) return null;
-    return { network, address, source, amount: numberOrNull(item?.amount), total_amount: numberOrNull(item?.totalAmount) };
+    return {
+      network,
+      address,
+      source,
+      amount: numberOrNull(item?.amount),
+      total_amount: numberOrNull(item?.totalAmount),
+      token_profile: normalizeCandidateProfile(item),
+    };
   }).filter(Boolean);
 }
 async function fetchDiscoveryCandidatePairs() {
@@ -1050,6 +1133,7 @@ async function fetchDiscoveryCandidatePairs() {
     if (!cur.candidate_sources.includes(row.source)) cur.candidate_sources.push(row.source);
     cur.amount = Math.max(Number(cur.amount || 0), Number(row.amount || 0));
     cur.total_amount = Math.max(Number(cur.total_amount || 0), Number(row.total_amount || 0));
+    cur.token_profile = mergeTokenProfile(cur.token_profile, row.token_profile);
     byIdentity.set(key, cur);
   }
   const grouped = new Map(Object.keys(NETWORKS).map((key) => [key, []]));
@@ -1073,6 +1157,7 @@ async function fetchDiscoveryCandidatePairs() {
         candidate_sources: match.candidate_sources,
         candidate_boost_amount: match.amount,
         candidate_total_boost_amount: match.total_amount,
+        candidate_token_profile: match.token_profile || null,
       });
     }
   }
@@ -1090,6 +1175,7 @@ function recentHotTokenRows(pairs) {
       candidate_sources: pair.candidate_sources || [],
       candidate_boost_amount: pair.candidate_boost_amount ?? null,
       candidate_total_boost_amount: pair.candidate_total_boost_amount ?? null,
+      token_profile: pair.candidate_token_profile || null,
       source: 'dexscreener_public_api_exact_discovery_token_rescore',
     });
     if (!row) continue;
@@ -1106,6 +1192,127 @@ function recentHotTokenRows(pairs) {
     .slice(0, MAX_RESPONSE_ROWS);
 }
 
+function currentCandidateMetadata() {
+  const byKey = new Map();
+  for (const row of trendingSnapshot) {
+    const address = text(row?.token?.address);
+    if (!address || !row?.network) continue;
+    byKey.set(`${row.network}|${lower(address)}`, {
+      network: row.network,
+      address,
+      candidate_sources: Array.isArray(row.candidate_sources) ? row.candidate_sources : [],
+      candidate_boost_amount: row.candidate_boost_amount ?? null,
+      candidate_total_boost_amount: row.candidate_total_boost_amount ?? null,
+      token_profile: row.token_profile || null,
+    });
+  }
+  return byKey;
+}
+async function refreshCurrentMarketFields() {
+  if (marketRefreshInflight || trendingSnapshot.length === 0) return marketRefreshInflight;
+  marketRefreshInflight = (async () => {
+    stats.market_refresh_started += 1;
+    const candidates = currentCandidateMetadata();
+    const grouped = new Map(Object.keys(NETWORKS).map((key) => [key, []]));
+    for (const row of candidates.values()) {
+      const list = grouped.get(row.network);
+      if (list && list.length < DISCOVERY_MAX_CANDIDATES_PER_CHAIN) list.push(row);
+    }
+    try {
+      const refreshedPairs = [];
+      for (const [network, list] of grouped) {
+        if (!list.length) continue;
+        const meta = networkMeta(network);
+        const addresses = list.map((x) => x.address).slice(0, DISCOVERY_MAX_CANDIDATES_PER_CHAIN);
+        const payload = await dexFetchJson(
+          `${DEX_BASE}/tokens/v1/${encodeURIComponent(meta.dex)}/${addresses.map(encodeURIComponent).join(',')}`,
+          { priority: -10, label: `background_market_refresh_${network}` },
+        );
+        const normalized = normalizeDexPairs(payload).filter((row) => row.network === network);
+        for (const pair of normalized) {
+          const match = list.find((x) =>
+            lower(pair.base_token.address) === lower(x.address) ||
+            lower(pair.quote_token.address) === lower(x.address));
+          if (!match) continue;
+          refreshedPairs.push({
+            ...pair,
+            candidate_token_address: match.address,
+            candidate_sources: match.candidate_sources,
+            candidate_boost_amount: match.candidate_boost_amount,
+            candidate_total_boost_amount: match.candidate_total_boost_amount,
+            candidate_token_profile: match.token_profile,
+          });
+        }
+      }
+      const rows = recentHotTokenRows(refreshedPairs);
+      if (!rows.length) throw new Error('dexscreener_current_market_refresh_empty');
+      trendingSnapshot = rows;
+      marketUpdatedAt = Date.now();
+      stats.market_refresh_succeeded += 1;
+      return rows.length;
+    } catch (error) {
+      stats.market_refresh_failed += 1;
+      throw error;
+    } finally {
+      marketRefreshInflight = null;
+    }
+  })();
+  return marketRefreshInflight;
+}
+function parseEcbDailyFxXml(xml) {
+  const raw = text(xml);
+  const timeMatch = raw.match(/<Cube\s+time=['\"]([^'\"]+)['\"]/i);
+  if (!timeMatch) throw new Error('ecb_fx_observation_missing');
+  const rates = {};
+  for (const match of raw.matchAll(/<Cube\s+currency=['\"]([A-Z]{3})['\"]\s+rate=['\"]([0-9.]+)['\"]\s*\/?>/g)) {
+    const value = Number(match[2]);
+    if (Number.isFinite(value) && value > 0) rates[match[1]] = value;
+  }
+  const usd = Number(rates.USD);
+  if (!Number.isFinite(usd) || usd <= 0) throw new Error('ecb_fx_usd_missing');
+  const usdTo = { USD: 1, EUR: 1 / usd };
+  for (const code of ['CNY', 'JPY']) {
+    const value = Number(rates[code]);
+    if (Number.isFinite(value) && value > 0) usdTo[code] = value / usd;
+  }
+  if (!usdTo.CNY || !usdTo.JPY) throw new Error('ecb_fx_required_currency_missing');
+  return {
+    source: 'ecb_euro_foreign_exchange_reference_rates',
+    source_role: 'daily_reference_secondary_display_only',
+    observation_date: timeMatch[1],
+    base_currency: 'USD',
+    usd_to: usdTo,
+    eur_reference: { USD: usd, CNY: Number(rates.CNY), JPY: Number(rates.JPY) },
+  };
+}
+async function refreshFxReference() {
+  if (fxRefreshInflight) return fxRefreshInflight;
+  fxRefreshInflight = (async () => {
+    stats.fx_refresh_started += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await fetch(ECB_FX_URL, {
+        signal: controller.signal,
+        headers: { accept: 'application/xml,text/xml;q=0.9,*/*;q=0.1', 'user-agent': 'KakaWeb3-FX-Shared/1037.5' },
+      });
+      const body = await response.text();
+      if (!response.ok) throw new Error(`ecb_fx_http_${response.status}`);
+      fxSnapshot = parseEcbDailyFxXml(body);
+      fxUpdatedAt = Date.now();
+      stats.fx_refresh_succeeded += 1;
+      return fxSnapshot;
+    } catch (error) {
+      stats.fx_refresh_failed += 1;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      fxRefreshInflight = null;
+    }
+  })();
+  return fxRefreshInflight;
+}
 async function refreshDiscovery() {
   if (discoveryInflight) return discoveryInflight;
   discoveryInflight = (async () => {
@@ -1117,6 +1324,7 @@ async function refreshDiscovery() {
       if (!rows.length) throw new Error('dexscreener_recent_hot_discovery_empty');
       trendingSnapshot = rows;
       discoveryUpdatedAt = Date.now();
+      marketUpdatedAt = discoveryUpdatedAt;
       stats.background_cycles_succeeded += 1;
       stats.last_background_success_at = new Date().toISOString();
       stats.last_background_error = '';
@@ -1136,12 +1344,22 @@ export function startOnchainMarketCollector() {
   first.unref?.();
   const timer = setInterval(() => refreshDiscovery().catch(() => {}), DISCOVERY_REFRESH_MS);
   timer.unref?.();
+  const marketFirst = setTimeout(() => refreshCurrentMarketFields().catch(() => {}), 22_000);
+  marketFirst.unref?.();
+  const marketTimer = setInterval(() => refreshCurrentMarketFields().catch(() => {}), MARKET_REFRESH_MS);
+  marketTimer.unref?.();
+  const fxFirst = setTimeout(() => refreshFxReference().catch(() => {}), 4_500);
+  fxFirst.unref?.();
+  const fxTimer = setInterval(() => refreshFxReference().catch(() => {}), FX_REFRESH_MS);
+  fxTimer.unref?.();
 }
 function discoveryRows(network, limit) {
   return trendingSnapshot.filter((row) => network === 'all' || row.network === network).slice(0, limit);
 }
 function healthPayload() {
   const ageMs = discoveryUpdatedAt ? Math.max(0, Date.now() - discoveryUpdatedAt) : null;
+  const marketAgeMs = marketUpdatedAt ? Math.max(0, Date.now() - marketUpdatedAt) : null;
+  const fxAgeMs = fxUpdatedAt ? Math.max(0, Date.now() - fxUpdatedAt) : null;
   return responseBase({
     service: 'onchain-market',
     networks: Object.values(NETWORKS).map((x) => ({ key: x.key, dex: x.dex, chain_id: x.chain_id, family: x.family, zh: x.zh, en: x.en })),
@@ -1156,6 +1374,15 @@ function healthPayload() {
         documented_search_pair_rate_limit_per_minute: 300,
         backend_global_min_gap_ms: DEX_MIN_GAP_MS,
         backend_global_max_starts_per_minute: Math.floor(60_000 / DEX_MIN_GAP_MS),
+      },
+      ecb_fx: {
+        docs: 'https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html',
+        data_url: ECB_FX_URL,
+        role: 'daily_reference_secondary_display_only',
+        background_only: true,
+        user_reads_start_upstream: false,
+        refresh_interval_ms: FX_REFRESH_MS,
+        retain_ms: FX_RETAIN_MS,
       },
       moralis: {
         docs_evm_ohlcv: 'https://docs.moralis.com/data-api/evm/price/ohlc',
@@ -1175,6 +1402,26 @@ function healthPayload() {
         budget: moralisBudgetState(),
       },
     },
+    current_market_refresh: {
+      ready: trendingSnapshot.length > 0 && (marketAgeMs === null || marketAgeMs <= MARKET_RETAIN_MS),
+      refresh_interval_ms: MARKET_REFRESH_MS,
+      retain_ms: MARKET_RETAIN_MS,
+      age_ms: marketAgeMs,
+      rows: trendingSnapshot.length,
+      user_reads_start_upstream: false,
+      fixed_background_rate_independent_of_user_count: true,
+    },
+    fx_reference: {
+      ready: Boolean(fxSnapshot) && (fxAgeMs === null || fxAgeMs <= FX_RETAIN_MS),
+      route: FX_REFERENCE_ROUTE,
+      source: 'ecb_euro_foreign_exchange_reference_rates',
+      observation_date: fxSnapshot?.observation_date || null,
+      supported_secondary_currencies: ['CNY', 'JPY', 'EUR'],
+      refresh_interval_ms: FX_REFRESH_MS,
+      retain_ms: FX_RETAIN_MS,
+      age_ms: fxAgeMs,
+      user_reads_start_upstream: false,
+    },
     discovery: {
       ready: trendingSnapshot.length > 0 && (ageMs === null || ageMs <= DISCOVERY_RETAIN_MS),
       name: 'recent_hot',
@@ -1183,6 +1430,7 @@ function healthPayload() {
       both_sides_of_pair_are_not_automatically_listed: true,
       quote_token_never_inherits_base_token_market_fields: true,
       basis: 'latest_profile_plus_top_boost_candidates_rescored_by_liquidity_volume_and_transactions',
+      token_profile_metadata_preserved: true,
       paid_boost_rank_not_used_as_final_rank: true,
       retained_if_refresh_fails: true,
       refresh_interval_ms: DISCOVERY_REFRESH_MS,
@@ -1315,6 +1563,12 @@ function runSelfTest() {
   t('moralis_single_auth_header_only', healthPayload().sources.moralis.auth_header_count_per_request === 1 && healthPayload().sources.moralis.duplicate_case_variant_headers === false);
   t('moralis_pair_swap_schema_not_token_swap_schema', healthPayload().recent_trades.token_swaps_bought_sold_schema_not_assumed === true);
   t('moralis_15m_same_pool_derivation_only', MORALIS_TIMEFRAME['15m'] === '5min');
+  const profileSynthetic = normalizeCandidateProfile({ icon: 'https://cdn.example/icon.png', header: 'https://cdn.example/header.png', description: 'Hello', url: 'https://dexscreener.com/x', links: [{ type: 'twitter', url: 'https://x.com/example' }] });
+  t('token_profile_metadata_parser', profileSynthetic?.icon_url.startsWith('https://') && profileSynthetic?.description === 'Hello' && profileSynthetic?.links?.length === 1);
+  const fxSynthetic = parseEcbDailyFxXml(`<gesmes><Cube><Cube time='2026-08-19'><Cube currency='USD' rate='1.1605'/><Cube currency='JPY' rate='184.62'/><Cube currency='CNY' rate='7.8197'/></Cube></Cube></gesmes>`);
+  t('ecb_fx_cross_rate_math', Math.abs(fxSynthetic.usd_to.CNY - (7.8197 / 1.1605)) < 1e-9 && Math.abs(fxSynthetic.usd_to.EUR - (1 / 1.1605)) < 1e-9);
+  t('market_refresh_fixed_background', MARKET_REFRESH_MS >= 30_000 && MARKET_REFRESH_MS < DISCOVERY_REFRESH_MS);
+  t('fx_user_reads_do_not_start_upstream', healthPayload().fx_reference.user_reads_start_upstream === false);
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
@@ -1323,11 +1577,20 @@ function runSelfTest() {
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
   if (path === SELF_TEST_ROUTE) { const result = runSelfTest(); sendJson(res, result.ok ? 200 : 500, result); return true; }
+  if (path === FX_REFERENCE_ROUTE) {
+    const ageMs = fxUpdatedAt ? Math.max(0, Date.now() - fxUpdatedAt) : null;
+    if (!fxSnapshot || ageMs === null || ageMs > FX_RETAIN_MS) {
+      sendJson(res, 503, responseBase({ ok: false, error: 'shared_fx_reference_not_ready', source: 'ecb_euro_foreign_exchange_reference_rates', user_read_upstream_requests: 0 }));
+      return true;
+    }
+    sendJson(res, 200, responseBase({ ...fxSnapshot, generated_at: new Date(fxUpdatedAt).toISOString(), shared_snapshot_age_ms: ageMs, user_read_upstream_requests: 0, cache_status: 'background_shared' }));
+    return true;
+  }
 
   const network = normalizeNetwork(url.searchParams.get('network'));
   const limit = intRange(url.searchParams.get('limit'), 1, MAX_RESPONSE_ROWS, 50);
@@ -1340,7 +1603,7 @@ export async function handleOnchainMarket(req, res, url) {
       sendJson(res, 503, responseBase({ ok: false, error: 'onchain_shared_recent_hot_not_ready', network, rows: [], user_read_upstream_requests: 0 }));
       return true;
     }
-    sendJson(res, 200, responseBase({ network, rows, row_count: rows.length, generated_at: discoveryUpdatedAt ? new Date(discoveryUpdatedAt).toISOString() : null, shared_snapshot_age_ms: ageMs, user_read_upstream_requests: 0, cache_status: 'background_shared' }));
+    sendJson(res, 200, responseBase({ network, rows, row_count: rows.length, generated_at: marketUpdatedAt ? new Date(marketUpdatedAt).toISOString() : (discoveryUpdatedAt ? new Date(discoveryUpdatedAt).toISOString() : null), shared_snapshot_age_ms: marketUpdatedAt ? Math.max(0, Date.now() - marketUpdatedAt) : ageMs, user_read_upstream_requests: 0, cache_status: 'background_shared' }));
     return true;
   }
 
@@ -1378,6 +1641,7 @@ export async function handleOnchainMarket(req, res, url) {
           token,
           best_pool: best,
           token_market: tokenMarket,
+          token_profile: tokenMarket?.token_profile || tokenProfileForIdentity(network, address) || null,
           token_market_fields_verified: tokenMarket?.token_market_fields_verified === true,
           pool_count: rows.length,
           pools_preview: rows.slice(0, 6),
