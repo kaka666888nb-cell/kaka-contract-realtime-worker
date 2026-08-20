@@ -1,4 +1,4 @@
-// Step1038.1 / Render 650.8.15.193.1
+// Step1038.2.1 / Render 650.8.15.193.2
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.193.1';
-const DATA_VERSION = 1038001;
+const VERSION = '650.8.15.193.2';
+const DATA_VERSION = 1038002;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 
@@ -69,6 +69,8 @@ const MORALIS_TOP_HOLDERS_CU = 50;
 const HOLDER_FRESH_MS = 15 * 60_000;
 const HOLDER_STALE_MS = 6 * 60 * 60_000;
 const HOLDER_NEGATIVE_MS = 2 * 60_000;
+const SOLANA_HELIUS_HOLDER_FRESH_MS = 30 * 60_000;
+const SOLANA_HELIUS_HOLDER_STALE_MS = 12 * 60 * 60_000;
 const GOPLUS_MIN_GAP_MS = Math.max(2_050, Number(process.env.KAKA_GOPLUS_MIN_GAP_MS || 2_100));
 const GOPLUS_MAX_QUEUE = Math.max(6, Math.min(40, Number(process.env.KAKA_GOPLUS_MAX_QUEUE || 24)));
 const GOPLUS_TIMEOUT_MS = Math.max(5_000, Math.min(25_000, Number(process.env.KAKA_GOPLUS_TIMEOUT_MS || 12_000)));
@@ -77,6 +79,22 @@ const SECURITY_FRESH_MS = 30 * 60_000;
 const SECURITY_STALE_MS = 24 * 60 * 60_000;
 const SECURITY_NEGATIVE_MS = 2 * 60_000;
 const EVM_GOPLUS_CHAIN_ID = Object.freeze({ ethereum: '1', bsc: '56', base: '8453' });
+
+// Step1038.2.1: Solana holder analytics moves away from Moralis' deprecated
+// Solana holder endpoints. Helius getProgramAccountsV2 is filtered by the exact
+// mint and paginated in the backend. We aggregate token accounts by wallet owner
+// and only publish holder count / Top10/20/50 when the full filtered account set
+// was completely scanned. No partial page is promoted to a holder statistic.
+const HELIUS_API_KEY = String(process.env.HELIUS_API_KEY || '').trim();
+const HELIUS_RPC_BASE = 'https://mainnet.helius-rpc.com/';
+const HELIUS_MIN_GAP_MS = Math.max(220, Number(process.env.KAKA_HELIUS_MIN_GAP_MS || 260));
+const HELIUS_MAX_QUEUE = Math.max(6, Math.min(48, Number(process.env.KAKA_HELIUS_MAX_QUEUE || 24)));
+const HELIUS_TIMEOUT_MS = Math.max(5_000, Math.min(30_000, Number(process.env.KAKA_HELIUS_TIMEOUT_MS || 15_000)));
+const HELIUS_PAGE_LIMIT = Math.max(500, Math.min(10_000, Number(process.env.KAKA_HELIUS_HOLDER_PAGE_LIMIT || 5_000)));
+const HELIUS_MAX_EXACT_TOKEN_ACCOUNTS = Math.max(5_000, Math.min(100_000, Number(process.env.KAKA_HELIUS_HOLDER_MAX_ACCOUNTS || 50_000)));
+const SOLANA_TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const SOLANA_TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
 const MORALIS_EVM_CHAIN = Object.freeze({
   ethereum: 'eth',
@@ -154,6 +172,12 @@ const stats = {
   goplus_upstream_started: 0,
   goplus_upstream_succeeded: 0,
   goplus_upstream_failed: 0,
+  helius_upstream_started: 0,
+  helius_upstream_succeeded: 0,
+  helius_upstream_failed: 0,
+  helius_key_missing_rejections: 0,
+  helius_holder_complete_scans: 0,
+  helius_holder_incomplete_scans: 0,
 };
 
 const cache = new Map();
@@ -474,6 +498,224 @@ async function goplusFetchJson(url, { priority = 0, label = '' } = {}) {
   }, { priority, label });
 }
 
+
+
+const heliusScheduler = createScheduler({
+  name: 'helius',
+  minGapMs: HELIUS_MIN_GAP_MS,
+  maxQueue: HELIUS_MAX_QUEUE,
+});
+function heliusRpcUrl() {
+  const u = new URL(HELIUS_RPC_BASE);
+  u.searchParams.set('api-key', HELIUS_API_KEY);
+  return u.toString();
+}
+async function heliusRpc(method, params, { priority = 0, label = '' } = {}) {
+  if (!HELIUS_API_KEY) {
+    stats.helius_key_missing_rejections += 1;
+    const error = new Error('helius_api_key_not_configured');
+    error.statusCode = 503;
+    throw error;
+  }
+  return heliusScheduler.enqueue(async () => {
+    stats.helius_upstream_started += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HELIUS_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await fetch(heliusRpcUrl(), {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1038.2.1',
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'kaka', method, params }),
+      });
+      const body = await response.text();
+      if (!response.ok) {
+        const error = new Error(`helius_http_${response.status}:${body.slice(0, 220)}`);
+        error.statusCode = response.status;
+        throw error;
+      }
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { throw new Error('helius_invalid_json'); }
+      if (parsed?.error) {
+        const code = parsed.error?.code ?? 'rpc';
+        const message = text(parsed.error?.message || 'helius_rpc_error');
+        const error = new Error(`helius_rpc_${code}:${message.slice(0, 180)}`);
+        error.statusCode = 503;
+        throw error;
+      }
+      stats.helius_upstream_succeeded += 1;
+      return parsed?.result;
+    } catch (error) {
+      stats.helius_upstream_failed += 1;
+      throw error;
+    } finally { clearTimeout(timer); }
+  }, { priority, label });
+}
+function base58Encode(bytes) {
+  if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes || []);
+  if (!bytes.length) return '';
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros += 1;
+  const digits = [0];
+  for (let i = zeros; i < bytes.length; i += 1) {
+    let carry = bytes[i];
+    for (let j = 0; j < digits.length; j += 1) {
+      const value = digits[j] * 256 + carry;
+      digits[j] = value % 58;
+      carry = Math.floor(value / 58);
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
+  }
+  let out = '1'.repeat(zeros);
+  for (let i = digits.length - 1; i >= 0; i -= 1) out += BASE58_ALPHABET[digits[i]];
+  return out;
+}
+function parseSolanaTokenAccountSlice(raw) {
+  const data = raw?.account?.data;
+  const encoded = Array.isArray(data) ? text(data[0]) : '';
+  if (!encoded) return null;
+  let bytes;
+  try { bytes = Buffer.from(encoded, 'base64'); } catch { return null; }
+  if (bytes.length < 72) return null;
+  const mint = base58Encode(bytes.subarray(0, 32));
+  const owner = base58Encode(bytes.subarray(32, 64));
+  if (!looksSolanaAddress(mint) || !looksSolanaAddress(owner)) return null;
+  let amount = 0n;
+  for (let i = 0; i < 8; i += 1) amount |= BigInt(bytes[64 + i]) << BigInt(i * 8);
+  if (amount <= 0n) return null;
+  return { mint, owner, amount };
+}
+function bigintPercent(balance, supply) {
+  if (typeof balance !== 'bigint' || typeof supply !== 'bigint' || balance < 0n || supply <= 0n) return null;
+  const scale = 1_000_000n;
+  return Number((balance * 100n * scale) / supply) / Number(scale);
+}
+function sumTopBigintPercent(rows, count, supply) {
+  if (!Array.isArray(rows) || rows.length < count || typeof supply !== 'bigint' || supply <= 0n) return null;
+  let sum = 0n;
+  for (const row of rows.slice(0, count)) sum += row.amount;
+  return bigintPercent(sum, supply);
+}
+async function heliusTokenSupply(address) {
+  const result = await heliusRpc('getTokenSupply', [address, { commitment: 'confirmed' }], {
+    priority: 9,
+    label: `token_supply:solana:${address}`,
+  });
+  const raw = text(result?.value?.amount);
+  if (!/^\d+$/.test(raw)) throw new Error('helius_token_supply_missing');
+  return { amount: BigInt(raw), decimals: Number(result?.value?.decimals || 0) };
+}
+async function heliusProgramTokenAccounts(programId, mint, ownerBalances, state) {
+  let paginationKey = null;
+  do {
+    if (state.accountsSeen >= HELIUS_MAX_EXACT_TOKEN_ACCOUNTS) {
+      state.complete = false;
+      state.truncated = true;
+      return;
+    }
+    const remaining = HELIUS_MAX_EXACT_TOKEN_ACCOUNTS - state.accountsSeen;
+    const pageLimit = Math.max(1, Math.min(HELIUS_PAGE_LIMIT, remaining));
+    const config = {
+      encoding: 'base64',
+      commitment: 'confirmed',
+      dataSlice: { offset: 0, length: 72 },
+      filters: [{ memcmp: { offset: 0, bytes: mint } }],
+      limit: pageLimit,
+      ...(paginationKey ? { paginationKey } : {}),
+    };
+    const result = await heliusRpc('getProgramAccountsV2', [programId, config], {
+      priority: 8,
+      label: `holder_accounts:${programId === SOLANA_TOKEN_PROGRAM ? 'spl' : 'token2022'}:${mint}`,
+    });
+    const page = result?.value && typeof result.value === 'object' ? result.value : result;
+    const accounts = Array.isArray(page?.accounts) ? page.accounts : [];
+    for (const account of accounts) {
+      state.accountsSeen += 1;
+      const parsed = parseSolanaTokenAccountSlice(account);
+      if (!parsed || !exactAddressEqual('solana', parsed.mint, mint)) continue;
+      state.tokenAccounts += 1;
+      ownerBalances.set(parsed.owner, (ownerBalances.get(parsed.owner) || 0n) + parsed.amount);
+    }
+    paginationKey = text(page?.paginationKey) || null;
+    if (!paginationKey) return;
+    if (state.accountsSeen >= HELIUS_MAX_EXACT_TOKEN_ACCOUNTS) {
+      state.complete = false;
+      state.truncated = true;
+      return;
+    }
+  } while (paginationKey);
+}
+async function buildHeliusSolanaHolderAnalysis(address) {
+  if (!HELIUS_API_KEY) throw new Error('helius_api_key_not_configured');
+  const ownerBalances = new Map();
+  const state = { tokenAccounts: 0, accountsSeen: 0, complete: true, truncated: false };
+  const supply = await heliusTokenSupply(address);
+  // Query both token programs. A mint normally belongs to only one program; the exact
+  // mint memcmp keeps the other query empty and avoids guessing Token vs Token-2022.
+  await heliusProgramTokenAccounts(SOLANA_TOKEN_PROGRAM, address, ownerBalances, state);
+  if (state.complete) await heliusProgramTokenAccounts(SOLANA_TOKEN_2022_PROGRAM, address, ownerBalances, state);
+  if (!state.complete) {
+    stats.helius_holder_incomplete_scans += 1;
+    const error = new Error(`helius_holder_scan_truncated_at_${state.accountsSeen}`);
+    error.partial = { token_accounts_scanned: state.accountsSeen, nonzero_token_accounts_scanned: state.tokenAccounts, unique_owners_scanned: ownerBalances.size };
+    throw error;
+  }
+  const rows = [...ownerBalances.entries()]
+    .filter(([, amount]) => amount > 0n)
+    .map(([owner, amount]) => ({ owner, amount }))
+    .sort((a, b) => (a.amount === b.amount ? 0 : a.amount > b.amount ? -1 : 1));
+  if (!rows.length) throw new Error('helius_holder_scan_no_nonzero_accounts');
+  stats.helius_holder_complete_scans += 1;
+  const topHolders = rows.slice(0, 50).map((row) => ({
+    address: row.owner,
+    label: null,
+    entity: null,
+    entity_logo: null,
+    balance: null,
+    raw_balance: row.amount.toString(),
+    usd_value: null,
+    percent: bigintPercent(row.amount, supply.amount),
+    is_contract: null,
+  }));
+  return {
+    source: 'helius_official_rpc_exact_solana_holder_index',
+    source_scope: 'exact_mint_full_token_account_scan_aggregated_by_wallet_owner',
+    total_holders: rows.length,
+    token_accounts_scanned: state.accountsSeen,
+    nonzero_token_accounts_scanned: state.tokenAccounts,
+    concentration: {
+      top10_percent: rows.length >= 10 ? sumTopBigintPercent(rows, 10, supply.amount) : null,
+      top20_percent: rows.length >= 20 ? sumTopBigintPercent(rows, 20, supply.amount) : null,
+      top25_percent: rows.length >= 25 ? sumTopBigintPercent(rows, 25, supply.amount) : null,
+      top50_percent: rows.length >= 50 ? sumTopBigintPercent(rows, 50, supply.amount) : null,
+    },
+    holder_change: { h1: null, h6: null, h24: null, d7: null },
+    holder_distribution: null,
+    holders_by_acquisition: null,
+    top_holders: topHolders,
+    exact_top20_available: rows.length >= 20,
+    top_holder_list_available: topHolders.length > 0,
+    field_sources: {
+      total_holders: 'helius_getProgramAccountsV2_full_exact_mint_scan_unique_owner_count',
+      top10_percent: rows.length >= 10 ? 'helius_full_exact_owner_balance_aggregation' : null,
+      top20_percent: rows.length >= 20 ? 'helius_full_exact_owner_balance_aggregation' : null,
+      top25_percent: rows.length >= 25 ? 'helius_full_exact_owner_balance_aggregation' : null,
+      top50_percent: rows.length >= 50 ? 'helius_full_exact_owner_balance_aggregation' : null,
+    },
+    upstream_partial_errors: null,
+    helius_scan_complete: true,
+    helius_supply_raw: supply.amount.toString(),
+  };
+}
+
 function bool01(value) {
   if (value === true || value === 1 || value === '1') return true;
   if (value === false || value === 0 || value === '0') return false;
@@ -564,6 +806,58 @@ function moralisTopHoldersUrl(network, address, limit = 50) {
 }
 async function buildHolderAnalysis(network, address) {
   stats.holder_builds += 1;
+
+  // Step1038.2.1: Moralis' Solana holder endpoints are deprecated. Prefer a
+  // complete exact-mint Helius RPC scan. If Helius is not configured/unavailable,
+  // preserve the previous GoPlus source-fact fallback without fabricating Top20/50.
+  if (network === 'solana') {
+    let heliusError = null;
+    try {
+      return await buildHeliusSolanaHolderAnalysis(address);
+    } catch (error) {
+      heliusError = error;
+    }
+    let holderFallback = null;
+    try {
+      const securityResult = await cachedBuild(
+        `step1038:security:${network}:${lower(address)}`,
+        { freshMs: SECURITY_FRESH_MS, staleMs: SECURITY_STALE_MS, negativeMs: SECURITY_NEGATIVE_MS },
+        () => buildGoPlusSecurity(network, address),
+      );
+      holderFallback = securityResult.value || null;
+    } catch {
+      holderFallback = null;
+    }
+    const totalHolders = numberOrNull(holderFallback?.holder_count);
+    const top10 = numberOrNull(holderFallback?.top10_percent_reported);
+    const rows = Array.isArray(holderFallback?.holders_top10) ? holderFallback.holders_top10 : [];
+    if (totalHolders === null && top10 === null && !rows.length) {
+      stats.holder_build_failures += 1;
+      throw heliusError || new Error('solana_holder_analysis_no_usable_facts');
+    }
+    return {
+      source: 'goplus_solana_token_security_holder_fallback',
+      source_scope: 'top10_and_holder_count_only_when_helius_exact_holder_index_unavailable',
+      total_holders: totalHolders,
+      concentration: { top10_percent: top10, top20_percent: null, top25_percent: null, top50_percent: null },
+      holder_change: { h1: null, h6: null, h24: null, d7: null },
+      holder_distribution: null,
+      holders_by_acquisition: null,
+      top_holders: rows,
+      exact_top20_available: false,
+      top_holder_list_available: rows.length > 0,
+      field_sources: {
+        total_holders: totalHolders !== null ? 'goplus_token_security_holder_count' : null,
+        top10_percent: top10 !== null ? 'goplus_token_security_top10_holders' : null,
+        top20_percent: null, top25_percent: null, top50_percent: null,
+      },
+      upstream_partial_errors: {
+        helius_exact_holder_index: heliusError ? String(heliusError.message || heliusError).slice(0, 180) : null,
+      },
+      helius_scan_complete: false,
+    };
+  }
+
   let metrics = normalizeHolderMetrics(null);
   let metricsError = null;
   try {
@@ -602,15 +896,8 @@ async function buildHolderAnalysis(network, address) {
     }
   }
 
-  // Some exact ERC20s can return an otherwise valid holder/top-owner payload while
-  // totalHolders is temporarily absent. GoPlus Token Security directly reports
-  // holder_count for the exact same contract, so use that field only as a protected
-  // fallback. Concentration is still Moralis/exact-owner based whenever available.
   let holderFallback = null;
-  const needsGoPlusHolderFact = network === 'solana'
-    ? metrics.total_holders === null || metrics.concentration.top10?.supply_percent == null
-    : metrics.total_holders === null;
-  if (needsGoPlusHolderFact) {
+  if (metrics.total_holders === null) {
     try {
       const securityResult = await cachedBuild(
         `step1038:security:${network}:${lower(address)}`,
@@ -624,37 +911,9 @@ async function buildHolderAnalysis(network, address) {
   }
 
   const totalHolders = metrics.total_holders ?? numberOrNull(holderFallback?.holder_count);
-  const top10 = exactTop10
-    ?? metrics.concentration.top10?.supply_percent
-    ?? numberOrNull(holderFallback?.top10_percent_reported);
+  const top10 = exactTop10 ?? metrics.concentration.top10?.supply_percent ?? numberOrNull(holderFallback?.top10_percent_reported);
   const top25 = metrics.concentration.top25?.supply_percent ?? null;
   const top50 = exactTop50 ?? metrics.concentration.top50?.supply_percent ?? null;
-
-  if (network === 'solana' && metricsError && holderFallback) {
-    return {
-      source: 'goplus_solana_token_security_holder_fallback',
-      source_scope: 'top10_and_holder_count_only_when_moralis_solana_holder_metrics_unavailable',
-      total_holders: totalHolders,
-      concentration: {
-        top10_percent: top10,
-        top20_percent: null,
-        top25_percent: null,
-        top50_percent: null,
-      },
-      holder_change: { h1: null, h6: null, h24: null, d7: null },
-      holder_distribution: null,
-      holders_by_acquisition: null,
-      top_holders: Array.isArray(holderFallback.holders_top10) ? holderFallback.holders_top10 : [],
-      exact_top20_available: false,
-      top_holder_list_available: Array.isArray(holderFallback.holders_top10) && holderFallback.holders_top10.length > 0,
-      field_sources: {
-        total_holders: totalHolders !== null ? 'goplus_token_security_holder_count' : null,
-        top10_percent: top10 !== null ? 'goplus_token_security_top10_holders' : null,
-        top20_percent: null, top25_percent: null, top50_percent: null,
-      },
-    };
-  }
-
   const anyUsable = totalHolders !== null || top10 !== null || exactTop20 !== null || top25 !== null || top50 !== null || topHolders.length > 0;
   if (!anyUsable) {
     stats.holder_build_failures += 1;
@@ -666,18 +925,11 @@ async function buildHolderAnalysis(network, address) {
     source: usedGoPlusTotal
       ? 'moralis_holder_analytics_plus_goplus_holder_count_fallback'
       : 'moralis_official_data_api_holder_analytics',
-    source_scope: network === 'solana'
-      ? 'moralis_holder_metrics_only_no_deprecated_solana_top_holder_dependency'
-      : usedGoPlusTotal
-        ? 'moralis_exact_owner_concentration_plus_goplus_exact_contract_holder_count'
-        : 'moralis_holder_metrics_plus_exact_top50_owner_list',
+    source_scope: usedGoPlusTotal
+      ? 'moralis_exact_owner_concentration_plus_goplus_exact_contract_holder_count'
+      : 'moralis_holder_metrics_plus_exact_top50_owner_list',
     total_holders: totalHolders,
-    concentration: {
-      top10_percent: top10,
-      top20_percent: exactTop20,
-      top25_percent: top25,
-      top50_percent: top50,
-    },
+    concentration: { top10_percent: top10, top20_percent: exactTop20, top25_percent: top25, top50_percent: top50 },
     holder_change: metrics.holder_change,
     holder_distribution: metrics.holder_distribution,
     holders_by_acquisition: metrics.holders_by_acquisition,
@@ -685,14 +937,8 @@ async function buildHolderAnalysis(network, address) {
     exact_top20_available: exactTop20 !== null,
     top_holder_list_available: topHolders.length > 0,
     field_sources: {
-      total_holders: metrics.total_holders !== null
-        ? 'moralis_holder_metrics'
-        : totalHolders !== null ? 'goplus_token_security_holder_count' : null,
-      top10_percent: exactTop10 !== null
-        ? 'moralis_exact_top_owners'
-        : metrics.concentration.top10?.supply_percent != null
-          ? 'moralis_holder_metrics'
-          : top10 !== null ? 'goplus_token_security_top10_holders' : null,
+      total_holders: metrics.total_holders !== null ? 'moralis_holder_metrics' : totalHolders !== null ? 'goplus_token_security_holder_count' : null,
+      top10_percent: exactTop10 !== null ? 'moralis_exact_top_owners' : metrics.concentration.top10?.supply_percent != null ? 'moralis_holder_metrics' : top10 !== null ? 'goplus_token_security_top10_holders' : null,
       top20_percent: exactTop20 !== null ? 'moralis_exact_top_owners' : null,
       top25_percent: top25 !== null ? 'moralis_holder_metrics' : null,
       top50_percent: exactTop50 !== null ? 'moralis_exact_top_owners' : top50 !== null ? 'moralis_holder_metrics' : null,
@@ -1887,6 +2133,20 @@ function healthPayload() {
         backend_global_max_starts_per_minute: Math.floor(60_000 / GOPLUS_MIN_GAP_MS),
         scheduler: goplusScheduler.state(),
       },
+      helius: {
+        docs_get_program_accounts_v2: 'https://www.helius.dev/docs/api-reference/rpc/http/getprogramaccountsv2',
+        docs_get_token_supply: 'https://www.helius.dev/docs/api-reference/rpc/http/gettokensupply',
+        docs_pricing: 'https://www.helius.dev/pricing',
+        role: 'solana_exact_mint_holder_index_from_full_filtered_token_account_scan',
+        api_key_configured: Boolean(HELIUS_API_KEY),
+        api_key_exposed: false,
+        backend_only_secret: true,
+        page_limit: HELIUS_PAGE_LIMIT,
+        exact_scan_max_token_accounts: HELIUS_MAX_EXACT_TOKEN_ACCOUNTS,
+        backend_global_min_gap_ms: HELIUS_MIN_GAP_MS,
+        backend_global_max_starts_per_second: Math.floor(1_000 / HELIUS_MIN_GAP_MS),
+        scheduler: heliusScheduler.state(),
+      },
     },
     step1038_holder_security: {
       opened: true,
@@ -1899,11 +2159,16 @@ function healthPayload() {
       cross_token_substitution: false,
       holder_cache_fresh_ms: HOLDER_FRESH_MS,
       holder_cache_stale_ms: HOLDER_STALE_MS,
+      solana_helius_holder_cache_fresh_ms: SOLANA_HELIUS_HOLDER_FRESH_MS,
+      solana_helius_holder_cache_stale_ms: SOLANA_HELIUS_HOLDER_STALE_MS,
       security_cache_fresh_ms: SECURITY_FRESH_MS,
       security_cache_stale_ms: SECURITY_STALE_MS,
       evm_exact_top20_from_owner_list: true,
       solana_top20_not_fabricated: true,
-      solana_moralis_top_holder_endpoint_not_used_because_deprecated_after_2026_07_31: true,
+      solana_holder_primary_source: 'helius_getProgramAccountsV2_exact_mint_full_scan',
+      solana_holder_requires_complete_scan_before_publish: true,
+      solana_holder_max_exact_token_accounts: HELIUS_MAX_EXACT_TOKEN_ACCOUNTS,
+      solana_moralis_holder_endpoints_not_used_because_deprecated: true,
       no_composite_security_score_generated: true,
       creator_owner_labels_are_source_facts_not_dev_inference: true,
       user_reads_direct_upstream_requests: 0,
@@ -2012,6 +2277,7 @@ function healthPayload() {
     scheduler: dexScheduler.state(),
     moralis_scheduler: moralisScheduler.state(),
     goplus_scheduler: goplusScheduler.state(),
+    helius_scheduler: heliusScheduler.state(),
     moralis_budget: moralisBudgetState(),
     stats: { ...stats },
     memory_usage: { rss_mb: Math.round(process.memoryUsage().rss / 1048576), heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576) },
@@ -2084,6 +2350,17 @@ function runSelfTest() {
   const gpSynthetic = normalizeGoPlusEvm({ token_name: 'T', token_symbol: 'T', is_honeypot: '0', is_open_source: '1', creator_address: '0x0000000000000000000000000000000000000001', creator_percent: '0.025', holders: [{ address: '0x0000000000000000000000000000000000000002', percent: '0.1', balance: '10', is_locked: '0' }] }, 'ethereum', '0x0000000000000000000000000000000000000003');
   t('step1038_goplus_evm_parser', gpSynthetic.contract_facts.is_open_source === true && gpSynthetic.trading_facts.is_honeypot === false && Math.abs(gpSynthetic.creator.percent - 2.5) < 1e-9 && Math.abs(gpSynthetic.top10_percent_reported - 10) < 1e-9);
   t('step1038_goplus_rate_below_30_per_min', 60_000 / GOPLUS_MIN_GAP_MS < 30);
+  const mintBytes = Buffer.alloc(32, 9);
+  const ownerBytes = Buffer.alloc(32, 7);
+  const slice = Buffer.alloc(72);
+  mintBytes.copy(slice, 0);
+  ownerBytes.copy(slice, 32);
+  slice.writeBigUInt64LE(123456789n, 64);
+  const parsedSlice = parseSolanaTokenAccountSlice({ account: { data: [slice.toString('base64'), 'base64'] } });
+  t('step1038_2_1_helius_token_account_slice_parser', parsedSlice?.amount === 123456789n && looksSolanaAddress(parsedSlice?.mint) && looksSolanaAddress(parsedSlice?.owner));
+  t('step1038_2_1_helius_percent_bigint', Math.abs(bigintPercent(25n, 100n) - 25) < 1e-9);
+  t('step1038_2_1_helius_rate_below_free_gpa_rps', 1_000 / HELIUS_MIN_GAP_MS < 5);
+  t('step1038_2_1_solana_moralis_deprecated_holder_not_used', healthPayload().step1038_holder_security.solana_moralis_holder_endpoints_not_used_because_deprecated === true);
   t('step1038_no_composite_security_score', healthPayload().step1038_holder_security.no_composite_security_score_generated === true);
   t('step1038_solana_top20_fail_closed', healthPayload().step1038_holder_security.solana_top20_not_fabricated === true);
   t('trading_disabled', responseBase().trading_enabled === false);
@@ -2125,7 +2402,7 @@ export async function handleOnchainMarket(req, res, url) {
     try {
       if (path === HOLDERS_ROUTE) {
         const key = `step1038:holders:${network}:${lower(address)}`;
-        const result = await cachedBuild(key, { freshMs: HOLDER_FRESH_MS, staleMs: HOLDER_STALE_MS, negativeMs: HOLDER_NEGATIVE_MS }, () => buildHolderAnalysis(network, address));
+        const result = await cachedBuild(key, { freshMs: network === 'solana' ? SOLANA_HELIUS_HOLDER_FRESH_MS : HOLDER_FRESH_MS, staleMs: network === 'solana' ? SOLANA_HELIUS_HOLDER_STALE_MS : HOLDER_STALE_MS, negativeMs: HOLDER_NEGATIVE_MS }, () => buildHolderAnalysis(network, address));
         const value = result.value;
         if (!value) throw new Error('holder_analysis_not_ready');
         sendJson(res, 200, responseBase({
@@ -2147,8 +2424,11 @@ export async function handleOnchainMarket(req, res, url) {
           cache_status: result.cache_status,
           user_read_direct_moralis_requests: 0,
           moralis_cu_if_full_evm_upstream_build: MORALIS_HOLDER_METRICS_CU + MORALIS_TOP_HOLDERS_CU,
-          moralis_cu_if_solana_metrics_build: MORALIS_HOLDER_METRICS_CU,
-          no_deprecated_solana_top_holder_call: true,
+          moralis_cu_if_solana_metrics_build: network === 'solana' ? 0 : MORALIS_HOLDER_METRICS_CU,
+          helius_exact_solana_holder_index: network === 'solana',
+          helius_scan_complete: value.helius_scan_complete ?? null,
+          token_accounts_scanned: value.token_accounts_scanned ?? null,
+          no_deprecated_solana_holder_call: true,
         }));
         return true;
       }
