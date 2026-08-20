@@ -1,4 +1,4 @@
-// Step1038.2.1 / Render 650.8.15.193.2
+// Step1038.2.2 / Render 650.8.15.193.3
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.193.2';
-const DATA_VERSION = 1038002;
+const VERSION = '650.8.15.193.3';
+const DATA_VERSION = 1038003;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 
@@ -80,21 +80,22 @@ const SECURITY_STALE_MS = 24 * 60 * 60_000;
 const SECURITY_NEGATIVE_MS = 2 * 60_000;
 const EVM_GOPLUS_CHAIN_ID = Object.freeze({ ethereum: '1', bsc: '56', base: '8453' });
 
-// Step1038.2.1: Solana holder analytics moves away from Moralis' deprecated
-// Solana holder endpoints. Helius getProgramAccountsV2 is filtered by the exact
-// mint and paginated in the backend. We aggregate token accounts by wallet owner
-// and only publish holder count / Top10/20/50 when the full filtered account set
-// was completely scanned. No partial page is promoted to a holder statistic.
+// Step1038.2.2: Solana holder analytics uses Helius DAS getTokenAccounts by
+// exact mint. Step1038.2.1 used getProgramAccountsV2 against the global SPL Token
+// programs; on a highly-filtered mint that can advance through hundreds of empty
+// cursor pages before finding matching accounts. DAS has a first-class mint index,
+// returns owner+amount directly, and is the Helius-documented holder enumeration
+// path. We still publish concentration only after the full exact-mint result set is
+// scanned; partial pages are never promoted to holder facts.
 const HELIUS_API_KEY = String(process.env.HELIUS_API_KEY || '').trim();
 const HELIUS_RPC_BASE = 'https://mainnet.helius-rpc.com/';
-const HELIUS_MIN_GAP_MS = Math.max(220, Number(process.env.KAKA_HELIUS_MIN_GAP_MS || 260));
+// DAS free tier is 2 req/s, so keep this backend lane below 2/s even with one user.
+const HELIUS_MIN_GAP_MS = Math.max(520, Number(process.env.KAKA_HELIUS_MIN_GAP_MS || 560));
 const HELIUS_MAX_QUEUE = Math.max(6, Math.min(48, Number(process.env.KAKA_HELIUS_MAX_QUEUE || 24)));
 const HELIUS_TIMEOUT_MS = Math.max(5_000, Math.min(30_000, Number(process.env.KAKA_HELIUS_TIMEOUT_MS || 15_000)));
-const HELIUS_PAGE_LIMIT = Math.max(500, Math.min(10_000, Number(process.env.KAKA_HELIUS_HOLDER_PAGE_LIMIT || 5_000)));
+const HELIUS_PAGE_LIMIT = Math.max(100, Math.min(1_000, Number(process.env.KAKA_HELIUS_HOLDER_PAGE_LIMIT || 1_000)));
 const HELIUS_MAX_EXACT_TOKEN_ACCOUNTS = Math.max(5_000, Math.min(100_000, Number(process.env.KAKA_HELIUS_HOLDER_MAX_ACCOUNTS || 50_000)));
-const SOLANA_TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-const SOLANA_TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const HELIUS_MAX_HOLDER_PAGES = Math.max(5, Math.min(100, Math.ceil(HELIUS_MAX_EXACT_TOKEN_ACCOUNTS / HELIUS_PAGE_LIMIT) + 2));
 
 const MORALIS_EVM_CHAIN = Object.freeze({
   ethereum: 'eth',
@@ -556,41 +557,26 @@ async function heliusRpc(method, params, { priority = 0, label = '' } = {}) {
     } finally { clearTimeout(timer); }
   }, { priority, label });
 }
-function base58Encode(bytes) {
-  if (!Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes || []);
-  if (!bytes.length) return '';
-  let zeros = 0;
-  while (zeros < bytes.length && bytes[zeros] === 0) zeros += 1;
-  const digits = [0];
-  for (let i = zeros; i < bytes.length; i += 1) {
-    let carry = bytes[i];
-    for (let j = 0; j < digits.length; j += 1) {
-      const value = digits[j] * 256 + carry;
-      digits[j] = value % 58;
-      carry = Math.floor(value / 58);
-    }
-    while (carry > 0) {
-      digits.push(carry % 58);
-      carry = Math.floor(carry / 58);
-    }
+function heliusDasAmountToBigInt(value) {
+  if (typeof value === 'bigint') return value >= 0n ? value : null;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value < 0) return null;
+    // Helius DAS returns integer raw token amounts. Converting the parsed integer
+    // to a decimal string is sufficient for current SPL supply ranges; values above
+    // JS safe integer are marked in diagnostics but are never converted to float
+    // before the final percentage ratio.
+    return BigInt(Math.trunc(value).toString());
   }
-  let out = '1'.repeat(zeros);
-  for (let i = digits.length - 1; i >= 0; i -= 1) out += BASE58_ALPHABET[digits[i]];
-  return out;
+  const raw = text(value).trim();
+  if (!/^\d+$/.test(raw)) return null;
+  try { return BigInt(raw); } catch { return null; }
 }
-function parseSolanaTokenAccountSlice(raw) {
-  const data = raw?.account?.data;
-  const encoded = Array.isArray(data) ? text(data[0]) : '';
-  if (!encoded) return null;
-  let bytes;
-  try { bytes = Buffer.from(encoded, 'base64'); } catch { return null; }
-  if (bytes.length < 72) return null;
-  const mint = base58Encode(bytes.subarray(0, 32));
-  const owner = base58Encode(bytes.subarray(32, 64));
-  if (!looksSolanaAddress(mint) || !looksSolanaAddress(owner)) return null;
-  let amount = 0n;
-  for (let i = 0; i < 8; i += 1) amount |= BigInt(bytes[64 + i]) << BigInt(i * 8);
-  if (amount <= 0n) return null;
+function parseHeliusDasTokenAccount(raw, expectedMint) {
+  if (!raw || typeof raw !== 'object') return null;
+  const mint = text(raw.mint);
+  const owner = text(raw.owner);
+  const amount = heliusDasAmountToBigInt(raw.amount);
+  if (!exactAddressEqual('solana', mint, expectedMint) || !looksSolanaAddress(owner) || amount === null || amount <= 0n) return null;
   return { mint, owner, amount };
 }
 function bigintPercent(balance, supply) {
@@ -613,59 +599,84 @@ async function heliusTokenSupply(address) {
   if (!/^\d+$/.test(raw)) throw new Error('helius_token_supply_missing');
   return { amount: BigInt(raw), decimals: Number(result?.value?.decimals || 0) };
 }
-async function heliusProgramTokenAccounts(programId, mint, ownerBalances, state) {
-  let paginationKey = null;
-  do {
-    if (state.accountsSeen >= HELIUS_MAX_EXACT_TOKEN_ACCOUNTS) {
+async function heliusDasMintAccounts(mint, ownerBalances, state) {
+  let cursor = null;
+  const seenCursors = new Set();
+  let page = 1;
+  while (page <= HELIUS_MAX_HOLDER_PAGES) {
+    const remaining = HELIUS_MAX_EXACT_TOKEN_ACCOUNTS - state.accountsSeen;
+    if (remaining <= 0) {
       state.complete = false;
       state.truncated = true;
       return;
     }
-    const remaining = HELIUS_MAX_EXACT_TOKEN_ACCOUNTS - state.accountsSeen;
     const pageLimit = Math.max(1, Math.min(HELIUS_PAGE_LIMIT, remaining));
-    const config = {
-      encoding: 'base64',
-      commitment: 'confirmed',
-      dataSlice: { offset: 0, length: 72 },
-      filters: [{ memcmp: { offset: 0, bytes: mint } }],
+    const params = {
+      mint,
       limit: pageLimit,
-      ...(paginationKey ? { paginationKey } : {}),
+      options: { showZeroBalance: false },
+      ...(cursor ? { cursor } : { page }),
     };
-    const result = await heliusRpc('getProgramAccountsV2', [programId, config], {
+    const result = await heliusRpc('getTokenAccounts', params, {
       priority: 8,
-      label: `holder_accounts:${programId === SOLANA_TOKEN_PROGRAM ? 'spl' : 'token2022'}:${mint}`,
+      label: `holder_accounts:das:${mint}:page${page}`,
     });
-    const page = result?.value && typeof result.value === 'object' ? result.value : result;
-    const accounts = Array.isArray(page?.accounts) ? page.accounts : [];
+    if (!result || typeof result !== 'object') throw new Error('helius_das_token_accounts_missing_result');
+    const accounts = Array.isArray(result.token_accounts) ? result.token_accounts : [];
+    const total = numberOrNull(result.total);
+    if (total !== null) {
+      state.reportedTotalTokenAccounts = Math.max(0, Math.trunc(total));
+      if (state.reportedTotalTokenAccounts > HELIUS_MAX_EXACT_TOKEN_ACCOUNTS) {
+        state.complete = false;
+        state.truncated = true;
+        state.tooLarge = true;
+        return;
+      }
+    }
     for (const account of accounts) {
       state.accountsSeen += 1;
-      const parsed = parseSolanaTokenAccountSlice(account);
-      if (!parsed || !exactAddressEqual('solana', parsed.mint, mint)) continue;
+      const parsed = parseHeliusDasTokenAccount(account, mint);
+      if (!parsed) continue;
       state.tokenAccounts += 1;
       ownerBalances.set(parsed.owner, (ownerBalances.get(parsed.owner) || 0n) + parsed.amount);
     }
-    paginationKey = text(page?.paginationKey) || null;
-    if (!paginationKey) return;
-    if (state.accountsSeen >= HELIUS_MAX_EXACT_TOKEN_ACCOUNTS) {
-      state.complete = false;
-      state.truncated = true;
+    state.pages += 1;
+    const nextCursor = text(result.cursor) || null;
+    if (nextCursor) {
+      if (seenCursors.has(nextCursor)) throw new Error('helius_das_cursor_loop_detected');
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } else {
+      // getTokenAccounts also supports page pagination. The indexed `total` gives a
+      // deterministic completion check; if no cursor is returned, advance pages only
+      // while we have not yet reached that total.
+      if (state.reportedTotalTokenAccounts !== null && state.accountsSeen < state.reportedTotalTokenAccounts && accounts.length > 0) {
+        cursor = null;
+        page += 1;
+        continue;
+      }
       return;
     }
-  } while (paginationKey);
+    page += 1;
+  }
+  state.complete = false;
+  state.truncated = true;
 }
+
 async function buildHeliusSolanaHolderAnalysis(address) {
   if (!HELIUS_API_KEY) throw new Error('helius_api_key_not_configured');
   const ownerBalances = new Map();
-  const state = { tokenAccounts: 0, accountsSeen: 0, complete: true, truncated: false };
+  const state = { tokenAccounts: 0, accountsSeen: 0, complete: true, truncated: false, tooLarge: false, reportedTotalTokenAccounts: null, pages: 0 };
   const supply = await heliusTokenSupply(address);
-  // Query both token programs. A mint normally belongs to only one program; the exact
-  // mint memcmp keeps the other query empty and avoids guessing Token vs Token-2022.
-  await heliusProgramTokenAccounts(SOLANA_TOKEN_PROGRAM, address, ownerBalances, state);
-  if (state.complete) await heliusProgramTokenAccounts(SOLANA_TOKEN_2022_PROGRAM, address, ownerBalances, state);
+  // Helius DAS getTokenAccounts is indexed directly by mint and handles SPL Token
+  // and Token-2022 without scanning either global program account space.
+  await heliusDasMintAccounts(address, ownerBalances, state);
   if (!state.complete) {
     stats.helius_holder_incomplete_scans += 1;
-    const error = new Error(`helius_holder_scan_truncated_at_${state.accountsSeen}`);
-    error.partial = { token_accounts_scanned: state.accountsSeen, nonzero_token_accounts_scanned: state.tokenAccounts, unique_owners_scanned: ownerBalances.size };
+    const error = new Error(state.tooLarge ? `helius_holder_exact_mint_too_large_${state.reportedTotalTokenAccounts}` : `helius_holder_scan_truncated_at_${state.accountsSeen}`);
+    error.partial = { token_accounts_scanned: state.accountsSeen,
+    reported_total_token_accounts: state.reportedTotalTokenAccounts,
+    helius_pages_scanned: state.pages, reported_total_token_accounts: state.reportedTotalTokenAccounts, pages: state.pages, nonzero_token_accounts_scanned: state.tokenAccounts, unique_owners_scanned: ownerBalances.size };
     throw error;
   }
   const rows = [...ownerBalances.entries()]
@@ -686,10 +697,12 @@ async function buildHeliusSolanaHolderAnalysis(address) {
     is_contract: null,
   }));
   return {
-    source: 'helius_official_rpc_exact_solana_holder_index',
-    source_scope: 'exact_mint_full_token_account_scan_aggregated_by_wallet_owner',
+    source: 'helius_official_das_exact_mint_token_accounts',
+    source_scope: 'exact_mint_das_token_accounts_full_scan_aggregated_by_wallet_owner',
     total_holders: rows.length,
     token_accounts_scanned: state.accountsSeen,
+    reported_total_token_accounts: state.reportedTotalTokenAccounts,
+    helius_pages_scanned: state.pages,
     nonzero_token_accounts_scanned: state.tokenAccounts,
     concentration: {
       top10_percent: rows.length >= 10 ? sumTopBigintPercent(rows, 10, supply.amount) : null,
@@ -704,11 +717,11 @@ async function buildHeliusSolanaHolderAnalysis(address) {
     exact_top20_available: rows.length >= 20,
     top_holder_list_available: topHolders.length > 0,
     field_sources: {
-      total_holders: 'helius_getProgramAccountsV2_full_exact_mint_scan_unique_owner_count',
-      top10_percent: rows.length >= 10 ? 'helius_full_exact_owner_balance_aggregation' : null,
-      top20_percent: rows.length >= 20 ? 'helius_full_exact_owner_balance_aggregation' : null,
-      top25_percent: rows.length >= 25 ? 'helius_full_exact_owner_balance_aggregation' : null,
-      top50_percent: rows.length >= 50 ? 'helius_full_exact_owner_balance_aggregation' : null,
+      total_holders: 'helius_getTokenAccounts_exact_mint_full_scan_unique_owner_count',
+      top10_percent: rows.length >= 10 ? 'helius_getTokenAccounts_full_exact_owner_balance_aggregation' : null,
+      top20_percent: rows.length >= 20 ? 'helius_getTokenAccounts_full_exact_owner_balance_aggregation' : null,
+      top25_percent: rows.length >= 25 ? 'helius_getTokenAccounts_full_exact_owner_balance_aggregation' : null,
+      top50_percent: rows.length >= 50 ? 'helius_getTokenAccounts_full_exact_owner_balance_aggregation' : null,
     },
     upstream_partial_errors: null,
     helius_scan_complete: true,
@@ -807,8 +820,8 @@ function moralisTopHoldersUrl(network, address, limit = 50) {
 async function buildHolderAnalysis(network, address) {
   stats.holder_builds += 1;
 
-  // Step1038.2.1: Moralis' Solana holder endpoints are deprecated. Prefer a
-  // complete exact-mint Helius RPC scan. If Helius is not configured/unavailable,
+  // Step1038.2.2: Moralis' Solana holder endpoints are deprecated. Prefer a
+  // complete exact-mint Helius DAS token-account scan. If Helius is not configured/unavailable,
   // preserve the previous GoPlus source-fact fallback without fabricating Top20/50.
   if (network === 'solana') {
     let heliusError = null;
@@ -837,7 +850,7 @@ async function buildHolderAnalysis(network, address) {
     }
     return {
       source: 'goplus_solana_token_security_holder_fallback',
-      source_scope: 'top10_and_holder_count_only_when_helius_exact_holder_index_unavailable',
+      source_scope: 'top10_and_holder_count_only_when_helius_exact_mint_das_index_unavailable',
       total_holders: totalHolders,
       concentration: { top10_percent: top10, top20_percent: null, top25_percent: null, top50_percent: null },
       holder_change: { h1: null, h6: null, h24: null, d7: null },
@@ -2134,10 +2147,10 @@ function healthPayload() {
         scheduler: goplusScheduler.state(),
       },
       helius: {
-        docs_get_program_accounts_v2: 'https://www.helius.dev/docs/api-reference/rpc/http/getprogramaccountsv2',
+        docs_get_token_accounts: 'https://www.helius.dev/docs/api-reference/das/gettokenaccounts',
         docs_get_token_supply: 'https://www.helius.dev/docs/api-reference/rpc/http/gettokensupply',
         docs_pricing: 'https://www.helius.dev/pricing',
-        role: 'solana_exact_mint_holder_index_from_full_filtered_token_account_scan',
+        role: 'solana_exact_mint_holder_index_from_helius_das_token_accounts',
         api_key_configured: Boolean(HELIUS_API_KEY),
         api_key_exposed: false,
         backend_only_secret: true,
@@ -2145,6 +2158,8 @@ function healthPayload() {
         exact_scan_max_token_accounts: HELIUS_MAX_EXACT_TOKEN_ACCOUNTS,
         backend_global_min_gap_ms: HELIUS_MIN_GAP_MS,
         backend_global_max_starts_per_second: Math.floor(1_000 / HELIUS_MIN_GAP_MS),
+        das_free_tier_reference_rps: 2,
+        das_credits_per_request: 10,
         scheduler: heliusScheduler.state(),
       },
     },
@@ -2165,7 +2180,7 @@ function healthPayload() {
       security_cache_stale_ms: SECURITY_STALE_MS,
       evm_exact_top20_from_owner_list: true,
       solana_top20_not_fabricated: true,
-      solana_holder_primary_source: 'helius_getProgramAccountsV2_exact_mint_full_scan',
+      solana_holder_primary_source: 'helius_getTokenAccounts_exact_mint_full_scan',
       solana_holder_requires_complete_scan_before_publish: true,
       solana_holder_max_exact_token_accounts: HELIUS_MAX_EXACT_TOKEN_ACCOUNTS,
       solana_moralis_holder_endpoints_not_used_because_deprecated: true,
@@ -2350,16 +2365,13 @@ function runSelfTest() {
   const gpSynthetic = normalizeGoPlusEvm({ token_name: 'T', token_symbol: 'T', is_honeypot: '0', is_open_source: '1', creator_address: '0x0000000000000000000000000000000000000001', creator_percent: '0.025', holders: [{ address: '0x0000000000000000000000000000000000000002', percent: '0.1', balance: '10', is_locked: '0' }] }, 'ethereum', '0x0000000000000000000000000000000000000003');
   t('step1038_goplus_evm_parser', gpSynthetic.contract_facts.is_open_source === true && gpSynthetic.trading_facts.is_honeypot === false && Math.abs(gpSynthetic.creator.percent - 2.5) < 1e-9 && Math.abs(gpSynthetic.top10_percent_reported - 10) < 1e-9);
   t('step1038_goplus_rate_below_30_per_min', 60_000 / GOPLUS_MIN_GAP_MS < 30);
-  const mintBytes = Buffer.alloc(32, 9);
-  const ownerBytes = Buffer.alloc(32, 7);
-  const slice = Buffer.alloc(72);
-  mintBytes.copy(slice, 0);
-  ownerBytes.copy(slice, 32);
-  slice.writeBigUInt64LE(123456789n, 64);
-  const parsedSlice = parseSolanaTokenAccountSlice({ account: { data: [slice.toString('base64'), 'base64'] } });
-  t('step1038_2_1_helius_token_account_slice_parser', parsedSlice?.amount === 123456789n && looksSolanaAddress(parsedSlice?.mint) && looksSolanaAddress(parsedSlice?.owner));
-  t('step1038_2_1_helius_percent_bigint', Math.abs(bigintPercent(25n, 100n) - 25) < 1e-9);
-  t('step1038_2_1_helius_rate_below_free_gpa_rps', 1_000 / HELIUS_MIN_GAP_MS < 5);
+  const dasMint = '6TpjRqHB5BBZH6gtKdqiHDD8u7noVqS85LhtwxySpump';
+  const dasOwner = '86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY';
+  const parsedDas = parseHeliusDasTokenAccount({ mint: dasMint, owner: dasOwner, amount: '123456789' }, dasMint);
+  t('step1038_2_2_helius_das_token_account_parser', parsedDas?.amount === 123456789n && parsedDas?.owner === dasOwner);
+  t('step1038_2_2_helius_percent_bigint', Math.abs(bigintPercent(25n, 100n) - 25) < 1e-9);
+  t('step1038_2_2_helius_das_rate_below_free_2rps', 1_000 / HELIUS_MIN_GAP_MS < 2);
+  t('step1038_2_2_helius_das_page_limit', HELIUS_PAGE_LIMIT <= 1_000 && HELIUS_MAX_HOLDER_PAGES <= 100);
   t('step1038_2_1_solana_moralis_deprecated_holder_not_used', healthPayload().step1038_holder_security.solana_moralis_holder_endpoints_not_used_because_deprecated === true);
   t('step1038_no_composite_security_score', healthPayload().step1038_holder_security.no_composite_security_score_generated === true);
   t('step1038_solana_top20_fail_closed', healthPayload().step1038_holder_security.solana_top20_not_fabricated === true);
@@ -2426,8 +2438,11 @@ export async function handleOnchainMarket(req, res, url) {
           moralis_cu_if_full_evm_upstream_build: MORALIS_HOLDER_METRICS_CU + MORALIS_TOP_HOLDERS_CU,
           moralis_cu_if_solana_metrics_build: network === 'solana' ? 0 : MORALIS_HOLDER_METRICS_CU,
           helius_exact_solana_holder_index: network === 'solana',
+          helius_holder_index_method: network === 'solana' ? 'getTokenAccounts' : null,
           helius_scan_complete: value.helius_scan_complete ?? null,
           token_accounts_scanned: value.token_accounts_scanned ?? null,
+          reported_total_token_accounts: value.reported_total_token_accounts ?? null,
+          helius_pages_scanned: value.helius_pages_scanned ?? null,
           no_deprecated_solana_holder_call: true,
         }));
         return true;
