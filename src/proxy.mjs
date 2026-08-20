@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.194';
+const STEP_VERSION = '650.8.15.195';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -428,6 +428,7 @@ const server = http.createServer(async (req, res) => {
       onchain_security: '/api/onchain/security',
       onchain_token_wallets: '/api/onchain/token-wallets',
       onchain_wallet_quickview: '/api/onchain/wallet-quickview',
+      onchain_relations: '/api/onchain/relations',
       onchain_market_state: onchainMarketState?.onchain_market || null,
       all_market_second_history_end_time_pagination: true,
       all_market_second_history_latest_audit_cases: 11,

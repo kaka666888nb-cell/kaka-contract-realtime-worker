@@ -1,4 +1,4 @@
-// Step1039 / Render 650.8.15.194
+// Step1040 / Render 650.8.15.195
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,11 +7,12 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.194';
-const DATA_VERSION = 1039000;
+const VERSION = '650.8.15.195';
+const DATA_VERSION = 1040000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
+const STEP1040_FEATURE_SCHEMA_VERSION = 'step1040_onchain_wallet_relationship_evidence_v1';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -27,6 +28,7 @@ const HOLDERS_ROUTE = '/api/onchain/holders';
 const SECURITY_ROUTE = '/api/onchain/security';
 const TOKEN_WALLETS_ROUTE = '/api/onchain/token-wallets';
 const WALLET_QUICKVIEW_ROUTE = '/api/onchain/wallet-quickview';
+const RELATIONS_ROUTE = '/api/onchain/relations';
 
 const DEX_BASE = 'https://api.dexscreener.com';
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
@@ -115,6 +117,24 @@ const SMART_MONEY_WALLET_MIN_PROFIT_USD = 5_000;
 const SMART_MONEY_WALLET_MIN_WIN_RATE_PCT = 55;
 const SMART_MONEY_WALLET_MIN_EVALUABLE_POSITIONS = 5;
 const SMART_MONEY_WALLET_MIN_TRADES = 10;
+
+// Step1040 relationship evidence. This is deliberately bounded and on-demand.
+// It produces evidence-backed relationship *signals*, never identity or wrongdoing labels.
+// Funding-source evidence is long-lived because the original funder is historical/immutable;
+// token relation snapshots are shorter because early-trader / holder scopes can change.
+const RELATION_ANALYZED_WALLET_MAX = 8;
+const RELATION_FRESH_MS = 15 * 60_000;
+const RELATION_STALE_MS = 2 * 60 * 60_000;
+const RELATION_NEGATIVE_MS = 2 * 60_000;
+const FUNDING_FRESH_MS = 24 * 60 * 60_000;
+const FUNDING_STALE_MS = 7 * 24 * 60 * 60_000;
+const FUNDING_NEGATIVE_MS = 10 * 60_000;
+const MORALIS_WALLET_HISTORY_BUDGET_CU = 100;
+const EVM_INITIAL_HISTORY_LIMIT = 40;
+const SNIPER_HIGH_SECONDS = 30;
+const SNIPER_MEDIUM_SECONDS = 120;
+const SNIPER_MAX_RANK = 10;
+const RELATION_CONFIDENCE_RULE_VERSION = 'kaka_step1040_evidence_confidence_v1';
 
 
 // Step1038.2.2: Solana holder analytics uses Helius DAS getTokenAccounts by
@@ -220,6 +240,10 @@ const stats = {
   token_wallet_build_failures: 0,
   wallet_quickview_builds: 0,
   wallet_quickview_build_failures: 0,
+  relation_builds: 0,
+  relation_build_failures: 0,
+  funding_source_builds: 0,
+  funding_source_build_failures: 0,
 };
 
 const cache = new Map();
@@ -604,6 +628,44 @@ async function heliusRpc(method, params, { priority = 0, label = '' } = {}) {
     } finally { clearTimeout(timer); }
   }, { priority, label });
 }
+
+async function heliusRestJson(url, { priority = 0, label = '' } = {}) {
+  if (!HELIUS_API_KEY) {
+    stats.helius_key_missing_rejections += 1;
+    const error = new Error('helius_api_key_not_configured');
+    error.statusCode = 503;
+    throw error;
+  }
+  return heliusScheduler.enqueue(async () => {
+    stats.helius_upstream_started += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HELIUS_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const u = new URL(url);
+      if (!u.searchParams.get('api-key')) u.searchParams.set('api-key', HELIUS_API_KEY);
+      const response = await fetch(u.toString(), {
+        signal: controller.signal,
+        headers: { accept: 'application/json', 'user-agent': 'KakaWeb3-Onchain-Shared/1040' },
+      });
+      const body = await response.text();
+      if (response.status === 404) { stats.helius_upstream_succeeded += 1; return null; }
+      if (!response.ok) {
+        const error = new Error(`helius_http_${response.status}:${body.slice(0, 220)}`);
+        error.statusCode = response.status;
+        throw error;
+      }
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { throw new Error('helius_invalid_json'); }
+      stats.helius_upstream_succeeded += 1;
+      return parsed;
+    } catch (error) {
+      stats.helius_upstream_failed += 1;
+      throw error;
+    } finally { clearTimeout(timer); }
+  }, { priority, label });
+}
+
 function heliusDasAmountToBigInt(value) {
   if (typeof value === 'bigint') return value >= 0n ? value : null;
   if (typeof value === 'number') {
@@ -1780,6 +1842,275 @@ async function buildWalletQuickview(network, wallet, tokenAddress = '') {
   }
 }
 
+
+// ---------------- Step1040 relationship evidence ----------------
+function moralisWalletHistoryUrl(network, wallet, order = 'ASC', limit = EVM_INITIAL_HISTORY_LIMIT) {
+  const chain = MORALIS_EVM_CHAIN[network];
+  if (!chain) throw new Error('moralis_evm_chain_not_supported');
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/wallets/${encodeURIComponent(wallet)}/history`);
+  u.searchParams.set('chain', chain);
+  u.searchParams.set('order', order === 'DESC' ? 'DESC' : 'ASC');
+  u.searchParams.set('limit', String(Math.max(1, Math.min(100, limit))));
+  u.searchParams.set('include_internal_transactions', 'true');
+  return u.toString();
+}
+function knownSharedEntityName(value) {
+  const v = lower(value);
+  if (!v) return false;
+  return ['binance','coinbase','okx','bybit','bitget','gate','kraken','kucoin','mexc','crypto.com','upbit','bithumb','htx','huobi'].some((x) => v.includes(x));
+}
+function normalizedFundingEvidence(network, wallet, funder, extra = {}) {
+  const f = text(funder);
+  if (!walletAddressValid(network, f) || exactAddressEqual(network, f, wallet)) return null;
+  const entityName = text(extra.funder_name || extra.entity || extra.label);
+  return {
+    wallet,
+    funder: f,
+    amount_native: numberOrNull(extra.amount_native),
+    token_symbol: text(extra.token_symbol),
+    transaction_hash: text(extra.transaction_hash || extra.signature),
+    funded_at: text(extra.funded_at || extra.date) || null,
+    funder_name: entityName,
+    funder_type: text(extra.funder_type),
+    shared_entity_funder: knownSharedEntityName(entityName) || lower(extra.funder_type) === 'exchange',
+    source: text(extra.source),
+    evidence_kind: 'original_or_earliest_observed_native_funding',
+  };
+}
+function extractEvmInitialFunding(network, wallet, raw) {
+  const rows = Array.isArray(raw?.result) ? raw.result : [];
+  const target = lower(wallet);
+  const candidates = [];
+  for (const row of rows) {
+    const at = text(row?.block_timestamp);
+    const native = Array.isArray(row?.native_transfers) ? row.native_transfers : [];
+    for (const tr of native) {
+      const to = lower(tr?.to_address);
+      const from = text(tr?.from_address);
+      const amount = numberOrNull(tr?.value_formatted);
+      if (to !== target || !looksEvmAddress(from) || lower(from) === target || !(amount > 0)) continue;
+      candidates.push(normalizedFundingEvidence(network, wallet, from, {
+        amount_native: amount,
+        token_symbol: text(tr?.token_symbol),
+        transaction_hash: text(row?.hash),
+        funded_at: text(tr?.block_timestamp || at),
+        funder_name: text(tr?.from_address_entity || tr?.from_address_label),
+        source: 'moralis_wallet_history_earliest_observed_native_transfer',
+      }));
+    }
+    const topTo = lower(row?.to_address);
+    const topFrom = text(row?.from_address);
+    const wei = numberOrNull(row?.value);
+    if (topTo === target && looksEvmAddress(topFrom) && lower(topFrom) !== target && wei && wei > 0) {
+      candidates.push(normalizedFundingEvidence(network, wallet, topFrom, {
+        amount_native: wei / 1e18,
+        token_symbol: network === 'bsc' ? 'BNB' : 'ETH',
+        transaction_hash: text(row?.hash),
+        funded_at: at,
+        funder_name: text(row?.from_address_entity || row?.from_address_label),
+        source: 'moralis_wallet_history_top_level_native_transfer',
+      }));
+    }
+  }
+  return candidates.filter(Boolean).sort((a,b) => Date.parse(a.funded_at || 0) - Date.parse(b.funded_at || 0))[0] || null;
+}
+async function buildFundingSource(network, wallet) {
+  stats.funding_source_builds += 1;
+  try {
+    if (network === 'solana') {
+      const raw = await heliusRestJson(`https://api.helius.xyz/v1/wallet/${encodeURIComponent(wallet)}/funded-by`, { priority: 4, label: 'step1040-solana-funded-by' });
+      if (!raw) return null;
+      return normalizedFundingEvidence(network, wallet, raw.funder, {
+        amount_native: raw.amount,
+        token_symbol: raw.symbol || 'SOL',
+        signature: raw.signature,
+        date: raw.date || (raw.timestamp ? new Date(Number(raw.timestamp) * 1000).toISOString() : null),
+        funder_name: raw.funderName,
+        funder_type: raw.funderType,
+        source: 'helius_wallet_api_funded_by',
+      });
+    }
+    const raw = await moralisFetchJson(moralisWalletHistoryUrl(network, wallet, 'ASC', EVM_INITIAL_HISTORY_LIMIT), {
+      cu: MORALIS_WALLET_HISTORY_BUDGET_CU, kind: 'relationship', priority: 4, label: `step1040-wallet-history-asc-${network}`,
+    });
+    return extractEvmInitialFunding(network, wallet, raw);
+  } catch (error) {
+    stats.funding_source_build_failures += 1;
+    throw error;
+  }
+}
+async function cachedFundingSource(network, wallet) {
+  const key = `step1040:funder:${network}:${walletIdentityKey(network, wallet)}`;
+  const result = await cachedBuild(key, { freshMs: FUNDING_FRESH_MS, staleMs: FUNDING_STALE_MS, negativeMs: FUNDING_NEGATIVE_MS }, () => buildFundingSource(network, wallet));
+  return { value: result.value || null, cache_status: result.cache_status };
+}
+function candidateWalletPriority(intel) {
+  const out = [];
+  const seen = new Set();
+  function add(address, source, extra = {}) {
+    if (!walletAddressValid(intel.network, address)) return;
+    const k = walletIdentityKey(intel.network, address);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ address, source, ...extra });
+  }
+  for (const x of intel.direct_role_wallets || []) add(text(x.address), 'direct_role', { direct_roles: x.roles || [] });
+  for (const x of (intel.early_buyers || []).slice(0, 4)) add(text(x.address), 'early_buyer', { early_buy_rank: x.early_buy_rank, first_observed_buy_at: x.first_observed_buy_at });
+  for (const x of (intel.large_holders || []).slice(0, 4)) add(text(x.address), 'large_holder', { holder_rank: x.holder_rank, holder_percent: x.holder_percent });
+  for (const x of (intel.smart_money_candidates || []).slice(0, 3)) add(text(x.address), 'token_profitability_candidate');
+  return out.slice(0, RELATION_ANALYZED_WALLET_MAX);
+}
+function confidenceFromSniper(seconds, rank) {
+  if (seconds >= 0 && seconds <= SNIPER_HIGH_SECONDS && rank <= 5) return 'high';
+  if (seconds >= 0 && seconds <= SNIPER_MEDIUM_SECONDS && rank <= SNIPER_MAX_RANK) return 'medium';
+  return 'low';
+}
+function buildSniperSignals(earlyBuyers, poolCreatedAt) {
+  const created = Date.parse(poolCreatedAt || '');
+  if (!Number.isFinite(created)) return [];
+  return (earlyBuyers || []).map((row) => {
+    const buy = Date.parse(row.first_observed_buy_at || '');
+    const rank = Number(row.early_buy_rank || 999);
+    if (!Number.isFinite(buy)) return null;
+    const seconds = Math.round((buy - created) / 1000);
+    if (seconds < 0 || seconds > SNIPER_MEDIUM_SECONDS || rank > SNIPER_MAX_RANK) return null;
+    return {
+      wallet: text(row.address),
+      signal: 'suspected_early_sniper_behavior',
+      confidence: confidenceFromSniper(seconds, rank),
+      confirmed_identity: false,
+      wrongdoing_claim: false,
+      evidence: {
+        pool_created_at: poolCreatedAt,
+        first_observed_buy_at: row.first_observed_buy_at,
+        seconds_after_pool_creation: seconds,
+        early_buy_rank: rank,
+        early_scope: row.evidence_scope || `first_${EARLY_SWAP_SCOPE}_token_swaps_not_exhaustive`,
+      },
+    };
+  }).filter(Boolean);
+}
+function roleAddressSet(network, security) {
+  const map = directRolesFromSecurity(network, security);
+  const out = new Map();
+  for (const row of map.values()) out.set(walletIdentityKey(network, row.address), row);
+  return out;
+}
+function fundingGroups(network, fundingRows) {
+  const groups = new Map();
+  for (const item of fundingRows || []) {
+    const f = item?.funding;
+    if (!f?.funder) continue;
+    const key = walletIdentityKey(network, f.funder);
+    const group = groups.get(key) || { funder: f.funder, funder_name: f.funder_name || '', funder_type: f.funder_type || '', shared_entity_funder: Boolean(f.shared_entity_funder), wallets: [] };
+    group.wallets.push(item.wallet);
+    groups.set(key, group);
+  }
+  return [...groups.values()].filter((g) => new Set(g.wallets.map((w)=>walletIdentityKey(network,w))).size >= 2).map((g) => ({
+    ...g,
+    wallets: [...new Map(g.wallets.map((w)=>[walletIdentityKey(network,w),w])).values()],
+    confidence: g.shared_entity_funder ? 'low' : 'high',
+    relation_semantics: g.shared_entity_funder ? 'same_known_shared_service_funder_is_not_wallet-control-evidence' : 'same_exact_original_funder_strong_relationship_evidence_not_identity_proof',
+  }));
+}
+function buildDevAssociationSignals(network, candidateFunding, security) {
+  const roles = roleAddressSet(network, security);
+  const out = [];
+  for (const item of candidateFunding || []) {
+    const walletKey = walletIdentityKey(network, item.wallet);
+    if (roles.has(walletKey)) {
+      out.push({ wallet: item.wallet, signal: 'direct_creator_or_owner_role_fact', confidence: 'high', inferred_dev_identity: false, evidence: { direct_source_roles: roles.get(walletKey).roles || [] } });
+    }
+    const f = item.funding;
+    if (f?.funder) {
+      const funderRole = roles.get(walletIdentityKey(network, f.funder));
+      if (funderRole) {
+        out.push({ wallet: item.wallet, signal: 'initial_funder_is_creator_or_owner', confidence: 'high', inferred_dev_identity: false, evidence: { funder: f.funder, funder_roles: funderRole.roles || [], funded_at: f.funded_at, transaction_hash: f.transaction_hash } });
+      }
+    }
+  }
+  return out;
+}
+function clusterFromEvidence(network, candidates, fundingGroupsRows, devSignals) {
+  const parent = new Map();
+  const addrMap = new Map();
+  function key(a){ return walletIdentityKey(network,a); }
+  function init(a){ if(!walletAddressValid(network,a)) return; const k=key(a); if(!parent.has(k)) parent.set(k,k); addrMap.set(k,a); }
+  function find(k){ let p=parent.get(k); if(p===undefined) return null; while(p!==parent.get(p)){ parent.set(p,parent.get(parent.get(p))); p=parent.get(p);} return p; }
+  function union(a,b){ init(a);init(b); const ka=find(key(a)), kb=find(key(b)); if(ka && kb && ka!==kb) parent.set(kb,ka); }
+  for(const c of candidates||[]) init(c.address);
+  for(const g of fundingGroupsRows||[]){ if(g.shared_entity_funder) continue; const ws=g.wallets||[]; for(let i=1;i<ws.length;i++) union(ws[0],ws[i]); }
+  for(const d of devSignals||[]){ const funder=d?.evidence?.funder; if(funder && walletAddressValid(network,funder)) union(d.wallet,funder); }
+  const groups=new Map();
+  for(const [k,a] of addrMap){ const r=find(k); if(!r) continue; const arr=groups.get(r)||[]; arr.push(a); groups.set(r,arr); }
+  return [...groups.values()].filter((x)=>x.length>=2).map((wallets,idx)=>({ cluster_id:`cluster_${idx+1}`, wallets, wallet_count:wallets.length, evidence_basis:'connected_by_same_non_exchange_original_funder_or_creator_owner_funding_edge', identity_certification:false }));
+}
+async function buildTokenRelations(network, tokenAddress) {
+  stats.relation_builds += 1;
+  try {
+    const [intelResult, context, pairsResult] = await Promise.all([
+      cachedBuild(`step1039:token-wallets:${network}:${lower(tokenAddress)}`, { freshMs: TOKEN_WALLET_FRESH_MS, staleMs: TOKEN_WALLET_STALE_MS, negativeMs: TOKEN_WALLET_NEGATIVE_MS }, () => buildTokenWalletIntelligence(network, tokenAddress)),
+      step1038Context(network, tokenAddress),
+      cachedBuild(`token_pairs:${network}:${lower(tokenAddress)}`, { freshMs: 20_000, staleMs: 5 * 60_000 }, () => buildDexTokenPairs(network, tokenAddress)),
+    ]);
+    const intel = intelResult.value;
+    if (!intel) throw new Error('token_wallet_intelligence_not_ready');
+    const candidates = candidateWalletPriority(intel);
+    const fundingSettled = await Promise.allSettled(candidates.map(async (c) => ({ ...c, ...(await cachedFundingSource(network, c.address)) })));
+    const candidateFunding = fundingSettled.map((r,i) => ({ wallet:candidates[i].address, candidate:candidates[i], funding:r.status==='fulfilled'?r.value.value:null, funding_cache_status:r.status==='fulfilled'?r.value.cache_status:null, funding_error:r.status==='rejected'?text(r.reason?.message||r.reason):'' }));
+    const bestPair = (pairsResult.value || [])[0] || null;
+    const sniperSignals = buildSniperSignals(intel.early_buyers, bestPair?.pool_created_at || null);
+    const commonGroups = fundingGroups(network, candidateFunding);
+    const devSignals = buildDevAssociationSignals(network, candidateFunding, context.security);
+    const clusters = clusterFromEvidence(network, candidates, commonGroups, devSignals);
+    const edges = [];
+    for (const g of commonGroups) {
+      for (const w of g.wallets) edges.push({ from: g.funder, to: w, type: 'common_original_funder', confidence: g.confidence, evidence: { funder_name:g.funder_name, funder_type:g.funder_type, shared_entity_funder:g.shared_entity_funder } });
+    }
+    for (const d of devSignals) {
+      if (d.evidence?.funder) edges.push({ from:d.evidence.funder, to:d.wallet, type:'creator_owner_initial_funding', confidence:d.confidence, evidence:d.evidence });
+    }
+    return {
+      source: network === 'solana' ? 'kaka_relationship_evidence_helius_funding_plus_step1039_signals' : 'kaka_relationship_evidence_moralis_wallet_history_plus_step1039_signals',
+      network,
+      token_address: tokenAddress,
+      pool_created_at: bestPair?.pool_created_at || null,
+      analyzed_wallets: candidates,
+      analyzed_wallet_count: candidates.length,
+      funding_evidence: candidateFunding,
+      suspected_sniper_behavior_signals: sniperSignals,
+      creator_owner_association_signals: devSignals,
+      common_funding_groups: commonGroups,
+      wallet_clusters: clusters,
+      relation_edges: edges,
+      confidence_rule_version: RELATION_CONFIDENCE_RULE_VERSION,
+      confidence_rules: {
+        high: 'direct_creator_owner_role_or_exact_original_funding_edge_or_buy_within_30s_and_rank_lte_5',
+        medium: 'buy_within_120s_and_rank_lte_10',
+        low: 'shared_known_exchange_or_service_funder_is_weak_context_only',
+      },
+      scope_limits: {
+        analyzed_wallet_max: RELATION_ANALYZED_WALLET_MAX,
+        early_swap_scope: EARLY_SWAP_SCOPE,
+        evm_initial_history_limit: EVM_INITIAL_HISTORY_LIMIT,
+        not_full_chain_graph: true,
+      },
+      semantics: {
+        suspected_sniper_behavior_is_timing_signal_not_identity: true,
+        creator_owner_are_direct_source_roles_not_dev_identity: true,
+        common_funder_is_relationship_evidence_not_common_control_proof: true,
+        wallet_cluster_is_evidence_component_not_entity_identity: true,
+        insider_or_rat_trading_claim_generated: false,
+        wrongdoing_claim_generated: false,
+      },
+      upstream_partial_errors: [...(intel.upstream_partial_errors || []), context.holder_error, context.security_error, ...candidateFunding.map((x)=>x.funding_error).filter(Boolean)].filter(Boolean),
+    };
+  } catch (error) {
+    stats.relation_build_failures += 1;
+    throw error;
+  }
+}
+
 function exactAddressEqual(network, a, b) {
   if (network === 'solana') return text(a) === text(b);
   return lower(a) === lower(b);
@@ -2767,8 +3098,9 @@ function healthPayload() {
         docs_top_traders: 'https://docs.moralis.com/data-api/evm/token/signals/top-traders',
         docs_solana_token_swaps: 'https://docs.moralis.com/data-api/solana/token/swaps/token-swaps',
         docs_solana_wallet_swaps: 'https://docs.moralis.com/data-api/solana/token/swaps/wallet-swaps',
+        docs_wallet_history: 'https://docs.moralis.com/data-api/evm/wallet/wallet-history',
         terms: 'https://moralis.com/terms/',
-        role: 'exact_pool_ohlcv_history_plus_recent_pair_swaps_plus_holder_analytics_plus_step1039_wallet_pnl_and_token_swap_signals',
+        role: 'exact_pool_ohlcv_history_plus_recent_pair_swaps_plus_holder_analytics_plus_step1039_wallet_pnl_plus_step1040_bounded_funding_evidence',
         api_key_configured: Boolean(MORALIS_API_KEY),
         api_key_exposed: false,
         backend_only_secret: true,
@@ -2783,6 +3115,7 @@ function healthPayload() {
         step1039_top_traders_cu: MORALIS_TOP_TRADERS_CU,
         step1039_wallet_pnl_cu: MORALIS_WALLET_PNL_CU,
         step1039_wallet_activity_internal_reserved_cu: MORALIS_WALLET_ACTIVITY_BUDGET_CU,
+        step1040_wallet_history_internal_reserved_cu: MORALIS_WALLET_HISTORY_BUDGET_CU,
         wallet_insights_premium_endpoint_used: false,
         scheduler: moralisScheduler.state(),
         budget: moralisBudgetState(),
@@ -2804,7 +3137,8 @@ function healthPayload() {
         docs_get_token_supply: 'https://www.helius.dev/docs/api-reference/rpc/http/gettokensupply',
         docs_pricing: 'https://www.helius.dev/pricing',
         docs_wallet_portfolio: 'https://www.helius.dev/docs/quickstart/portfolio-tracker',
-        role: 'solana_exact_mint_holder_index_plus_step1039_wallet_portfolio_and_bounded_age',
+        docs_wallet_funded_by: 'https://www.helius.dev/docs/api-reference/wallet-api/funded-by',
+        role: 'solana_exact_mint_holder_index_plus_step1039_wallet_portfolio_plus_step1040_original_funder_evidence',
         api_key_configured: Boolean(HELIUS_API_KEY),
         api_key_exposed: false,
         backend_only_secret: true,
@@ -2871,6 +3205,27 @@ function healthPayload() {
       common_funding_inference_enabled: false,
       quickview_on_demand_only: true,
       no_bulk_wallet_enrichment_for_token_lists: true,
+      user_reads_direct_upstream_requests: 0,
+    },
+    step1040_relationship_evidence: {
+      opened: true,
+      feature_schema_version: STEP1040_FEATURE_SCHEMA_VERSION,
+      relations_route: RELATIONS_ROUTE,
+      supported_networks: Object.keys(NETWORKS),
+      analyzed_wallet_max: RELATION_ANALYZED_WALLET_MAX,
+      relation_cache_fresh_ms: RELATION_FRESH_MS,
+      relation_cache_stale_ms: RELATION_STALE_MS,
+      funding_cache_fresh_ms: FUNDING_FRESH_MS,
+      funding_cache_stale_ms: FUNDING_STALE_MS,
+      evm_funding_source: 'moralis_wallet_history_earliest_observed_native_transfer',
+      solana_funding_source: 'helius_wallet_api_funded_by',
+      sniper_signal_is_timing_evidence_not_identity: true,
+      creator_owner_direct_roles_are_facts_not_dev_inference: true,
+      common_funding_same_known_exchange_is_low_confidence_only: true,
+      wallet_clusters_are_evidence_components_not_entity_identity: true,
+      insider_or_rat_trading_claim_generated: false,
+      wrongdoing_claim_generated: false,
+      confidence_rule_version: RELATION_CONFIDENCE_RULE_VERSION,
       user_reads_direct_upstream_requests: 0,
     },
     current_market_refresh: {
@@ -3079,6 +3434,14 @@ function runSelfTest() {
   t('step1039_no_premium_wallet_insights', healthPayload().step1039_wallet_intelligence.moralis_wallet_insights_premium_not_used === true);
   t('step1039_solana_cashflow_not_pnl', healthPayload().step1039_wallet_intelligence.solana_swap_cashflow_not_labeled_pnl === true);
   t('step1039_no_sniper_dev_insider_inference', healthPayload().step1039_wallet_intelligence.sniper_label_generated === false && healthPayload().step1039_wallet_intelligence.dev_label_inferred === false && healthPayload().step1039_wallet_intelligence.insider_label_generated === false);
+  const sniperSynthetic = buildSniperSignals([{ address:'0x0000000000000000000000000000000000000003', early_buy_rank:2, first_observed_buy_at:'2026-01-01T00:00:20Z', evidence_scope:'synthetic' }], '2026-01-01T00:00:00Z');
+  t('step1040_sniper_signal_evidence_not_identity', sniperSynthetic.length === 1 && sniperSynthetic[0].confidence === 'high' && sniperSynthetic[0].confirmed_identity === false);
+  const fundingSynthetic = fundingGroups('ethereum', [
+    {wallet:'0x0000000000000000000000000000000000000001',funding:{funder:'0x0000000000000000000000000000000000000009',shared_entity_funder:false}},
+    {wallet:'0x0000000000000000000000000000000000000002',funding:{funder:'0x0000000000000000000000000000000000000009',shared_entity_funder:false}},
+  ]);
+  t('step1040_common_funder_group_exact', fundingSynthetic.length === 1 && fundingSynthetic[0].wallets.length === 2 && fundingSynthetic[0].confidence === 'high');
+  t('step1040_no_wrongdoing_or_insider_claim', healthPayload().step1040_relationship_evidence.wrongdoing_claim_generated === false && healthPayload().step1040_relationship_evidence.insider_or_rat_trading_claim_generated === false);
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
@@ -3087,7 +3450,7 @@ function runSelfTest() {
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -3104,6 +3467,28 @@ export async function handleOnchainMarket(req, res, url) {
 
   const network = normalizeNetwork(url.searchParams.get('network'));
   const limit = intRange(url.searchParams.get('limit'), 1, MAX_RESPONSE_ROWS, 50);
+
+  if (path === RELATIONS_ROUTE) {
+    if (!network || network === 'all') {
+      sendJson(res, 400, responseBase({ ok: false, error: 'exact_network_required', feature_schema_version: STEP1040_FEATURE_SCHEMA_VERSION }));
+      return true;
+    }
+    const tokenAddress = text(url.searchParams.get('address') || url.searchParams.get('token_address'));
+    if (!validAddressForNetwork(network, tokenAddress)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'invalid_contract_address', network, feature_schema_version: STEP1040_FEATURE_SCHEMA_VERSION }));
+      return true;
+    }
+    try {
+      const key = `step1040:relations:${network}:${lower(tokenAddress)}`;
+      const result = await cachedBuild(key, { freshMs: RELATION_FRESH_MS, staleMs: RELATION_STALE_MS, negativeMs: RELATION_NEGATIVE_MS }, () => buildTokenRelations(network, tokenAddress));
+      const value = result.value;
+      if (!value) throw new Error('relationship_evidence_not_ready');
+      sendJson(res, 200, responseBase({ feature_schema_version: STEP1040_FEATURE_SCHEMA_VERSION, ...value, cache_status: result.cache_status, user_read_direct_upstream_requests: 0 }));
+    } catch (error) {
+      sendJson(res, 503, responseBase({ ok: false, feature_schema_version: STEP1040_FEATURE_SCHEMA_VERSION, error: text(error?.message || error), network, address: tokenAddress, no_cross_chain_or_wallet_fallback: true }));
+    }
+    return true;
+  }
 
   if (path === TOKEN_WALLETS_ROUTE || path === WALLET_QUICKVIEW_ROUTE) {
     if (!network || network === 'all') {
