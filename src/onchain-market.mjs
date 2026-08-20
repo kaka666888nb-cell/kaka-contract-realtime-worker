@@ -1,4 +1,4 @@
-// Step1038.2.2 / Render 650.8.15.193.3
+// Step1039 / Render 650.8.15.194
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,10 +7,11 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.193.3';
-const DATA_VERSION = 1038003;
+const VERSION = '650.8.15.194';
+const DATA_VERSION = 1039000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
+const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -24,6 +25,8 @@ const NEW_POOLS_ROUTE = '/api/onchain/new-pools';
 const FX_REFERENCE_ROUTE = '/api/onchain/fx-reference';
 const HOLDERS_ROUTE = '/api/onchain/holders';
 const SECURITY_ROUTE = '/api/onchain/security';
+const TOKEN_WALLETS_ROUTE = '/api/onchain/token-wallets';
+const WALLET_QUICKVIEW_ROUTE = '/api/onchain/wallet-quickview';
 
 const DEX_BASE = 'https://api.dexscreener.com';
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
@@ -79,6 +82,40 @@ const SECURITY_FRESH_MS = 30 * 60_000;
 const SECURITY_STALE_MS = 24 * 60 * 60_000;
 const SECURITY_NEGATIVE_MS = 2 * 60_000;
 const EVM_GOPLUS_CHAIN_ID = Object.freeze({ ethereum: '1', bsc: '56', base: '8453' });
+
+// Step1039 wallet intelligence. Heavy wallet enrichment is strictly on-demand, cached,
+// singleflight and shares the same Moralis daily CU guard / Helius scheduler as Step1038.
+// Wallet Insights is intentionally NOT used because Moralis currently classifies it as a
+// Pro/premium endpoint. This step stays compatible with the existing free-key deployment:
+// EVM age comes from Wallet Chain Activity and PnL from Wallet PnL Breakdown; Solana
+// portfolio/age uses Helius and exact-token swap cashflow uses Moralis Solana wallet swaps.
+const MORALIS_TOKEN_SWAPS_CU = 50;
+const MORALIS_TOP_TRADERS_CU = 50;
+const MORALIS_WALLET_PNL_CU = 50;
+// Conservative internal reservation for Wallet Chain Activity. It intentionally over-reserves
+// relative to a small metadata call so the local 30k/day guard cannot understate provider use.
+const MORALIS_WALLET_ACTIVITY_BUDGET_CU = 100;
+const MORALIS_SOLANA_WALLET_SWAPS_CU = 50;
+const TOKEN_WALLET_FRESH_MS = 5 * 60_000;
+const TOKEN_WALLET_STALE_MS = 30 * 60_000;
+const TOKEN_WALLET_NEGATIVE_MS = 90_000;
+const WALLET_BASE_FRESH_MS = 10 * 60_000;
+const WALLET_BASE_STALE_MS = 60 * 60_000;
+const WALLET_BASE_NEGATIVE_MS = 90_000;
+const WALLET_QUICKVIEW_FRESH_MS = 5 * 60_000;
+const WALLET_QUICKVIEW_STALE_MS = 30 * 60_000;
+const EARLY_SWAP_SCOPE = 100;
+const RECENT_SWAP_SCOPE = 100;
+const WALLET_SIGNAL_MAX_ROWS = 50;
+const SMART_MONEY_RULE_VERSION = 'kaka_step1039_profit_signal_v1';
+const SMART_MONEY_TOKEN_MIN_PROFIT_USD = 1_000;
+const SMART_MONEY_TOKEN_MIN_ROI_PCT = 20;
+const SMART_MONEY_TOKEN_MIN_TRADES = 5;
+const SMART_MONEY_WALLET_MIN_PROFIT_USD = 5_000;
+const SMART_MONEY_WALLET_MIN_WIN_RATE_PCT = 55;
+const SMART_MONEY_WALLET_MIN_EVALUABLE_POSITIONS = 5;
+const SMART_MONEY_WALLET_MIN_TRADES = 10;
+
 
 // Step1038.2.2: Solana holder analytics uses Helius DAS getTokenAccounts by
 // exact mint. Step1038.2.1 used getProgramAccountsV2 against the global SPL Token
@@ -179,6 +216,10 @@ const stats = {
   helius_key_missing_rejections: 0,
   helius_holder_complete_scans: 0,
   helius_holder_incomplete_scans: 0,
+  token_wallet_builds: 0,
+  token_wallet_build_failures: 0,
+  wallet_quickview_builds: 0,
+  wallet_quickview_build_failures: 0,
 };
 
 const cache = new Map();
@@ -343,7 +384,7 @@ function utcBudgetDay() {
   return new Date().toISOString().slice(0, 10);
 }
 function loadMoralisLedger() {
-  const fallback = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, updated_at: null };
+  const fallback = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, wallet_calls: 0, signal_calls: 0, updated_at: null };
   try {
     const parsed = JSON.parse(readFileSync(MORALIS_LEDGER_PATH, 'utf8'));
     if (!parsed || parsed.day !== utcBudgetDay()) return fallback;
@@ -354,6 +395,8 @@ function loadMoralisLedger() {
       kline_calls: Math.max(0, Number(parsed.kline_calls || 0)),
       trade_calls: Math.max(0, Number(parsed.trade_calls || 0)),
       holder_calls: Math.max(0, Number(parsed.holder_calls || 0)),
+      wallet_calls: Math.max(0, Number(parsed.wallet_calls || 0)),
+      signal_calls: Math.max(0, Number(parsed.signal_calls || 0)),
       updated_at: parsed.updated_at || null,
     };
   } catch {
@@ -364,7 +407,7 @@ let moralisLedger = loadMoralisLedger();
 
 function refreshMoralisBudgetDay() {
   if (moralisLedger.day === utcBudgetDay()) return;
-  moralisLedger = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, updated_at: null };
+  moralisLedger = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, wallet_calls: 0, signal_calls: 0, updated_at: null };
   persistMoralisLedger();
 }
 function persistMoralisLedger() {
@@ -388,6 +431,8 @@ function moralisBudgetState() {
     kline_calls: moralisLedger.kline_calls,
     trade_calls: moralisLedger.trade_calls,
     holder_calls: moralisLedger.holder_calls,
+    wallet_calls: moralisLedger.wallet_calls,
+    signal_calls: moralisLedger.signal_calls,
     ledger_path_kind: 'local_ephemeral_process_restart_persistent_tmp',
     database_write: false,
   };
@@ -405,6 +450,8 @@ function reserveMoralisBudget(cu, kind) {
   if (kind === 'kline') moralisLedger.kline_calls += 1;
   if (kind === 'trade') moralisLedger.trade_calls += 1;
   if (kind === 'holder') moralisLedger.holder_calls += 1;
+  if (kind === 'wallet') moralisLedger.wallet_calls += 1;
+  if (kind === 'signal') moralisLedger.signal_calls += 1;
   moralisLedger.updated_at = new Date().toISOString();
   persistMoralisLedger();
 }
@@ -438,7 +485,7 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
           // "key, key", which Moralis correctly rejects as an invalid token.
           // Send exactly one official authentication header.
           'X-API-Key': MORALIS_API_KEY,
-          'user-agent': 'KakaWeb3-Onchain-Shared/1037.3',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1039',
         },
       });
       const body = await response.text();
@@ -530,7 +577,7 @@ async function heliusRpc(method, params, { priority = 0, label = '' } = {}) {
         headers: {
           accept: 'application/json',
           'content-type': 'application/json',
-          'user-agent': 'KakaWeb3-Onchain-Shared/1038.2.1',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1039',
         },
         body: JSON.stringify({ jsonrpc: '2.0', id: 'kaka', method, params }),
       });
@@ -1134,6 +1181,601 @@ async function buildGoPlusSecurity(network, address) {
       : normalizeGoPlusEvm(raw, network, address);
   } catch (error) {
     stats.security_build_failures += 1;
+    throw error;
+  }
+}
+
+
+
+// ---------------- Step1039 wallet intelligence ----------------
+function walletIdentityKey(network, address) {
+  return network === 'solana' ? text(address) : lower(address);
+}
+function walletAddressValid(network, address) {
+  return validAddressForNetwork(network, address);
+}
+function moralisEvmTokenSwapsUrl(network, address, order = 'DESC', limit = 100) {
+  const chain = MORALIS_EVM_CHAIN[network];
+  if (!chain) throw new Error('moralis_evm_chain_not_supported');
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/erc20/${encodeURIComponent(address)}/swaps`);
+  u.searchParams.set('chain', chain);
+  u.searchParams.set('limit', String(Math.max(1, Math.min(100, limit))));
+  u.searchParams.set('order', order === 'ASC' ? 'ASC' : 'DESC');
+  u.searchParams.set('transactionTypes', 'buy,sell');
+  return u.toString();
+}
+function moralisSolanaTokenSwapsUrl(address, order = 'DESC', limit = 100) {
+  const u = new URL(`https://solana-gateway.moralis.io/token/mainnet/${encodeURIComponent(address)}/swaps`);
+  u.searchParams.set('limit', String(Math.max(1, Math.min(100, limit))));
+  u.searchParams.set('order', order === 'ASC' ? 'ASC' : 'DESC');
+  u.searchParams.set('transactionTypes', 'buy,sell');
+  return u.toString();
+}
+function moralisTopTradersUrl(network, address) {
+  if (!['ethereum', 'base'].includes(network)) return null;
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/erc20/${encodeURIComponent(address)}/top-gainers`);
+  u.searchParams.set('chain', MORALIS_EVM_CHAIN[network]);
+  u.searchParams.set('days', 'all');
+  return u.toString();
+}
+function moralisWalletPnlUrl(network, wallet) {
+  const chain = MORALIS_EVM_CHAIN[network];
+  if (!chain) throw new Error('moralis_evm_chain_not_supported');
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/wallets/${encodeURIComponent(wallet)}/profitability`);
+  u.searchParams.set('chain', chain);
+  u.searchParams.set('days', 'all');
+  return u.toString();
+}
+function moralisWalletChainActivityUrl(network, wallet) {
+  const chain = MORALIS_EVM_CHAIN[network];
+  if (!chain) throw new Error('moralis_evm_chain_not_supported');
+  const u = new URL(`https://deep-index.moralis.io/api/v2.2/wallets/${encodeURIComponent(wallet)}/chains`);
+  u.searchParams.append('chains', chain);
+  return u.toString();
+}
+function moralisSolanaWalletSwapsUrl(wallet, tokenAddress = '', cursor = '') {
+  const u = new URL(`https://solana-gateway.moralis.io/account/mainnet/${encodeURIComponent(wallet)}/swaps`);
+  u.searchParams.set('limit', '100');
+  u.searchParams.set('order', 'ASC');
+  u.searchParams.set('transactionTypes', 'buy,sell');
+  if (tokenAddress) u.searchParams.set('tokenAddress', tokenAddress);
+  if (cursor) u.searchParams.set('cursor', cursor);
+  return u.toString();
+}
+function normalizeTokenSwap(network, raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const wallet = text(raw.walletAddress ?? raw.wallet_address);
+  if (!walletAddressValid(network, wallet)) return null;
+  const side = lower(raw.transactionType ?? raw.transaction_type);
+  if (!['buy', 'sell'].includes(side)) return null;
+  return {
+    wallet_address: wallet,
+    wallet_label: text(raw.walletAddressLabel ?? raw.wallet_address_label),
+    entity: text(raw.entity),
+    entity_logo: text(raw.entityLogo ?? raw.entity_logo),
+    transaction_hash: text(raw.transactionHash ?? raw.transaction_hash),
+    transaction_type: side,
+    block_timestamp: text(raw.blockTimestamp ?? raw.block_timestamp) || null,
+    block_number: numberOrNull(raw.blockNumber ?? raw.block_number),
+    total_value_usd: numberOrNull(raw.totalValueUsd ?? raw.total_value_usd),
+    exchange_name: text(raw.exchangeName ?? raw.exchange_name),
+    pair_address: text(raw.pairAddress ?? raw.pair_address),
+    pair_label: text(raw.pairLabel ?? raw.pair_label),
+  };
+}
+function normalizeSwapPayload(network, payload) {
+  const rows = Array.isArray(payload?.result) ? payload.result : [];
+  return rows.map((x) => normalizeTokenSwap(network, x)).filter(Boolean);
+}
+function aggregateRecentWallets(network, rows, limit = 30) {
+  const map = new Map();
+  for (const row of rows) {
+    const key = walletIdentityKey(network, row.wallet_address);
+    let item = map.get(key);
+    if (!item) {
+      item = {
+        address: row.wallet_address,
+        label: row.wallet_label || row.entity || '',
+        entity: row.entity || '',
+        buys: 0,
+        sells: 0,
+        buy_usd: 0,
+        sell_usd: 0,
+        total_usd: 0,
+        trade_count: 0,
+        last_activity_at: row.block_timestamp || null,
+        last_exchange: row.exchange_name || '',
+      };
+      map.set(key, item);
+    }
+    const usd = Math.max(0, numberOrNull(row.total_value_usd) || 0);
+    item.trade_count += 1;
+    item.total_usd += usd;
+    if (row.transaction_type === 'buy') { item.buys += 1; item.buy_usd += usd; }
+    if (row.transaction_type === 'sell') { item.sells += 1; item.sell_usd += usd; }
+    if (row.block_timestamp && (!item.last_activity_at || row.block_timestamp > item.last_activity_at)) item.last_activity_at = row.block_timestamp;
+    if (row.exchange_name) item.last_exchange = row.exchange_name;
+    if (!item.label && (row.wallet_label || row.entity)) item.label = row.wallet_label || row.entity;
+  }
+  return [...map.values()].sort((a, b) => b.total_usd - a.total_usd || b.trade_count - a.trade_count).slice(0, limit);
+}
+function earliestBuyerRows(network, rows, limit = 20) {
+  const seen = new Set();
+  const out = [];
+  for (const row of rows) {
+    if (row.transaction_type !== 'buy') continue;
+    const key = walletIdentityKey(network, row.wallet_address);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      address: row.wallet_address,
+      label: row.wallet_label || row.entity || '',
+      entity: row.entity || '',
+      early_buy_rank: out.length + 1,
+      first_observed_buy_at: row.block_timestamp || null,
+      first_observed_buy_usd: numberOrNull(row.total_value_usd),
+      evidence_scope: `first_${EARLY_SWAP_SCOPE}_token_swaps_ordered_asc`,
+      exhaustive_since_launch: false,
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+function normalizeTopTrader(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const address = text(raw.address);
+  if (!looksEvmAddress(address)) return null;
+  return {
+    address,
+    count_of_trades: numberOrNull(raw.count_of_trades),
+    realized_profit_usd: numberOrNull(raw.realized_profit_usd),
+    realized_profit_percentage: numberOrNull(raw.realized_profit_percentage),
+    total_usd_invested: numberOrNull(raw.total_usd_invested),
+    total_sold_usd: numberOrNull(raw.total_sold_usd),
+    avg_buy_price_usd: numberOrNull(raw.avg_buy_price_usd),
+    avg_sell_price_usd: numberOrNull(raw.avg_sell_price_usd),
+  };
+}
+function smartMoneyTokenCandidate(row) {
+  const profit = numberOrNull(row?.realized_profit_usd);
+  const roi = numberOrNull(row?.realized_profit_percentage);
+  const trades = numberOrNull(row?.count_of_trades);
+  if (profit === null || roi === null || trades === null) return null;
+  const pass = profit >= SMART_MONEY_TOKEN_MIN_PROFIT_USD && roi >= SMART_MONEY_TOKEN_MIN_ROI_PCT && trades >= SMART_MONEY_TOKEN_MIN_TRADES;
+  if (!pass) return null;
+  return {
+    ...row,
+    smart_money_candidate: true,
+    candidate_kind: 'token_profitability_signal',
+    rule_version: SMART_MONEY_RULE_VERSION,
+    rule: `realized_profit_usd>=${SMART_MONEY_TOKEN_MIN_PROFIT_USD}; realized_profit_percentage>=${SMART_MONEY_TOKEN_MIN_ROI_PCT}; count_of_trades>=${SMART_MONEY_TOKEN_MIN_TRADES}`,
+    reasons: [
+      `realized_profit_usd=${profit}`,
+      `realized_profit_percentage=${roi}`,
+      `count_of_trades=${trades}`,
+    ],
+    confirmed_smart_money: false,
+  };
+}
+function directRolesFromSecurity(network, security) {
+  const roles = new Map();
+  const add = (address, role) => {
+    if (!walletAddressValid(network, address)) return;
+    const key = walletIdentityKey(network, address);
+    const item = roles.get(key) || { address, roles: [] };
+    if (!item.roles.includes(role)) item.roles.push(role);
+    roles.set(key, item);
+  };
+  if (!security || typeof security !== 'object') return roles;
+  if (network === 'solana') {
+    for (const raw of Array.isArray(security.creators) ? security.creators : []) add(text(raw?.address), 'creator');
+  } else {
+    add(text(security.creator?.address), 'creator');
+    add(text(security.owner?.address), 'owner');
+  }
+  return roles;
+}
+function mergeWalletCandidate(map, network, raw, tags = [], evidence = {}) {
+  const address = text(raw?.address ?? raw?.wallet_address);
+  if (!walletAddressValid(network, address)) return;
+  const key = walletIdentityKey(network, address);
+  const item = map.get(key) || { address, tags: [], evidence: {} };
+  for (const tag of tags) if (tag && !item.tags.includes(tag)) item.tags.push(tag);
+  item.evidence = { ...item.evidence, ...evidence };
+  if (raw?.label && !item.label) item.label = raw.label;
+  if (raw?.entity && !item.entity) item.entity = raw.entity;
+  map.set(key, item);
+}
+async function step1038Context(network, address) {
+  const holderKey = `step1038:holders:${network}:${lower(address)}`;
+  const securityKey = `step1038:security:${network}:${lower(address)}`;
+  const holderPromise = cachedBuild(holderKey, {
+    freshMs: network === 'solana' ? SOLANA_HELIUS_HOLDER_FRESH_MS : HOLDER_FRESH_MS,
+    staleMs: network === 'solana' ? SOLANA_HELIUS_HOLDER_STALE_MS : HOLDER_STALE_MS,
+    negativeMs: HOLDER_NEGATIVE_MS,
+  }, () => buildHolderAnalysis(network, address));
+  const securityPromise = cachedBuild(securityKey, { freshMs: SECURITY_FRESH_MS, staleMs: SECURITY_STALE_MS, negativeMs: SECURITY_NEGATIVE_MS }, () => buildGoPlusSecurity(network, address));
+  const [h, sec] = await Promise.allSettled([holderPromise, securityPromise]);
+  return {
+    holders: h.status === 'fulfilled' ? h.value?.value || null : null,
+    holder_error: h.status === 'rejected' ? text(h.reason?.message || h.reason) : '',
+    security: sec.status === 'fulfilled' ? sec.value?.value || null : null,
+    security_error: sec.status === 'rejected' ? text(sec.reason?.message || sec.reason) : '',
+  };
+}
+async function fetchTokenSwapScopes(network, address) {
+  const ascUrl = network === 'solana' ? moralisSolanaTokenSwapsUrl(address, 'ASC', EARLY_SWAP_SCOPE) : moralisEvmTokenSwapsUrl(network, address, 'ASC', EARLY_SWAP_SCOPE);
+  const descUrl = network === 'solana' ? moralisSolanaTokenSwapsUrl(address, 'DESC', RECENT_SWAP_SCOPE) : moralisEvmTokenSwapsUrl(network, address, 'DESC', RECENT_SWAP_SCOPE);
+  const [asc, desc] = await Promise.allSettled([
+    moralisFetchJson(ascUrl, { cu: MORALIS_TOKEN_SWAPS_CU, kind: 'signal', priority: 5, label: `step1039-token-swaps-asc-${network}` }),
+    moralisFetchJson(descUrl, { cu: MORALIS_TOKEN_SWAPS_CU, kind: 'signal', priority: 4, label: `step1039-token-swaps-desc-${network}` }),
+  ]);
+  return {
+    early: asc.status === 'fulfilled' ? normalizeSwapPayload(network, asc.value) : [],
+    recent: desc.status === 'fulfilled' ? normalizeSwapPayload(network, desc.value) : [],
+    errors: [
+      asc.status === 'rejected' ? `early:${text(asc.reason?.message || asc.reason)}` : '',
+      desc.status === 'rejected' ? `recent:${text(desc.reason?.message || desc.reason)}` : '',
+    ].filter(Boolean),
+  };
+}
+async function buildTokenWalletIntelligence(network, address) {
+  stats.token_wallet_builds += 1;
+  try {
+    const [context, swapScopes] = await Promise.all([step1038Context(network, address), fetchTokenSwapScopes(network, address)]);
+    const holders = Array.isArray(context.holders?.top_holders) ? context.holders.top_holders.slice(0, 50) : [];
+    const largeHolders = holders.filter((row, idx) => idx < 10 || (numberOrNull(row?.percent) || 0) >= 1).map((row, idx) => ({
+      address: text(row.address),
+      label: text(row.label || row.entity),
+      entity: text(row.entity),
+      holder_rank: idx + 1,
+      holder_percent: numberOrNull(row.percent),
+      large_holder_rule: 'top10_or_holder_percent_gte_1',
+    }));
+    const earlyBuyers = earliestBuyerRows(network, swapScopes.early, 20);
+    const recentTraders = aggregateRecentWallets(network, swapScopes.recent, 30);
+    const roleMap = directRolesFromSecurity(network, context.security);
+
+    let topTraderRows = [];
+    let topTraderError = '';
+    const topUrl = moralisTopTradersUrl(network, address);
+    if (topUrl) {
+      try {
+        const raw = await moralisFetchJson(topUrl, { cu: MORALIS_TOP_TRADERS_CU, kind: 'signal', priority: 2, label: `step1039-top-traders-${network}` });
+        topTraderRows = (Array.isArray(raw?.result) ? raw.result : []).map(normalizeTopTrader).filter(Boolean).slice(0, 50);
+      } catch (error) { topTraderError = text(error?.message || error); }
+    }
+    const profitableCandidates = topTraderRows.map(smartMoneyTokenCandidate).filter(Boolean).slice(0, 20);
+    const all = new Map();
+    for (const row of holders) mergeWalletCandidate(all, network, row, ['holder'], { holder_percent: numberOrNull(row.percent), holder_rank: holders.indexOf(row) + 1 });
+    for (const row of largeHolders) mergeWalletCandidate(all, network, row, ['large_holder'], { holder_percent: row.holder_percent, holder_rank: row.holder_rank, large_holder_rule: row.large_holder_rule });
+    for (const row of earlyBuyers) mergeWalletCandidate(all, network, row, ['early_buyer'], { early_buy_rank: row.early_buy_rank, first_observed_buy_at: row.first_observed_buy_at, early_scope: row.evidence_scope });
+    for (const row of recentTraders) mergeWalletCandidate(all, network, row, ['recent_trader'], { buys: row.buys, sells: row.sells, total_usd: row.total_usd, last_activity_at: row.last_activity_at });
+    for (const row of profitableCandidates) mergeWalletCandidate(all, network, row, ['smart_money_candidate'], { smart_money_candidate: true, realized_profit_usd: row.realized_profit_usd, realized_profit_percentage: row.realized_profit_percentage, count_of_trades: row.count_of_trades, smart_money_rule: row.rule, smart_money_rule_version: row.rule_version });
+    for (const role of roleMap.values()) mergeWalletCandidate(all, network, role, role.roles, { direct_source_roles: role.roles });
+
+    return {
+      source: 'kaka_shared_token_wallet_intelligence',
+      network,
+      address,
+      scopes: {
+        early_buyers: `first_${EARLY_SWAP_SCOPE}_token_swaps_ordered_asc_non_exhaustive`,
+        recent_traders: `latest_${RECENT_SWAP_SCOPE}_token_swaps_ordered_desc`,
+        large_holders: 'exact_step1038_top_holders_top10_or_percent_gte_1',
+        profitable_candidates: topUrl ? 'moralis_token_top_traders_profitability_signal' : 'not_supported_for_this_network',
+      },
+      early_buyers: earlyBuyers,
+      large_holders: largeHolders,
+      recent_traders: recentTraders,
+      smart_money_candidates: profitableCandidates,
+      direct_role_wallets: [...roleMap.values()],
+      all_candidates: [...all.values()].slice(0, WALLET_SIGNAL_MAX_ROWS),
+      smart_money_rule_version: SMART_MONEY_RULE_VERSION,
+      smart_money_is_candidate_not_identity: true,
+      no_kol_sniper_dev_insider_inference: true,
+      top_traders_supported_network: Boolean(topUrl),
+      upstream_partial_errors: [context.holder_error, context.security_error, ...swapScopes.errors, topTraderError ? `top_traders:${topTraderError}` : ''].filter(Boolean),
+    };
+  } catch (error) {
+    stats.token_wallet_build_failures += 1;
+    throw error;
+  }
+}
+function normalizePnlRow(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const address = text(raw.token_address);
+  if (!looksEvmAddress(address)) return null;
+  return {
+    token_address: address,
+    name: text(raw.name),
+    symbol: text(raw.symbol),
+    possible_spam: raw.possible_spam === true || lower(raw.possible_spam) === 'true',
+    total_usd_invested: numberOrNull(raw.total_usd_invested),
+    total_sold_usd: numberOrNull(raw.total_sold_usd),
+    count_of_trades: numberOrNull(raw.count_of_trades),
+    realized_profit_usd: numberOrNull(raw.realized_profit_usd),
+    realized_profit_percentage: numberOrNull(raw.realized_profit_percentage),
+    total_buys: numberOrNull(raw.total_buys),
+    total_sells: numberOrNull(raw.total_sells),
+    avg_buy_price_usd: numberOrNull(raw.avg_buy_price_usd),
+    avg_sell_price_usd: numberOrNull(raw.avg_sell_price_usd),
+  };
+}
+function summarizePnl(rows) {
+  const usable = rows.filter((x) => !x.possible_spam && x.realized_profit_usd !== null && x.count_of_trades !== null && x.count_of_trades > 0);
+  const profitable = usable.filter((x) => x.realized_profit_usd > 0);
+  return {
+    available: usable.length > 0,
+    realized_profit_usd: usable.reduce((a, x) => a + (x.realized_profit_usd || 0), 0),
+    total_usd_invested: usable.reduce((a, x) => a + (x.total_usd_invested || 0), 0),
+    total_sold_usd: usable.reduce((a, x) => a + (x.total_sold_usd || 0), 0),
+    total_buys: usable.reduce((a, x) => a + (x.total_buys || 0), 0),
+    total_sells: usable.reduce((a, x) => a + (x.total_sells || 0), 0),
+    trade_count: usable.reduce((a, x) => a + (x.count_of_trades || 0), 0),
+    evaluable_token_positions: usable.length,
+    profitable_token_positions: profitable.length,
+    realized_token_position_win_rate_pct: usable.length ? (profitable.length / usable.length) * 100 : null,
+    methodology: 'moralis_realized_token_pnl_rows_non_spam; win_rate_is_profitable_token_positions/evaluable_token_positions_not_trade_win_rate; gas_not_added_by_kaka',
+  };
+}
+function evmWalletCandidate(summary) {
+  const p = numberOrNull(summary?.realized_profit_usd);
+  const w = numberOrNull(summary?.realized_token_position_win_rate_pct);
+  const n = numberOrNull(summary?.evaluable_token_positions);
+  const t = numberOrNull(summary?.trade_count);
+  const pass = p !== null && w !== null && n !== null && t !== null && p >= SMART_MONEY_WALLET_MIN_PROFIT_USD && w >= SMART_MONEY_WALLET_MIN_WIN_RATE_PCT && n >= SMART_MONEY_WALLET_MIN_EVALUABLE_POSITIONS && t >= SMART_MONEY_WALLET_MIN_TRADES;
+  return {
+    smart_money_candidate: pass,
+    confirmed_smart_money: false,
+    rule_version: SMART_MONEY_RULE_VERSION,
+    rule: `realized_profit_usd>=${SMART_MONEY_WALLET_MIN_PROFIT_USD}; realized_token_position_win_rate_pct>=${SMART_MONEY_WALLET_MIN_WIN_RATE_PCT}; evaluable_token_positions>=${SMART_MONEY_WALLET_MIN_EVALUABLE_POSITIONS}; trade_count>=${SMART_MONEY_WALLET_MIN_TRADES}`,
+    reasons: pass ? [`realized_profit_usd=${p}`, `realized_token_position_win_rate_pct=${w}`, `evaluable_token_positions=${n}`, `trade_count=${t}`] : [],
+  };
+}
+function normalizeChainActivity(network, raw) {
+  const chain = MORALIS_EVM_CHAIN[network];
+  const rows = Array.isArray(raw?.active_chains) ? raw.active_chains : [];
+  const found = rows.find((x) => lower(x?.chain) === chain || lower(x?.chain_id) === lower(NETWORKS[network]?.chain_id ? `0x${NETWORKS[network].chain_id.toString(16)}` : '')) || null;
+  const first = text(found?.first_transaction?.block_timestamp) || null;
+  const last = text(found?.last_transaction?.block_timestamp) || null;
+  const firstMs = first ? Date.parse(first) : NaN;
+  const walletAgeDays = Number.isFinite(firstMs)
+    ? Math.max(0, (Date.now() - firstMs) / 86_400_000)
+    : null;
+  return {
+    first_activity_at: first,
+    last_activity_at: last,
+    wallet_age_days: walletAgeDays,
+    new_wallet: walletAgeDays === null ? null : walletAgeDays <= 7,
+    new_wallet_rule: 'first_activity_at_within_7d',
+    source: 'moralis_wallet_chain_activity',
+  };
+}
+async function buildEvmWalletBase(network, wallet) {
+  const [activity, pnl] = await Promise.allSettled([
+    moralisFetchJson(moralisWalletChainActivityUrl(network, wallet), { cu: MORALIS_WALLET_ACTIVITY_BUDGET_CU, kind: 'wallet', priority: 5, label: `step1039-wallet-activity-${network}` }),
+    moralisFetchJson(moralisWalletPnlUrl(network, wallet), { cu: MORALIS_WALLET_PNL_CU, kind: 'wallet', priority: 4, label: `step1039-wallet-pnl-${network}` }),
+  ]);
+  const activityFacts = activity.status === 'fulfilled' ? normalizeChainActivity(network, activity.value) : { first_activity_at: null, last_activity_at: null, wallet_age_days: null, new_wallet: null, new_wallet_rule: 'first_activity_at_within_7d', source: null };
+  const pnlRows = pnl.status === 'fulfilled' && Array.isArray(pnl.value?.result) ? pnl.value.result.map(normalizePnlRow).filter(Boolean) : [];
+  const pnlSummary = summarizePnl(pnlRows);
+  return {
+    network,
+    wallet,
+    source: 'moralis_wallet_chain_activity_plus_wallet_pnl_breakdown',
+    activity: activityFacts,
+    pnl: pnlSummary,
+    pnl_rows: pnlRows.slice(0, 250),
+    smart_money_signal: evmWalletCandidate(pnlSummary),
+    upstream_partial_errors: [
+      activity.status === 'rejected' ? `activity:${text(activity.reason?.message || activity.reason)}` : '',
+      pnl.status === 'rejected' ? `pnl:${text(pnl.reason?.message || pnl.reason)}` : '',
+    ].filter(Boolean),
+  };
+}
+function solanaPortfolioFacts(raw) {
+  const items = Array.isArray(raw?.items) ? raw.items : [];
+  const fungible = items.filter((x) => lower(x?.interface).includes('fungible'));
+  let pricedUsd = 0;
+  let pricedCount = 0;
+  for (const item of fungible) {
+    const ti = item?.token_info || item?.tokenInfo || {};
+    const price = ti?.price_info || ti?.priceInfo || {};
+    let usd = numberOrNull(price?.total_price ?? price?.totalPrice ?? item?.value?.usd_value ?? item?.value?.usdValue);
+    if (usd === null) {
+      const per = numberOrNull(price?.price_per_token ?? price?.pricePerToken);
+      const rawBal = numberOrNull(ti?.balance);
+      const dec = numberOrNull(ti?.decimals);
+      if (per !== null && rawBal !== null && dec !== null) usd = per * rawBal / (10 ** dec);
+    }
+    if (usd !== null && usd >= 0) { pricedUsd += usd; pricedCount += 1; }
+  }
+  const total = numberOrNull(raw?.total);
+  const nativeLamports = numberOrNull(raw?.nativeBalance?.lamports);
+  return {
+    fungible_asset_rows_returned: fungible.length,
+    reported_total_assets: total,
+    portfolio_first_page_complete: total === null ? fungible.length < 1000 : total <= 1000,
+    priced_fungible_assets: pricedCount,
+    fungible_portfolio_usd_observed: pricedCount ? pricedUsd : null,
+    native_sol: nativeLamports === null ? null : nativeLamports / 1e9,
+    source: 'helius_getAssetsByOwner_showFungible_showNativeBalance',
+  };
+}
+async function solanaWalletAge(wallet) {
+  const cutoff = Date.now() - 7 * 86_400_000;
+  let before = '';
+  let oldest = null;
+  let exhausted = false;
+  let pages = 0;
+  let signatures = 0;
+  for (let i = 0; i < 3; i += 1) {
+    const opts = { limit: 1000 };
+    if (before) opts.before = before;
+    const page = await heliusRpc('getSignaturesForAddress', [wallet, opts], { priority: 5, label: `step1039-wallet-age-${i + 1}` });
+    if (!Array.isArray(page)) throw new Error('helius_wallet_signatures_bad_response');
+    pages += 1;
+    signatures += page.length;
+    if (page.length) {
+      const last = page[page.length - 1];
+      if (Number.isFinite(Number(last?.blockTime))) oldest = { signature: text(last.signature), block_time: Number(last.blockTime) };
+      before = text(last?.signature);
+    }
+    if (page.length < 1000) { exhausted = true; break; }
+    if (!before) break;
+    if (oldest && oldest.block_time * 1000 < cutoff) break;
+  }
+  const oldestMs = oldest?.block_time ? oldest.block_time * 1000 : null;
+  const olderThan7dObserved = oldestMs !== null && oldestMs < cutoff;
+  const newWallet = signatures === 0 ? null : olderThan7dObserved ? false : exhausted && oldestMs !== null ? (Date.now() - oldestMs <= 7 * 86_400_000) : null;
+  return {
+    new_wallet: newWallet,
+    wallet_age_days: exhausted && oldestMs !== null ? Math.max(0, (Date.now() - oldestMs) / 86_400_000) : null,
+    first_activity_at: exhausted && oldestMs !== null ? new Date(oldestMs).toISOString() : null,
+    oldest_observed_activity_at: oldestMs !== null ? new Date(oldestMs).toISOString() : null,
+    scan_exhausted: exhausted,
+    pages_scanned: pages,
+    signatures_scanned: signatures,
+    new_wallet_rule: 'true_only_when_history_exhausted_and_first_activity_within_7d; false_when_activity_older_than_7d_observed; otherwise_unknown',
+    source: 'helius_getSignaturesForAddress_bounded_history',
+  };
+}
+async function buildSolanaWalletBase(wallet) {
+  const [assets, age] = await Promise.allSettled([
+    heliusRpc('getAssetsByOwner', { ownerAddress: wallet, page: 1, limit: 1000, displayOptions: { showFungible: true, showNativeBalance: true, showZeroBalance: false } }, { priority: 4, label: 'step1039-wallet-assets' }),
+    solanaWalletAge(wallet),
+  ]);
+  return {
+    network: 'solana',
+    wallet,
+    source: 'helius_wallet_portfolio_plus_bounded_age',
+    activity: age.status === 'fulfilled' ? age.value : { new_wallet: null, wallet_age_days: null, source: null },
+    portfolio: assets.status === 'fulfilled' ? solanaPortfolioFacts(assets.value) : { source: null },
+    pnl: { available: false, reason: 'solana_step1039_does_not_label_swap_cashflow_as_pnl' },
+    smart_money_signal: { smart_money_candidate: false, confirmed_smart_money: false, rule_version: SMART_MONEY_RULE_VERSION, reasons: [], unavailable_reason: 'no_exact_realized_pnl_source_for_solana_in_step1039' },
+    upstream_partial_errors: [
+      assets.status === 'rejected' ? `portfolio:${text(assets.reason?.message || assets.reason)}` : '',
+      age.status === 'rejected' ? `age:${text(age.reason?.message || age.reason)}` : '',
+    ].filter(Boolean),
+  };
+}
+async function cachedWalletBase(network, wallet) {
+  const key = `step1039:walletbase:${network}:${walletIdentityKey(network, wallet)}`;
+  const result = await cachedBuild(key, { freshMs: WALLET_BASE_FRESH_MS, staleMs: WALLET_BASE_STALE_MS, negativeMs: WALLET_BASE_NEGATIVE_MS }, () => network === 'solana' ? buildSolanaWalletBase(wallet) : buildEvmWalletBase(network, wallet));
+  return result.value;
+}
+async function solanaTokenSwapCashflow(wallet, tokenAddress) {
+  if (!tokenAddress) return null;
+  let cursor = '';
+  let pages = 0;
+  let complete = false;
+  const rows = [];
+  const seenCursor = new Set();
+  while (pages < 3) {
+    const raw = await moralisFetchJson(moralisSolanaWalletSwapsUrl(wallet, tokenAddress, cursor), { cu: MORALIS_SOLANA_WALLET_SWAPS_CU, kind: 'wallet', priority: 3, label: `step1039-sol-wallet-swaps-${pages + 1}` });
+    const page = normalizeSwapPayload('solana', raw);
+    rows.push(...page);
+    pages += 1;
+    const next = text(raw?.cursor);
+    if (!next) { complete = true; break; }
+    if (seenCursor.has(next)) break;
+    seenCursor.add(next);
+    cursor = next;
+  }
+  let buyUsd = 0; let sellUsd = 0; let buys = 0; let sells = 0;
+  for (const row of rows) {
+    const usd = Math.max(0, numberOrNull(row.total_value_usd) || 0);
+    if (row.transaction_type === 'buy') { buys += 1; buyUsd += usd; }
+    if (row.transaction_type === 'sell') { sells += 1; sellUsd += usd; }
+  }
+  return {
+    available: rows.length > 0,
+    exact_token_address: tokenAddress,
+    buys,
+    sells,
+    buy_usd: buyUsd,
+    sell_usd: sellUsd,
+    net_sell_minus_buy_usd: sellUsd - buyUsd,
+    rows_observed: rows.length,
+    pages_scanned: pages,
+    scan_complete_within_3_pages: complete,
+    is_pnl: false,
+    note: 'DEX swap cashflow only; transfers in/out and external inventory can change cost basis, so Kaka does not label this as PnL.',
+    source: 'moralis_solana_wallet_swaps_exact_token',
+  };
+}
+function walletHolderContext(network, wallet, holders) {
+  const rows = Array.isArray(holders?.top_holders) ? holders.top_holders : [];
+  const idx = rows.findIndex((x) => exactAddressEqual(network, x?.address, wallet));
+  if (idx < 0) return { in_top_holder_list: false, rank: null, percent: null };
+  return { in_top_holder_list: true, rank: idx + 1, percent: numberOrNull(rows[idx]?.percent), label: text(rows[idx]?.label || rows[idx]?.entity) };
+}
+function directWalletRoles(network, wallet, security) {
+  const map = directRolesFromSecurity(network, security);
+  return map.get(walletIdentityKey(network, wallet))?.roles || [];
+}
+function tokenIntelWalletContext(network, wallet, intel) {
+  const find = (rows) => (Array.isArray(rows) ? rows : []).find((x) => exactAddressEqual(network, x?.address, wallet)) || null;
+  return {
+    early_buyer: find(intel?.early_buyers),
+    large_holder: find(intel?.large_holders),
+    recent_trader: find(intel?.recent_traders),
+    token_profitability_candidate: find(intel?.smart_money_candidates),
+  };
+}
+async function buildWalletQuickview(network, wallet, tokenAddress = '') {
+  stats.wallet_quickview_builds += 1;
+  try {
+    const base = await cachedWalletBase(network, wallet);
+    let holders = null; let security = null; let intel = null; let cashflow = null;
+    const partialErrors = [...(base?.upstream_partial_errors || [])];
+    if (tokenAddress) {
+      const [ctx, intelResult] = await Promise.allSettled([
+        step1038Context(network, tokenAddress),
+        cachedBuild(`step1039:token-wallets:${network}:${lower(tokenAddress)}`, { freshMs: TOKEN_WALLET_FRESH_MS, staleMs: TOKEN_WALLET_STALE_MS, negativeMs: TOKEN_WALLET_NEGATIVE_MS }, () => buildTokenWalletIntelligence(network, tokenAddress)),
+      ]);
+      if (ctx.status === 'fulfilled') { holders = ctx.value.holders; security = ctx.value.security; partialErrors.push(ctx.value.holder_error, ctx.value.security_error); }
+      else partialErrors.push(`context:${text(ctx.reason?.message || ctx.reason)}`);
+      if (intelResult.status === 'fulfilled') intel = intelResult.value?.value || null;
+      else partialErrors.push(`token_wallets:${text(intelResult.reason?.message || intelResult.reason)}`);
+      if (network === 'solana') {
+        try { cashflow = await solanaTokenSwapCashflow(wallet, tokenAddress); }
+        catch (error) { partialErrors.push(`solana_cashflow:${text(error?.message || error)}`); }
+      }
+    }
+    const currentPnl = tokenAddress && network !== 'solana' && Array.isArray(base?.pnl_rows)
+      ? base.pnl_rows.find((x) => exactAddressEqual(network, x?.token_address, tokenAddress)) || null
+      : null;
+    const tokenContext = tokenAddress ? tokenIntelWalletContext(network, wallet, intel) : { early_buyer: null, large_holder: null, recent_trader: null, token_profitability_candidate: null };
+    const globalSignal = base?.smart_money_signal || { smart_money_candidate: false, confirmed_smart_money: false };
+    const tokenSignal = tokenContext.token_profitability_candidate;
+    const candidate = Boolean(globalSignal.smart_money_candidate || tokenSignal?.smart_money_candidate);
+    return {
+      source: network === 'solana' ? 'kaka_wallet_quickview_helius_plus_moralis_cashflow' : 'kaka_wallet_quickview_moralis_pnl_plus_chain_activity',
+      network,
+      wallet,
+      token_address: tokenAddress || null,
+      activity: base?.activity || null,
+      portfolio: base?.portfolio || null,
+      pnl: base?.pnl || null,
+      current_token_pnl: currentPnl,
+      solana_current_token_dex_swap_cashflow: cashflow,
+      holder_context: tokenAddress ? walletHolderContext(network, wallet, holders) : null,
+      direct_source_roles: tokenAddress ? directWalletRoles(network, wallet, security) : [],
+      token_context: tokenContext,
+      smart_money_signal: {
+        smart_money_candidate: candidate,
+        confirmed_smart_money: false,
+        rule_version: SMART_MONEY_RULE_VERSION,
+        global_wallet_signal: globalSignal,
+        token_profitability_signal: tokenSignal,
+        label_semantics: 'Kaka profitability-signal candidate, not an identity certification',
+      },
+      no_sniper_dev_insider_common_funding_inference: true,
+      upstream_partial_errors: partialErrors.filter(Boolean),
+    };
+  } catch (error) {
+    stats.wallet_quickview_build_failures += 1;
     throw error;
   }
 }
@@ -2119,8 +2761,14 @@ function healthPayload() {
         docs_evm_ohlcv: 'https://docs.moralis.com/data-api/evm/price/ohlc',
         docs_solana_ohlcv: 'https://docs.moralis.com/data-api/solana/price/ohlc',
         docs_pricing: 'https://docs.moralis.com/data-api/pricing',
+        docs_wallet_pnl: 'https://docs.moralis.com/data-api/evm/wallet/wallet-pnl',
+        docs_wallet_chain_activity: 'https://docs.moralis.com/data-api/evm/wallet/chain-activity',
+        docs_evm_token_swaps: 'https://docs.moralis.com/data-api/evm/token/swaps/token-swaps',
+        docs_top_traders: 'https://docs.moralis.com/data-api/evm/token/signals/top-traders',
+        docs_solana_token_swaps: 'https://docs.moralis.com/data-api/solana/token/swaps/token-swaps',
+        docs_solana_wallet_swaps: 'https://docs.moralis.com/data-api/solana/token/swaps/wallet-swaps',
         terms: 'https://moralis.com/terms/',
-        role: 'exact_pool_ohlcv_history_plus_recent_pair_swaps_plus_holder_analytics',
+        role: 'exact_pool_ohlcv_history_plus_recent_pair_swaps_plus_holder_analytics_plus_step1039_wallet_pnl_and_token_swap_signals',
         api_key_configured: Boolean(MORALIS_API_KEY),
         api_key_exposed: false,
         backend_only_secret: true,
@@ -2131,6 +2779,11 @@ function healthPayload() {
         pair_swap_cu: MORALIS_TRADES_CU,
         holder_metrics_cu: MORALIS_HOLDER_METRICS_CU,
         evm_top_holders_cu: MORALIS_TOP_HOLDERS_CU,
+        step1039_token_swaps_cu: MORALIS_TOKEN_SWAPS_CU,
+        step1039_top_traders_cu: MORALIS_TOP_TRADERS_CU,
+        step1039_wallet_pnl_cu: MORALIS_WALLET_PNL_CU,
+        step1039_wallet_activity_internal_reserved_cu: MORALIS_WALLET_ACTIVITY_BUDGET_CU,
+        wallet_insights_premium_endpoint_used: false,
         scheduler: moralisScheduler.state(),
         budget: moralisBudgetState(),
       },
@@ -2150,7 +2803,8 @@ function healthPayload() {
         docs_get_token_accounts: 'https://www.helius.dev/docs/api-reference/das/gettokenaccounts',
         docs_get_token_supply: 'https://www.helius.dev/docs/api-reference/rpc/http/gettokensupply',
         docs_pricing: 'https://www.helius.dev/pricing',
-        role: 'solana_exact_mint_holder_index_from_helius_das_token_accounts',
+        docs_wallet_portfolio: 'https://www.helius.dev/docs/quickstart/portfolio-tracker',
+        role: 'solana_exact_mint_holder_index_plus_step1039_wallet_portfolio_and_bounded_age',
         api_key_configured: Boolean(HELIUS_API_KEY),
         api_key_exposed: false,
         backend_only_secret: true,
@@ -2186,6 +2840,37 @@ function healthPayload() {
       solana_moralis_holder_endpoints_not_used_because_deprecated: true,
       no_composite_security_score_generated: true,
       creator_owner_labels_are_source_facts_not_dev_inference: true,
+      user_reads_direct_upstream_requests: 0,
+    },
+    step1039_wallet_intelligence: {
+      opened: true,
+      feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION,
+      token_wallets_route: TOKEN_WALLETS_ROUTE,
+      wallet_quickview_route: WALLET_QUICKVIEW_ROUTE,
+      supported_networks: Object.keys(NETWORKS),
+      exact_chain_token_wallet_identity_required: true,
+      token_wallet_cache_fresh_ms: TOKEN_WALLET_FRESH_MS,
+      token_wallet_cache_stale_ms: TOKEN_WALLET_STALE_MS,
+      wallet_base_cache_fresh_ms: WALLET_BASE_FRESH_MS,
+      wallet_base_cache_stale_ms: WALLET_BASE_STALE_MS,
+      evm_wallet_age_source: 'moralis_wallet_chain_activity_non_premium',
+      evm_pnl_source: 'moralis_wallet_pnl_breakdown',
+      moralis_wallet_insights_premium_not_used: true,
+      solana_wallet_portfolio_source: 'helius_getAssetsByOwner',
+      solana_wallet_age_source: 'helius_getSignaturesForAddress_bounded',
+      solana_swap_cashflow_not_labeled_pnl: true,
+      early_buyer_scope: `first_${EARLY_SWAP_SCOPE}_token_swaps_not_exhaustive_launch_history`,
+      whale_rule: 'top10_or_holder_percent_gte_1',
+      smart_money_candidate_rule_version: SMART_MONEY_RULE_VERSION,
+      smart_money_is_candidate_not_confirmed_identity: true,
+      confirmed_smart_money_label_generated: false,
+      kol_label_generated: false,
+      sniper_label_generated: false,
+      dev_label_inferred: false,
+      insider_label_generated: false,
+      common_funding_inference_enabled: false,
+      quickview_on_demand_only: true,
+      no_bulk_wallet_enrichment_for_token_lists: true,
       user_reads_direct_upstream_requests: 0,
     },
     current_market_refresh: {
@@ -2375,6 +3060,25 @@ function runSelfTest() {
   t('step1038_2_1_solana_moralis_deprecated_holder_not_used', healthPayload().step1038_holder_security.solana_moralis_holder_endpoints_not_used_because_deprecated === true);
   t('step1038_no_composite_security_score', healthPayload().step1038_holder_security.no_composite_security_score_generated === true);
   t('step1038_solana_top20_fail_closed', healthPayload().step1038_holder_security.solana_top20_not_fabricated === true);
+  const syntheticSwaps = [
+    { walletAddress: '0x0000000000000000000000000000000000000001', transactionType: 'buy', blockTimestamp: '2026-01-01T00:00:00Z', totalValueUsd: 100 },
+    { walletAddress: '0x0000000000000000000000000000000000000001', transactionType: 'sell', blockTimestamp: '2026-01-02T00:00:00Z', totalValueUsd: 150 },
+    { walletAddress: '0x0000000000000000000000000000000000000002', transactionType: 'buy', blockTimestamp: '2026-01-03T00:00:00Z', totalValueUsd: 200 },
+  ].map((x) => normalizeTokenSwap('ethereum', x)).filter(Boolean);
+  const aggWallets = aggregateRecentWallets('ethereum', syntheticSwaps, 10);
+  t('step1039_swap_parser', syntheticSwaps.length === 3 && syntheticSwaps[0].transaction_type === 'buy');
+  t('step1039_recent_wallet_aggregation', aggWallets.length === 2 && aggWallets[0].total_usd >= 200);
+  t('step1039_early_buyer_unique', earliestBuyerRows('ethereum', syntheticSwaps, 10).length === 2);
+  const signalSynthetic = smartMoneyTokenCandidate({ address: '0x0000000000000000000000000000000000000001', realized_profit_usd: 1500, realized_profit_percentage: 30, count_of_trades: 8 });
+  t('step1039_smart_money_candidate_transparent', signalSynthetic?.smart_money_candidate === true && signalSynthetic?.confirmed_smart_money === false);
+  const pnlSynthetic = summarizePnl([
+    normalizePnlRow({ token_address: '0x0000000000000000000000000000000000000001', realized_profit_usd: '100', count_of_trades: 2, total_usd_invested: '50', total_sold_usd: '150', total_buys: 1, total_sells: 1, possible_spam: false }),
+    normalizePnlRow({ token_address: '0x0000000000000000000000000000000000000002', realized_profit_usd: '-20', count_of_trades: 2, total_usd_invested: '100', total_sold_usd: '80', total_buys: 1, total_sells: 1, possible_spam: false }),
+  ].filter(Boolean));
+  t('step1039_pnl_win_rate_semantics', pnlSynthetic.evaluable_token_positions === 2 && pnlSynthetic.profitable_token_positions === 1 && Math.abs(pnlSynthetic.realized_token_position_win_rate_pct - 50) < 0.001);
+  t('step1039_no_premium_wallet_insights', healthPayload().step1039_wallet_intelligence.moralis_wallet_insights_premium_not_used === true);
+  t('step1039_solana_cashflow_not_pnl', healthPayload().step1039_wallet_intelligence.solana_swap_cashflow_not_labeled_pnl === true);
+  t('step1039_no_sniper_dev_insider_inference', healthPayload().step1039_wallet_intelligence.sniper_label_generated === false && healthPayload().step1039_wallet_intelligence.dev_label_inferred === false && healthPayload().step1039_wallet_intelligence.insider_label_generated === false);
   t('trading_disabled', responseBase().trading_enabled === false);
   t('db_writes_disabled', responseBase().database_writes === false);
   t('commercial_source_terms_recorded', healthPayload().sources.dexscreener.commercial_use_permitted_subject_to_api_terms === true);
@@ -2383,7 +3087,7 @@ function runSelfTest() {
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -2400,6 +3104,78 @@ export async function handleOnchainMarket(req, res, url) {
 
   const network = normalizeNetwork(url.searchParams.get('network'));
   const limit = intRange(url.searchParams.get('limit'), 1, MAX_RESPONSE_ROWS, 50);
+
+  if (path === TOKEN_WALLETS_ROUTE || path === WALLET_QUICKVIEW_ROUTE) {
+    if (!network || network === 'all') {
+      sendJson(res, 400, responseBase({ ok: false, error: 'exact_network_required', feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION }));
+      return true;
+    }
+    const tokenAddress = text(url.searchParams.get('address') || url.searchParams.get('token_address'));
+    if (path === TOKEN_WALLETS_ROUTE) {
+      if (!validAddressForNetwork(network, tokenAddress)) {
+        sendJson(res, 400, responseBase({ ok: false, error: 'invalid_contract_address', network, feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION }));
+        return true;
+      }
+      try {
+        const key = `step1039:token-wallets:${network}:${lower(tokenAddress)}`;
+        const result = await cachedBuild(key, { freshMs: TOKEN_WALLET_FRESH_MS, staleMs: TOKEN_WALLET_STALE_MS, negativeMs: TOKEN_WALLET_NEGATIVE_MS }, () => buildTokenWalletIntelligence(network, tokenAddress));
+        const value = result.value;
+        if (!value) throw new Error('token_wallet_intelligence_not_ready');
+        sendJson(res, 200, responseBase({
+          feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION,
+          network,
+          address: tokenAddress,
+          source: value.source,
+          scopes: value.scopes,
+          early_buyers: value.early_buyers,
+          large_holders: value.large_holders,
+          recent_traders: value.recent_traders,
+          smart_money_candidates: value.smart_money_candidates,
+          direct_role_wallets: value.direct_role_wallets,
+          all_candidates: value.all_candidates,
+          smart_money_rule_version: value.smart_money_rule_version,
+          smart_money_is_candidate_not_identity: true,
+          confirmed_smart_money_label_generated: false,
+          no_kol_sniper_dev_insider_inference: true,
+          cache_status: result.cache_status,
+          upstream_partial_errors: value.upstream_partial_errors,
+          user_read_direct_upstream_requests: 0,
+        }));
+      } catch (error) {
+        sendJson(res, 503, responseBase({ ok: false, feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION, error: text(error?.message || error), network, address: tokenAddress, no_cross_chain_or_wallet_fallback: true }));
+      }
+      return true;
+    }
+
+    const wallet = text(url.searchParams.get('wallet') || url.searchParams.get('wallet_address'));
+    if (!walletAddressValid(network, wallet)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'invalid_wallet_address', network, feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION }));
+      return true;
+    }
+    if (tokenAddress && !validAddressForNetwork(network, tokenAddress)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'invalid_contract_address', network, feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION }));
+      return true;
+    }
+    try {
+      const key = `step1039:wallet-quickview:${network}:${walletIdentityKey(network, wallet)}:${tokenAddress ? lower(tokenAddress) : 'none'}`;
+      const result = await cachedBuild(key, { freshMs: WALLET_QUICKVIEW_FRESH_MS, staleMs: WALLET_QUICKVIEW_STALE_MS, negativeMs: WALLET_BASE_NEGATIVE_MS }, () => buildWalletQuickview(network, wallet, tokenAddress));
+      const value = result.value;
+      if (!value) throw new Error('wallet_quickview_not_ready');
+      sendJson(res, 200, responseBase({
+        feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION,
+        ...value,
+        cache_status: result.cache_status,
+        smart_money_is_candidate_not_identity: true,
+        confirmed_smart_money_label_generated: false,
+        win_rate_semantics: network === 'solana' ? 'unavailable_exact_realized_pnl' : 'profitable_realized_token_positions_divided_by_evaluable_realized_token_positions_not_trade_win_rate',
+        solana_swap_cashflow_not_pnl: network === 'solana',
+        user_read_direct_upstream_requests: 0,
+      }));
+    } catch (error) {
+      sendJson(res, 503, responseBase({ ok: false, feature_schema_version: STEP1039_FEATURE_SCHEMA_VERSION, error: text(error?.message || error), network, wallet, token_address: tokenAddress || null, no_cross_chain_or_wallet_fallback: true }));
+    }
+    return true;
+  }
 
   if (path === HOLDERS_ROUTE || path === SECURITY_ROUTE) {
     if (!network || network === 'all') {
