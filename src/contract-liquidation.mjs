@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.196.4';
+const STEP_VERSION = '650.8.15.196.5';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -42,7 +42,7 @@ const BINANCE_LIQUIDATION_MAX_CONNECT_ATTEMPTS_5M = 10;
 const binanceLiquidationConnectAttempts = [];
 let binanceLiquidationConnectChain = Promise.resolve();
 let binanceLiquidationLastConnectAt = 0;
-const binanceLiquidationWsStats = { attempts: 0, waits: 0, window_blocks: 0 };
+const binanceLiquidationWsStats = { attempts: 0, waits: 0, window_blocks: 0, cm_rejected: 0, non_usdt_universe_rejected: 0 };
 let WS_CTOR_PROMISE = null;
 
 
@@ -3385,9 +3385,27 @@ async function handleBinance(feed, data) {
   }
   const event = payload;
   if (String(event?.e || '') !== 'forceOrder' || !event?.o) return;
-  if (integerValue(event?.st) === 2) return;
   const order = event.o;
+  const symbolType = integerValue(event?.st) || integerValue(order?.st);
+  if (symbolType === 2) { binanceLiquidationWsStats.cm_rejected += 1; return; }
   const symbol = compactSymbol(order?.s);
+  // Step1041.5.4.2: Binance's !forceOrder@arr is now a merged UM + CM stream.
+  // Some migrated CM payloads can arrive without a usable st discriminator.
+  // Never let inverse COIN-M symbols (BTCUSD_PERP / BTCUSD_YYMMDD etc.) enter
+  // Kaka's USD-M/USDT liquidation layer. Their q/z values are contract counts,
+  // so price*quantity would inflate notional by orders of magnitude.
+  const binanceCoinMShape =
+      /USD(?:PERP|[0-9]{6})$/.test(symbol) &&
+      !/(?:USDT|USDC)(?:[0-9]{6})?$/.test(symbol);
+  if (binanceCoinMShape) { binanceLiquidationWsStats.cm_rejected += 1; return; }
+  const binanceUniverse = liquidationMarketUniverse.get('binance');
+  if (binanceUniverse instanceof Map &&
+      binanceUniverse.size > 0 &&
+      !binanceUniverse.has(symbol) &&
+      !symbol.endsWith('USDC')) {
+    binanceLiquidationWsStats.non_usdt_universe_rejected += 1;
+    return;
+  }
   const side = String(order?.S || '').toUpperCase();
   const price = positiveNumber(order?.ap) ?? positiveNumber(order?.L) ?? positiveNumber(order?.p);
   const quantity = positiveNumber(order?.z) ?? positiveNumber(order?.l) ?? positiveNumber(order?.q);
@@ -3618,6 +3636,10 @@ export function getBinanceLiquidationWsHealth() {
     connect_attempts_total: binanceLiquidationWsStats.attempts,
     connect_waits: binanceLiquidationWsStats.waits,
     connect_window_blocks: binanceLiquidationWsStats.window_blocks,
+    merged_um_cm_stream: true,
+    cm_rejected: binanceLiquidationWsStats.cm_rejected,
+    non_usdt_universe_rejected: binanceLiquidationWsStats.non_usdt_universe_rejected,
+    usd_m_usdt_exact_filter_enabled: true,
     production_ws_only: true,
   };
 }
