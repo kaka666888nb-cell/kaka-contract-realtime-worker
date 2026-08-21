@@ -129,6 +129,64 @@ function intervalMs(interval) {
   })[interval] || 900_000;
 }
 
+// Step1041.5.4.3.8 / Render650.8.15.196.7:
+// Binance native 1W candles open at Monday 00:00 UTC. Unix-epoch floor(ms/7d)
+// is Thursday anchored because 1970-01-01 was Thursday; mixing those archive
+// buckets with native/live Monday 1W rows creates two overlapping weekly series.
+// Calendar months also must not be treated as fixed 30-day epoch buckets.
+function canonicalBucketOpenMs(valueMs, interval) {
+  const ms = Math.max(0, Number(valueMs) || 0);
+  if (interval === '1w') {
+    const date = new Date(ms);
+    const mondayOffset = (date.getUTCDay() + 6) % 7;
+    return Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate() - mondayOffset,
+    );
+  }
+  if (interval === '1M') {
+    const date = new Date(ms);
+    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+  }
+  const step = intervalMs(interval);
+  return Math.floor(ms / step) * step;
+}
+
+function shiftBucketOpenMs(openMs, interval, count) {
+  const base = canonicalBucketOpenMs(openMs, interval);
+  const delta = Number.isFinite(Number(count)) ? Math.trunc(Number(count)) : 0;
+  if (interval === '1M') {
+    const date = new Date(base);
+    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + delta, 1);
+  }
+  return base + delta * intervalMs(interval);
+}
+
+function canonicalBucketCloseMs(openMs, interval) {
+  return shiftBucketOpenMs(openMs, interval, 1) - 1;
+}
+
+function canonicalBucketDistance(fromOpenMs, toOpenMs, interval) {
+  const from = canonicalBucketOpenMs(fromOpenMs, interval);
+  const to = canonicalBucketOpenMs(toOpenMs, interval);
+  if (to <= from) return 0;
+  if (interval === '1M') {
+    const a = new Date(from);
+    const b = new Date(to);
+    return Math.max(0,
+      (b.getUTCFullYear() - a.getUTCFullYear()) * 12 +
+      (b.getUTCMonth() - a.getUTCMonth()),
+    );
+  }
+  return Math.max(0, Math.round((to - from) / intervalMs(interval)));
+}
+
+function canonicalLongIntervalOpen(openMs, interval) {
+  if (interval !== '1w' && interval !== '1M') return true;
+  return Number(openMs) === canonicalBucketOpenMs(openMs, interval);
+}
+
 function toMs(value) {
   let parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
@@ -167,7 +225,11 @@ function normalizeRows(rawRows, symbol, interval, source = 'binance_official_pub
     const low = finite(raw.low ?? raw.low_price);
     const close = finite(raw.close ?? raw.close_price);
     if ([openTimeMs, open, high, low, close].some((value) => value === null)) continue;
-    const closeTimeMs = toMs(raw.close_time_ms ?? raw.close_time ?? raw.closeTime) ?? (openTimeMs + intervalMs(interval) - 1);
+    // Reject old persisted long-interval rows whose bucket anchor does not match
+    // Binance's real candle identity. This automatically drops previously persisted
+    // Thursday-anchored fake 1W buckets on the first read after deploy.
+    if (!canonicalLongIntervalOpen(openTimeMs, interval)) continue;
+    const closeTimeMs = toMs(raw.close_time_ms ?? raw.close_time ?? raw.closeTime) ?? canonicalBucketCloseMs(openTimeMs, interval);
     rows.push({
       provider: PROVIDER,
       market_type: MARKET_TYPE,
@@ -197,9 +259,8 @@ function aggregateRows(sourceRows, symbol, targetInterval) {
     return normalizeRows(sourceRows, symbol, targetInterval);
   }
   const buckets = new Map();
-  const target = intervalMs(targetInterval);
   for (const source of normalizeRows(sourceRows, symbol, '1d')) {
-    const bucket = Math.floor(source.open_time_ms / target) * target;
+    const bucket = canonicalBucketOpenMs(source.open_time_ms, targetInterval);
     const current = buckets.get(bucket);
     if (!current) {
       buckets.set(bucket, {
@@ -207,8 +268,8 @@ function aggregateRows(sourceRows, symbol, targetInterval) {
         interval: targetInterval,
         open_time: iso(bucket),
         open_time_ms: bucket,
-        close_time: iso(bucket + target - 1),
-        source: 'binance_official_public_archive_kline_seed_aggregated',
+        close_time: iso(canonicalBucketCloseMs(bucket, targetInterval)),
+        source: 'binance_official_public_archive_kline_seed_aggregated_calendar_aligned',
       });
     } else {
       current.high = Math.max(current.high, source.high);
@@ -347,8 +408,7 @@ function isNearNow(endMs, interval) {
 }
 
 function expectedCurrentOpen(endMs, interval) {
-  const step = intervalMs(interval);
-  return Math.floor(Math.max(0, endMs - 1) / step) * step;
+  return canonicalBucketOpenMs(Math.max(0, endMs - 1), interval);
 }
 
 function inspectRecentContinuity(rows, interval, endMs, limit = MAX_PERSIST_ROWS) {
@@ -365,23 +425,23 @@ function inspectRecentContinuity(rows, interval, endMs, limit = MAX_PERSIST_ROWS
   for (let index = 1; index < sorted.length; index += 1) {
     const previous = sorted[index - 1].open_time_ms;
     const current = sorted[index].open_time_ms;
-    const difference = current - previous;
-    if (difference > step) {
+    const bucketDistance = canonicalBucketDistance(previous, current, interval);
+    if (bucketDistance > 1) {
       gapCount += 1;
-      missingIntervals += Math.max(0, Math.round(difference / step) - 1);
-      firstMissingOpen ??= previous + step;
+      missingIntervals += bucketDistance - 1;
+      firstMissingOpen ??= shiftBucketOpenMs(previous, interval, 1);
     }
   }
 
   const lastOpen = sorted.at(-1)?.open_time_ms ?? null;
   const lagIntervals = lastOpen == null
     ? null
-    : Math.max(0, Math.round((targetOpen - lastOpen) / step));
+    : canonicalBucketDistance(lastOpen, targetOpen, interval);
 
-  if (firstMissingOpen == null && (lastOpen == null || lastOpen < targetOpen - step)) {
+  if (firstMissingOpen == null && (lastOpen == null || (lagIntervals ?? 0) > 1)) {
     firstMissingOpen = lastOpen == null
-      ? Math.max(0, targetOpen - ((safeLimit - 1) * step))
-      : lastOpen + step;
+      ? shiftBucketOpenMs(targetOpen, interval, -(safeLimit - 1))
+      : shiftBucketOpenMs(lastOpen, interval, 1);
   }
 
   return {
@@ -401,8 +461,8 @@ function bridgeStartForRecentWindow(rows, interval, endMs, limit = MAX_PERSIST_R
   const coverage = inspectRecentContinuity(rows, interval, endMs, limit);
   if (coverage.first_missing_open_ms != null) return coverage.first_missing_open_ms;
   return coverage.last_open_ms != null
-    ? coverage.last_open_ms + intervalMs(interval)
-    : Math.max(0, coverage.target_open_ms - ((Math.max(2, limit) - 1) * intervalMs(interval)));
+    ? shiftBucketOpenMs(coverage.last_open_ms, interval, 1)
+    : shiftBucketOpenMs(coverage.target_open_ms, interval, -(Math.max(2, limit) - 1));
 }
 
 const bridgeCandidateState = new Map();
@@ -456,7 +516,7 @@ async function markBridgeFailure(candidate, symbol, status, message) {
 
 function inspectBridgeWindow(rows, interval, startTime, endTime) {
   const step = intervalMs(interval);
-  const requestedStart = Math.floor(Math.max(0, startTime) / step) * step;
+  const requestedStart = canonicalBucketOpenMs(Math.max(0, startTime), interval);
   const targetOpen = expectedCurrentOpen(endTime, interval);
   const sorted = normalizeRows(rows, '', interval)
     .filter((row) => row.open_time_ms >= requestedStart && row.open_time_ms < endTime)
@@ -465,10 +525,14 @@ function inspectBridgeWindow(rows, interval, startTime, endTime) {
   let gapCount = 0;
   let missingIntervals = 0;
   for (let index = 1; index < sorted.length; index += 1) {
-    const difference = sorted[index].open_time_ms - sorted[index - 1].open_time_ms;
-    if (difference > step) {
+    const distance = canonicalBucketDistance(
+      sorted[index - 1].open_time_ms,
+      sorted[index].open_time_ms,
+      interval,
+    );
+    if (distance > 1) {
       gapCount += 1;
-      missingIntervals += Math.max(0, Math.round(difference / step) - 1);
+      missingIntervals += distance - 1;
     }
   }
 
@@ -477,7 +541,7 @@ function inspectBridgeWindow(rows, interval, startTime, endTime) {
   const coversStart = firstOpen != null && firstOpen <= requestedStart;
   const lagIntervals = lastOpen == null
     ? null
-    : Math.max(0, Math.round((targetOpen - lastOpen) / step));
+    : canonicalBucketDistance(lastOpen, targetOpen, interval);
 
   return {
     rows: sorted,
@@ -516,7 +580,7 @@ async function fetchBridgeCandidate(candidate, symbol, interval, startTime, endT
 
 async function fetchCurrentBridgeRows(symbol, interval, startTime, endTime, maxRows, { bypassCache = false, signal = null, requestContext = null } = {}) {
   if (interval === '1s' || startTime >= endTime || maxRows <= 0) return [];
-  const cacheKey = `${symbol}|${interval}|${Math.floor(startTime / intervalMs(interval))}|${Math.floor(endTime / intervalMs(interval))}`;
+  const cacheKey = `${symbol}|${interval}|${canonicalBucketOpenMs(startTime, interval)}|${canonicalBucketOpenMs(Math.max(startTime, endTime - 1), interval)}`;
   const cached = bypassCache ? null : bridgeResultCache.get(cacheKey);
   let combined = [];
   if (cached && Date.now() - cached.loadedAt <= HTTP_BRIDGE_CACHE_MS) {
@@ -1040,7 +1104,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
   if (forceRestValidation === true) {
     if (normalizedInterval !== '15m' || safeLimit !== 240 || !nearNow) return [];
     const requestContext = { restCallsUsed: 0, maxRestCalls: 1, signal, validationAuthorized: true };
-    const validationStart = Math.max(0, targetOpen - ((safeLimit - 1) * step));
+    const validationStart = shiftBucketOpenMs(targetOpen, normalizedInterval, -(safeLimit - 1));
     const rows = await fetchCurrentBridgeRows(
       normalizedSymbol,
       normalizedInterval,
@@ -1101,7 +1165,7 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
       // for 500/1000. This avoids making a larger cold request the condition for drawing
       // any chart. Older history continues through archive/paged loading.
       const coldRelayLimit = Math.max(20, Math.min(EDGE_FIRST_PAINT_ROWS, safeLimit));
-      const coldStart = Math.max(0, targetOpen - ((coldRelayLimit - 1) * step));
+      const coldStart = shiftBucketOpenMs(targetOpen, normalizedInterval, -(coldRelayLimit - 1));
       try {
         bridge = await fetchCurrentBridgeRows(
           normalizedSymbol,
@@ -1259,6 +1323,10 @@ export function getBinanceContractKlineSeedHealth() {
     })(),
     edge_kline_relay: getBinanceContractKlineRelayHealth(),
     direct_binance_rest_used_by_kline: false,
+    weekly_bucket_anchor: 'monday_00_utc_binance_native',
+    monthly_bucket_anchor: 'calendar_month_00_utc',
+    persisted_noncanonical_long_interval_rows_filtered: true,
+    archive_long_interval_aggregation_calendar_aligned: true,
     bridge_min_request_gap_ms: getBinanceContractKlineRelayHealth().min_request_gap_ms,
     source: 'binance_archive_plus_supabase_edge_exact_kline_relay_plus_live_websocket_no_render_binance_rest',
     time: iso(Date.now()),
@@ -1276,4 +1344,8 @@ export const _test = {
   inspectRecentContinuity,
   bridgeStartForRecentWindow,
   inspectBridgeWindow,
+  canonicalBucketOpenMs,
+  canonicalBucketCloseMs,
+  canonicalBucketDistance,
+  canonicalLongIntervalOpen,
 };
