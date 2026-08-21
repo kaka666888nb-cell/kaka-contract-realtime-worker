@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196.6';
-const DATA_VERSION = 1041006;
+const VERSION = '650.8.15.196.9';
+const DATA_VERSION = 1041009;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
@@ -22,6 +22,7 @@ const SEARCH_ROUTE = '/api/onchain/search';
 const TOKEN_ROUTE = '/api/onchain/token';
 const POOLS_ROUTE = '/api/onchain/pools';
 const KLINES_ROUTE = '/api/onchain/klines';
+const POOL_PRICE_ROUTE = '/api/onchain/pool-price';
 const TRADES_ROUTE = '/api/onchain/trades';
 const NEW_POOLS_ROUTE = '/api/onchain/new-pools';
 const FX_REFERENCE_ROUTE = '/api/onchain/fx-reference';
@@ -65,6 +66,12 @@ const UPSTREAM_TIMEOUT_MS = 12_000;
 const DISCOVERY_REFRESH_MS = 5 * 60_000;
 // Step1037.5: discovery/profile remains slow; exact market fields refresh on a separate fixed backend lane.
 const MARKET_REFRESH_MS = 30_000;
+// Step1041.5.4.3.4.2: bounded exact-pool near-realtime focus collector.
+// User reads only register exact identities in memory; the fixed timer owns all DEX upstream work.
+const POOL_PRICE_REFRESH_MS = 5_000;
+const POOL_PRICE_RETAIN_MS = 20_000;
+const POOL_PRICE_FOCUS_TTL_MS = 2 * 60_000;
+const POOL_PRICE_FOCUS_MAX = 32;
 const MARKET_RETAIN_MS = 5 * 60_000;
 const FX_REFRESH_MS = 6 * 60 * 60_000;
 const FX_RETAIN_MS = 96 * 60 * 60_000;
@@ -290,6 +297,11 @@ const stats = {
   funding_source_builds: 0,
   funding_source_build_failures: 0,
   step1041_shared_snapshot_reads: 0,
+  pool_price_focus_reads: 0,
+  pool_price_refresh_started: 0,
+  pool_price_refresh_succeeded: 0,
+  pool_price_refresh_failed: 0,
+  pool_price_rows: 0,
 };
 
 const cache = new Map();
@@ -306,6 +318,10 @@ let trendingSnapshot = [];
 let discoveryUpdatedAt = 0;
 let marketRefreshInflight = null;
 let marketUpdatedAt = 0;
+const poolPriceFocus = new Map();
+const poolPriceSnapshot = new Map();
+let poolPriceRefreshInflight = null;
+let poolPriceUpdatedAt = 0;
 let fxRefreshInflight = null;
 let fxSnapshot = null;
 let fxUpdatedAt = 0;
@@ -3468,6 +3484,102 @@ function recentHotTokenRows(pairs) {
     .slice(0, STEP1041_HOT_MAX_ROWS);
 }
 
+
+function exactPoolPriceFocusKey(network, tokenAddress, poolAddress) {
+  return `${network}|${lower(tokenAddress)}|${lower(poolAddress)}`;
+}
+function prunePoolPriceFocus(now = Date.now()) {
+  for (const [key, row] of poolPriceFocus) {
+    if (now - Number(row?.last_seen_ms || 0) > POOL_PRICE_FOCUS_TTL_MS) {
+      poolPriceFocus.delete(key);
+      poolPriceSnapshot.delete(key);
+    }
+  }
+  if (poolPriceFocus.size <= POOL_PRICE_FOCUS_MAX) return;
+  const ordered = [...poolPriceFocus.entries()]
+    .sort((a, b) => Number(a[1]?.last_seen_ms || 0) - Number(b[1]?.last_seen_ms || 0));
+  while (ordered.length && poolPriceFocus.size > POOL_PRICE_FOCUS_MAX) {
+    const [key] = ordered.shift();
+    poolPriceFocus.delete(key);
+    poolPriceSnapshot.delete(key);
+  }
+}
+function touchExactPoolPriceFocus(network, tokenAddress, poolAddress) {
+  const key = exactPoolPriceFocusKey(network, tokenAddress, poolAddress);
+  const now = Date.now();
+  poolPriceFocus.set(key, {
+    network,
+    token_address: tokenAddress,
+    pool_address: poolAddress,
+    last_seen_ms: now,
+  });
+  prunePoolPriceFocus(now);
+  return key;
+}
+async function refreshExactPoolPrices() {
+  if (poolPriceRefreshInflight) return poolPriceRefreshInflight;
+  poolPriceRefreshInflight = (async () => {
+    const now = Date.now();
+    prunePoolPriceFocus(now);
+    if (!poolPriceFocus.size) return 0;
+    stats.pool_price_refresh_started += 1;
+    try {
+      const grouped = new Map(Object.keys(NETWORKS).map((key) => [key, []]));
+      for (const focus of poolPriceFocus.values()) {
+        const list = grouped.get(focus.network);
+        if (list) list.push(focus);
+      }
+
+      let refreshed = 0;
+      for (const [network, focuses] of grouped) {
+        if (!focuses.length) continue;
+        const meta = networkMeta(network);
+        const uniqueTokens = [...new Map(
+          focuses.map((row) => [lower(row.token_address), row.token_address]),
+        ).values()];
+        for (let offset = 0; offset < uniqueTokens.length; offset += DEX_TOKEN_BATCH_MAX) {
+          const tokens = uniqueTokens.slice(offset, offset + DEX_TOKEN_BATCH_MAX);
+          const payload = await dexFetchJson(
+            `${DEX_BASE}/tokens/v1/${encodeURIComponent(meta.dex)}/${tokens.map(encodeURIComponent).join(',')}`,
+            { priority: -8, label: `background_exact_pool_price_${network}_${Math.floor(offset / DEX_TOKEN_BATCH_MAX) + 1}` },
+          );
+          const pairs = normalizeDexPairs(payload).filter((row) => row.network === network);
+          for (const focus of focuses) {
+            if (!tokens.some((token) => exactAddressEqual(network, token, focus.token_address))) continue;
+            const match = pairs.find((pair) =>
+              exactAddressEqual(network, pair?.pool_address, focus.pool_address) &&
+              pairContainsToken(network, pair, focus.token_address)
+            );
+            const price = numberOrNull(match?.price_usd);
+            if (!match || price === null || price <= 0) continue;
+            const key = exactPoolPriceFocusKey(network, focus.token_address, focus.pool_address);
+            poolPriceSnapshot.set(key, {
+              network,
+              token_address: focus.token_address,
+              pool_address: focus.pool_address,
+              dex_id: text(match.dex_id),
+              price_usd: price,
+              source_time_ms: Date.now(),
+              source: 'dexscreener_background_exact_pool_price',
+            });
+            refreshed += 1;
+          }
+        }
+      }
+      poolPriceUpdatedAt = Date.now();
+      stats.pool_price_refresh_succeeded += 1;
+      stats.pool_price_rows = refreshed;
+      return refreshed;
+    } catch (error) {
+      stats.pool_price_refresh_failed += 1;
+      throw error;
+    } finally {
+      poolPriceRefreshInflight = null;
+    }
+  })();
+  return poolPriceRefreshInflight;
+}
+
 function currentCandidateMetadata() {
   const byKey = new Map();
   for (const row of trendingSnapshot) {
@@ -3647,6 +3759,8 @@ export function startOnchainMarketCollector() {
   marketFirst.unref?.();
   const marketTimer = setInterval(() => refreshCurrentMarketFields().catch(() => {}), MARKET_REFRESH_MS);
   marketTimer.unref?.();
+  const poolPriceTimer = setInterval(() => refreshExactPoolPrices().catch(() => {}), POOL_PRICE_REFRESH_MS);
+  poolPriceTimer.unref?.();
   const fxFirst = setTimeout(() => refreshFxReference().catch(() => {}), 4_500);
   fxFirst.unref?.();
   const fxTimer = setInterval(() => refreshFxReference().catch(() => {}), FX_REFRESH_MS);
@@ -3869,6 +3983,28 @@ function healthPayload() {
       rows: trendingSnapshot.length,
       user_reads_start_upstream: false,
       fixed_background_rate_independent_of_user_count: true,
+    },
+    exact_pool_price_realtime: {
+      route: POOL_PRICE_ROUTE,
+      mode: 'bounded_fixed_background_focus_refresh',
+      refresh_interval_ms: POOL_PRICE_REFRESH_MS,
+      retain_ms: POOL_PRICE_RETAIN_MS,
+      focus_ttl_ms: POOL_PRICE_FOCUS_TTL_MS,
+      focus_max: POOL_PRICE_FOCUS_MAX,
+      active_focus: poolPriceFocus.size,
+      cached_rows: poolPriceSnapshot.size,
+      updated_at: isoFromMs(poolPriceUpdatedAt),
+      user_reads_start_upstream: false,
+      user_reads_direct_upstream_requests: 0,
+      fixed_background_rate_independent_of_user_count: true,
+      exact_chain_token_pool_required: true,
+      stats: {
+        reads: stats.pool_price_focus_reads,
+        refresh_started: stats.pool_price_refresh_started,
+        refresh_succeeded: stats.pool_price_refresh_succeeded,
+        refresh_failed: stats.pool_price_refresh_failed,
+        rows: stats.pool_price_rows,
+      },
     },
     fx_reference: {
       ready: Boolean(fxSnapshot) && (fxAgeMs === null || fxAgeMs <= FX_RETAIN_MS),
@@ -4126,7 +4262,7 @@ function runSelfTest() {
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, POOL_PRICE_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -4154,6 +4290,56 @@ export async function handleOnchainMarket(req, res, url) {
 
   const network = normalizeNetwork(url.searchParams.get('network'));
   const limit = intRange(url.searchParams.get('limit'), 1, MAX_RESPONSE_ROWS, 50);
+
+  if (path === POOL_PRICE_ROUTE) {
+    stats.pool_price_focus_reads += 1;
+    if (!network || network === 'all') {
+      sendJson(res, 400, responseBase({ ok: false, error: 'exact_network_required', user_read_upstream_requests: 0 }));
+      return true;
+    }
+    const tokenAddress = text(url.searchParams.get('address') || url.searchParams.get('token_address'));
+    const poolAddress = text(url.searchParams.get('pool') || url.searchParams.get('pool_address'));
+    if (!validAddressForNetwork(network, tokenAddress) || !validAddressForNetwork(network, poolAddress)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'invalid_exact_token_or_pool_address', network, user_read_upstream_requests: 0 }));
+      return true;
+    }
+    const key = touchExactPoolPriceFocus(network, tokenAddress, poolAddress);
+    const current = poolPriceSnapshot.get(key) || null;
+    const ageMs = current ? Math.max(0, Date.now() - Number(current.source_time_ms || 0)) : null;
+    if (!current || ageMs === null || ageMs > POOL_PRICE_RETAIN_MS) {
+      sendJson(res, 503, responseBase({
+        ok: false,
+        ready: false,
+        error: 'shared_exact_pool_price_pending',
+        network,
+        token_address: tokenAddress,
+        pool_address: poolAddress,
+        user_read_upstream_requests: 0,
+        direct_upstream_requests: 0,
+        focus_registered: true,
+        background_refresh_interval_ms: POOL_PRICE_REFRESH_MS,
+      }));
+      return true;
+    }
+    sendJson(res, 200, responseBase({
+      ready: true,
+      network,
+      token_address: current.token_address,
+      pool_address: current.pool_address,
+      dex_id: current.dex_id,
+      price_usd: current.price_usd,
+      source_time_ms: current.source_time_ms,
+      source_time: isoFromMs(current.source_time_ms),
+      age_ms: ageMs,
+      source: current.source,
+      cache_status: 'background_shared_exact_pool',
+      user_read_upstream_requests: 0,
+      direct_upstream_requests: 0,
+      focus_registered: true,
+      exact_chain_token_pool_verified_by_background_pair: true,
+    }));
+    return true;
+  }
 
   if (path === RELATIONS_ROUTE) {
     if (!network || network === 'all') {

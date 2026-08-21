@@ -94,6 +94,63 @@ function intervalMs(interval) {
   };
   return map[interval] || 900_000;
 }
+
+function providerPeriodShiftMs(provider) {
+  return provider === 'bitget' ? 8 * 60 * 60_000 : 0;
+}
+function naturalPeriodOpenMs(provider, interval, timestamp) {
+  const raw = Number(timestamp);
+  if (!Number.isFinite(raw)) return Date.now();
+  const shift = providerPeriodShiftMs(provider);
+  const shifted = new Date(raw + shift);
+  if (interval === '1w') {
+    const dayStart = Date.UTC(
+      shifted.getUTCFullYear(),
+      shifted.getUTCMonth(),
+      shifted.getUTCDate(),
+    );
+    const weekday = shifted.getUTCDay() || 7;
+    return dayStart - (weekday - 1) * 86_400_000 - shift;
+  }
+  if (interval === '1M') {
+    return Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), 1) - shift;
+  }
+  const step = intervalMs(interval);
+  return Math.floor(raw / step) * step;
+}
+function naturalPeriodCloseMs(provider, interval, openTimeMs) {
+  if (interval === '1M') {
+    const shift = providerPeriodShiftMs(provider);
+    const shifted = new Date(Number(openTimeMs) + shift);
+    return Date.UTC(
+      shifted.getUTCFullYear(),
+      shifted.getUTCMonth() + 1,
+      1,
+    ) - shift - 1;
+  }
+  return Number(openTimeMs) + intervalMs(interval) - 1;
+}
+function normalizedPriceMessage(provider, market, symbol, interval, price, eventTime = Date.now()) {
+  const px = Number(price);
+  const ts = Number(eventTime);
+  if (!Number.isFinite(px) || px <= 0) return null;
+  return JSON.stringify({
+    stream: `${provider}:${symbol}:${market}:${interval}`,
+    provider,
+    market,
+    data: {
+      e: 'price_tick',
+      E: Number.isFinite(ts) ? ts : Date.now(),
+      T: Number.isFinite(ts) ? ts : Date.now(),
+      s: symbol,
+      p: String(px),
+      q: '0',
+      i: interval,
+      source_role: 'same_provider_exact_symbol_realtime_price_tick',
+    },
+  });
+}
+
 function okxChannel(interval) {
   const map = {
     '1m':'candle1m','3m':'candle3m','5m':'candle5m','15m':'candle15m','30m':'candle30m',
@@ -154,7 +211,7 @@ function normalizedMessage(provider, market, symbol, interval, values, closed = 
       s: symbol,
       k: {
         t: timestamp,
-        T: timestamp + intervalMs(interval) - 1,
+        T: naturalPeriodCloseMs(provider, interval, timestamp),
         s: symbol,
         i: interval,
         o: open,
@@ -186,8 +243,8 @@ function sourceInterval(provider, market, interval) {
   };
   if (provider === 'gate') {
     const gateFallback = market === 'contract'
-      ? { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1M':'1d' }
-      : { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d' };
+      ? { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1w':'1d', '1M':'1d' }
+      : { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1w':'1d', '1M':'1d' };
     return gateFallback[interval] || interval;
   }
   return fallback[provider]?.[interval] || interval;
@@ -597,7 +654,7 @@ async function coinbaseConfig(symbol, interval, outputInterval = interval) {
         const price = Number(trade.price);
         const size = Number(trade.size);
         if (!Number.isFinite(timestamp) || !Number.isFinite(price) || !Number.isFinite(size)) continue;
-        const start = Math.floor(timestamp / bucketMs) * bucketMs;
+        const start = naturalPeriodOpenMs('coinbase', outputInterval, timestamp);
         if (!candle || start > candle.start) {
           if (candle) outputs.push(candleMessage(candle, true));
           candle = {
@@ -1370,22 +1427,25 @@ wss.on('connection', async (client, req, parsedUrl) => {
         const rows = await fetchMarketKlines(provider, market, symbol, cfg.sourceInterval || interval, Date.now(), 3);
         const latest = rows.at(-1);
         if (!latest || client.readyState !== WebSocket.OPEN) return;
-        client.send(normalizedMessage(
+        const eventTime = Date.now();
+        const priceMessage = normalizedPriceMessage(
           provider,
           market,
           symbol,
           interval,
-          [latest.open_time_ms,latest.open,latest.high,latest.low,latest.close,latest.volume,latest.quote_volume],
-          Date.now() > Date.parse(latest.close_time || ''),
-          latest.trade_count,
-        ));
+          latest.close,
+          eventTime,
+        );
+        if (priceMessage && client.readyState === WebSocket.OPEN) {
+          client.send(priceMessage);
+        }
       } catch (_) {
         // 保持连接，下一轮继续读取同平台官方公开K线；绝不跨平台回落。
       } finally {
         restPollBusy = false;
       }
     };
-    client.send(JSON.stringify({ type:'ready', provider, market, symbol, interval, protocol:'kaka.market.realtime.v1', mode:'official_rest_poll' }));
+    client.send(JSON.stringify({ type:'ready', provider, market, symbol, interval, protocol:'kaka.market.realtime.v1', mode:'shared_same_provider_price_tick_poll' }));
     await sendLatest();
     restPollTimer = setInterval(sendLatest, 2500);
     heartbeat = setInterval(() => {
