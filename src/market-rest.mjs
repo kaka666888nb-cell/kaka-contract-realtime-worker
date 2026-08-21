@@ -475,14 +475,36 @@ function klineCoverage(rows, interval, endMs) {
   let missingIntervals = 0;
   for (let index = 1; index < sorted.length; index += 1) {
     const difference = Number(sorted[index].open_time_ms) - Number(sorted[index - 1].open_time_ms);
-    if (difference > step) {
+    if (interval === '1M') {
+      // Native monthly candles can be UTC, UTC+8, etc. Calendar months vary
+      // from 28-31 days, so never judge gaps against a synthetic fixed 30d step.
+      if (difference > 32 * 86_400_000) {
+        gapCount += 1;
+        missingIntervals += Math.max(1, Math.round(difference / (30.4375 * 86_400_000)) - 1);
+      }
+    } else if (difference > step) {
       gapCount += 1;
       missingIntervals += Math.max(0, Math.round(difference / step) - 1);
     }
   }
   const lastOpenMs = Number(sorted.at(-1).open_time_ms);
-  const targetOpenMs = Math.floor(Math.max(0, Number(endMs || Date.now()) - 1) / step) * step;
-  const lagIntervals = Math.max(0, Math.round((targetOpenMs - lastOpenMs) / step));
+  const safeEndMs = Math.max(0, Number(endMs || Date.now()) - 1);
+  let lagIntervals = 0;
+  if (interval === '1w') {
+    // Preserve the provider's own weekly anchor (UTC, UTC+8, etc.) by using
+    // the latest returned row as the modulo anchor instead of Unix Thursday.
+    const anchor = ((lastOpenMs % step) + step) % step;
+    const targetOpenMs = safeEndMs - (((safeEndMs - anchor) % step) + step) % step;
+    lagIntervals = Math.max(0, Math.round((targetOpenMs - lastOpenMs) / step));
+  } else if (interval === '1M') {
+    const age = Math.max(0, safeEndMs - lastOpenMs);
+    lagIntervals = age <= 32 * 86_400_000
+      ? 0
+      : Math.max(1, Math.floor(age / (30.4375 * 86_400_000)));
+  } else {
+    const targetOpenMs = Math.floor(safeEndMs / step) * step;
+    lagIntervals = Math.max(0, Math.round((targetOpenMs - lastOpenMs) / step));
+  }
   return {
     row_count: sorted.length,
     first_open_time: sorted[0].open_time || new Date(Number(sorted[0].open_time_ms)).toISOString(),
@@ -540,9 +562,13 @@ function sourceIntervalFor(provider, market, interval) {
     bybit: { '8h':'4h', '3d':'1d' },
   };
   if (provider === 'gate') {
+    // Gate distinguishes natural week (1w) from Unix-epoch 7d. The public
+    // mapping below exposes 7d, so derive user-facing 1w from official 1d
+    // instead of mislabelling a Unix-aligned 7d candle as a natural week.
+    // Contract 1M is likewise derived from official 1d calendar-month rows.
     const gateFallback = market === 'contract'
-      ? { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1M':'1d' }
-      : { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d' };
+      ? { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1w':'1d', '1M':'1d' }
+      : { '3m':'1m', '2h':'1h', '6h':'1h', '12h':'4h', '3d':'1d', '1w':'1d' };
     return gateFallback[interval] || interval;
   }
   return fallback[provider]?.[interval] || interval;
@@ -1814,12 +1840,36 @@ function krow(provider, market, symbol, interval, values) {
   };
 }
 
-function aggregateCandles(sourceRows, provider, market, symbol, interval) {
+function canonicalDerivedBucket(sourceOpenMs, interval) {
+  const value = Number(sourceOpenMs);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const date = new Date(value);
+  if (interval === '1w') {
+    // User-facing 1w means a natural UTC week for derived sources.
+    // JS getUTCDay(): Sunday=0 ... Saturday=6. Shift to Monday=0.
+    const daysSinceMonday = (date.getUTCDay() + 6) % 7;
+    const open = Date.UTC(
+      date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - daysSinceMonday,
+    );
+    return { open, close: open + 7 * 86_400_000 - 1 };
+  }
+  if (interval === '1M') {
+    const open = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+    const close = Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) - 1;
+    return { open, close };
+  }
   const targetMs = intervalMs(interval);
+  const open = Math.floor(value / targetMs) * targetMs;
+  return { open, close: open + targetMs - 1 };
+}
+
+function aggregateCandles(sourceRows, provider, market, symbol, interval) {
   const buckets = new Map();
   const sorted = [...sourceRows].sort((a, b) => a.open_time_ms - b.open_time_ms);
   for (const source of sorted) {
-    const bucketStart = Math.floor(source.open_time_ms / targetMs) * targetMs;
+    const bucket = canonicalDerivedBucket(source.open_time_ms, interval);
+    if (!bucket) continue;
+    const bucketStart = bucket.open;
     const current = buckets.get(bucketStart);
     const sourceVolume = num(source.volume) || 0;
     const sourceQuote = num(source.quote_volume) || sourceVolume * (num(source.close) || 0);
@@ -1831,7 +1881,7 @@ function aggregateCandles(sourceRows, provider, market, symbol, interval) {
         interval,
         open_time: new Date(bucketStart).toISOString(),
         open_time_ms: bucketStart,
-        close_time: new Date(bucketStart + targetMs - 1).toISOString(),
+        close_time: new Date(bucket.close).toISOString(),
         open: source.open,
         high: source.high,
         low: source.low,
@@ -1972,6 +2022,9 @@ function alignedKlineEnd(end, interval) {
   const now = Date.now();
   const requested = Number(end);
   const safe = Number.isFinite(requested) && requested > 0 ? Math.min(requested, now) : now;
+  // Weekly/monthly provider candles can use native calendar/timezone anchors.
+  // endTime is only an upper bound, so do not snap it to Unix-epoch 7d/30d.
+  if (interval === '1w' || interval === '1M') return safe;
   const step = intervalMs(interval);
   return Math.floor(safe / step) * step;
 }
@@ -3521,7 +3574,11 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   if (provider === 'coinbase') return coinbaseKlines(symbol, interval, end, limit);
   if (provider === 'binance' && market === 'spot') {
     const step = intervalMs(interval);
-    const endBucket = Math.floor(Math.max(1, Number(end || Date.now())) / step) * step;
+    const rawEnd = Math.max(1, Number(end || Date.now()));
+    const natural = canonicalDerivedBucket(Math.max(1, rawEnd - 1), interval);
+    const endBucket = (interval === '1w' || interval === '1M') && natural
+      ? natural.open
+      : Math.floor(rawEnd / step) * step;
     const ttlMs = Math.max(1_000, Math.min(30_000, Math.floor(step / 4)));
     const key = `spot_kline:${symbol}:${interval}:${limit}:${endBucket}`;
     return await sharedBinanceResult(
