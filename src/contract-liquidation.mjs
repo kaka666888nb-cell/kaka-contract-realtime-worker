@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.52';
+const STEP_VERSION = '650.8.15.196.4';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -60,6 +60,7 @@ const LIQUIDATION_MINUTE_TABLE = 'app_contract_liquidation_1m_cache';
 const LIQUIDATION_GATE_COVERAGE_TABLE = 'app_contract_liquidation_gate_1m_coverage';
 const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_step997_cache';
 const LIQUIDATION_STEP997_HISTORY_RPC = 'kaka_contract_liquidation_history_step997';
+const LIQUIDATION_WINDOW_SUMMARY_RPC = 'kaka_contract_liquidation_window_summary_step1041_5_4';
 const LIQUIDATION_MINUTE_RETENTION_HOURS = 30;
 const STEP997_HISTORY_INTERVALS = Object.freeze({
   '1m': { canonical: '1m', durationMs: MINUTE_BUCKET_MS, base: 'minute', maxHours: 24 },
@@ -724,6 +725,31 @@ function aggregatePersistedLiquidationRows(rows, spec) {
   return [...grouped.values()].sort((a, b) => b.bucket_start_ms - a.bucket_start_ms || a.provider.localeCompare(b.provider) || a.symbol.localeCompare(b.symbol));
 }
 
+async function readLiquidationWindowSummaryStep104154({ provider = '', symbol = '' } = {}) {
+  const safeProvider = normalizeProvider(provider);
+  const safeSymbol = compactSymbol(symbol);
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${LIQUIDATION_WINDOW_SUMMARY_RPC}`, {
+    method: 'POST',
+    headers: liquidationSupabaseHeaders({ 'content-type': 'application/json', accept: 'application/json' }),
+    body: JSON.stringify({
+      p_provider: safeProvider || null,
+      p_symbol: safeSymbol || null,
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const rawText = await response.text();
+  if (!response.ok) throw new Error(`liquidation_window_summary_rpc_http_${response.status}:${rawText.slice(0, 220)}`);
+  const decoded = JSON.parse(rawText);
+  const row = Array.isArray(decoded) && decoded[0] && typeof decoded[0] === 'object' ? decoded[0] : null;
+  if (!row) throw new Error('liquidation_window_summary_empty');
+  return {
+    ...row,
+    source: String(row.source || 'supabase_step1041_5_4_recent_1m_window_summary_v1'),
+    one_hour_platforms: Array.isArray(row.one_hour_platforms) ? row.one_hour_platforms : [],
+    six_hour_pairs: Array.isArray(row.six_hour_pairs) ? row.six_hour_pairs : [],
+  };
+}
+
 async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', symbol = '', limit = 2500 } = {}) {
   if (!LIQUIDATION_PERSISTENCE_ENABLED) throw new Error('liquidation_history_persistence_disabled');
   const spec = canonicalStep997HistoryInterval(interval);
@@ -764,6 +790,15 @@ async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', s
       normalized.source = String(raw?.source || `render_step997_unified_${spec.canonical}_from_${spec.base}_event_buckets_v1`);
       return normalized;
     }).filter(Boolean);
+    let windowSummary = null;
+    let windowSummaryError = '';
+    if (spec.base === 'hour') {
+      try {
+        windowSummary = await readLiquidationWindowSummaryStep104154({ provider: safeProvider, symbol: safeSymbol });
+      } catch (error) {
+        windowSummaryError = String(error?.message || error).slice(0, 320);
+      }
+    }
     const providers = [...new Set(rows.map((row) => row.provider))].sort();
     const pairs = new Set(rows.map((row) => `${row.provider}|${row.symbol}`));
     const payload = {
@@ -783,6 +818,12 @@ async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', s
       persistence_enabled: true,
       aggregation_location: 'supabase_rpc_shared_server_side',
       aggregation_rpc: LIQUIDATION_STEP997_HISTORY_RPC,
+      window_summary: windowSummary,
+      window_summary_ready: windowSummary != null,
+      window_summary_rpc: LIQUIDATION_WINDOW_SUMMARY_RPC,
+      window_summary_error: windowSummaryError || null,
+      detail_rows_may_be_postgrest_capped: rows.length >= 1000,
+      window_summary_not_affected_by_detail_row_cap: true,
       cache_hit: false,
       cache_age_ms: 0,
     };
