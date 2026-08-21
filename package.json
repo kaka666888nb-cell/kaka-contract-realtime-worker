@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-196.8",
+  "version": "650.8.15-196.9",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.196.8 cross-market natural week/calendar-month Kline identity root fix"
+  "description": "Kaka Web3 Render 650.8.15.196.9 all-domain Kline realtime start + Gate/Coinbase natural-period realtime + bounded onchain exact-pool price"
 }
