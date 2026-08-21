@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.196.5';
+const STEP_VERSION = '650.8.15.196.6';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -43,6 +43,7 @@ const binanceLiquidationConnectAttempts = [];
 let binanceLiquidationConnectChain = Promise.resolve();
 let binanceLiquidationLastConnectAt = 0;
 const binanceLiquidationWsStats = { attempts: 0, waits: 0, window_blocks: 0, cm_rejected: 0, non_usdt_universe_rejected: 0 };
+const bitgetLiquidationWsStats = { usdt_events_accepted: 0, non_usdt_events_mapped: 0, non_usdt_unmapped_rejected: 0, insttype_symbol_mismatch_rejected: 0 };
 let WS_CTOR_PROMISE = null;
 
 
@@ -1932,6 +1933,15 @@ export function getContractLiquidationPersistenceHealth() {
     raw_events_process_memory_only: true,
     gate_liq_orders: { ...gateLiqOrdersHealth },
     bitget_liquidations_history: { ...bitgetLiqHistoryHealth },
+    bitget_liquidation_ws_exactness: {
+      subscriptions: ['usdt-futures', 'usdc-futures', 'coin-futures'],
+      insttype_aware: true,
+      usdt_market_universe_exact_filter: true,
+      non_usdt_requires_explicit_native_display_identity: true,
+      quote_from_compact_default_not_used_for_unmapped_non_usdt: true,
+      amount_semantics: 'official_quote_coin',
+      ...bitgetLiquidationWsStats,
+    },
     close_grace_seconds: Math.trunc(LIQUIDATION_CLOSE_GRACE_MS / 1000),
     persist_flush_seconds: Math.trunc(LIQUIDATION_PERSIST_FLUSH_MS / 1000),
     persist_queue: liquidationPersistQueue.size,
@@ -3509,18 +3519,58 @@ async function handleBybit(feed, data) {
 
 async function handleBitget(feed, data) {
   if (String(data?.arg?.topic || '') !== 'liquidation' || !Array.isArray(data?.data)) return;
+  const instType = String(data?.arg?.instType || '').trim().toLowerCase();
+  const expectedQuote = instType === 'usdt-futures'
+    ? 'USDT'
+    : instType === 'usdc-futures'
+      ? 'USDC'
+      : instType === 'coin-futures'
+        ? 'USD'
+        : '';
+  if (!expectedQuote) return;
+
   for (const row of data.data) {
     const native = compactSymbol(row?.symbol);
-    const symbol = displaySymbolForNative(feed, native);
-    if (!symbol) continue;
+    if (!native) continue;
+
+    let symbol = '';
+    const mapped = feed?.nativeToDisplay?.get(native);
+    if (instType === 'usdt-futures') {
+      // Step1041.5.4.3: the all-market product is the exact USDT contract universe.
+      // Do not let Bitget's USDC symbols (e.g. BTCPERP/ETHPERP) or Coin-M symbols
+      // fall through quoteFromCompact(), whose compatibility default is USDT.
+      if (!native.endsWith('USDT')) {
+        bitgetLiquidationWsStats.insttype_symbol_mismatch_rejected += 1;
+        continue;
+      }
+      const universe = liquidationMarketUniverse.get('bitget');
+      if (universe instanceof Map && universe.size > 0 && !universe.has(native)) {
+        bitgetLiquidationWsStats.insttype_symbol_mismatch_rejected += 1;
+        continue;
+      }
+      symbol = mapped && quoteFromCompact(mapped) === 'USDT' ? mapped : native;
+      bitgetLiquidationWsStats.usdt_events_accepted += 1;
+    } else {
+      // Preserve explicitly requested USDC / Coin-M detail reads, but only when
+      // an exact native->display identity was already established by that request.
+      // Unrequested market-wide non-USDT events are intentionally not persisted.
+      if (!mapped || quoteFromCompact(mapped) !== expectedQuote) {
+        bitgetLiquidationWsStats.non_usdt_unmapped_rejected += 1;
+        continue;
+      }
+      symbol = mapped;
+      bitgetLiquidationWsStats.non_usdt_events_mapped += 1;
+    }
+
     const side = String(row?.side || '').toLowerCase();
     const price = positiveNumber(row?.price);
+    // Bitget official docs define liquidation amount in quote coin.
     const notional = positiveNumber(row?.amount);
     const timeMs = integerValue(row?.ts) || integerValue(data?.ts) || Date.now();
     const quantity = price != null && notional != null ? notional / price : null;
     if (!symbol || !['buy', 'sell'].includes(side) || price == null || notional == null || quantity == null || quantity <= 0) continue;
     addEvent(feed, {
-      id: `bitget:${symbol}:${timeMs}:${side}:${notional}`,
+      id: `bitget:${instType}:${symbol}:${timeMs}:${side}:${notional}`,
       symbol,
       native_symbol: String(row?.symbol || native),
       time_ms: timeMs,
