@@ -265,7 +265,10 @@ function secondTradeConfig(provider, market, symbol, nativeSymbol = symbol, quot
       tradeMode: true,
       url: market === 'contract'
         ? `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@aggTrade`
-        : `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@aggTrade`,
+        : `wss://data-stream.binance.vision/ws/${symbol.toLowerCase()}@aggTrade`,
+      fallbackUrls: market === 'contract'
+        ? []
+        : [`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@aggTrade`],
       subscribe: null,
       parseTrades(raw) {
         const message = JSON.parse(raw.toString());
@@ -721,7 +724,10 @@ async function upstreamConfig(provider, market, symbol, interval) {
   if (provider === 'binance') return {
     url: market === 'contract'
       ? `wss://fstream.binance.com/market/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`
-      : `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`,
+      : `wss://data-stream.binance.vision/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`,
+    fallbackUrls: market === 'contract'
+      ? []
+      : [`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${upstreamInterval}`],
     subscribe: null,
     parse(raw) {
       const message = JSON.parse(raw.toString());
@@ -917,6 +923,8 @@ const binanceSharedStats = {
   downstream_ip_capacity_rejections: 0,
   downstream_ip_rate_rejections: 0,
   last_error: '',
+  first_data_timeouts: 0,
+  spot_market_data_host_fallbacks: 0,
 };
 
 function binanceSharedStreamKey(market, symbol, interval) {
@@ -999,10 +1007,12 @@ function closeBinanceSharedEntry(entry, reason = 'closed') {
   clearTimeout(entry.idleTimer);
   clearInterval(entry.heartbeat);
   clearInterval(entry.secondTickTimer);
+  clearTimeout(entry.firstDataTimer);
   entry.reconnectTimer = null;
   entry.idleTimer = null;
   entry.heartbeat = null;
   entry.secondTickTimer = null;
+  entry.firstDataTimer = null;
   entry.secondAggregator = null;
   try {
     if (entry.upstream?.readyState === WebSocket.OPEN || entry.upstream?.readyState === WebSocket.CONNECTING) {
@@ -1035,13 +1045,36 @@ function scheduleBinanceSharedReconnect(entry) {
   entry.reconnectTimer.unref?.();
 }
 
+
+function binanceSharedCandidateUrls(entry) {
+  const urls = [entry?.cfg?.url, ...(Array.isArray(entry?.cfg?.fallbackUrls) ? entry.cfg.fallbackUrls : [])]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  return [...new Set(urls)];
+}
+
+function markBinanceSharedFirstData(entry) {
+  if (entry.firstDataSeen) return;
+  entry.firstDataSeen = true;
+  clearTimeout(entry.firstDataTimer);
+  entry.firstDataTimer = null;
+  broadcastBinanceShared(entry, binanceReadyMessage(entry), { remember: false });
+}
+
 async function connectBinanceSharedEntry(entry) {
   if (entry.closed || entry.clients.size === 0) return;
   if (entry.upstream?.readyState === WebSocket.OPEN || entry.connecting) return entry.connecting;
   entry.connecting = (async () => {
     await acquireBinanceConnectSlot();
     if (entry.closed || entry.clients.size === 0) return;
-    const upstream = new WebSocket(entry.cfg.url, { handshakeTimeout: 15_000 });
+    const candidateUrls = binanceSharedCandidateUrls(entry);
+    if (!candidateUrls.length) throw new Error('binance_shared_ws_no_candidate_url');
+    if (!Number.isInteger(entry.upstreamUrlIndex) || entry.upstreamUrlIndex < 0) {
+      entry.upstreamUrlIndex = 0;
+    }
+    const selectedUrl = candidateUrls[entry.upstreamUrlIndex % candidateUrls.length];
+    entry.currentUpstreamUrl = selectedUrl;
+    const upstream = new WebSocket(selectedUrl, { handshakeTimeout: 15_000 });
     entry.upstream = upstream;
     await new Promise((resolve, reject) => {
       let settled = false;
@@ -1082,7 +1115,17 @@ async function connectBinanceSharedEntry(entry) {
       entry.secondTickTimer = setInterval(() => entry.secondAggregator?.tick(), 250);
       entry.secondTickTimer.unref?.();
     }
-    broadcastBinanceShared(entry, binanceReadyMessage(entry), { remember: false });
+    entry.firstDataSeen = false;
+    clearTimeout(entry.firstDataTimer);
+    entry.firstDataTimer = setTimeout(() => {
+      if (entry.closed || entry.upstream !== upstream || entry.firstDataSeen) return;
+      binanceSharedStats.first_data_timeouts += 1;
+      binanceSharedStats.last_error =
+          `binance_shared_ws_no_first_data:${entry.market}:${entry.symbol}:${entry.interval}:${entry.currentUpstreamUrl}`;
+      try { upstream.terminate(); } catch (_) {}
+    }, 7_000);
+    entry.firstDataTimer.unref?.();
+
     clearInterval(entry.heartbeat);
     entry.heartbeat = setInterval(() => {
       if (upstream.readyState === WebSocket.OPEN) {
@@ -1101,6 +1144,7 @@ async function connectBinanceSharedEntry(entry) {
         if (entry.cfg.tradeMode === true) {
           const trades = entry.cfg.parseTrades(raw);
           if (Array.isArray(trades) && trades.length) {
+            markBinanceSharedFirstData(entry);
             binanceSharedStats.upstream_messages += trades.length;
             entry.secondAggregator?.ingest(trades);
           }
@@ -1111,17 +1155,31 @@ async function connectBinanceSharedEntry(entry) {
         const messages = Array.isArray(normalized) ? normalized : [normalized];
         for (const message of messages) {
           if (!message) continue;
+          markBinanceSharedFirstData(entry);
           binanceSharedStats.upstream_messages += 1;
           broadcastBinanceShared(entry, message);
         }
       } catch (_) {}
     });
     upstream.on('close', () => {
+      const hadFirstData = entry.firstDataSeen === true;
+      const candidates = binanceSharedCandidateUrls(entry);
       clearInterval(entry.heartbeat);
       clearInterval(entry.secondTickTimer);
+      clearTimeout(entry.firstDataTimer);
       entry.heartbeat = null;
       entry.secondTickTimer = null;
+      entry.firstDataTimer = null;
       entry.secondAggregator = null;
+      entry.firstDataSeen = false;
+      if (!hadFirstData && candidates.length > 1) {
+        entry.upstreamUrlIndex = (entry.upstreamUrlIndex + 1) % candidates.length;
+        if (entry.market === 'spot' && entry.upstreamUrlIndex > 0) {
+          binanceSharedStats.spot_market_data_host_fallbacks += 1;
+        }
+      } else if (hadFirstData) {
+        entry.upstreamUrlIndex = 0;
+      }
       if (entry.upstream === upstream) entry.upstream = null;
       scheduleBinanceSharedReconnect(entry);
     });
@@ -1179,6 +1237,10 @@ async function attachBinanceSharedClient(client, market, symbol, interval, cfg) 
       createdAt: Date.now(),
       secondAggregator: null,
       secondTickTimer: null,
+      firstDataSeen: false,
+      firstDataTimer: null,
+      upstreamUrlIndex: 0,
+      currentUpstreamUrl: '',
       lastPayload: null,
     };
     binanceSharedStreams.set(key, entry);
@@ -1202,8 +1264,10 @@ async function attachBinanceSharedClient(client, market, symbol, interval, cfg) 
   client.on('error', cleanup);
 
   if (entry.upstream?.readyState === WebSocket.OPEN) {
-    sendWsSafe(client, binanceReadyMessage(entry));
-    if (entry.lastPayload) sendWsSafe(client, entry.lastPayload);
+    if (entry.firstDataSeen) {
+      sendWsSafe(client, binanceReadyMessage(entry));
+      if (entry.lastPayload) sendWsSafe(client, entry.lastPayload);
+    }
     return;
   }
   try {
@@ -1232,7 +1296,10 @@ function binanceSharedWsHealth() {
     max_total_clients: BINANCE_SHARED_MAX_TOTAL_CLIENTS,
     max_clients_per_stream: BINANCE_SHARED_MAX_CLIENTS_PER_STREAM,
     max_client_buffered_bytes: BINANCE_SHARED_MAX_CLIENT_BUFFERED_BYTES,
-    official_production_hosts: ['fstream.binance.com/market', 'fstream.binance.com/public', 'stream.binance.com:9443'],
+    official_production_hosts: ['fstream.binance.com/market', 'fstream.binance.com/public', 'data-stream.binance.vision', 'stream.binance.com:9443'],
+    spot_market_data_primary: 'data-stream.binance.vision',
+    spot_market_data_fallback: 'stream.binance.com:9443',
+    ready_requires_first_real_market_data: true,
     futures_ws_route_migration: 'market_public_split',
     futures_ws_legacy_root_disabled: true,
     futures_ws_market_channels: ['kline','continuousKline','aggTrade','ticker','contractInfo','forceOrder'],
@@ -1252,6 +1319,11 @@ function binanceSharedWsHealth() {
       clients: entry.clients.size,
       connected: entry.upstream?.readyState === WebSocket.OPEN,
       reconnect_attempt: entry.reconnectAttempt,
+      first_data_seen: entry.firstDataSeen === true,
+      upstream_url_index: entry.upstreamUrlIndex,
+      upstream_host: (() => {
+        try { return new URL(entry.currentUpstreamUrl || entry.cfg.url).host; } catch (_) { return ''; }
+      })(),
     })),
     ...binanceSharedStats,
   };
@@ -1263,7 +1335,7 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.70', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', coinbase_all_directory_quotes_realtime_supported: true,
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.70.1', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', coinbase_all_directory_quotes_realtime_supported: true,
       all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
       coinbase_usdt_directory_not_cross_aliased_to_usd: true, bybit_shallow_latest_page_reserves_verified_older_rows: true, bybit_btc_eth_quote_pairs_prestarted_from_official_directory: true, shared_spot_quote_suffixes: SPOT_QUOTE_SUFFIXES, binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
@@ -1272,7 +1344,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.70',
+      version: '650.8.15.70.1',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
       coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat',
@@ -1566,7 +1638,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Kaka market realtime worker 650.8.15.70 listening on ${PORT}`);
+  console.log(`Kaka market realtime worker 650.8.15.70.1 listening on ${PORT}`);
   setTimeout(() => {
     startBybitSecondHistoryHotSeeds().catch(() => {});
   }, 1200).unref?.();
