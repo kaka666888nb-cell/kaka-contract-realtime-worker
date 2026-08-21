@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-196.3",
+  "version": "650.8.15-196.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Step1041.5 Binance Wallet Trending primary hot rank plus exact onchain verification and final UI/data fixes"
+  "description": "Kaka Web3 Step1041.5.4 complete liquidation window summary plus Binance Wallet hot and exact onchain fixes"
 }
