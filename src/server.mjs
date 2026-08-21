@@ -178,6 +178,12 @@ function bitgetChannel(interval) {
   };
   return map[interval] || null;
 }
+function bitgetRealityV3Interval(interval) {
+  const map = {
+    '1m':'1m','5m':'5m','15m':'15m','1h':'1H','4h':'4H','1d':'1D',
+  };
+  return map[interval] || null;
+}
 function bybitInterval(interval) {
   const map = {
     '1m':'1','3m':'3','5m':'5','15m':'15','30m':'30','1h':'60','2h':'120',
@@ -687,7 +693,7 @@ async function coinbaseConfig(symbol, interval, outputInterval = interval) {
   };
 }
 
-async function upstreamConfig(provider, market, symbol, interval) {
+async function upstreamConfig(provider, market, symbol, interval, { realityStockToken = false } = {}) {
   const upstreamInterval = sourceInterval(provider, market, interval);
   let nativeSymbol = symbol;
   let quoteAsset = splitSymbol(symbol)[1];
@@ -815,6 +821,45 @@ async function upstreamConfig(provider, market, symbol, interval) {
           ],
           false,
           result.n,
+        );
+      },
+    };
+  }
+  if (provider === 'bitget' && market === 'spot' && realityStockToken === true) {
+    const realityInterval = bitgetRealityV3Interval(upstreamInterval);
+    if (!realityInterval) throw new Error(`bitget reality interval ${upstreamInterval} is not supported`);
+    return {
+      url: 'wss://ws.bitget.com/v3/ws/public',
+      sourceName: 'bitget_uta_v3_reality_public_kline',
+      subscribe: {
+        op: 'subscribe',
+        args: [{
+          instType: 'spot',
+          topic: 'kline',
+          symbol: nativeSymbol,
+          interval: realityInterval,
+        }],
+      },
+      parse(raw) {
+        const message = JSON.parse(raw.toString());
+        if (message?.arg?.topic !== 'kline') return null;
+        const candle = Array.isArray(message?.data) ? message.data[0] : null;
+        if (!candle || typeof candle !== 'object') return null;
+        return normalizedMessage(
+          provider,
+          market,
+          symbol,
+          interval,
+          [
+            candle.start,
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume ?? 0,
+            candle.turnover ?? 0,
+          ],
+          false,
         );
       },
     };
@@ -1335,18 +1380,19 @@ const server = http.createServer(async (req, res) => {
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {
     res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'});
-    res.end(JSON.stringify({ ok: true, version: '650.8.15.70.1', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', coinbase_all_directory_quotes_realtime_supported: true,
+    res.end(JSON.stringify({ ok: true, version: '650.8.15.70.2', coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat', coinbase_all_directory_quotes_realtime_supported: true,
       all_provider_asset_quote_discovery_uses_shared_exact_quote_set: true,
-      coinbase_usdt_directory_not_cross_aliased_to_usd: true, bybit_shallow_latest_page_reserves_verified_older_rows: true, bybit_btc_eth_quote_pairs_prestarted_from_official_directory: true, shared_spot_quote_suffixes: SPOT_QUOTE_SUFFIXES, binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
+      coinbase_usdt_directory_not_cross_aliased_to_usd: true, bybit_shallow_latest_page_reserves_verified_older_rows: true, bybit_btc_eth_quote_pairs_prestarted_from_official_directory: true, shared_spot_quote_suffixes: SPOT_QUOTE_SUFFIXES, bitget_reality_ws: { explicit_product_kind_required: true, transport: 'uta_v3_public', host: 'ws.bitget.com/v3/ws/public', topic: 'kline', supported_intervals: ['1m','5m','15m','1h','4h','1d'] }, binance_shared_ws: binanceSharedWsHealth(), bybit_second_history: getBybitSecondHistoryHealth(), provider_request_governor: getProviderGovernorHealth(), time: new Date().toISOString() }));
     return;
   }
   if (req.url?.startsWith('/health')) {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true,
-      version: '650.8.15.70.1',
+      version: '650.8.15.70.2',
       protocol: 'kaka.market.realtime.v1',
       realtime_intervals: ['timeline', '1s'],
+      bitget_reality_ws: { explicit_product_kind_required: true, transport: 'uta_v3_public', host: 'ws.bitget.com/v3/ws/public', topic: 'kline', supported_intervals: ['1m','5m','15m','1h','4h','1d'] },
       coinbase_one_second_realtime_source: 'coinbase_exchange_ticker_per_match_plus_heartbeat',
       coinbase_one_second_empty_seconds_owned_by_app: true,
       coinbase_spot_usdt_realtime_supported: true,
@@ -1458,14 +1504,21 @@ wss.on('connection', async (client, req, parsedUrl) => {
   const symbol = symbolKey(parsedUrl.searchParams.get('symbol'));
   const interval = parsedUrl.searchParams.get('interval') || '15m';
   const market = marketKey(parsedUrl.searchParams.get('market'));
+  const assetProductKind = String(parsedUrl.searchParams.get('asset_product_kind') || '').trim().toLowerCase();
+  const realityStockToken = assetProductKind === 'reality_stock_token';
   if (!provider || !symbol || !VALID_INTERVALS.has(interval) || !providerMarketAllowed(provider, market)) {
     client.close(1008, 'invalid market channel');
     return;
   }
 
+  if (realityStockToken && (provider !== 'bitget' || market !== 'spot')) {
+    client.close(1008, 'reality_stock_token requires bitget spot');
+    return;
+  }
+
   let cfg;
   try {
-    cfg = await upstreamConfig(provider, market, symbol, interval);
+    cfg = await upstreamConfig(provider, market, symbol, interval, { realityStockToken });
   } catch (error) {
     client.close(1011, String(error).slice(0, 120));
     return;
@@ -1638,7 +1691,7 @@ wss.on('connection', async (client, req, parsedUrl) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Kaka market realtime worker 650.8.15.70.1 listening on ${PORT}`);
+  console.log(`Kaka market realtime worker 650.8.15.70.2 listening on ${PORT}`);
   setTimeout(() => {
     startBybitSecondHistoryHotSeeds().catch(() => {});
   }, 1200).unref?.();
