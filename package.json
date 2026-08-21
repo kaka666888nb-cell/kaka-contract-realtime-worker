@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-196.9.1",
+  "version": "650.8.15-196.9.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.196.9.1 Binance first-real-data readiness + official market-data-only Spot WS fallback"
+  "description": "Kaka Web3 Render 650.8.15.196.9.2 Reality UTA v3 realtime + onchain exact-pool inflight root fix"
 }
