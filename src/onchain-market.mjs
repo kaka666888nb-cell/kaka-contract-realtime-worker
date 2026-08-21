@@ -1,4 +1,4 @@
-// Step1041 / Render 650.8.15.196
+// Step1041 / Render 650.8.15.196.9.2.1
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196.9.2';
-const DATA_VERSION = 10410092;
+const VERSION = '650.8.15.196.9.2.1';
+const DATA_VERSION = 104100921;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
@@ -3518,17 +3518,20 @@ function touchExactPoolPriceFocus(network, tokenAddress, poolAddress) {
 }
 async function refreshExactPoolPrices() {
   if (poolPriceRefreshInflight) return poolPriceRefreshInflight;
-  poolPriceRefreshInflight = (async () => {
-    const now = Date.now();
-    prunePoolPriceFocus(now);
+
+  // Step1041.5.4.3.4.2.2.1: do the empty-focus check BEFORE assigning the
+  // shared inflight Promise. An async IIFE can run synchronously until its first
+  // await. With an empty focus set, its finally used to set the variable to null
+  // before the outer `poolPriceRefreshInflight = <promise>` assignment completed;
+  // that outer assignment then wrote the already-resolved Promise back forever.
+  // No user read starts upstream here: the fixed 5s background timer is still the
+  // only caller that reaches the upstream lane.
+  const now = Date.now();
+  prunePoolPriceFocus(now);
+  if (!poolPriceFocus.size) return 0;
+
+  const run = (async () => {
     try {
-      // Step1041.5.4.3.4.2.2: the old empty-focus early return sat before
-      // this try/finally. On the first 5s timer tick after process start there
-      // are normally no viewers yet, so the resolved Promise stayed forever in
-      // poolPriceRefreshInflight and every later exact-pool refresh short-circuited.
-      // Keep the empty pass inside finally ownership so future focus registrations
-      // can always trigger the fixed background lane.
-      if (!poolPriceFocus.size) return 0;
       stats.pool_price_refresh_started += 1;
       const grouped = new Map(Object.keys(NETWORKS).map((key) => [key, []]));
       for (const focus of poolPriceFocus.values()) {
@@ -3580,10 +3583,11 @@ async function refreshExactPoolPrices() {
       stats.pool_price_refresh_failed += 1;
       throw error;
     } finally {
-      poolPriceRefreshInflight = null;
+      if (poolPriceRefreshInflight === run) poolPriceRefreshInflight = null;
     }
   })();
-  return poolPriceRefreshInflight;
+  poolPriceRefreshInflight = run;
+  return run;
 }
 
 function currentCandidateMetadata() {
@@ -4005,6 +4009,7 @@ function healthPayload() {
       fixed_background_rate_independent_of_user_count: true,
       exact_chain_token_pool_required: true,
       empty_focus_inflight_release_fixed: true,
+      empty_focus_inflight_assignment_order_fixed: true,
       stats: {
         reads: stats.pool_price_focus_reads,
         refresh_started: stats.pool_price_refresh_started,
