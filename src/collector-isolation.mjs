@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.196.11.3.1';
+const VERSION = '650.8.15.197';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -71,6 +71,8 @@ function sharedResponsePolicy(pathname) {
   if (path === '/api/onchain/pool-price' || path === '/api/onchain/pool-prices') return { freshMs: 500, staleMs: 2_000, cdnSMaxAgeSec: 0 };
   if (path === '/api/onchain/trades') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/onchain/new-pools') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
+  if (path === '/api/onchain/smart-money') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
+  if (path === '/api/onchain/top-wallets') return { freshMs: 15_000, staleMs: 90_000, cdnSMaxAgeSec: 15 };
   if (path === '/api/onchain/fx-reference') return { freshMs: 60_000, staleMs: 10 * 60_000, cdnSMaxAgeSec: 60 };
   if (path === '/api/onchain/holders') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };
   if (path === '/api/onchain/security') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };

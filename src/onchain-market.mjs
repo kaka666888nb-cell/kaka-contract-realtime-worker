@@ -1,4 +1,4 @@
-// Step1041 / Render 650.8.15.196.11.2
+// Step1042 / Render 650.8.15.197
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,13 +7,14 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196.11.2';
-const DATA_VERSION = 104101000;
+const VERSION = '650.8.15.197';
+const DATA_VERSION = 1042000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
 const STEP1040_FEATURE_SCHEMA_VERSION = 'step1040_onchain_wallet_relationship_evidence_v1';
 const STEP1041_FEATURE_SCHEMA_VERSION = 'step1041_onchain_final_productization_v1';
+const STEP1042_FEATURE_SCHEMA_VERSION = 'step1042_onchain_multichain_smart_money_v1';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -34,6 +35,8 @@ const TOKEN_WALLETS_ROUTE = '/api/onchain/token-wallets';
 const WALLET_QUICKVIEW_ROUTE = '/api/onchain/wallet-quickview';
 const RELATIONS_ROUTE = '/api/onchain/relations';
 const OVERVIEW_ROUTE = '/api/onchain/overview';
+const SMART_MONEY_ROUTE = '/api/onchain/smart-money';
+const TOP_WALLETS_ROUTE = '/api/onchain/top-wallets';
 
 const DEX_BASE = 'https://api.dexscreener.com';
 // Step1041.4 objective hot discovery. GeckoTerminal trending-pool feeds are used only by the
@@ -44,7 +47,10 @@ const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
 const GECKO_MIN_GAP_MS = Math.max(6_200, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 6_500));
 const GECKO_MAX_QUEUE = Math.max(6, Math.min(32, Number(process.env.KAKA_GECKO_MAX_QUEUE || 20)));
 const GECKO_TIMEOUT_MS = Math.max(6_000, Math.min(25_000, Number(process.env.KAKA_GECKO_TIMEOUT_MS || 15_000)));
-const GECKO_NETWORK = Object.freeze({ ethereum: 'eth', bsc: 'bsc', base: 'base', solana: 'solana' });
+const GECKO_NETWORK = Object.freeze({
+  ethereum: 'eth', bsc: 'bsc', base: 'base', solana: 'solana',
+  arbitrum: 'arbitrum', polygon: 'polygon_pos', optimism: 'optimism', avalanche: 'avax', linea: 'linea',
+});
 // Step1041.5: Kaka's public "热门" order follows Binance Wallet's official Trending board
 // while the app is young and has insufficient first-party search/view traffic to build a mature
 // proprietary ranking. Binance rank only determines order; Kaka still re-verifies exact
@@ -60,6 +66,22 @@ const BINANCE_WALLET_TIMEOUT_MS = 12_000;
 const BINANCE_WALLET_MIN_GAP_MS = Math.max(1_200, Number(process.env.KAKA_BINANCE_WALLET_MIN_GAP_MS || 1_500));
 const BINANCE_ALPHA_LIST_URL = 'https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list';
 const BINANCE_ALPHA_REFRESH_MS = 10 * 60_000;
+
+// Step1042: official Binance Web3 public smart-money and top-trader boards.
+// Smart-money inflow currently supports BSC/Base/Solana; address PnL leaderboard additionally supports Ethereum.
+// All requests are background-only shared collectors. User reads never start Binance upstream work.
+const BINANCE_SMART_MONEY_INFLOW_URL = 'https://web3.binance.com/bapi/defi/v1/public/wallet-direct/tracker/wallet/token/inflow/rank/query/ai';
+const BINANCE_TOP_WALLETS_URL = 'https://web3.binance.com/bapi/defi/v1/public/wallet-direct/market/leaderboard/query/ai';
+const SMART_MONEY_FLOW_NETWORKS = Object.freeze(['bsc', 'base', 'solana']);
+const TOP_WALLET_NETWORKS = Object.freeze(['ethereum', 'bsc', 'base', 'solana']);
+const SMART_MONEY_FLOW_PERIODS = Object.freeze(['1h', '4h', '24h']);
+const TOP_WALLET_PERIODS = Object.freeze(['7d', '30d', '90d']);
+const SMART_MONEY_REFRESH_MS = 5 * 60_000;
+const TOP_WALLET_REFRESH_MS = 15 * 60_000;
+const SMART_MONEY_RETAIN_MS = 30 * 60_000;
+const TOP_WALLET_RETAIN_MS = 60 * 60_000;
+const SMART_MONEY_MAX_ROWS = 50;
+const TOP_WALLET_MAX_ROWS = 25;
 // Candidate endpoints are documented at 60/min; search/pairs at 300/min.
 // One global 1.2s lane caps the whole on-chain module at <=50 upstream starts/min regardless of users.
 const DEX_MIN_GAP_MS = 1_200;
@@ -85,7 +107,8 @@ const STEP1041_CANDIDATE_FEED_COUNT = 8;
 const CACHE_MAX_ENTRIES = 512;
 const NEGATIVE_CACHE_MAX_ENTRIES = 256;
 const MAX_RESPONSE_ROWS = 100;
-const STEP1041_HOT_MAX_ROWS = 50;
+const STEP1041_HOT_MAX_ROWS = 50; // response cap remains 50
+const STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN = 30; // one DEX token batch per chain; 9-chain internal coverage
 const STEP1041_NEW_MAX_ROWS = 50;
 const STEP1041_NEW_POOL_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 
@@ -123,7 +146,10 @@ const GOPLUS_ACCESS_TOKEN = String(process.env.GOPLUS_ACCESS_TOKEN || '').trim()
 const SECURITY_FRESH_MS = 30 * 60_000;
 const SECURITY_STALE_MS = 24 * 60 * 60_000;
 const SECURITY_NEGATIVE_MS = 2 * 60_000;
-const EVM_GOPLUS_CHAIN_ID = Object.freeze({ ethereum: '1', bsc: '56', base: '8453' });
+const EVM_GOPLUS_CHAIN_ID = Object.freeze({
+  ethereum: '1', bsc: '56', base: '8453', arbitrum: '42161', polygon: '137',
+  optimism: '10', avalanche: '43114', linea: '59144',
+});
 
 // Step1039 wallet intelligence. Heavy wallet enrichment is strictly on-demand, cached,
 // singleflight and shares the same Moralis daily CU guard / Helius scheduler as Step1038.
@@ -198,6 +224,11 @@ const MORALIS_EVM_CHAIN = Object.freeze({
   ethereum: 'eth',
   bsc: 'bsc',
   base: 'base',
+  arbitrum: 'arbitrum',
+  polygon: 'polygon',
+  optimism: 'optimism',
+  avalanche: 'avalanche',
+  linea: 'linea',
 });
 const MORALIS_TIMEFRAME = Object.freeze({
   '1m': '1min',
@@ -223,6 +254,11 @@ const NETWORKS = Object.freeze({
   bsc: Object.freeze({ key: 'bsc', dex: 'bsc', chain_id: 56, family: 'evm', zh: 'BNB Chain', en: 'BNB Chain' }),
   base: Object.freeze({ key: 'base', dex: 'base', chain_id: 8453, family: 'evm', zh: 'Base', en: 'Base' }),
   solana: Object.freeze({ key: 'solana', dex: 'solana', chain_id: null, family: 'solana', zh: 'Solana', en: 'Solana' }),
+  arbitrum: Object.freeze({ key: 'arbitrum', dex: 'arbitrum', chain_id: 42161, family: 'evm', zh: 'Arbitrum', en: 'Arbitrum' }),
+  polygon: Object.freeze({ key: 'polygon', dex: 'polygon', chain_id: 137, family: 'evm', zh: 'Polygon', en: 'Polygon' }),
+  optimism: Object.freeze({ key: 'optimism', dex: 'optimism', chain_id: 10, family: 'evm', zh: 'Optimism', en: 'Optimism' }),
+  avalanche: Object.freeze({ key: 'avalanche', dex: 'avalanche', chain_id: 43114, family: 'evm', zh: 'Avalanche', en: 'Avalanche' }),
+  linea: Object.freeze({ key: 'linea', dex: 'linea', chain_id: 59144, family: 'evm', zh: 'Linea', en: 'Linea' }),
 });
 const DEX_TO_NETWORK = Object.freeze(Object.fromEntries(Object.values(NETWORKS).map((x) => [x.dex, x.key])));
 
@@ -254,6 +290,14 @@ const stats = {
   binance_wallet_rank_rows: 0,
   binance_wallet_rank_last_success_at: null,
   binance_wallet_rank_last_error: '',
+  smart_money_refresh_started: 0,
+  smart_money_refresh_succeeded: 0,
+  smart_money_refresh_failed: 0,
+  smart_money_upstream_requests: 0,
+  top_wallet_refresh_started: 0,
+  top_wallet_refresh_succeeded: 0,
+  top_wallet_refresh_failed: 0,
+  top_wallet_upstream_requests: 0,
   binance_alpha_refresh_started: 0,
   binance_alpha_refresh_succeeded: 0,
   binance_alpha_refresh_failed: 0,
@@ -328,6 +372,12 @@ let poolPriceUpdatedAt = 0;
 let fxRefreshInflight = null;
 let fxSnapshot = null;
 let fxUpdatedAt = 0;
+let smartMoneySnapshot = new Map();
+let smartMoneyUpdatedAt = 0;
+let smartMoneyInflight = null;
+let topWalletSnapshot = new Map();
+let topWalletUpdatedAt = 0;
+let topWalletInflight = null;
 
 function text(value) { return String(value ?? '').trim(); }
 function lower(value) { return text(value).toLowerCase(); }
@@ -352,6 +402,11 @@ function normalizeNetwork(raw) {
   if (value === 'bsc' || value === 'bnb' || value === 'bnbchain' || value === 'bep20') return 'bsc';
   if (value === 'base') return 'base';
   if (value === 'sol' || value === 'solana' || value === 'spl') return 'solana';
+  if (value === 'arb' || value === 'arbitrum' || value === 'arbitrumone') return 'arbitrum';
+  if (value === 'polygon' || value === 'matic' || value === 'polygonpos') return 'polygon';
+  if (value === 'op' || value === 'optimism' || value === 'opmainnet') return 'optimism';
+  if (value === 'avax' || value === 'avalanche' || value === 'avalanchecchain') return 'avalanche';
+  if (value === 'linea') return 'linea';
   return '';
 }
 function networkMeta(key) { return NETWORKS[key] || null; }
@@ -588,6 +643,185 @@ async function fetchBinanceWalletTrendingCandidates() {
     stats.binance_wallet_rank_last_error = text(error?.message || error).slice(0, 400);
     return { candidates: [], succeeded: false, upstream_rows: 0 };
   }
+}
+
+
+function binancePublicChainId(network) {
+  if (network === 'bsc') return '56';
+  if (network === 'base') return '8453';
+  if (network === 'ethereum') return '1';
+  if (network === 'solana') return 'CT_501';
+  return '';
+}
+function binancePublicAssetUrl(value) {
+  const raw = text(value);
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return `https://bin.bnbstatic.com${raw.startsWith('/') ? '' : '/'}${raw}`;
+}
+function binancePublicRows(payload) {
+  const d = payload?.data;
+  if (Array.isArray(d)) return d;
+  if (Array.isArray(d?.list)) return d.list;
+  if (Array.isArray(d?.rows)) return d.rows;
+  if (Array.isArray(d?.tokens)) return d.tokens;
+  if (Array.isArray(d?.data)) return d.data;
+  if (Array.isArray(payload?.list)) return payload.list;
+  return [];
+}
+async function binancePublicFetch(url, { method = 'GET', body = null, label = '' } = {}) {
+  return binanceWalletScheduler.enqueue(async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), BINANCE_WALLET_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await fetch(url, {
+        method,
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json',
+          'accept-encoding': 'identity',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1042',
+          ...(body ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      const raw = await response.text();
+      if (!response.ok) throw new Error(`${label || 'binance_public'}_http_${response.status}:${raw.slice(0, 200)}`);
+      let decoded;
+      try { decoded = JSON.parse(raw); } catch { throw new Error(`${label || 'binance_public'}_invalid_json`); }
+      const code = text(decoded?.code);
+      if (code && code !== '000000' && code !== '0') throw new Error(`${label || 'binance_public'}_code_${code}`);
+      return decoded;
+    } finally { clearTimeout(timer); }
+  }, { priority: -45, label });
+}
+function normalizeSmartMoneyFlowRow(network, period, raw, index) {
+  const address = text(raw?.ca ?? raw?.contractAddress ?? raw?.contract_address ?? raw?.address);
+  if (!validAddressForNetwork(network, address)) return null;
+  const inflow = numberOrNull(raw?.inflow ?? raw?.netInflow ?? raw?.net_inflow ?? raw?.netFlow ?? raw?.net_flow);
+  return {
+    rank: index + 1,
+    network,
+    period,
+    token_address: address,
+    symbol: text(raw?.symbol ?? raw?.tokenSymbol ?? raw?.token_symbol),
+    name: text(raw?.tokenName ?? raw?.token_name ?? raw?.name),
+    icon: binancePublicAssetUrl(raw?.tokenIconUrl ?? raw?.token_icon_url ?? raw?.icon ?? raw?.logo),
+    net_inflow_usd: inflow,
+    price_usd: numberOrNull(raw?.price ?? raw?.priceUsd ?? raw?.price_usd),
+    market_cap_usd: numberOrNull(raw?.marketCap ?? raw?.market_cap ?? raw?.marketCapUsd),
+    holders: numberOrNull(raw?.holders ?? raw?.holderCount),
+    source_time_ms: numberOrNull(raw?.latestTxTime ?? raw?.timestamp ?? raw?.updateTime),
+    source: 'binance_web3_public_smart_money_inflow_rank',
+    source_semantics: 'official_smart_money_tag_net_inflow_rank_not_kaka_inference',
+  };
+}
+function normalizeTopWalletRow(network, period, raw, index) {
+  const address = text(raw?.address ?? raw?.walletAddress ?? raw?.wallet_address);
+  if (!walletAddressValid(network, address)) return null;
+  return {
+    rank: index + 1,
+    network,
+    period,
+    wallet: address,
+    label: text(raw?.addressLabel ?? raw?.label ?? raw?.name),
+    avatar: binancePublicAssetUrl(raw?.addressLogo ?? raw?.addressLogoUrl ?? raw?.logo ?? raw?.avatar),
+    realized_pnl_usd: numberOrNull(raw?.realizedPnl ?? raw?.pnl ?? raw?.realized_pnl),
+    realized_pnl_pct: numberOrNull(raw?.realizedPnlPercent ?? raw?.pnlPercent ?? raw?.realized_pnl_percent),
+    win_rate_pct: numberOrNull(raw?.winRate ?? raw?.win_rate),
+    total_volume_usd: numberOrNull(raw?.totalVolume ?? raw?.volume ?? raw?.total_volume),
+    trade_count: numberOrNull(raw?.totalTxCnt ?? raw?.tradeCount ?? raw?.total_tx_count),
+    traded_token_count: numberOrNull(raw?.totalTradedTokens ?? raw?.tokenCount ?? raw?.total_traded_tokens),
+    last_active_time_ms: numberOrNull(raw?.lastActivity ?? raw?.lastActiveTime ?? raw?.latestTxTime ?? raw?.timestamp),
+    source: 'binance_web3_public_address_pnl_leaderboard',
+    source_semantics: 'official_top_trader_performance_board_not_kaka_smart_money_identity',
+  };
+}
+async function refreshSmartMoneySnapshot() {
+  if (smartMoneyInflight) return smartMoneyInflight;
+  smartMoneyInflight = (async () => {
+    stats.smart_money_refresh_started += 1;
+    const next = new Map();
+    let success = 0;
+    try {
+      for (const network of SMART_MONEY_FLOW_NETWORKS) {
+        const chainId = binancePublicChainId(network);
+        for (const period of SMART_MONEY_FLOW_PERIODS) {
+          try {
+            stats.smart_money_upstream_requests += 1;
+            const payload = await binancePublicFetch(BINANCE_SMART_MONEY_INFLOW_URL, {
+              method: 'POST',
+              body: { chainId, period, tagType: 2 },
+              label: `background_smart_money_${network}_${period}`,
+            });
+            const rows = binancePublicRows(payload)
+              .map((row, index) => normalizeSmartMoneyFlowRow(network, period, row, index))
+              .filter(Boolean)
+              .slice(0, SMART_MONEY_MAX_ROWS);
+            if (rows.length) { next.set(`${network}|${period}`, rows); success += 1; }
+          } catch (_) {}
+        }
+      }
+      if (!success) throw new Error('binance_smart_money_all_scopes_failed');
+      for (const [key, rows] of smartMoneySnapshot) if (!next.has(key)) next.set(key, rows);
+      smartMoneySnapshot = next;
+      smartMoneyUpdatedAt = Date.now();
+      stats.smart_money_refresh_succeeded += 1;
+      return next;
+    } catch (error) {
+      stats.smart_money_refresh_failed += 1;
+      throw error;
+    } finally { smartMoneyInflight = null; }
+  })();
+  return smartMoneyInflight;
+}
+async function refreshTopWalletSnapshot() {
+  if (topWalletInflight) return topWalletInflight;
+  topWalletInflight = (async () => {
+    stats.top_wallet_refresh_started += 1;
+    const next = new Map();
+    let success = 0;
+    try {
+      for (const network of TOP_WALLET_NETWORKS) {
+        const chainId = binancePublicChainId(network);
+        for (const period of TOP_WALLET_PERIODS) {
+          try {
+            stats.top_wallet_upstream_requests += 1;
+            const q = new URLSearchParams({ chainId, period, tag: 'ALL', pageNo: '1', pageSize: String(TOP_WALLET_MAX_ROWS) });
+            const payload = await binancePublicFetch(`${BINANCE_TOP_WALLETS_URL}?${q}`, { label: `background_top_wallet_${network}_${period}` });
+            const rows = binancePublicRows(payload)
+              .map((row, index) => normalizeTopWalletRow(network, period, row, index))
+              .filter(Boolean)
+              .slice(0, TOP_WALLET_MAX_ROWS);
+            if (rows.length) { next.set(`${network}|${period}`, rows); success += 1; }
+          } catch (_) {}
+        }
+      }
+      if (!success) throw new Error('binance_top_wallet_all_scopes_failed');
+      for (const [key, rows] of topWalletSnapshot) if (!next.has(key)) next.set(key, rows);
+      topWalletSnapshot = next;
+      topWalletUpdatedAt = Date.now();
+      stats.top_wallet_refresh_succeeded += 1;
+      return next;
+    } catch (error) {
+      stats.top_wallet_refresh_failed += 1;
+      throw error;
+    } finally { topWalletInflight = null; }
+  })();
+  return topWalletInflight;
+}
+function sharedSmartMoneyRows(network, period) {
+  if (network !== 'all') return (smartMoneySnapshot.get(`${network}|${period}`) || []).map((x) => ({ ...x }));
+  return SMART_MONEY_FLOW_NETWORKS.flatMap((n) => smartMoneySnapshot.get(`${n}|${period}`) || [])
+    .map((x) => ({ ...x }))
+    .sort((a, b) => (numberOrNull(b.net_inflow_usd) ?? -Infinity) - (numberOrNull(a.net_inflow_usd) ?? -Infinity));
+}
+function sharedTopWalletRows(network, period) {
+  if (network !== 'all') return (topWalletSnapshot.get(`${network}|${period}`) || []).map((x) => ({ ...x }));
+  return TOP_WALLET_NETWORKS.flatMap((n) => topWalletSnapshot.get(`${n}|${period}`) || [])
+    .map((x) => ({ ...x }))
+    .sort((a, b) => (numberOrNull(b.realized_pnl_usd) ?? -Infinity) - (numberOrNull(a.realized_pnl_usd) ?? -Infinity));
 }
 
 let binanceAlphaRegistry = new Map();
@@ -3473,18 +3707,25 @@ function recentHotTokenRows(pairs) {
     });
     if (row?.token_market_fields_verified === true) rows.push(row);
   }
-  return rows
-    .sort((a, b) => {
-      const ar = Number(a.binance_wallet_rank || 0);
-      const br = Number(b.binance_wallet_rank || 0);
-      const aOfficial = ar > 0;
-      const bOfficial = br > 0;
-      if (aOfficial && bOfficial && ar !== br) return ar - br;
-      if (aOfficial !== bOfficial) return aOfficial ? -1 : 1;
-      return Number(b.hot_score || 0) - Number(a.hot_score || 0)
-        || poolLiquidity(b.best_pool) - poolLiquidity(a.best_pool);
-    })
-    .slice(0, STEP1041_HOT_MAX_ROWS);
+  const compareHotRows = (a, b) => {
+    const ar = Number(a.binance_wallet_rank || 0);
+    const br = Number(b.binance_wallet_rank || 0);
+    const aOfficial = ar > 0;
+    const bOfficial = br > 0;
+    if (aOfficial && bOfficial && ar !== br) return ar - br;
+    if (aOfficial !== bOfficial) return aOfficial ? -1 : 1;
+    return Number(b.hot_score || 0) - Number(a.hot_score || 0)
+      || poolLiquidity(b.best_pool) - poolLiquidity(a.best_pool);
+  };
+  const sorted = rows.sort(compareHotRows);
+  // Step1042: keep bounded coverage PER CHAIN internally. The old global slice(50)
+  // could starve newly-supported networks even when discovery succeeded. Thirty rows
+  // fit one DEX Screener token batch per chain; public responses still cap at 50.
+  const selected = [];
+  for (const network of Object.keys(NETWORKS)) {
+    selected.push(...sorted.filter((row) => row.network === network).slice(0, STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN));
+  }
+  return selected.sort(compareHotRows);
 }
 
 
@@ -3774,6 +4015,14 @@ export function startOnchainMarketCollector() {
   marketTimer.unref?.();
   const poolPriceTimer = setInterval(() => refreshExactPoolPrices().catch(() => {}), POOL_PRICE_REFRESH_MS);
   poolPriceTimer.unref?.();
+  const smartFirst = setTimeout(() => refreshSmartMoneySnapshot().catch(() => {}), 7_500);
+  smartFirst.unref?.();
+  const smartTimer = setInterval(() => refreshSmartMoneySnapshot().catch(() => {}), SMART_MONEY_REFRESH_MS);
+  smartTimer.unref?.();
+  const walletFirst = setTimeout(() => refreshTopWalletSnapshot().catch(() => {}), 38_000);
+  walletFirst.unref?.();
+  const walletTimer = setInterval(() => refreshTopWalletSnapshot().catch(() => {}), TOP_WALLET_REFRESH_MS);
+  walletTimer.unref?.();
   const fxFirst = setTimeout(() => refreshFxReference().catch(() => {}), 4_500);
   fxFirst.unref?.();
   const fxTimer = setInterval(() => refreshFxReference().catch(() => {}), FX_REFRESH_MS);
@@ -3954,6 +4203,8 @@ function healthPayload() {
       opened: true,
       feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION,
       hot_max_rows: STEP1041_HOT_MAX_ROWS,
+      internal_hot_max_rows_per_chain: STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN,
+      internal_hot_max_rows_total: STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN * Object.keys(NETWORKS).length,
       new_max_rows: STEP1041_NEW_MAX_ROWS,
       expected_self_test_min: 65,
       discovery_candidate_feed_count: STEP1041_CANDIDATE_FEED_COUNT,
@@ -3987,6 +4238,50 @@ function healthPayload() {
       default_pool_order: 'liquidity_usd_desc_then_volume_then_activity',
       geckoterminal_objective_discovery: true,
       binance_alpha_badge_source: 'binance_official_alpha_token_list_exact_chain_contract',
+    },
+    step1042_multichain_smart_money: {
+      opened: true,
+      feature_schema_version: STEP1042_FEATURE_SCHEMA_VERSION,
+      supported_market_networks: Object.keys(NETWORKS),
+      added_market_networks: ['arbitrum','polygon','optimism','avalanche','linea'],
+      smart_money_route: SMART_MONEY_ROUTE,
+      top_wallets_route: TOP_WALLETS_ROUTE,
+      smart_money_supported_networks: SMART_MONEY_FLOW_NETWORKS,
+      smart_money_periods: SMART_MONEY_FLOW_PERIODS,
+      top_wallet_supported_networks: TOP_WALLET_NETWORKS,
+      top_wallet_periods: TOP_WALLET_PERIODS,
+      hot_order_source_coverage: {
+        binance_wallet_trending_primary: ['ethereum','bsc','base','solana'],
+        objective_gecko_dex_fallback: ['arbitrum','polygon','optimism','avalanche','linea'],
+        paid_promotion_affects_rank: false,
+      },
+      smart_money_ready_networks: SMART_MONEY_FLOW_NETWORKS.filter((n) => SMART_MONEY_FLOW_PERIODS.some((p) => smartMoneySnapshot.has(`${n}|${p}`))),
+      top_wallet_ready_networks: TOP_WALLET_NETWORKS.filter((n) => TOP_WALLET_PERIODS.some((p) => topWalletSnapshot.has(`${n}|${p}`))),
+      smart_money_refresh_ms: SMART_MONEY_REFRESH_MS,
+      top_wallet_refresh_ms: TOP_WALLET_REFRESH_MS,
+      smart_money_ready: smartMoneySnapshot.size > 0 && smartMoneyUpdatedAt > 0 && Date.now() - smartMoneyUpdatedAt <= SMART_MONEY_RETAIN_MS,
+      top_wallet_ready: topWalletSnapshot.size > 0 && topWalletUpdatedAt > 0 && Date.now() - topWalletUpdatedAt <= TOP_WALLET_RETAIN_MS,
+      smart_money_scope_count: smartMoneySnapshot.size,
+      top_wallet_scope_count: topWalletSnapshot.size,
+      smart_money_rows: [...smartMoneySnapshot.values()].reduce((n, rows) => n + rows.length, 0),
+      top_wallet_rows: [...topWalletSnapshot.values()].reduce((n, rows) => n + rows.length, 0),
+      smart_money_source: 'binance_web3_public_smart_money_inflow_rank_tagType2',
+      top_wallet_source: 'binance_web3_public_address_pnl_leaderboard_ALL',
+      official_source_labels_preserved: true,
+      kaka_profit_candidate_not_relabelled_as_official_smart_money: true,
+      user_reads_start_upstream: false,
+      user_read_upstream_requests: 0,
+      pressure_contract: { users: [10,100,1000], direct_upstream_amplification_coefficient: 0 },
+      stats: {
+        smart_money_refresh_started: stats.smart_money_refresh_started,
+        smart_money_refresh_succeeded: stats.smart_money_refresh_succeeded,
+        smart_money_refresh_failed: stats.smart_money_refresh_failed,
+        smart_money_upstream_requests: stats.smart_money_upstream_requests,
+        top_wallet_refresh_started: stats.top_wallet_refresh_started,
+        top_wallet_refresh_succeeded: stats.top_wallet_refresh_succeeded,
+        top_wallet_refresh_failed: stats.top_wallet_refresh_failed,
+        top_wallet_upstream_requests: stats.top_wallet_upstream_requests,
+      },
     },
     current_market_refresh: {
       ready: trendingSnapshot.length > 0 && (marketAgeMs === null || marketAgeMs <= MARKET_RETAIN_MS),
@@ -4156,6 +4451,15 @@ function runSelfTest() {
   t('network_eth_alias', normalizeNetwork('ETH') === 'ethereum');
   t('network_bsc_alias', normalizeNetwork('BNBChain') === 'bsc');
   t('network_sol_alias', normalizeNetwork('SOL') === 'solana');
+  t('network_arbitrum_alias', normalizeNetwork('ARB') === 'arbitrum');
+  t('network_polygon_alias', normalizeNetwork('MATIC') === 'polygon');
+  t('network_optimism_alias', normalizeNetwork('OP') === 'optimism');
+  t('network_avalanche_alias', normalizeNetwork('AVAX') === 'avalanche');
+  t('network_linea_alias', normalizeNetwork('LINEA') === 'linea');
+  t('step1042_nine_market_networks', Object.keys(NETWORKS).length === 9);
+  t('step1042_smart_money_official_scope', SMART_MONEY_FLOW_NETWORKS.join(',') === 'bsc,base,solana');
+  t('step1042_top_wallet_official_scope', TOP_WALLET_NETWORKS.length === 4 && TOP_WALLET_NETWORKS.includes('ethereum'));
+  t('step1042_user_reads_do_not_start_smart_money_upstream', healthPayload().step1042_multichain_smart_money.user_reads_start_upstream === false);
   t('evm_address_validation', looksEvmAddress('0x0000000000000000000000000000000000000001'));
   t('solana_address_validation', looksSolanaAddress('So11111111111111111111111111111111111111112'));
   t('bad_address_rejected', !looksEvmAddress('not-a-contract') && !looksSolanaAddress('not-a-contract'));
@@ -4253,7 +4557,7 @@ function runSelfTest() {
   t('step1040_common_funder_group_exact', fundingSynthetic.length === 1 && fundingSynthetic[0].wallets.length === 2 && fundingSynthetic[0].confidence === 'high');
   t('step1040_no_wrongdoing_or_insider_claim', healthPayload().step1040_relationship_evidence.wrongdoing_claim_generated === false && healthPayload().step1040_relationship_evidence.insider_or_rat_trading_claim_generated === false);
   const finalOverview = buildStep1041Overview();
-  t('step1041_hot_cap_50', STEP1041_HOT_MAX_ROWS === 50 && recentHotTokenRows([]).length <= 50);
+  t('step1042_public_hot_cap_50_internal_per_chain_30', STEP1041_HOT_MAX_ROWS === 50 && STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN === 30 && recentHotTokenRows([]).length === 0);
   t('step1041_overview_shared_only', finalOverview.no_user_upstream_build === true && finalOverview.volume_liquidity_are_sample_sums_not_whole_chain_totals === true);
   t('step1041_new_pool_semantics_fail_closed', STEP1041_NEW_POOL_MAX_AGE_MS === 7 * 24 * 60 * 60_000);
   t('step1041_pressure_contract_10_100_1000', JSON.stringify(healthPayload().step1041_final_productization.pressure_contract.users) === JSON.stringify([10,100,1000]));
@@ -4345,7 +4649,7 @@ function onchainRankPage(rows, { sort = 'default', offset = 0, limit = 50 } = {}
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, POOL_PRICE_ROUTE, POOL_PRICES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, POOL_PRICE_ROUTE, POOL_PRICES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE, SMART_MONEY_ROUTE, TOP_WALLETS_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -4368,6 +4672,88 @@ export async function handleOnchainMarket(req, res, url) {
       return true;
     }
     sendJson(res, 200, responseBase({ ...buildStep1041Overview(), cache_status: 'background_shared', shared_snapshot_age_ms: ageMs, user_read_upstream_requests: 0 }));
+    return true;
+  }
+
+  if (path === SMART_MONEY_ROUTE) {
+    const requestedNetwork = normalizeNetwork(url.searchParams.get('network'));
+    const network = requestedNetwork || 'all';
+    const period = text(url.searchParams.get('period')) || '24h';
+    const limit = intRange(url.searchParams.get('limit'), 1, SMART_MONEY_MAX_ROWS, 25);
+    if (!SMART_MONEY_FLOW_PERIODS.includes(period)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'unsupported_smart_money_period', supported_periods: SMART_MONEY_FLOW_PERIODS }));
+      return true;
+    }
+    if (network !== 'all' && !SMART_MONEY_FLOW_NETWORKS.includes(network)) {
+      sendJson(res, 200, responseBase({
+        feature_schema_version: STEP1042_FEATURE_SCHEMA_VERSION,
+        network, period, supported: false, rows: [], row_count: 0,
+        supported_networks: SMART_MONEY_FLOW_NETWORKS,
+        source: 'binance_web3_public_smart_money_inflow_rank_tagType2',
+        message: 'official_smart_money_inflow_board_not_available_for_selected_network',
+        user_read_upstream_requests: 0,
+      }));
+      return true;
+    }
+    const ageMs = smartMoneyUpdatedAt ? Math.max(0, Date.now() - smartMoneyUpdatedAt) : null;
+    const rows = sharedSmartMoneyRows(network, period).slice(0, limit);
+    if (!rows.length && (!smartMoneyUpdatedAt || ageMs > SMART_MONEY_RETAIN_MS)) {
+      sendJson(res, 503, responseBase({ ok: false, error: 'shared_smart_money_snapshot_not_ready', network, period, rows: [], user_read_upstream_requests: 0 }));
+      return true;
+    }
+    sendJson(res, 200, responseBase({
+      feature_schema_version: STEP1042_FEATURE_SCHEMA_VERSION,
+      network, period, supported: true, rows, row_count: rows.length,
+      supported_networks: SMART_MONEY_FLOW_NETWORKS,
+      supported_periods: SMART_MONEY_FLOW_PERIODS,
+      source: 'binance_web3_public_smart_money_inflow_rank_tagType2',
+      semantics: 'official_smart_money_tag_net_inflow_rank_not_kaka_inference',
+      generated_at: smartMoneyUpdatedAt ? new Date(smartMoneyUpdatedAt).toISOString() : null,
+      shared_snapshot_age_ms: ageMs,
+      cache_status: 'background_shared',
+      user_read_upstream_requests: 0,
+    }));
+    return true;
+  }
+
+  if (path === TOP_WALLETS_ROUTE) {
+    const requestedNetwork = normalizeNetwork(url.searchParams.get('network'));
+    const network = requestedNetwork || 'all';
+    const period = text(url.searchParams.get('period')) || '30d';
+    const limit = intRange(url.searchParams.get('limit'), 1, TOP_WALLET_MAX_ROWS, 25);
+    if (!TOP_WALLET_PERIODS.includes(period)) {
+      sendJson(res, 400, responseBase({ ok: false, error: 'unsupported_top_wallet_period', supported_periods: TOP_WALLET_PERIODS }));
+      return true;
+    }
+    if (network !== 'all' && !TOP_WALLET_NETWORKS.includes(network)) {
+      sendJson(res, 200, responseBase({
+        feature_schema_version: STEP1042_FEATURE_SCHEMA_VERSION,
+        network, period, supported: false, rows: [], row_count: 0,
+        supported_networks: TOP_WALLET_NETWORKS,
+        source: 'binance_web3_public_address_pnl_leaderboard_ALL',
+        message: 'official_top_wallet_board_not_available_for_selected_network',
+        user_read_upstream_requests: 0,
+      }));
+      return true;
+    }
+    const ageMs = topWalletUpdatedAt ? Math.max(0, Date.now() - topWalletUpdatedAt) : null;
+    const rows = sharedTopWalletRows(network, period).slice(0, limit);
+    if (!rows.length && (!topWalletUpdatedAt || ageMs > TOP_WALLET_RETAIN_MS)) {
+      sendJson(res, 503, responseBase({ ok: false, error: 'shared_top_wallet_snapshot_not_ready', network, period, rows: [], user_read_upstream_requests: 0 }));
+      return true;
+    }
+    sendJson(res, 200, responseBase({
+      feature_schema_version: STEP1042_FEATURE_SCHEMA_VERSION,
+      network, period, supported: true, rows, row_count: rows.length,
+      supported_networks: TOP_WALLET_NETWORKS,
+      supported_periods: TOP_WALLET_PERIODS,
+      source: 'binance_web3_public_address_pnl_leaderboard_ALL',
+      semantics: 'official_top_trader_performance_board_not_kaka_smart_money_identity',
+      generated_at: topWalletUpdatedAt ? new Date(topWalletUpdatedAt).toISOString() : null,
+      shared_snapshot_age_ms: ageMs,
+      cache_status: 'background_shared',
+      user_read_upstream_requests: 0,
+    }));
     return true;
   }
 
