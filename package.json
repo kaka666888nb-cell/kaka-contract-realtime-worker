@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-196.10.2",
+  "version": "650.8.15-196.10.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.196.10.2 shared market-cap rank reusing verified Supabase tokenomics snapshot + prior exact-pool fix"
+  "description": "Kaka Web3 Render 650.8.15.196.10.3 shared market-cap rank reusing verified Supabase tokenomics snapshot + prior exact-pool fix"
 }
