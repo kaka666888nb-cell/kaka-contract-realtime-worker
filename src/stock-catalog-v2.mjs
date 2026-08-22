@@ -1,7 +1,7 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 
-const VERSION = '650.8.15.196.10.2';
+const VERSION = '650.8.15.196.10.3';
 const DATA_VERSION = 1041010;
 const SCHEMA_VERSION = 'step1035_stock_catalog_v2';
 const IMPLEMENTATION_REVISION = '1041_6_shared_cash_stock_rank_before_pagination';

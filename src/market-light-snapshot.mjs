@@ -1,7 +1,7 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.196.10.2';
+const STEP_VERSION = '650.8.15.196.10.3';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const HEALTH_ROUTE = '/api/market-light/health';
@@ -146,7 +146,7 @@ const directoryRowsByKey = new Map();
 const directoryUpdatedAtByKey = new Map();
 const responseCache = new Map();
 
-// Step1041.6.2 / Render650.8.15.196.10.2: shared full-market ranking index.
+// Step1041.6.3 / Render650.8.15.196.10.3: shared full-market ranking index.
 // Ranking is computed from the already-collected shared market-light rows BEFORE
 // pagination. User reads never start exchange requests and the App still receives
 // only 50 ranked assets per page. A rank_version freezes the ORDER (not full market
@@ -2127,6 +2127,8 @@ function marketRankBaseFromRow(row) {
 }
 
 function marketRankNumber(value) {
+  if (value == null) return null;
+  if (typeof value === 'string' && !value.trim()) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
@@ -2517,7 +2519,7 @@ async function marketCapFetchSupabaseJson(path, { label = 'supabase_shared_marke
         accept: 'application/json',
         apikey: cfg.key,
         authorization: `Bearer ${cfg.key}`,
-        'user-agent': `KakaWeb3/650.8.15.196.10.2 ${label}`,
+        'user-agent': `KakaWeb3/650.8.15.196.10.3 ${label}`,
       },
       signal: controller.signal,
     });
