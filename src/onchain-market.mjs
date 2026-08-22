@@ -1,4 +1,4 @@
-// Step1042 / Render 650.8.15.197
+// Step1042.1 / Render 650.8.15.197.1
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.197';
+const VERSION = '650.8.15.197.1';
 const DATA_VERSION = 1042000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
@@ -101,7 +101,7 @@ const FX_REFRESH_MS = 6 * 60 * 60_000;
 const FX_RETAIN_MS = 96 * 60 * 60_000;
 const ECB_FX_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml';
 const DISCOVERY_RETAIN_MS = 30 * 60_000;
-const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 90;
+const DISCOVERY_MAX_CANDIDATES_PER_CHAIN = 30; // Step1042.1 cold-start bound: one exact DEX batch per chain
 const DEX_TOKEN_BATCH_MAX = 30;
 const STEP1041_CANDIDATE_FEED_COUNT = 8;
 const CACHE_MAX_ENTRIES = 512;
@@ -284,6 +284,8 @@ const stats = {
   gecko_upstream_failed: 0,
   gecko_discovery_cycles: 0,
   gecko_discovery_candidates: 0,
+  gecko_discovery_ready_networks: [],
+  gecko_discovery_failed_networks: [],
   binance_wallet_rank_started: 0,
   binance_wallet_rank_succeeded: 0,
   binance_wallet_rank_failed: 0,
@@ -534,7 +536,10 @@ async function geckoFetchJson(url, { priority = 0, label = '' } = {}) {
     try {
       const response = await fetch(url, {
         signal: controller.signal,
-        headers: { accept: 'application/json', 'user-agent': 'KakaWeb3-Onchain-Shared/1041.5' },
+        headers: {
+          accept: 'application/json;version=20230203',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1042.1',
+        },
       });
       const body = await response.text();
       if (!response.ok) throw new Error(`geckoterminal_http_${response.status}:${body.slice(0, 220)}`);
@@ -3517,38 +3522,60 @@ function geckoAddressFromRelationship(network, relation) {
 async function fetchGeckoTrendingCandidates() {
   const candidates = [];
   let succeeded = 0;
+  const readyNetworks = [];
+  const failedNetworks = [];
   function appendPoolResources(network, payload, source) {
+    let added = 0;
     for (const resource of Array.isArray(payload?.data) ? payload.data : []) {
       const address = geckoAddressFromRelationship(network, resource?.relationships?.base_token);
       if (!validAddressForNetwork(network, address)) continue;
       candidates.push({ network, address, source, token_profile: null, amount: 0, total_amount: 0 });
+      added += 1;
     }
+    return added;
   }
+
+  // Step1042.1: one GeckoTerminal Trending call per chain is the normal path.
+  // The public keyless API is ~10 calls/min and each response is cached, so doing both
+  // Trending + Top Pools for all nine chains serially made cold start unbounded in practice.
+  // Top Pools is now a per-chain fallback only when Trending returns no usable base token.
   for (const network of Object.keys(NETWORKS)) {
     const gtNetwork = GECKO_NETWORK[network];
     if (!gtNetwork) continue;
+    let added = 0;
     try {
       const trending = await geckoFetchJson(
-        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/trending_pools?page=1`,
+        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/trending_pools?page=1&duration=24h`,
         { priority: -30, label: `background_gt_trending_${network}` },
       );
-      appendPoolResources(network, trending, 'geckoterminal_trending_pool_candidate');
-      succeeded += 1;
+      added = appendPoolResources(network, trending, 'geckoterminal_trending_pool_candidate');
+      if (added > 0) {
+        succeeded += 1;
+        readyNetworks.push(network);
+        continue;
+      }
     } catch (_) {}
     try {
-      // Top 24h-volume pools widen the objective universe toward actively traded, deeper
-      // pools (often stable-quote markets) instead of relying on launch/native-quote feeds.
-      const topVolume = await geckoFetchJson(
-        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/pools?page=1&sort=h24_volume_usd_desc`,
-        { priority: -32, label: `background_gt_top_volume_${network}` },
+      const topPools = await geckoFetchJson(
+        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/pools?page=1`,
+        { priority: -32, label: `background_gt_top_pool_fallback_${network}` },
       );
-      appendPoolResources(network, topVolume, 'geckoterminal_top_volume_pool_candidate');
-      succeeded += 1;
-    } catch (_) {}
+      added = appendPoolResources(network, topPools, 'geckoterminal_top_pool_candidate_fallback');
+      if (added > 0) {
+        succeeded += 1;
+        readyNetworks.push(network);
+      } else {
+        failedNetworks.push(network);
+      }
+    } catch (_) {
+      failedNetworks.push(network);
+    }
   }
   stats.gecko_discovery_cycles += 1;
   stats.gecko_discovery_candidates = candidates.length;
-  return { candidates, succeeded };
+  stats.gecko_discovery_ready_networks = readyNetworks;
+  stats.gecko_discovery_failed_networks = failedNetworks;
+  return { candidates, succeeded, ready_networks: readyNetworks, failed_networks: failedNetworks };
 }
 
 
@@ -3557,8 +3584,10 @@ async function fetchDiscoveryCandidatePairs() {
   // GeckoTerminal + DEX Screener feeds are fallback/recall only. Every candidate — including
   // Binance-ranked tokens — is re-read through DEX Screener's exact token endpoint before
   // publication, so external rank never overrides Kaka's exact chain+contract identity rules.
-  const binanceWalletRank = await fetchBinanceWalletTrendingCandidates();
-  const gecko = await fetchGeckoTrendingCandidates();
+  // Step1042.1: source families use independent schedulers, so start them together.
+  // This keeps the fixed upstream rate limits intact while avoiding serial cold-start walls.
+  const binanceWalletRankPromise = fetchBinanceWalletTrendingCandidates();
+  const geckoPromise = fetchGeckoTrendingCandidates();
   const feedSpecs = [
     { path: '/token-boosts/top/v1', source: 'top_boost_candidate', label: 'background_boost_top_candidates' },
     { path: '/token-boosts/latest/v1', source: 'latest_boost_candidate', label: 'background_boost_latest_candidates' },
@@ -3566,7 +3595,7 @@ async function fetchDiscoveryCandidatePairs() {
     { path: '/community-takeovers/latest/v1', source: 'latest_community_takeover_candidate', label: 'background_cto_candidates' },
     { path: '/ads/latest/v1', source: 'latest_ad_candidate', label: 'background_ad_candidates' },
   ];
-  const settled = await Promise.all(feedSpecs.map(async (spec) => {
+  const dexFeedsPromise = Promise.all(feedSpecs.map(async (spec) => {
     try {
       const payload = await dexFetchJson(`${DEX_BASE}${spec.path}`, { priority: -20, label: spec.label });
       return { ...spec, payload, ok: true };
@@ -3574,6 +3603,11 @@ async function fetchDiscoveryCandidatePairs() {
       return { ...spec, payload: [], ok: false, error: text(error?.message || error).slice(0, 160) };
     }
   }));
+  const [binanceWalletRank, gecko, settled] = await Promise.all([
+    binanceWalletRankPromise,
+    geckoPromise,
+    dexFeedsPromise,
+  ]);
   const dexFeedReady = settled.some((x) => x.ok);
   if (!binanceWalletRank.candidates.length && !gecko.candidates.length && !dexFeedReady) {
     throw new Error('all_hot_candidate_sources_failed');
@@ -4347,8 +4381,13 @@ function healthPayload() {
       rows: trendingSnapshot.length,
       max_candidates_per_chain: DISCOVERY_MAX_CANDIDATES_PER_CHAIN,
       exact_market_batch_max: DEX_TOKEN_BATCH_MAX,
+      cold_start_exact_batches_per_chain_max: Math.ceil(DISCOVERY_MAX_CANDIDATES_PER_CHAIN / DEX_TOKEN_BATCH_MAX),
+      gecko_normal_calls_per_cycle_max: Object.keys(GECKO_NETWORK).length,
+      gecko_fallback_only_when_trending_empty: true,
+      gecko_ready_networks: stats.gecko_discovery_ready_networks,
+      gecko_failed_networks: stats.gecko_discovery_failed_networks,
       candidate_feed_count: STEP1041_CANDIDATE_FEED_COUNT,
-      candidate_feeds: ['binance_wallet_trending_1h','geckoterminal_trending','geckoterminal_top_24h_volume','top_boost','latest_boost','latest_profile','community_takeover','latest_ad'],
+      candidate_feeds: ['binance_wallet_trending_1h','geckoterminal_trending','geckoterminal_top_pool_fallback','top_boost','latest_boost','latest_profile','community_takeover','latest_ad'],
       paid_or_cto_presence_not_used_as_final_rank: true,
       binance_wallet_trending_rank_preserved_for_verified_rows: true,
       binance_wallet_trending_endpoint_public_no_user_auth: true,
@@ -4558,6 +4597,7 @@ function runSelfTest() {
   t('step1040_no_wrongdoing_or_insider_claim', healthPayload().step1040_relationship_evidence.wrongdoing_claim_generated === false && healthPayload().step1040_relationship_evidence.insider_or_rat_trading_claim_generated === false);
   const finalOverview = buildStep1041Overview();
   t('step1042_public_hot_cap_50_internal_per_chain_30', STEP1041_HOT_MAX_ROWS === 50 && STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN === 30 && recentHotTokenRows([]).length === 0);
+  t('step1042_1_gecko_nine_chain_rate_bound', Object.keys(GECKO_NETWORK).length === 9 && 60_000 / GECKO_MIN_GAP_MS < 10);
   t('step1041_overview_shared_only', finalOverview.no_user_upstream_build === true && finalOverview.volume_liquidity_are_sample_sums_not_whole_chain_totals === true);
   t('step1041_new_pool_semantics_fail_closed', STEP1041_NEW_POOL_MAX_AGE_MS === 7 * 24 * 60 * 60_000);
   t('step1041_pressure_contract_10_100_1000', JSON.stringify(healthPayload().step1041_final_productization.pressure_contract.users) === JSON.stringify([10,100,1000]));
@@ -4567,7 +4607,7 @@ function runSelfTest() {
   t('step1041_4_badges_fact_only', productBadgesForToken({network:'bsc',dex_id:'pumpswap'}, {address:'0x0000000000000000000000000000000000000001'}).every((x)=>x.confidence === 'fact'));
   t('step1041_4_hot_score_components_finite', Number.isFinite(hotScoreComponents([{liquidity_usd:1000,volume_usd:{h24:5000},txns:{h1:{buys:10,sells:5},m5:{buys:3,sells:2}}}]).score));
   t('step1041_candidate_feed_expansion_8', STEP1041_CANDIDATE_FEED_COUNT === 8);
-  t('step1041_exact_market_batches_bounded_30', DEX_TOKEN_BATCH_MAX === 30 && DISCOVERY_MAX_CANDIDATES_PER_CHAIN <= 90);
+  t('step1042_1_discovery_one_exact_batch_per_chain', DEX_TOKEN_BATCH_MAX === 30 && DISCOVERY_MAX_CANDIDATES_PER_CHAIN === 30);
   t('step1041_hot_rows_verified_only', healthPayload().discovery.final_hot_rows_require_verified_token_market_identity === true);
   t('step1041_5_binance_wallet_trending_primary', healthPayload().step1041_final_productization.primary_hot_rank_source.includes('binance_wallet_public_token_rank_trending'));
   t('step1041_5_binance_wallet_period_1h', BINANCE_WALLET_TRENDING_PERIOD === 30 && healthPayload().step1041_final_productization.primary_hot_rank_period === '1h');
