@@ -1,9 +1,11 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
+import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.196.11';
+const STEP_VERSION = '650.8.15.196.11.3';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
+const WATCHLIST_TICKERS_ROUTE = '/api/market-light/watchlist-tickers';
 const HEALTH_ROUTE = '/api/market-light/health';
 const SECTOR_SNAPSHOT_ROUTE = '/api/crypto-sector-professional/current-snapshot';
 const SECTOR_HEALTH_ROUTE = '/api/crypto-sector-professional/health';
@@ -145,6 +147,31 @@ const directoryCountByKey = new Map();
 const directoryRowsByKey = new Map();
 const directoryUpdatedAtByKey = new Map();
 const responseCache = new Map();
+
+// Step1041.6.3.1.5 / Render650.8.15.196.11.3: exact watchlist ticker focus.
+// User reads only register/read exact identities. Non-stream venues are refreshed by one
+// fixed backend scheduler per active provider-market group; Binance Spot/Contract and
+// Coinbase Spot reuse already-running shared WebSocket state. No user read starts exchange work.
+const WATCHLIST_TICKER_BATCH_MAX = 64;
+const WATCHLIST_FOCUS_MAX = 256;
+const WATCHLIST_FOCUS_REFRESH_MS = Math.max(3_000, Number(process.env.KAKA_MARKET_WATCHLIST_FOCUS_REFRESH_MS || 5_000));
+const WATCHLIST_FOCUS_TTL_MS = Math.max(30_000, Number(process.env.KAKA_MARKET_WATCHLIST_FOCUS_TTL_MS || 2 * 60_000));
+const watchlistTickerFocus = new Map();
+const watchlistTickerRows = new Map();
+let watchlistTickerRefreshTimer = null;
+let watchlistTickerRefreshInflight = null;
+const watchlistTickerStats = {
+  user_reads: 0,
+  registered: 0,
+  refresh_started: 0,
+  refresh_succeeded: 0,
+  refresh_failed: 0,
+  provider_group_reads: 0,
+  rows: 0,
+  last_started_at: null,
+  last_completed_at: null,
+  last_error: '',
+};
 
 // Step1041.6.3 / Render650.8.15.196.11: shared full-market ranking index.
 // Ranking is computed from the already-collected shared market-light rows BEFORE
@@ -2090,6 +2117,7 @@ export function startMarketLightSnapshotScanner() {
   ensureBinanceSpotMiniTicker().catch(() => {});
   refreshBinanceSpotTickerBaseline().catch(() => {});
   ensureBinanceContractBookTicker().catch(() => {});
+  startWatchlistTickerFocusScheduler();
   refreshDirectoryCounts().catch(() => {});
   scanTimer = setTimeout(() => {
     runMarketLightSnapshotCycle({ reason: 'startup' }).catch(() => {});
@@ -2784,6 +2812,213 @@ function snapshotPayload({ market = '', provider = '', includeRows = true, offse
 }
 
 
+
+function watchlistTickerIdentityKey(market, provider, symbol) {
+  const safeMarket = String(market || '').trim().toLowerCase();
+  const safeProvider = String(provider || '').trim().toLowerCase();
+  const safeSymbol = String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9._:-]/g, '');
+  if (!['spot', 'contract'].includes(safeMarket) || !safeProvider || !safeSymbol) return '';
+  const allowed = safeMarket === 'spot' ? SPOT_PROVIDERS : CONTRACT_PROVIDERS;
+  if (!allowed.includes(safeProvider)) return '';
+  return `${safeMarket}|${safeProvider}|${safeSymbol}`;
+}
+
+function parseWatchlistTickerSpecs(raw) {
+  const out = [];
+  const seen = new Set();
+  for (const token of String(raw || '').split('~')) {
+    const parts = token.split('|');
+    if (parts.length < 3) continue;
+    const market = String(parts[0] || '').trim().toLowerCase();
+    const provider = String(parts[1] || '').trim().toLowerCase();
+    const symbol = String(parts.slice(2).join('|') || '').trim().toUpperCase().replace(/[^A-Z0-9._:-]/g, '');
+    const key = watchlistTickerIdentityKey(market, provider, symbol);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, market, provider, symbol });
+    if (out.length >= WATCHLIST_TICKER_BATCH_MAX) break;
+  }
+  return out;
+}
+
+function pruneWatchlistTickerFocus(now = Date.now()) {
+  for (const [key, value] of watchlistTickerFocus.entries()) {
+    if (!value || Number(value.expires_at || 0) <= now) {
+      watchlistTickerFocus.delete(key);
+      watchlistTickerRows.delete(key);
+    }
+  }
+  while (watchlistTickerFocus.size > WATCHLIST_FOCUS_MAX) {
+    const oldest = [...watchlistTickerFocus.entries()]
+      .sort((a, b) => Number(a[1]?.seen_at || 0) - Number(b[1]?.seen_at || 0))[0];
+    if (!oldest) break;
+    watchlistTickerFocus.delete(oldest[0]);
+    watchlistTickerRows.delete(oldest[0]);
+  }
+}
+
+function registerWatchlistTickerSpecs(specs) {
+  const now = Date.now();
+  pruneWatchlistTickerFocus(now);
+  for (const spec of specs) {
+    watchlistTickerFocus.set(spec.key, {
+      ...spec,
+      seen_at: now,
+      expires_at: now + WATCHLIST_FOCUS_TTL_MS,
+    });
+  }
+  watchlistTickerStats.registered = watchlistTickerFocus.size;
+}
+
+function mergeWatchlistTickerRow(base, patch) {
+  const result = { ...(base || {}) };
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value == null) continue;
+    if (typeof value === 'string' && !value.trim()) continue;
+    result[key] = value;
+  }
+  return result;
+}
+
+function baseWatchlistTickerRow(spec) {
+  const rows = rowsByKey.get(keyFor(spec.market, spec.provider)) || [];
+  const row = rows.find((item) => compact(item?.symbol) === spec.symbol);
+  return row ? { ...row } : null;
+}
+
+function liveWatchlistTickerPatch(spec) {
+  if (spec.provider === 'binance' && spec.market === 'spot') {
+    const row = binanceSpotTicker.rows.get(spec.symbol);
+    return row ? { ...row, watchlist_realtime_source: 'binance_spot_shared_miniticker_websocket_1s' } : null;
+  }
+  if (spec.provider === 'binance' && spec.market === 'contract') {
+    const row = getBinanceContractRealtimeMeta(spec.symbol);
+    return row ? { ...row, watchlist_realtime_source: 'binance_usdm_persistent_shared_websocket' } : null;
+  }
+  if (spec.provider === 'coinbase' && spec.market === 'spot') {
+    const row = coinbase.rows.get(spec.symbol);
+    return row ? { ...row, watchlist_realtime_source: 'coinbase_public_ticker_batch_websocket' } : null;
+  }
+  const row = watchlistTickerRows.get(spec.key);
+  return row ? { ...row, watchlist_realtime_source: row.watchlist_realtime_source || 'fixed_background_focus_ticker' } : null;
+}
+
+function materializeWatchlistTickerRow(spec) {
+  const base = baseWatchlistTickerRow(spec);
+  const live = liveWatchlistTickerPatch(spec);
+  const row = mergeWatchlistTickerRow(base, live);
+  const price = positive(row?.last_price ?? row?.price ?? row?.contract_price ?? row?.mark_price);
+  return {
+    ready: price != null,
+    market_type: spec.market,
+    provider: spec.provider,
+    symbol: spec.symbol,
+    source_time: row?.source_time || row?.cached_at || null,
+    row: Object.keys(row).length ? {
+      ...row,
+      provider: spec.provider,
+      market_type: spec.market,
+      symbol: spec.symbol,
+    } : null,
+  };
+}
+
+async function refreshWatchlistTickerFocus() {
+  if (watchlistTickerRefreshInflight) return watchlistTickerRefreshInflight;
+  const task = (async () => {
+    pruneWatchlistTickerFocus();
+    const groups = new Map();
+    for (const spec of watchlistTickerFocus.values()) {
+      // Existing shared streams are already live and require no extra focus REST work.
+      if (spec.provider === 'binance') continue;
+      if (spec.provider === 'coinbase' && spec.market === 'spot') continue;
+      const groupKey = `${spec.market}|${spec.provider}`;
+      if (!groups.has(groupKey)) groups.set(groupKey, []);
+      groups.get(groupKey).push(spec);
+    }
+    if (!groups.size) {
+      watchlistTickerStats.rows = watchlistTickerRows.size;
+      return true;
+    }
+    watchlistTickerStats.refresh_started += 1;
+    watchlistTickerStats.last_started_at = new Date().toISOString();
+    let successes = 0;
+    const errors = [];
+    await mapLimit([...groups.values()], 2, async (specs) => {
+      const first = specs[0];
+      const symbols = [...new Set(specs.map((spec) => spec.symbol))].slice(0, WATCHLIST_TICKER_BATCH_MAX);
+      if (!first || !symbols.length) return;
+      try {
+        watchlistTickerStats.provider_group_reads += 1;
+        const rows = await loadMarketTickers(first.provider, first.market, symbols);
+        for (const raw of Array.isArray(rows) ? rows : []) {
+          const symbol = compact(raw?.symbol);
+          const key = watchlistTickerIdentityKey(first.market, first.provider, symbol);
+          if (!key || !watchlistTickerFocus.has(key)) continue;
+          watchlistTickerRows.set(key, {
+            ...raw,
+            provider: first.provider,
+            market_type: first.market,
+            symbol,
+            watchlist_realtime_source: 'fixed_background_focus_ticker',
+            watchlist_realtime_refreshed_at: new Date().toISOString(),
+          });
+        }
+        successes += 1;
+      } catch (error) {
+        errors.push(`${first.provider}:${first.market}:${String(error?.message || error).slice(0, 120)}`);
+      }
+    });
+    watchlistTickerStats.rows = watchlistTickerRows.size;
+    watchlistTickerStats.last_completed_at = new Date().toISOString();
+    if (successes > 0) {
+      watchlistTickerStats.refresh_succeeded += 1;
+      watchlistTickerStats.last_error = errors.join('|');
+      return true;
+    }
+    watchlistTickerStats.refresh_failed += 1;
+    watchlistTickerStats.last_error = errors.join('|') || 'watchlist_focus_refresh_no_success';
+    return false;
+  })().finally(() => {
+    if (watchlistTickerRefreshInflight === task) watchlistTickerRefreshInflight = null;
+  });
+  watchlistTickerRefreshInflight = task;
+  return task;
+}
+
+function startWatchlistTickerFocusScheduler() {
+  if (watchlistTickerRefreshTimer) return;
+  watchlistTickerRefreshTimer = setInterval(() => {
+    refreshWatchlistTickerFocus().catch(() => {});
+  }, WATCHLIST_FOCUS_REFRESH_MS);
+  watchlistTickerRefreshTimer.unref?.();
+}
+
+function watchlistTickerPayload(specs) {
+  registerWatchlistTickerSpecs(specs);
+  const items = specs.map(materializeWatchlistTickerRow);
+  return {
+    ok: true,
+    version: STEP_VERSION,
+    route: WATCHLIST_TICKERS_ROUTE,
+    batch_max: WATCHLIST_TICKER_BATCH_MAX,
+    focus_max: WATCHLIST_FOCUS_MAX,
+    focus_refresh_ms: WATCHLIST_FOCUS_REFRESH_MS,
+    focus_ttl_ms: WATCHLIST_FOCUS_TTL_MS,
+    accepted: specs.length,
+    ready: items.filter((item) => item.ready).length,
+    items,
+    user_read_upstream_requests: 0,
+    user_read_exchange_connections_started: 0,
+    reads_scale_with_users: false,
+    fixed_background_focus_refresh: true,
+    binance_spot_shared_stream: true,
+    binance_contract_persistent_shared_stream: true,
+    coinbase_spot_shared_stream: true,
+    generated_at: new Date().toISOString(),
+  };
+}
+
 export function getMarketLightInternalSnapshot({ market = '', provider = '' } = {}) {
   const normalizedMarket = String(market || '').trim().toLowerCase();
   const normalizedProvider = String(provider || '').trim().toLowerCase();
@@ -3149,7 +3384,25 @@ export function getMarketLightSnapshotHealth() {
     mode: 'shared_primary_quote_full_directory_light_snapshot',
     snapshot_endpoint: SNAPSHOT_ROUTE,
     ranked_page_endpoint: RANKED_PAGE_ROUTE,
+    watchlist_tickers_endpoint: WATCHLIST_TICKERS_ROUTE,
     health_endpoint: HEALTH_ROUTE,
+    watchlist_realtime: {
+      ready: true,
+      batch_max: WATCHLIST_TICKER_BATCH_MAX,
+      focus_max: WATCHLIST_FOCUS_MAX,
+      focus_refresh_ms: WATCHLIST_FOCUS_REFRESH_MS,
+      focus_ttl_ms: WATCHLIST_FOCUS_TTL_MS,
+      active_focus: watchlistTickerFocus.size,
+      cached_focus_rows: watchlistTickerRows.size,
+      user_reads_start_upstream: false,
+      user_read_upstream_requests: 0,
+      fixed_background_refresh_independent_of_user_count: true,
+      binance_spot_source: 'existing_shared_miniticker_websocket',
+      binance_contract_source: 'existing_persistent_usdm_shared_websocket',
+      coinbase_spot_source: 'existing_public_ticker_batch_websocket',
+      other_provider_source: 'fixed_background_exact_focus_ticker_batches',
+      stats: { ...watchlistTickerStats },
+    },
     shared_rank_index: {
       schema_version: 'step1041_6_shared_full_market_rank_page_v2',
       ranking_happens_before_pagination: true,
@@ -3438,7 +3691,7 @@ function sendJson(res, status, payload) {
 export async function handleMarketLightSnapshot(req, res, url) {
   const sectorHistoryRoute = url.pathname === '/api/crypto-sector-professional/history' ||
     url.pathname === '/api/crypto-sector-professional/history-health';
-  if (![SNAPSHOT_ROUTE, RANKED_PAGE_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
+  if (![SNAPSHOT_ROUTE, RANKED_PAGE_ROUTE, WATCHLIST_TICKERS_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -3466,6 +3719,22 @@ export async function handleMarketLightSnapshot(req, res, url) {
   if (url.pathname === SECTOR_SNAPSHOT_ROUTE) {
     sectorSnapshotReads += 1;
     sendJson(res, 200, buildSectorProfessionalSnapshot());
+    return true;
+  }
+  if (url.pathname === WATCHLIST_TICKERS_ROUTE) {
+    const specs = parseWatchlistTickerSpecs(url.searchParams.get('items'));
+    if (!specs.length) {
+      sendJson(res, 400, {
+        ok: false,
+        version: STEP_VERSION,
+        error: 'watchlist_items_required',
+        batch_max: WATCHLIST_TICKER_BATCH_MAX,
+        user_read_upstream_requests: 0,
+      });
+      return true;
+    }
+    watchlistTickerStats.user_reads += 1;
+    sendJson(res, 200, watchlistTickerPayload(specs));
     return true;
   }
   const market = String(url.searchParams.get('market_type') || url.searchParams.get('market') || '').trim().toLowerCase();

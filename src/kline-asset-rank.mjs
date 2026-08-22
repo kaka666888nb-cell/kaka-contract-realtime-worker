@@ -1,14 +1,15 @@
-// Step1041.6.4 / Render 650.8.15.196.11.1
+// Step1041.6.4 / Render 650.8.15.196.11.3
 // Shared ranking for exchange assets that have a verified official K-line capability.
 // Cash equities are intentionally excluded. User reads are memory-only and never start
 // exchange/Binance Wallet/Supabase upstream work. Binance Wallet rankType=40 supplies the
 // external mature "Popular" order for tokenized securities; it never substitutes product prices.
 
-const VERSION = '650.8.15.196.11.1';
+const VERSION = '650.8.15.196.11.3';
 const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1041_6_4_kline_asset_rank_page_v1';
 const ROUTE = '/api/asset-market/ranked-page';
 const HEALTH_ROUTE = '/api/asset-market/rank-health';
+const WATCHLIST_ROUTE = '/api/asset-market/watchlist-tickers';
 const PAGE_MAX = 50;
 const ORDER_TTL_MS = Math.max(60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_ORDER_TTL_MS || 5 * 60_000));
 const ORDER_MAX = Math.max(8, Math.min(32, Number(process.env.KAKA_KLINE_ASSET_RANK_ORDER_MAX || 20)));
@@ -29,6 +30,14 @@ const BINANCE_STOCK_RANK_TYPE = 40;
 const BINANCE_STOCK_PERIOD = 50; // official 24h code
 const BINANCE_STOCK_SORT_BY = 0; // official default board order
 const BINANCE_STOCK_SIZE = 200;
+
+// Step1041.6.3.1.5: exact asset watchlist realtime focus.
+// User reads only register/read exact product identities; a fixed 5s backend timer owns all
+// exchange-assets ticker batch work. This avoids one upstream build per user/watchlist refresh.
+const WATCHLIST_BATCH_MAX = 32;
+const WATCHLIST_FOCUS_MAX = 128;
+const WATCHLIST_REFRESH_MS = Math.max(3_000, Number(process.env.KAKA_ASSET_WATCHLIST_REFRESH_MS || 5_000));
+const WATCHLIST_FOCUS_TTL_MS = Math.max(30_000, Number(process.env.KAKA_ASSET_WATCHLIST_FOCUS_TTL_MS || 2 * 60_000));
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -56,6 +65,10 @@ let lastHotError = '';
 let catalogInflight = null;
 let marketInflight = null;
 let hotInflight = null;
+let assetWatchlistTimer = null;
+let assetWatchlistInflight = null;
+const assetWatchlistFocus = new Map();
+const assetWatchlistRows = new Map();
 let seq = 0;
 const orders = new Map();
 const currentByScope = new Map();
@@ -80,6 +93,14 @@ const stats = {
   rank_builds: 0,
   rank_hits: 0,
   rank_expired: 0,
+  watchlist_reads: 0,
+  watchlist_focus_registered: 0,
+  watchlist_refresh_started: 0,
+  watchlist_refresh_succeeded: 0,
+  watchlist_refresh_failed: 0,
+  watchlist_group_reads: 0,
+  watchlist_rows: 0,
+  watchlist_last_error: '',
 };
 
 function text(v) { return String(v ?? '').trim(); }
@@ -413,19 +434,177 @@ function currentOrder(scope) {
 function requestedOrder(version,scope) {
   pruneOrders(); const s=orders.get(version); if (!s || s.scope!==scopeKey(scope)) return null; stats.rank_hits += 1; return s;
 }
+
+function assetWatchlistSpecKey(spec) {
+  const provider=lower(spec?.provider);
+  const marketType=lower(spec?.market_type);
+  const assetClass=lower(spec?.asset_class);
+  const productKind=lower(spec?.product_kind);
+  const symbol=upper(spec?.symbol);
+  if (!provider || !marketType || !assetClass || !productKind || !symbol) return '';
+  if (assetClass === CASH_CLASS) return '';
+  if (!/^[A-Z0-9._:\-/]+$/.test(symbol)) return '';
+  return `${provider}|${marketType}|${assetClass}|${productKind}|${symbol}`;
+}
+function parseAssetWatchlistSpecs(raw) {
+  const out=[]; const seen=new Set();
+  for (const token of text(raw).split('~')) {
+    const parts=token.split('|');
+    if (parts.length<5) continue;
+    const spec={
+      provider:lower(parts[0]),
+      market_type:lower(parts[1]),
+      asset_class:lower(parts[2]),
+      product_kind:lower(parts[3]),
+      symbol:upper(parts.slice(4).join('|')),
+    };
+    const key=assetWatchlistSpecKey(spec);
+    if (!key || seen.has(key)) continue;
+    seen.add(key); out.push({...spec,key});
+    if (out.length>=WATCHLIST_BATCH_MAX) break;
+  }
+  return out;
+}
+function pruneAssetWatchlistFocus(now=Date.now()) {
+  for (const [key,value] of assetWatchlistFocus.entries()) {
+    if (!value || Number(value.expires_at||0)<=now) {
+      assetWatchlistFocus.delete(key);
+      assetWatchlistRows.delete(key);
+    }
+  }
+  while (assetWatchlistFocus.size>WATCHLIST_FOCUS_MAX) {
+    const oldest=[...assetWatchlistFocus.entries()]
+      .sort((a,b)=>Number(a[1]?.seen_at||0)-Number(b[1]?.seen_at||0))[0];
+    if (!oldest) break;
+    assetWatchlistFocus.delete(oldest[0]);
+    assetWatchlistRows.delete(oldest[0]);
+  }
+}
+function registerAssetWatchlistSpecs(specs) {
+  const now=Date.now(); pruneAssetWatchlistFocus(now);
+  for (const spec of specs) {
+    assetWatchlistFocus.set(spec.key,{...spec,seen_at:now,expires_at:now+WATCHLIST_FOCUS_TTL_MS});
+  }
+  stats.watchlist_focus_registered=assetWatchlistFocus.size;
+}
+function assetWatchlistFallbackItem(spec) {
+  const market=marketByKey.get(`${spec.provider}|${spec.market_type}|${spec.symbol}`)||null;
+  if (!market) return null;
+  return {
+    native_symbol:spec.symbol,
+    ticker:market.ticker||market,
+    source_cache_status:'rank_market_shared_fallback',
+  };
+}
+async function refreshAssetWatchlistFocus() {
+  if (assetWatchlistInflight) return assetWatchlistInflight;
+  const task=(async()=>{
+    pruneAssetWatchlistFocus();
+    const groups=new Map();
+    for (const spec of assetWatchlistFocus.values()) {
+      const key=`${spec.provider}|${spec.market_type}|${spec.asset_class}|${spec.product_kind}`;
+      if (!groups.has(key)) groups.set(key,[]);
+      groups.get(key).push(spec);
+    }
+    if (!groups.size) { stats.watchlist_rows=assetWatchlistRows.size; return true; }
+    stats.watchlist_refresh_started+=1;
+    let successes=0; const errors=[];
+    for (const specs of groups.values()) {
+      const first=specs[0];
+      const symbols=[...new Set(specs.map((spec)=>spec.symbol))].slice(0,WATCHLIST_BATCH_MAX);
+      if (!first || !symbols.length) continue;
+      try {
+        stats.watchlist_group_reads+=1;
+        const q=new URLSearchParams({
+          provider:first.provider,
+          market_type:first.market_type,
+          asset_class:first.asset_class,
+          product_kind:first.product_kind,
+          symbols:symbols.join(','),
+        });
+        const payload=await deps.requestIsolatedJson(
+          'exchange-assets',
+          `/api/asset-market/tickers?${q.toString()}`,
+          18_000,
+        );
+        if (!payload?.ok || !Array.isArray(payload?.items)) {
+          throw new Error(`asset_watchlist_batch_invalid:${first.provider}`);
+        }
+        for (const item of payload.items) {
+          const symbol=upper(item?.native_symbol);
+          if (!symbol) continue;
+          const spec=specs.find((candidate)=>candidate.symbol===symbol);
+          if (!spec || !assetWatchlistFocus.has(spec.key)) continue;
+          assetWatchlistRows.set(spec.key,{
+            ...item,
+            watchlist_realtime_source:'fixed_background_asset_ticker_batch',
+            watchlist_realtime_refreshed_at:new Date().toISOString(),
+          });
+        }
+        successes+=1;
+      } catch(error) {
+        errors.push(`${first.provider}:${first.market_type}:${String(error?.message||error).slice(0,120)}`);
+      }
+    }
+    stats.watchlist_rows=assetWatchlistRows.size;
+    if (successes>0) {
+      stats.watchlist_refresh_succeeded+=1;
+      stats.watchlist_last_error=errors.join('|');
+      return true;
+    }
+    stats.watchlist_refresh_failed+=1;
+    stats.watchlist_last_error=errors.join('|')||'asset_watchlist_refresh_no_success';
+    return false;
+  })().finally(()=>{ if(assetWatchlistInflight===task) assetWatchlistInflight=null; });
+  assetWatchlistInflight=task;
+  return task;
+}
+function startAssetWatchlistFocusScheduler() {
+  if (assetWatchlistTimer) return;
+  assetWatchlistTimer=setInterval(()=>{ refreshAssetWatchlistFocus().catch(()=>{}); },WATCHLIST_REFRESH_MS);
+  assetWatchlistTimer.unref?.();
+}
+function assetWatchlistPayload(specs) {
+  registerAssetWatchlistSpecs(specs);
+  const items=specs.map((spec)=>{
+    const current=assetWatchlistRows.get(spec.key)||assetWatchlistFallbackItem(spec);
+    const ticker=current?.ticker&&typeof current.ticker==='object'?current.ticker:null;
+    const price=num(ticker?.last_price??ticker?.price??current?.last_price??current?.price);
+    return {
+      ready:price!=null&&price>0,
+      provider:spec.provider,
+      market_type:spec.market_type,
+      asset_class:spec.asset_class,
+      product_kind:spec.product_kind,
+      native_symbol:spec.symbol,
+      market_item:current||null,
+    };
+  });
+  return {
+    ok:true,version:VERSION,route:WATCHLIST_ROUTE,
+    batch_max:WATCHLIST_BATCH_MAX,focus_max:WATCHLIST_FOCUS_MAX,
+    focus_refresh_ms:WATCHLIST_REFRESH_MS,focus_ttl_ms:WATCHLIST_FOCUS_TTL_MS,
+    accepted:specs.length,ready:items.filter((item)=>item.ready).length,items,
+    read_only_shared:true,user_read_upstream_requests:0,user_read_upstream_connections:0,
+    fixed_background_refresh_independent_of_user_count:true,reads_scale_with_users:false,
+    generated_at:new Date().toISOString(),
+  };
+}
+
 function healthPayload() {
   const age=(ts)=>ts?Math.max(0,Date.now()-ts):null;
   const groups={}; for (const r of catalogRows) { const k=`${lower(r.asset_group)}|${lower(r.asset_class)}`; groups[k]=(groups[k]||0)+1; }
   return {
-    ok:true,version:VERSION,data_version:DATA_VERSION,schema_version:SCHEMA_VERSION,route:ROUTE,health_route:HEALTH_ROUTE,
+    ok:true,version:VERSION,data_version:DATA_VERSION,schema_version:SCHEMA_VERSION,route:ROUTE,health_route:HEALTH_ROUTE,watchlist_route:WATCHLIST_ROUTE,
     read_only_shared:true,only_official_kline_assets:true,cash_equities_excluded:true,page_limit_max:PAGE_MAX,
     user_reads_start_upstream:false,user_read_upstream_requests:0,reads_scale_with_users:false,
     supported_sorts:['name_asc','hot','change_desc','change_asc','volume_desc'],hot_supported_asset_groups:['stocks','rwa'],
     catalog:{ready:catalogRows.length>0&&age(catalogUpdatedAt)<=RETAIN_MS,rows:catalogRows.length,version:catalogVersion,updated_at:catalogUpdatedAt?new Date(catalogUpdatedAt).toISOString():null,age_ms:age(catalogUpdatedAt),refresh_ms:CATALOG_REFRESH_MS,groups,last_error:lastCatalogError},
     market:{ready:marketByKey.size>0&&age(marketUpdatedAt)<=RETAIN_MS,rows:marketByKey.size,version:marketVersion,updated_at:marketUpdatedAt?new Date(marketUpdatedAt).toISOString():null,age_ms:age(marketUpdatedAt),refresh_ms:MARKET_REFRESH_MS,last_error:lastMarketError},
     popular:{ready:hotByTicker.size>0&&age(hotUpdatedAt)<=RETAIN_MS,rows:hotByTicker.size,version:hotVersion,updated_at:hotUpdatedAt?new Date(hotUpdatedAt).toISOString():null,age_ms:age(hotUpdatedAt),refresh_ms:HOT_REFRESH_MS,source:'binance_wallet_unified_token_rank_stock',rank_type:BINANCE_STOCK_RANK_TYPE,period:BINANCE_STOCK_PERIOD,sort_by:BINANCE_STOCK_SORT_BY,size:BINANCE_STOCK_SIZE,detail_exact_identity_source:'binance_wallet_tokenized_stock_detail_list',last_error:lastHotError},
+    watchlist_realtime:{ready:true,route:WATCHLIST_ROUTE,batch_max:WATCHLIST_BATCH_MAX,focus_max:WATCHLIST_FOCUS_MAX,refresh_ms:WATCHLIST_REFRESH_MS,focus_ttl_ms:WATCHLIST_FOCUS_TTL_MS,active_focus:assetWatchlistFocus.size,cached_rows:assetWatchlistRows.size,user_reads_start_upstream:false,user_read_upstream_requests:0,fixed_background_refresh_independent_of_user_count:true},
     pagination:{ranking_happens_before_pagination:true,pagination_order_frozen_by_rank_version:true,order_ttl_ms:ORDER_TTL_MS,snapshots:orders.size},
-    pressure:{catalog_supabase_reads_per_refresh_max:5,market_group_shared_reads_per_refresh_max:12,binance_popular_requests_per_refresh:2,user_scale_upstream_amplification:0},
+    pressure:{catalog_supabase_reads_per_refresh_max:5,market_group_shared_reads_per_refresh_max:12,binance_popular_requests_per_refresh:2,watchlist_fixed_refresh_ms:WATCHLIST_REFRESH_MS,watchlist_focus_max:WATCHLIST_FOCUS_MAX,user_scale_upstream_amplification:0},
     stats:{...stats},
   };
 }
@@ -439,12 +618,20 @@ export function startKlineAssetRankCollector(options) {
   catalogTimer=setInterval(()=>safe(refreshCatalog),CATALOG_REFRESH_MS); catalogTimer.unref?.();
   marketTimer=setInterval(()=>safe(refreshMarket),MARKET_REFRESH_MS); marketTimer.unref?.();
   hotTimer=setInterval(()=>safe(refreshHot),HOT_REFRESH_MS); hotTimer.unref?.();
+  startAssetWatchlistFocusScheduler();
 }
 export async function handleKlineAssetRank(req,res,url) {
-  if (![ROUTE,HEALTH_ROUTE].includes(url?.pathname)) return false;
+  if (![ROUTE,HEALTH_ROUTE,WATCHLIST_ROUTE].includes(url?.pathname)) return false;
   if (req.method==='OPTIONS') { res.writeHead(204,{'access-control-allow-origin':'*','access-control-allow-methods':'GET, OPTIONS','cache-control':'no-store'}); res.end(); return true; }
   if (req.method!=='GET') { send(res,405,{ok:false,version:VERSION,error:'method_not_allowed'}); return true; }
   if (url.pathname===HEALTH_ROUTE) { send(res,200,healthPayload()); return true; }
+  if (url.pathname===WATCHLIST_ROUTE) {
+    const specs=parseAssetWatchlistSpecs(url.searchParams.get('items'));
+    if (!specs.length) { send(res,400,{ok:false,version:VERSION,error:'asset_watchlist_items_required',batch_max:WATCHLIST_BATCH_MAX,user_read_upstream_requests:0}); return true; }
+    stats.watchlist_reads+=1;
+    send(res,200,assetWatchlistPayload(specs));
+    return true;
+  }
   stats.user_reads += 1;
   const group=lower(url.searchParams.get('asset_group')) || 'all';
   const assetClass=lower(url.searchParams.get('asset_class')) || 'all';
