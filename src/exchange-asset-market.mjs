@@ -2,8 +2,8 @@
 // Coinbase opaque product_id is provider identity, not a crypto ticker: preserve its exact casing end-to-end.
 // Reuse the V50-proven exact Get Public Product path for rules/status/session, shared per canonical product_id across users.
 
-const VERSION = '650.8.15.170';
-const DATA_VERSION = 10269;
+const VERSION = '650.8.15.196.11';
+const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1026_exchange_asset_market_v1';
 const ENDPOINT = '/api/asset-market';
 const BATCH_ENDPOINT = '/api/asset-market/tickers';
@@ -134,7 +134,7 @@ function symbolList(v, provider = '') {
     const s = providerNativeKey(provider, raw);
     if (!s || seen.has(s)) continue;
     seen.add(s); out.push(s);
-    if (out.length >= 80) break;
+    if (out.length >= 500) break;
   }
   return out;
 }

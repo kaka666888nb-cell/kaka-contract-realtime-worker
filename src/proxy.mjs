@@ -29,11 +29,12 @@ import {
 } from './slow-stats-bridge.mjs';
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, requestIsolatedJson, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
+import { startKlineAssetRankCollector, handleKlineAssetRank, getKlineAssetRankHealth } from './kline-asset-rank.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.196.10.3';
+const STEP_VERSION = '650.8.15.196.11';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -45,6 +46,7 @@ startSpotCurrentSnapshotScanner();
 startContractBasisScanner();
 startProjectFundamentalsCollector();
 startStockCatalogV2Collector();
+startKlineAssetRankCollector({ requestIsolatedJson, getMarketLightInternalSnapshot });
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -585,6 +587,9 @@ const server = http.createServer(async (req, res) => {
         user_reads_start_upstream: false,
         reads_scale_with_users: false,
       },
+      kline_asset_ranked_page: '/api/asset-market/ranked-page',
+      kline_asset_rank_health: '/api/asset-market/rank-health',
+      kline_asset_rank_state: getKlineAssetRankHealth(),
       crypto_sector_professional_history_state:
         getMarketLightSnapshotHealth()?.crypto_sector_history || null,
       collector_isolation: getCollectorIsolationHealth(),
@@ -1280,6 +1285,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (await handleRealityRankedPage(req, res, url)) return;
+  if (await handleKlineAssetRank(req, res, url)) return;
   if (proxyIsolatedCollectorRequest(req, res, url)) return;
 
   const requestAbortController = new AbortController();
