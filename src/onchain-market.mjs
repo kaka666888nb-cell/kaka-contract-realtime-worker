@@ -1,4 +1,4 @@
-// Step1041 / Render 650.8.15.196.10
+// Step1041 / Render 650.8.15.196.10.1
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196.10';
+const VERSION = '650.8.15.196.10.1';
 const DATA_VERSION = 104101000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';

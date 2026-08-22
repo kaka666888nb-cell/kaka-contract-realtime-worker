@@ -1,7 +1,7 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.196.10';
+const STEP_VERSION = '650.8.15.196.10.1';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const HEALTH_ROUTE = '/api/market-light/health';
@@ -146,7 +146,7 @@ const directoryRowsByKey = new Map();
 const directoryUpdatedAtByKey = new Map();
 const responseCache = new Map();
 
-// Step1041.6 / Render650.8.15.196.10: shared full-market ranking index.
+// Step1041.6.1 / Render650.8.15.196.10.1: shared full-market ranking index.
 // Ranking is computed from the already-collected shared market-light rows BEFORE
 // pagination. User reads never start exchange requests and the App still receives
 // only 50 ranked assets per page. A rank_version freezes the ORDER (not full market
@@ -162,6 +162,18 @@ const MARKET_CAP_START_DELAY_MS = Math.max(8_000, Number(process.env.KAKA_MARKET
 const MARKET_CAP_PAGES = Math.max(1, Math.min(24, Number(process.env.KAKA_MARKET_CAP_RANK_PAGES || 20)));
 const MARKET_CAP_PAGE_SIZE = 250;
 const MARKET_CAP_GLOBAL_SYMBOL_REFRESH_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_MARKET_CAP_SYMBOL_LIST_REFRESH_MS || 24 * 60 * 60_000));
+// CoinGecko public access can be as low as 5 calls/minute. Keep the no-key
+// background lane below that lower bound instead of assuming the previous
+// 4.2s cadence is always safe. Demo/Pro keys retain faster but still bounded
+// lanes. User reads never enter this lane.
+const MARKET_CAP_PUBLIC_REQUEST_GAP_MS = Math.max(12_000, Number(process.env.KAKA_MARKET_CAP_PUBLIC_REQUEST_GAP_MS || 13_000));
+const MARKET_CAP_DEMO_REQUEST_GAP_MS = Math.max(2_000, Number(process.env.KAKA_MARKET_CAP_DEMO_REQUEST_GAP_MS || 2_500));
+const MARKET_CAP_PRO_REQUEST_GAP_MS = Math.max(500, Number(process.env.KAKA_MARKET_CAP_PRO_REQUEST_GAP_MS || 1_000));
+const MARKET_CAP_RATE_LIMIT_RETRY_BUDGET = Math.max(0, Math.min(4, Number(process.env.KAKA_MARKET_CAP_RATE_LIMIT_RETRY_BUDGET || 3)));
+const MARKET_CAP_429_FALLBACK_RETRY_MS = Math.max(20_000, Number(process.env.KAKA_MARKET_CAP_429_FALLBACK_RETRY_MS || 35_000));
+const MARKET_CAP_429_MAX_RETRY_MS = Math.max(MARKET_CAP_429_FALLBACK_RETRY_MS, Number(process.env.KAKA_MARKET_CAP_429_MAX_RETRY_MS || 120_000));
+const MARKET_CAP_COLD_FAILURE_RETRY_MS = Math.max(60_000, Number(process.env.KAKA_MARKET_CAP_COLD_FAILURE_RETRY_MS || 90_000));
+const MARKET_CAP_WARM_FAILURE_RETRY_MS = Math.max(5 * 60_000, Number(process.env.KAKA_MARKET_CAP_WARM_FAILURE_RETRY_MS || 30 * 60_000));
 const rankedPageCache = new Map();
 const rankOrderSnapshots = new Map();
 const rankCurrentBySignature = new Map();
@@ -185,6 +197,13 @@ let marketCapRefreshFailures = 0;
 let marketCapRows = 0;
 let marketCapUniqueSymbols = 0;
 let marketCapDuplicateSymbols = 0;
+let marketCapSourceRequestsStarted = 0;
+let marketCapRateLimitResponses = 0;
+let marketCapRateLimitRetries = 0;
+let marketCapLastRetryAfterMs = null;
+let marketCapLastRequestAtMs = 0;
+let marketCapNextRetryAt = null;
+let marketCapLastRequestMode = 'public_no_key';
 let rankPageReads = 0;
 let rankPageBuilds = 0;
 let rankPageCacheHits = 0;
@@ -2477,59 +2496,127 @@ function marketRankedPagePayload({ market, provider = '', quote = '', sort = 'ma
 function coingeckoConfig() {
   const proKey = String(process.env.COINGECKO_PRO_API_KEY || '').trim();
   const demoKey = String(process.env.COINGECKO_DEMO_API_KEY || process.env.CG_DEMO_API_KEY || '').trim();
-  if (proKey) return { base: 'https://pro-api.coingecko.com/api/v3', headerName: 'x-cg-pro-api-key', key: proKey };
-  if (demoKey) return { base: 'https://api.coingecko.com/api/v3', headerName: 'x-cg-demo-api-key', key: demoKey };
-  return { base: 'https://api.coingecko.com/api/v3', headerName: '', key: '' };
+  if (proKey) return { base: 'https://pro-api.coingecko.com/api/v3', headerName: 'x-cg-pro-api-key', key: proKey, mode: 'pro_key' };
+  if (demoKey) return { base: 'https://api.coingecko.com/api/v3', headerName: 'x-cg-demo-api-key', key: demoKey, mode: 'demo_key' };
+  return { base: 'https://api.coingecko.com/api/v3', headerName: '', key: '', mode: 'public_no_key' };
 }
 
-async function fetchCoinGeckoMarketPage(page) {
+function marketCapRequestGapMs(cfg = coingeckoConfig()) {
+  if (cfg?.mode === 'pro_key') return MARKET_CAP_PRO_REQUEST_GAP_MS;
+  if (cfg?.mode === 'demo_key') return MARKET_CAP_DEMO_REQUEST_GAP_MS;
+  return MARKET_CAP_PUBLIC_REQUEST_GAP_MS;
+}
+
+function marketCapRetryAfterMs(response) {
+  const raw = String(response?.headers?.get?.('retry-after') || '').trim();
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  const at = Date.parse(raw);
+  if (Number.isFinite(at)) return Math.max(0, at - Date.now());
+  return null;
+}
+
+function marketCapSleep(ms) {
+  const safe = Math.max(0, Math.trunc(Number(ms) || 0));
+  if (!safe) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, safe);
+    timer.unref?.();
+  });
+}
+
+async function waitForMarketCapRequestSlot(cfg) {
+  const gapMs = marketCapRequestGapMs(cfg);
+  marketCapLastRequestMode = cfg?.mode || 'public_no_key';
+  const elapsed = marketCapLastRequestAtMs > 0 ? Date.now() - marketCapLastRequestAtMs : Number.POSITIVE_INFINITY;
+  if (elapsed < gapMs) await marketCapSleep(gapMs - elapsed);
+  marketCapLastRequestAtMs = Date.now();
+}
+
+function marketCapHttpError(label, response, retryAfterMs = null) {
+  const error = new Error(`${label}_http_${response?.status || 0}`);
+  error.httpStatus = Number(response?.status || 0) || null;
+  error.retryAfterMs = retryAfterMs;
+  return error;
+}
+
+async function fetchCoinGeckoJson(path, { label, timeoutMs, requestContext }) {
   const cfg = coingeckoConfig();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
-  timer.unref?.();
-  try {
-    const headers = { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.15.196.10 shared-market-cap-rank' };
-    if (cfg.headerName && cfg.key) headers[cfg.headerName] = cfg.key;
-    const url = `${cfg.base}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${MARKET_CAP_PAGE_SIZE}&page=${page}&sparkline=false`;
-    const response = await fetch(url, { headers, signal: controller.signal });
-    if (!response.ok) throw new Error(`coingecko_market_cap_http_${response.status}`);
-    const payload = await response.json();
-    if (!Array.isArray(payload)) throw new Error('coingecko_market_cap_payload_invalid');
-    return payload;
-  } finally {
-    clearTimeout(timer);
+  const headers = {
+    accept: 'application/json',
+    'user-agent': `KakaWeb3/650.8.15.196.10.1 ${label}`,
+  };
+  if (cfg.headerName && cfg.key) headers[cfg.headerName] = cfg.key;
+  for (;;) {
+    await waitForMarketCapRequestSlot(cfg);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    timer.unref?.();
+    let response;
+    try {
+      marketCapSourceRequestsStarted += 1;
+      if (requestContext) requestContext.requestsStarted += 1;
+      response = await fetch(`${cfg.base}${path}`, { headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (response.status !== 429) {
+      if (!response.ok) throw marketCapHttpError(label, response);
+      return response.json();
+    }
+
+    marketCapRateLimitResponses += 1;
+    const retryAfterMs = marketCapRetryAfterMs(response);
+    marketCapLastRetryAfterMs = retryAfterMs;
+    const used = Number(requestContext?.rateLimitRetriesUsed || 0);
+    if (!requestContext || used >= MARKET_CAP_RATE_LIMIT_RETRY_BUDGET) {
+      throw marketCapHttpError(label, response, retryAfterMs);
+    }
+    requestContext.rateLimitRetriesUsed = used + 1;
+    marketCapRateLimitRetries += 1;
+    const exponentialMs = MARKET_CAP_429_FALLBACK_RETRY_MS * (2 ** used);
+    const boundedMs = Math.min(MARKET_CAP_429_MAX_RETRY_MS, Math.max(
+      marketCapRequestGapMs(cfg),
+      retryAfterMs == null ? 0 : retryAfterMs,
+      exponentialMs,
+    ));
+    // Small deterministic jitter prevents several Render instances that cold-start
+    // together from retrying the same shared public IP on the exact same millisecond.
+    const jitterMs = 400 + ((marketCapRateLimitRetries * 977) % 1_600);
+    await marketCapSleep(boundedMs + jitterMs);
   }
 }
 
-async function refreshCoinGeckoGlobalSymbolCounts() {
+async function fetchCoinGeckoMarketPage(page, requestContext) {
+  const payload = await fetchCoinGeckoJson(
+    `/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${MARKET_CAP_PAGE_SIZE}&page=${page}&sparkline=false`,
+    { label: 'coingecko_market_cap', timeoutMs: 15_000, requestContext },
+  );
+  if (!Array.isArray(payload)) throw new Error('coingecko_market_cap_payload_invalid');
+  return payload;
+}
+
+async function refreshCoinGeckoGlobalSymbolCounts(requestContext) {
   const ageMs = marketCapGlobalSymbolListAt > 0 ? Date.now() - marketCapGlobalSymbolListAt : Number.POSITIVE_INFINITY;
   if (marketCapGlobalSymbolCounts.size > 0 && ageMs <= MARKET_CAP_GLOBAL_SYMBOL_REFRESH_MS) return true;
-  const cfg = coingeckoConfig();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
-  timer.unref?.();
-  try {
-    const headers = { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.15.196.10 shared-market-cap-identity' };
-    if (cfg.headerName && cfg.key) headers[cfg.headerName] = cfg.key;
-    const response = await fetch(`${cfg.base}/coins/list?include_platform=false`, { headers, signal: controller.signal });
-    if (!response.ok) throw new Error(`coingecko_coin_list_http_${response.status}`);
-    const payload = await response.json();
-    if (!Array.isArray(payload) || payload.length < 1000) throw new Error('coingecko_coin_list_payload_invalid');
-    const next = new Map();
-    for (const raw of payload) {
-      const symbol = marketRankNormalizeBase(raw?.symbol);
-      if (!symbol) continue;
-      next.set(symbol, Number(next.get(symbol) || 0) + 1);
-    }
-    if (!next.size) throw new Error('coingecko_coin_list_symbol_index_empty');
-    marketCapGlobalSymbolCounts.clear();
-    for (const [symbol, count] of next.entries()) marketCapGlobalSymbolCounts.set(symbol, count);
-    marketCapGlobalSymbolListAt = Date.now();
-    marketCapGlobalSymbolRows = payload.length;
-    return true;
-  } finally {
-    clearTimeout(timer);
+  const payload = await fetchCoinGeckoJson(
+    '/coins/list?include_platform=false',
+    { label: 'coingecko_coin_list', timeoutMs: 20_000, requestContext },
+  );
+  if (!Array.isArray(payload) || payload.length < 1000) throw new Error('coingecko_coin_list_payload_invalid');
+  const next = new Map();
+  for (const raw of payload) {
+    const symbol = marketRankNormalizeBase(raw?.symbol);
+    if (!symbol) continue;
+    next.set(symbol, Number(next.get(symbol) || 0) + 1);
   }
+  if (!next.size) throw new Error('coingecko_coin_list_symbol_index_empty');
+  marketCapGlobalSymbolCounts.clear();
+  for (const [symbol, count] of next.entries()) marketCapGlobalSymbolCounts.set(symbol, count);
+  marketCapGlobalSymbolListAt = Date.now();
+  marketCapGlobalSymbolRows = payload.length;
+  return true;
 }
 
 async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
@@ -2537,13 +2624,15 @@ async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
   const task = (async () => {
     marketCapRefreshAttempts += 1;
     marketCapLastStartedAt = new Date().toISOString();
+    marketCapNextRetryAt = null;
+    const requestContext = { requestsStarted: 0, rateLimitRetriesUsed: 0 };
+    const hadReadyIndex = marketCapBySymbol.size > 0 && marketCapGlobalSymbolCounts.size > 0;
     try {
-      await refreshCoinGeckoGlobalSymbolCounts();
+      await refreshCoinGeckoGlobalSymbolCounts(requestContext);
       const all = [];
       for (let page = 1; page <= MARKET_CAP_PAGES; page += 1) {
-        const rows = await fetchCoinGeckoMarketPage(page);
+        const rows = await fetchCoinGeckoMarketPage(page, requestContext);
         all.push(...rows);
-        if (page < MARKET_CAP_PAGES) await new Promise((resolve) => setTimeout(resolve, 4_200));
       }
       const candidatesBySymbol = new Map();
       for (const raw of all) {
@@ -2576,17 +2665,23 @@ async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
       marketCapLastSucceededAt = new Date().toISOString();
       marketCapLastError = '';
       marketCapRefreshSuccesses += 1;
+      marketCapNextRetryAt = null;
       if (marketCapRetryTimer) { clearTimeout(marketCapRetryTimer); marketCapRetryTimer = null; }
       rankedPageCache.clear();
       return true;
     } catch (error) {
       marketCapRefreshFailures += 1;
       marketCapLastError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
+      // Cold start gets a bounded near-term recovery lane. Once a verified index
+      // already exists, preserve it and retry slowly instead of hammering CoinGecko.
+      const retryDelayMs = hadReadyIndex ? MARKET_CAP_WARM_FAILURE_RETRY_MS : MARKET_CAP_COLD_FAILURE_RETRY_MS;
       if (!marketCapRetryTimer) {
+        marketCapNextRetryAt = new Date(Date.now() + retryDelayMs).toISOString();
         marketCapRetryTimer = setTimeout(() => {
           marketCapRetryTimer = null;
-          refreshMarketCapRankIndex({ reason: 'bounded_retry_after_failure' }).catch(() => {});
-        }, 30 * 60_000);
+          marketCapNextRetryAt = null;
+          refreshMarketCapRankIndex({ reason: hadReadyIndex ? 'bounded_warm_retry_after_failure' : 'bounded_cold_retry_after_failure' }).catch(() => {});
+        }, retryDelayMs);
         marketCapRetryTimer.unref?.();
       }
       return false;
@@ -3073,7 +3168,14 @@ export function getMarketLightSnapshotHealth() {
         refresh_interval_ms: MARKET_CAP_REFRESH_MS,
         pages_per_refresh: MARKET_CAP_PAGES,
         page_size: MARKET_CAP_PAGE_SIZE,
-        requests_per_refresh_max: MARKET_CAP_PAGES + 1,
+        nominal_requests_per_refresh_max: MARKET_CAP_PAGES + 1,
+        requests_per_refresh_max: MARKET_CAP_PAGES + 1 + MARKET_CAP_RATE_LIMIT_RETRY_BUDGET,
+        rate_limit_retry_budget: MARKET_CAP_RATE_LIMIT_RETRY_BUDGET,
+        request_mode: marketCapLastRequestMode,
+        request_gap_ms: marketCapRequestGapMs(),
+        public_request_gap_ms: MARKET_CAP_PUBLIC_REQUEST_GAP_MS,
+        demo_request_gap_ms: MARKET_CAP_DEMO_REQUEST_GAP_MS,
+        pro_request_gap_ms: MARKET_CAP_PRO_REQUEST_GAP_MS,
         version: marketCapRankVersion,
         ready: marketCapBySymbol.size > 0 && marketCapGlobalSymbolCounts.size > 0,
         rows: marketCapRows,
@@ -3089,7 +3191,13 @@ export function getMarketLightSnapshotHealth() {
         last_succeeded_at: marketCapLastSucceededAt,
         last_error: marketCapLastError,
         bounded_retry_pending: Boolean(marketCapRetryTimer),
-        bounded_retry_after_failure_ms: 30 * 60_000,
+        next_retry_at: marketCapNextRetryAt,
+        cold_retry_after_failure_ms: MARKET_CAP_COLD_FAILURE_RETRY_MS,
+        warm_retry_after_failure_ms: MARKET_CAP_WARM_FAILURE_RETRY_MS,
+        source_requests_started: marketCapSourceRequestsStarted,
+        rate_limit_responses: marketCapRateLimitResponses,
+        rate_limit_retries: marketCapRateLimitRetries,
+        last_retry_after_ms: marketCapLastRetryAfterMs,
         per_user_upstream_requests: 0,
       },
     },

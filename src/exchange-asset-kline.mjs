@@ -9,7 +9,7 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { resolveCoinbaseEquityCandleRoute, getCoinbaseCoreKlineReplicaHealth } from './stock-catalog-v2.mjs';
 
-const VERSION = '650.8.15.196.10';
+const VERSION = '650.8.15.196.10.1';
 const DATA_VERSION = 1041010;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
