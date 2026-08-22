@@ -1,4 +1,4 @@
-// Step1041 / Render 650.8.15.196.11
+// Step1041 / Render 650.8.15.196.11.2
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196.11';
+const VERSION = '650.8.15.196.11.2';
 const DATA_VERSION = 104101000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
@@ -23,6 +23,8 @@ const TOKEN_ROUTE = '/api/onchain/token';
 const POOLS_ROUTE = '/api/onchain/pools';
 const KLINES_ROUTE = '/api/onchain/klines';
 const POOL_PRICE_ROUTE = '/api/onchain/pool-price';
+const POOL_PRICES_ROUTE = '/api/onchain/pool-prices';
+const POOL_PRICE_BATCH_MAX = 32;
 const TRADES_ROUTE = '/api/onchain/trades';
 const NEW_POOLS_ROUTE = '/api/onchain/new-pools';
 const FX_REFERENCE_ROUTE = '/api/onchain/fx-reference';
@@ -298,6 +300,7 @@ const stats = {
   funding_source_build_failures: 0,
   step1041_shared_snapshot_reads: 0,
   pool_price_focus_reads: 0,
+  pool_price_batch_reads: 0,
   pool_price_refresh_started: 0,
   pool_price_refresh_succeeded: 0,
   pool_price_refresh_failed: 0,
@@ -3996,6 +3999,8 @@ function healthPayload() {
     },
     exact_pool_price_realtime: {
       route: POOL_PRICE_ROUTE,
+      batch_route: POOL_PRICES_ROUTE,
+      batch_max: POOL_PRICE_BATCH_MAX,
       mode: 'bounded_fixed_background_focus_refresh',
       refresh_interval_ms: POOL_PRICE_REFRESH_MS,
       retain_ms: POOL_PRICE_RETAIN_MS,
@@ -4012,6 +4017,7 @@ function healthPayload() {
       empty_focus_inflight_assignment_order_fixed: true,
       stats: {
         reads: stats.pool_price_focus_reads,
+        batch_reads: stats.pool_price_batch_reads,
         refresh_started: stats.pool_price_refresh_started,
         refresh_succeeded: stats.pool_price_refresh_succeeded,
         refresh_failed: stats.pool_price_refresh_failed,
@@ -4339,7 +4345,7 @@ function onchainRankPage(rows, { sort = 'default', offset = 0, limit = 50 } = {}
 
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
-  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, POOL_PRICE_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE].includes(path)) return false;
+  if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, POOL_PRICE_ROUTE, POOL_PRICES_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE].includes(path)) return false;
   stats.user_reads += 1;
   if (req.method !== 'GET') { sendJson(res, 405, responseBase({ ok: false, error: 'method_not_allowed' })); return true; }
   if (path === HEALTH_ROUTE) { sendJson(res, 200, healthPayload()); return true; }
@@ -4367,6 +4373,82 @@ export async function handleOnchainMarket(req, res, url) {
 
   const network = normalizeNetwork(url.searchParams.get('network'));
   const limit = intRange(url.searchParams.get('limit'), 1, MAX_RESPONSE_ROWS, 50);
+
+  if (path === POOL_PRICES_ROUTE) {
+    stats.pool_price_batch_reads += 1;
+    const rawItems = text(url.searchParams.get('items'));
+    const specs = rawItems
+      .split('~')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, POOL_PRICE_BATCH_MAX);
+    if (!specs.length) {
+      sendJson(res, 400, responseBase({
+        ok: false,
+        error: 'exact_pool_items_required',
+        rows: [],
+        user_read_upstream_requests: 0,
+        direct_upstream_requests: 0,
+      }));
+      return true;
+    }
+
+    const rows = [];
+    const seen = new Set();
+    let invalidRows = 0;
+    const now = Date.now();
+    for (const spec of specs) {
+      const parts = spec.split('|');
+      if (parts.length !== 3) { invalidRows += 1; continue; }
+      const itemNetwork = normalizeNetwork(parts[0]);
+      const tokenAddress = text(parts[1]);
+      const poolAddress = text(parts[2]);
+      if (!itemNetwork || itemNetwork === 'all' ||
+          !validAddressForNetwork(itemNetwork, tokenAddress) ||
+          !validAddressForNetwork(itemNetwork, poolAddress)) {
+        invalidRows += 1;
+        continue;
+      }
+      const exactKey = exactPoolPriceFocusKey(itemNetwork, tokenAddress, poolAddress);
+      if (seen.has(exactKey)) continue;
+      seen.add(exactKey);
+      const key = touchExactPoolPriceFocus(itemNetwork, tokenAddress, poolAddress);
+      const current = poolPriceSnapshot.get(key) || null;
+      const ageMs = current ? Math.max(0, now - Number(current.source_time_ms || 0)) : null;
+      const ready = Boolean(current) && ageMs !== null && ageMs <= POOL_PRICE_RETAIN_MS;
+      rows.push({
+        ready,
+        network: itemNetwork,
+        token_address: tokenAddress,
+        pool_address: poolAddress,
+        dex_id: ready ? current.dex_id : null,
+        price_usd: ready ? current.price_usd : null,
+        source_time_ms: ready ? current.source_time_ms : null,
+        source_time: ready ? isoFromMs(current.source_time_ms) : null,
+        age_ms: ready ? ageMs : null,
+        source: ready ? current.source : null,
+        focus_registered: true,
+        exact_chain_token_pool_required: true,
+      });
+    }
+    const readyRows = rows.filter((row) => row.ready).length;
+    sendJson(res, 200, responseBase({
+      ready: readyRows > 0,
+      requested_rows: specs.length,
+      accepted_rows: rows.length,
+      invalid_rows: invalidRows,
+      ready_rows: readyRows,
+      rows,
+      batch_max: POOL_PRICE_BATCH_MAX,
+      background_refresh_interval_ms: POOL_PRICE_REFRESH_MS,
+      cache_status: 'background_shared_exact_pool_batch',
+      user_read_upstream_requests: 0,
+      direct_upstream_requests: 0,
+      user_reads_register_focus_only: true,
+      fixed_background_rate_independent_of_user_count: true,
+    }));
+    return true;
+  }
 
   if (path === POOL_PRICE_ROUTE) {
     stats.pool_price_focus_reads += 1;
