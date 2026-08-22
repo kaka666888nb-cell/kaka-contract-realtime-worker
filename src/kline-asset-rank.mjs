@@ -1,10 +1,10 @@
-// Step1041.6.4 / Render 650.8.15.196.11.3
+// Step1041.6.4 / Render 650.8.15.196.11.3.1
 // Shared ranking for exchange assets that have a verified official K-line capability.
 // Cash equities are intentionally excluded. User reads are memory-only and never start
 // exchange/Binance Wallet/Supabase upstream work. Binance Wallet rankType=40 supplies the
 // external mature "Popular" order for tokenized securities; it never substitutes product prices.
 
-const VERSION = '650.8.15.196.11.3';
+const VERSION = '650.8.15.196.11.3.1';
 const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1041_6_4_kline_asset_rank_page_v1';
 const ROUTE = '/api/asset-market/ranked-page';

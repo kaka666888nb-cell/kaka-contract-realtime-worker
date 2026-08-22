@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.196.11.3';
+const STEP_VERSION = '650.8.15.196.11.3.1';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const WATCHLIST_TICKERS_ROUTE = '/api/market-light/watchlist-tickers';
@@ -148,7 +148,7 @@ const directoryRowsByKey = new Map();
 const directoryUpdatedAtByKey = new Map();
 const responseCache = new Map();
 
-// Step1041.6.3.1.5 / Render650.8.15.196.11.3: exact watchlist ticker focus.
+// Step1041.6.3.1.5.1 / Render650.8.15.196.11.3.1: exact watchlist ticker focus.
 // User reads only register/read exact identities. Non-stream venues are refreshed by one
 // fixed backend scheduler per active provider-market group; Binance Spot/Contract and
 // Coinbase Spot reuse already-running shared WebSocket state. No user read starts exchange work.
@@ -2892,8 +2892,41 @@ function liveWatchlistTickerPatch(spec) {
     return row ? { ...row, watchlist_realtime_source: 'binance_spot_shared_miniticker_websocket_1s' } : null;
   }
   if (spec.provider === 'binance' && spec.market === 'contract') {
-    const row = getBinanceContractRealtimeMeta(spec.symbol);
-    return row ? { ...row, watchlist_realtime_source: 'binance_usdm_persistent_shared_websocket' } : null;
+    // Step1041.6.3.1.5.1: do NOT use binance-contract-market's 60s ticker snapshot as
+    // a realtime watchlist price. Reuse Step990's already-running all-symbol !bookTicker
+    // shared WebSocket and derive a same-venue best-bid/ask midpoint. This adds no Binance
+    // connection and no REST request. The slower ticker row remains enrichment only for
+    // 24h metrics/funding; it is retained separately as last_trade_price metadata.
+    const meta = getBinanceContractRealtimeMeta(spec.symbol);
+    const book = binanceContractBookTicker.rows.get(spec.symbol) || null;
+    const bid = positive(book?.best_bid ?? book?.bid_price);
+    const ask = positive(book?.best_ask ?? book?.ask_price);
+    const bookTimeMs = Date.parse(String(book?.source_time || book?.cached_at || ''));
+    const bookFresh = Number.isFinite(bookTimeMs) && Date.now() - bookTimeMs <= 20_000;
+    if (book && bid != null && ask != null && ask >= bid && bookFresh) {
+      const midpoint = (bid + ask) / 2;
+      const lastTradePrice = positive(meta?.last_price ?? meta?.price ?? meta?.contract_price);
+      return {
+        ...(meta || {}),
+        ...book,
+        last_trade_price: lastTradePrice,
+        last_trade_price_source: meta?.source || null,
+        last_price: midpoint,
+        price: midpoint,
+        contract_price: midpoint,
+        watchlist_realtime_source: 'binance_usdm_all_book_tickers_shared_websocket',
+        watchlist_realtime_price_semantics: 'same_venue_best_bid_ask_midpoint',
+        watchlist_realtime_midpoint_derived: true,
+        source_time: book.source_time || book.cached_at || meta?.source_time || meta?.cached_at || null,
+        cached_at: book.cached_at || book.source_time || meta?.cached_at || meta?.source_time || null,
+      };
+    }
+    return meta ? {
+      ...meta,
+      watchlist_realtime_source: 'binance_usdm_periodic_ticker_fallback_not_realtime',
+      watchlist_realtime_price_semantics: 'last_trade_snapshot_fallback',
+      watchlist_realtime_midpoint_derived: false,
+    } : null;
   }
   if (spec.provider === 'coinbase' && spec.market === 'spot') {
     const row = coinbase.rows.get(spec.symbol);
