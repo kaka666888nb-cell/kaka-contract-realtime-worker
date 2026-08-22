@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.192';
+const VERSION = '650.8.15.196.10';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -52,6 +52,7 @@ const sharedResponseStats = {
 function sharedResponsePolicy(pathname) {
   const path = String(pathname || '');
   if (path === '/api/market-light/current-snapshot') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
+  if (path === '/api/market-light/ranked-page') return { freshMs: 2_000, staleMs: 15_000, cdnSMaxAgeSec: 2 };
   if (path === '/api/crypto-sector-professional/current-snapshot') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
   if (path === '/api/contract-flow/market-snapshot') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/contract-liquidation/market-snapshot') return { freshMs: 1_500, staleMs: 8_000, cdnSMaxAgeSec: 2 };
@@ -428,6 +429,7 @@ export function collectorRoleForPath(pathname) {
   const path = String(pathname || '');
   if (
     path === '/api/market-light/current-snapshot' ||
+    path === '/api/market-light/ranked-page' ||
     path === '/api/market-light/health' ||
     path.startsWith('/api/crypto-sector-professional')
   ) return 'market-light';

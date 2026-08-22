@@ -9,8 +9,8 @@
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { resolveCoinbaseEquityCandleRoute, getCoinbaseCoreKlineReplicaHealth } from './stock-catalog-v2.mjs';
 
-const VERSION = '650.8.15.189';
-const DATA_VERSION = 1035196;
+const VERSION = '650.8.15.196.10';
+const DATA_VERSION = 1041010;
 const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
@@ -46,7 +46,7 @@ const BITGET_REALITY_CATALOG_URL =
   'https://api.bitget.com/api/v3/market/instruments?category=SPOT';
 const BITGET_REALITY_CATALOG_REFRESH_MS = 60 * 60_000;
 const BITGET_REALITY_CATALOG_RETAIN_MS = 24 * 60 * 60_000;
-const BITGET_REALITY_MAP_MAX_LIMIT = 100;
+const BITGET_REALITY_MAP_MAX_LIMIT = 1000;
 
 let bitgetRealityCatalogRows = [];
 let bitgetRealityByUnderlying = new Map();

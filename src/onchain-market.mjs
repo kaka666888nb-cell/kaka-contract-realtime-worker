@@ -1,4 +1,4 @@
-// Step1041 / Render 650.8.15.196.9.2.1
+// Step1041 / Render 650.8.15.196.10
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,8 +7,8 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.196.9.2.1';
-const DATA_VERSION = 104100921;
+const VERSION = '650.8.15.196.10';
+const DATA_VERSION = 104101000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
@@ -4272,6 +4272,71 @@ function runSelfTest() {
   return responseBase({ ok: tests.every((x) => x.pass), test_count: tests.length, passed: tests.filter((x) => x.pass).length, failed: tests.filter((x) => !x.pass).length, tests });
 }
 
+
+function onchainRankSortKey(raw) {
+  const value = lower(raw);
+  if (['change_desc','gainers','gain'].includes(value)) return 'change_desc';
+  if (['change_asc','losers','loss'].includes(value)) return 'change_asc';
+  if (['volume_desc','turnover_desc','volume'].includes(value)) return 'volume_desc';
+  if (['liquidity_desc','liquidity'].includes(value)) return 'liquidity_desc';
+  if (['market_cap_desc','market_cap','cap'].includes(value)) return 'market_cap_desc';
+  return 'default';
+}
+
+function onchainRankNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function onchainRankCompareNullable(a, b, descending = false) {
+  const av = onchainRankNumber(a);
+  const bv = onchainRankNumber(b);
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  return descending ? bv - av : av - bv;
+}
+
+function onchainRankRows(rows, sortKey) {
+  if (sortKey === 'default') return rows.map((row) => ({ ...row }));
+  return rows.map((row) => ({ ...row })).sort((a, b) => {
+    let cmp = 0;
+    if (sortKey === 'change_desc') cmp = onchainRankCompareNullable(a?.price_change_pct?.h24, b?.price_change_pct?.h24, true);
+    else if (sortKey === 'change_asc') cmp = onchainRankCompareNullable(a?.price_change_pct?.h24, b?.price_change_pct?.h24, false);
+    else if (sortKey === 'volume_desc') cmp = onchainRankCompareNullable(a?.volume_usd?.h24, b?.volume_usd?.h24, true);
+    else if (sortKey === 'liquidity_desc') cmp = onchainRankCompareNullable(a?.liquidity_usd, b?.liquidity_usd, true);
+    else if (sortKey === 'market_cap_desc') cmp = onchainRankCompareNullable(a?.market_cap_usd, b?.market_cap_usd, true);
+    if (!cmp) cmp = onchainRankCompareNullable(a?.liquidity_usd, b?.liquidity_usd, true);
+    if (!cmp) cmp = onchainRankCompareNullable(a?.volume_usd?.h24, b?.volume_usd?.h24, true);
+    if (!cmp) {
+      const aKey = `${lower(a?.network)}|${lower(a?.token?.address)}|${lower(a?.best_pool?.pool_address)}`;
+      const bKey = `${lower(b?.network)}|${lower(b?.token?.address)}|${lower(b?.best_pool?.pool_address)}`;
+      cmp = aKey.localeCompare(bKey);
+    }
+    return cmp;
+  });
+}
+
+function onchainRankPage(rows, { sort = 'default', offset = 0, limit = 50 } = {}) {
+  const sortKey = onchainRankSortKey(sort);
+  const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
+  const safeLimit = Math.max(1, Math.min(50, Math.trunc(Number(limit) || 50)));
+  const ranked = onchainRankRows(rows, sortKey);
+  const page = ranked.slice(safeOffset, safeOffset + safeLimit).map((row, index) => ({
+    ...row,
+    rank_index: safeOffset + index + 1,
+  }));
+  return {
+    sort: sortKey,
+    total_ranked_rows: ranked.length,
+    offset: safeOffset,
+    limit: safeLimit,
+    has_more: safeOffset + page.length < ranked.length,
+    next_offset: safeOffset + page.length < ranked.length ? safeOffset + page.length : null,
+    rows: page,
+  };
+}
+
 export async function handleOnchainMarket(req, res, url) {
   const path = url?.pathname || '';
   if (![HEALTH_ROUTE, SELF_TEST_ROUTE, TRENDING_ROUTE, SEARCH_ROUTE, TOKEN_ROUTE, POOLS_ROUTE, KLINES_ROUTE, POOL_PRICE_ROUTE, TRADES_ROUTE, NEW_POOLS_ROUTE, FX_REFERENCE_ROUTE, HOLDERS_ROUTE, SECURITY_ROUTE, TOKEN_WALLETS_ROUTE, WALLET_QUICKVIEW_ROUTE, RELATIONS_ROUTE, OVERVIEW_ROUTE].includes(path)) return false;
@@ -4526,13 +4591,29 @@ export async function handleOnchainMarket(req, res, url) {
   if (path === TRENDING_ROUTE) {
     stats.step1041_shared_snapshot_reads += 1;
     if (!network) { sendJson(res, 400, responseBase({ ok: false, error: 'invalid_network' })); return true; }
-    const rows = discoveryRows(network, Math.min(limit, STEP1041_HOT_MAX_ROWS));
+    const sourceRows = discoveryRows(network, STEP1041_HOT_MAX_ROWS);
+    const rankPage = onchainRankPage(sourceRows, {
+      sort: url.searchParams.get('sort') || 'default',
+      offset: url.searchParams.get('offset') || 0,
+      limit,
+    });
+    const rows = rankPage.rows;
     const ageMs = discoveryUpdatedAt ? Math.max(0, Date.now() - discoveryUpdatedAt) : null;
-    if (!rows.length && (!discoveryUpdatedAt || ageMs > DISCOVERY_RETAIN_MS)) {
+    if (!rows.length && !sourceRows.length && (!discoveryUpdatedAt || ageMs > DISCOVERY_RETAIN_MS)) {
       sendJson(res, 503, responseBase({ ok: false, error: 'onchain_shared_recent_hot_not_ready', network, rows: [], user_read_upstream_requests: 0 }));
       return true;
     }
-    sendJson(res, 200, responseBase({ network, rows, row_count: rows.length, generated_at: marketUpdatedAt ? new Date(marketUpdatedAt).toISOString() : (discoveryUpdatedAt ? new Date(discoveryUpdatedAt).toISOString() : null), shared_snapshot_age_ms: marketUpdatedAt ? Math.max(0, Date.now() - marketUpdatedAt) : ageMs, user_read_upstream_requests: 0, cache_status: 'background_shared' }));
+    sendJson(res, 200, responseBase({
+      network,
+      ...rankPage,
+      row_count: rows.length,
+      ranking_happens_before_pagination: true,
+      supported_sorts: ['default','market_cap_desc','change_desc','change_asc','volume_desc','liquidity_desc'],
+      generated_at: marketUpdatedAt ? new Date(marketUpdatedAt).toISOString() : (discoveryUpdatedAt ? new Date(discoveryUpdatedAt).toISOString() : null),
+      shared_snapshot_age_ms: marketUpdatedAt ? Math.max(0, Date.now() - marketUpdatedAt) : ageMs,
+      user_read_upstream_requests: 0,
+      cache_status: 'background_shared',
+    }));
     return true;
   }
 
@@ -4585,13 +4666,21 @@ export async function handleOnchainMarket(req, res, url) {
   if (path === NEW_POOLS_ROUTE) {
     stats.step1041_shared_snapshot_reads += 1;
     if (!network) { sendJson(res, 400, responseBase({ ok: false, error: 'invalid_network', rows: [] })); return true; }
-    const rows = recentCandidatePools(network, Math.min(limit, STEP1041_NEW_MAX_ROWS));
+    const sourceRows = recentCandidatePools(network, STEP1041_NEW_MAX_ROWS);
+    const rankPage = onchainRankPage(sourceRows, {
+      sort: url.searchParams.get('sort') || 'default',
+      offset: url.searchParams.get('offset') || 0,
+      limit,
+    });
+    const rows = rankPage.rows;
     sendJson(res, 200, responseBase({
       feature_schema_version: STEP1041_FEATURE_SCHEMA_VERSION,
       network,
-      rows,
+      ...rankPage,
       row_count: rows.length,
       max_rows: STEP1041_NEW_MAX_ROWS,
+      ranking_happens_before_pagination: true,
+      supported_sorts: ['default','market_cap_desc','change_desc','change_asc','volume_desc','liquidity_desc'],
       cache_status: 'background_shared',
       coverage: 'newest_pool_among_current_objective_and_supplemental_candidate_tokens_not_token_contract_creation_and_not_exhaustive_chain_scan',
       new_pool_max_age_ms: STEP1041_NEW_POOL_MAX_AGE_MS,

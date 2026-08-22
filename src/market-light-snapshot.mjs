@@ -1,8 +1,9 @@
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.168';
+const STEP_VERSION = '650.8.15.196.10';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
+const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const HEALTH_ROUTE = '/api/market-light/health';
 const SECTOR_SNAPSHOT_ROUTE = '/api/crypto-sector-professional/current-snapshot';
 const SECTOR_HEALTH_ROUTE = '/api/crypto-sector-professional/health';
@@ -144,6 +145,53 @@ const directoryCountByKey = new Map();
 const directoryRowsByKey = new Map();
 const directoryUpdatedAtByKey = new Map();
 const responseCache = new Map();
+
+// Step1041.6 / Render650.8.15.196.10: shared full-market ranking index.
+// Ranking is computed from the already-collected shared market-light rows BEFORE
+// pagination. User reads never start exchange requests and the App still receives
+// only 50 ranked assets per page. A rank_version freezes the ORDER (not full market
+// payloads) across subsequent +50 pages, preventing duplicates/missing rows while
+// realtime prices continue to move. Market-cap metadata is a fixed background job:
+// CoinGecko top 5000 every 6h plus one global symbol-identity list at most daily.
+const RANK_PAGE_LIMIT_MAX = 50;
+const RANK_RESPONSE_CACHE_TTL_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_RANK_RESPONSE_CACHE_TTL_MS || 5_000));
+const RANK_ORDER_SNAPSHOT_TTL_MS = Math.max(60_000, Number(process.env.KAKA_MARKET_RANK_ORDER_TTL_MS || 3 * 60_000));
+const RANK_ORDER_SNAPSHOT_MAX = Math.max(4, Math.min(24, Number(process.env.KAKA_MARKET_RANK_ORDER_MAX || 16)));
+const MARKET_CAP_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_MARKET_CAP_RANK_REFRESH_MS || 6 * 60 * 60_000));
+const MARKET_CAP_START_DELAY_MS = Math.max(8_000, Number(process.env.KAKA_MARKET_CAP_RANK_START_DELAY_MS || 20_000));
+const MARKET_CAP_PAGES = Math.max(1, Math.min(24, Number(process.env.KAKA_MARKET_CAP_RANK_PAGES || 20)));
+const MARKET_CAP_PAGE_SIZE = 250;
+const MARKET_CAP_GLOBAL_SYMBOL_REFRESH_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_MARKET_CAP_SYMBOL_LIST_REFRESH_MS || 24 * 60 * 60_000));
+const rankedPageCache = new Map();
+const rankOrderSnapshots = new Map();
+const rankCurrentBySignature = new Map();
+let rankOrderSnapshotSeq = 0;
+const marketCapBySymbol = new Map();
+const marketCapAmbiguousSymbols = new Set();
+const marketCapGlobalSymbolCounts = new Map();
+let marketCapGlobalSymbolListAt = 0;
+let marketCapGlobalSymbolRows = 0;
+let marketCapRankVersion = 0;
+let marketCapRefreshInflight = null;
+let marketCapRefreshTimer = null;
+let marketCapRefreshInterval = null;
+let marketCapRetryTimer = null;
+let marketCapLastStartedAt = null;
+let marketCapLastSucceededAt = null;
+let marketCapLastError = '';
+let marketCapRefreshAttempts = 0;
+let marketCapRefreshSuccesses = 0;
+let marketCapRefreshFailures = 0;
+let marketCapRows = 0;
+let marketCapUniqueSymbols = 0;
+let marketCapDuplicateSymbols = 0;
+let rankPageReads = 0;
+let rankPageBuilds = 0;
+let rankPageCacheHits = 0;
+let rankOrderSnapshotBuilds = 0;
+let rankOrderSnapshotHits = 0;
+let rankOrderSnapshotExpired = 0;
+
 let sectorSnapshotCache = null;
 let sectorSnapshotCacheAt = 0;
 let sectorSnapshotBuilds = 0;
@@ -1999,6 +2047,7 @@ export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {})
     round = cycleRound;
     lastCompletedAt = new Date().toISOString();
     responseCache.clear();
+    rankedPageCache.clear();
     if (successful > 0) {
       maybeArchiveCryptoSectorSnapshot(buildSectorProfessionalSnapshot()).catch(() => {});
     }
@@ -2015,6 +2064,7 @@ export function startMarketLightSnapshotScanner() {
   if (started || process.env.KAKA_DISABLE_MARKET_LIGHT_SCANNER === '1') return;
   started = true;
   primeCryptoSectorHistory();
+  startMarketCapRankCollector();
   ensureCoinbaseTickerBatch().catch(() => {});
   ensureBinanceSpotMiniTicker().catch(() => {});
   refreshBinanceSpotTickerBaseline().catch(() => {});
@@ -2034,6 +2084,529 @@ export function startMarketLightSnapshotScanner() {
     ensureBinanceContractBookTicker().catch(() => {});
   }, DIRECTORY_INTERVAL_MS);
   directoryInterval.unref?.();
+}
+
+
+function marketRankNormalizeBase(raw) {
+  let value = compact(raw);
+  if (value === 'XBT') value = 'BTC';
+  if (/^1000[A-Z0-9]+$/.test(value)) value = value.slice(4);
+  return value;
+}
+
+function marketRankBaseFromRow(row) {
+  const explicit = compact(row?.base_asset);
+  if (explicit) return marketRankNormalizeBase(explicit);
+  const quote = compact(row?.quote_asset ?? row?.quote_symbol);
+  const symbol = compact(row?.symbol);
+  if (quote && symbol.endsWith(quote) && symbol.length > quote.length) {
+    return marketRankNormalizeBase(symbol.slice(0, -quote.length));
+  }
+  return marketRankNormalizeBase(symbol);
+}
+
+function marketRankNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function marketRankCapForBase(base) {
+  const key = marketRankNormalizeBase(base);
+  const item = key ? marketCapBySymbol.get(key) : null;
+  return item ? { ...item } : null;
+}
+
+function marketRankCompareNullable(a, b, { descending = false } = {}) {
+  const av = marketRankNumber(a);
+  const bv = marketRankNumber(b);
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  return descending ? bv - av : av - bv;
+}
+
+function marketRankSortKey(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  if (['change_desc','gainers','gain'].includes(value)) return 'change_desc';
+  if (['change_asc','losers','loss'].includes(value)) return 'change_asc';
+  if (['volume_desc','turnover_desc','volume'].includes(value)) return 'volume_desc';
+  if (['market_cap_desc','market_cap','cap','symbol'].includes(value)) return 'market_cap_desc';
+  return 'market_cap_desc';
+}
+
+function marketRankEntryComparator(sortKey) {
+  return (a, b) => {
+    let cmp = 0;
+    if (sortKey === 'change_desc') {
+      cmp = marketRankCompareNullable(a.change_desc, b.change_desc, { descending: true });
+    } else if (sortKey === 'change_asc') {
+      cmp = marketRankCompareNullable(a.change_asc, b.change_asc, { descending: false });
+    } else if (sortKey === 'volume_desc') {
+      cmp = marketRankCompareNullable(a.volume_desc, b.volume_desc, { descending: true });
+    } else {
+      const ar = marketRankNumber(a.market_cap_rank);
+      const br = marketRankNumber(b.market_cap_rank);
+      if (ar != null || br != null) {
+        if (ar == null) return 1;
+        if (br == null) return -1;
+        cmp = ar - br;
+      }
+      if (!cmp) {
+        cmp = marketRankCompareNullable(a.market_cap_usd, b.market_cap_usd, { descending: true });
+      }
+    }
+    if (!cmp) cmp = marketRankCompareNullable(a.volume_desc, b.volume_desc, { descending: true });
+    if (!cmp) cmp = String(a.rank_identity).localeCompare(String(b.rank_identity));
+    return cmp;
+  };
+}
+
+function buildMarketRankEntries({ market, provider = '', quote = '', sortKey }) {
+  const providers = market === 'spot' ? SPOT_PROVIDERS : CONTRACT_PROVIDERS;
+  const selectedProviders = provider && provider !== 'all' ? [provider] : providers;
+  const quoteFilter = compact(quote);
+  const rows = [];
+  for (const providerName of selectedProviders) {
+    for (const row of rowsByKey.get(keyFor(market, providerName)) || []) {
+      const rowQuote = compact(row?.quote_asset ?? row?.quote_symbol);
+      if (quoteFilter && rowQuote !== quoteFilter) continue;
+      rows.push({ ...row });
+    }
+  }
+
+  // Spot "all providers" is an asset ranking, matching the existing App UI:
+  // one base asset occupies one ranked position while exact venue rows remain
+  // available inside venue_rows. Provider-specific spot and all contract pages
+  // keep exact provider+symbol identity.
+  if (market === 'spot' && (!provider || provider === 'all')) {
+    const grouped = new Map();
+    for (const row of rows) {
+      const base = marketRankBaseFromRow(row);
+      if (!base) continue;
+      const list = grouped.get(base) || [];
+      list.push(row);
+      grouped.set(base, list);
+    }
+    const entries = [];
+    for (const [base, venueRows] of grouped.entries()) {
+      const changes = venueRows.map((row) => marketRankNumber(row?.price_change_percent_24h)).filter((v) => v != null);
+      const volumes = venueRows.map((row) => marketRankNumber(row?.quote_volume_24h)).filter((v) => v != null && v >= 0);
+      const cap = marketRankCapForBase(base);
+      const representative = [...venueRows].sort((a, b) => {
+        const byVolume = marketRankCompareNullable(a?.quote_volume_24h, b?.quote_volume_24h, { descending: true });
+        if (byVolume) return byVolume;
+        return `${a?.provider || ''}|${a?.symbol || ''}`.localeCompare(`${b?.provider || ''}|${b?.symbol || ''}`);
+      })[0] || null;
+      entries.push({
+        rank_identity: base,
+        base_asset: base,
+        provider: 'all',
+        market_type: 'spot',
+        quote_asset: quoteFilter || null,
+        change_desc: changes.length ? Math.max(...changes) : null,
+        change_asc: changes.length ? Math.min(...changes) : null,
+        volume_desc: volumes.length ? Math.max(...volumes) : null,
+        market_cap_rank: cap?.market_cap_rank ?? null,
+        market_cap_usd: cap?.market_cap_usd ?? null,
+        coingecko_id: cap?.coingecko_id ?? null,
+        representative_row: representative,
+        venue_rows: venueRows,
+      });
+    }
+    return entries.sort(marketRankEntryComparator(sortKey));
+  }
+
+  const entries = rows.map((row) => {
+    const base = marketRankBaseFromRow(row);
+    const cap = marketRankCapForBase(base);
+    const change = marketRankNumber(row?.price_change_percent_24h);
+    const volume = marketRankNumber(row?.quote_volume_24h);
+    return {
+      rank_identity: `${String(row?.provider || '').trim().toLowerCase()}|${market}|${compact(row?.symbol)}`,
+      base_asset: base,
+      provider: String(row?.provider || ''),
+      market_type: market,
+      quote_asset: compact(row?.quote_asset ?? row?.quote_symbol) || null,
+      change_desc: change,
+      change_asc: change,
+      volume_desc: volume,
+      market_cap_rank: cap?.market_cap_rank ?? null,
+      market_cap_usd: cap?.market_cap_usd ?? null,
+      coingecko_id: cap?.coingecko_id ?? null,
+      row,
+    };
+  });
+  return entries.sort(marketRankEntryComparator(sortKey));
+}
+
+function marketRankSnapshotSignature({ market, provider = '', quote = '', sortKey }) {
+  return `${market}|${provider || 'all'}|${compact(quote) || 'all'}|${sortKey}`;
+}
+
+function pruneMarketRankOrderSnapshots() {
+  const now = Date.now();
+  for (const [key, value] of rankOrderSnapshots.entries()) {
+    if (now - Number(value?.created_at_ms || 0) > RANK_ORDER_SNAPSHOT_TTL_MS) {
+      rankOrderSnapshots.delete(key);
+      for (const [signature, version] of rankCurrentBySignature.entries()) if (version === key) rankCurrentBySignature.delete(signature);
+      rankOrderSnapshotExpired += 1;
+    }
+  }
+  if (rankOrderSnapshots.size <= RANK_ORDER_SNAPSHOT_MAX) return;
+  const oldest = [...rankOrderSnapshots.entries()]
+    .sort((a, b) => Number(a[1]?.created_at_ms || 0) - Number(b[1]?.created_at_ms || 0));
+  while (oldest.length > RANK_ORDER_SNAPSHOT_MAX) {
+    const [key] = oldest.shift();
+    rankOrderSnapshots.delete(key);
+    for (const [signature, version] of rankCurrentBySignature.entries()) if (version === key) rankCurrentBySignature.delete(signature);
+  }
+}
+
+function marketRankMetricValue(entry, sortKey) {
+  if (sortKey === 'change_desc') return marketRankNumber(entry?.change_desc);
+  if (sortKey === 'change_asc') return marketRankNumber(entry?.change_asc);
+  if (sortKey === 'volume_desc') return marketRankNumber(entry?.volume_desc);
+  return marketRankNumber(entry?.market_cap_rank);
+}
+
+function createMarketRankOrderSnapshot({ market, provider = '', quote = '', sortKey }) {
+  pruneMarketRankOrderSnapshots();
+  const signature = marketRankSnapshotSignature({ market, provider, quote, sortKey });
+  const ranked = buildMarketRankEntries({ market, provider, quote, sortKey });
+  const createdAtMs = Date.now();
+  rankOrderSnapshotSeq += 1;
+  const rankVersion = `mlr-${round}-${marketCapRankVersion}-${rankOrderSnapshotSeq}`;
+  const order = ranked.map((entry) => ({
+    rank_identity: String(entry?.rank_identity || ''),
+    base_asset: compact(entry?.base_asset) || null,
+    provider: String(entry?.provider || ''),
+    market_type: market,
+    quote_asset: compact(entry?.quote_asset) || null,
+    market_cap_rank: marketRankNumber(entry?.market_cap_rank),
+    market_cap_usd: marketRankNumber(entry?.market_cap_usd),
+    coingecko_id: entry?.coingecko_id || null,
+    rank_metric_value: marketRankMetricValue(entry, sortKey),
+  })).filter((entry) => entry.rank_identity);
+  const snapshot = {
+    rank_version: rankVersion,
+    signature,
+    market,
+    provider: provider || 'all',
+    quote: compact(quote) || '',
+    sort: sortKey,
+    created_at_ms: createdAtMs,
+    market_light_round: round,
+    market_cap_rank_version: marketCapRankVersion,
+    order,
+  };
+  rankOrderSnapshots.set(rankVersion, snapshot);
+  rankCurrentBySignature.set(signature, rankVersion);
+  rankOrderSnapshotBuilds += 1;
+  pruneMarketRankOrderSnapshots();
+  return snapshot;
+}
+
+function getMarketRankOrderSnapshot(rankVersion, scope) {
+  if (!rankVersion) return null;
+  pruneMarketRankOrderSnapshots();
+  const snapshot = rankOrderSnapshots.get(rankVersion);
+  if (!snapshot) return null;
+  const signature = marketRankSnapshotSignature(scope);
+  if (snapshot.signature !== signature) return null;
+  rankOrderSnapshotHits += 1;
+  return snapshot;
+}
+
+function getOrCreateCurrentMarketRankOrderSnapshot(scope) {
+  pruneMarketRankOrderSnapshots();
+  const signature = marketRankSnapshotSignature(scope);
+  const version = rankCurrentBySignature.get(signature);
+  const current = version ? rankOrderSnapshots.get(version) : null;
+  if (current &&
+      current.market_light_round === round &&
+      current.market_cap_rank_version === marketCapRankVersion &&
+      Date.now() - Number(current.created_at_ms || 0) <= RANK_ORDER_SNAPSHOT_TTL_MS) {
+    rankOrderSnapshotHits += 1;
+    return current;
+  }
+  return createMarketRankOrderSnapshot(scope);
+}
+
+function currentMarketRowsForRankScope({ market, provider = '', quote = '' }) {
+  const providers = market === 'spot' ? SPOT_PROVIDERS : CONTRACT_PROVIDERS;
+  const selectedProviders = provider && provider !== 'all' ? [provider] : providers;
+  const quoteFilter = compact(quote);
+  const exact = new Map();
+  const spotByBase = new Map();
+  for (const providerName of selectedProviders) {
+    for (const row of rowsByKey.get(keyFor(market, providerName)) || []) {
+      const rowQuote = compact(row?.quote_asset ?? row?.quote_symbol);
+      if (quoteFilter && rowQuote !== quoteFilter) continue;
+      const symbol = compact(row?.symbol);
+      if (!symbol) continue;
+      exact.set(`${String(row?.provider || '').trim().toLowerCase()}|${market}|${symbol}`, row);
+      if (market === 'spot') {
+        const base = marketRankBaseFromRow(row);
+        if (!base) continue;
+        const list = spotByBase.get(base) || [];
+        list.push(row);
+        spotByBase.set(base, list);
+      }
+    }
+  }
+  return { exact, spotByBase };
+}
+
+function materializeMarketRankItem(orderEntry, { market, provider = '', quote = '' }, current) {
+  if (market === 'spot' && (!provider || provider === 'all')) {
+    const venueRows = current.spotByBase.get(compact(orderEntry?.base_asset)) || [];
+    const representative = [...venueRows].sort((a, b) => {
+      const byVolume = marketRankCompareNullable(a?.quote_volume_24h, b?.quote_volume_24h, { descending: true });
+      if (byVolume) return byVolume;
+      return `${a?.provider || ''}|${a?.symbol || ''}`.localeCompare(`${b?.provider || ''}|${b?.symbol || ''}`);
+    })[0] || null;
+    return {
+      ...orderEntry,
+      representative_row: representative,
+      venue_rows: venueRows,
+    };
+  }
+  return {
+    ...orderEntry,
+    row: current.exact.get(orderEntry.rank_identity) || null,
+  };
+}
+
+function marketRankedPagePayload({ market, provider = '', quote = '', sort = 'market_cap_desc', offset = 0, limit = 50, rankVersion = '' }) {
+  const safeSort = marketRankSortKey(sort);
+  if (safeSort === 'market_cap_desc' && (marketCapBySymbol.size === 0 || marketCapGlobalSymbolCounts.size === 0)) {
+    return {
+      ok: false,
+      status_code: 503,
+      version: STEP_VERSION,
+      schema_version: 'step1041_6_shared_full_market_rank_page_v2',
+      error: 'shared_market_cap_rank_pending',
+      market_cap_index: {
+        ready: false,
+        refresh_attempts: marketCapRefreshAttempts,
+        refresh_successes: marketCapRefreshSuccesses,
+        refresh_failures: marketCapRefreshFailures,
+        last_error: marketCapLastError,
+      },
+      user_read_upstream_requests: 0,
+      reads_scale_with_users: false,
+    };
+  }
+  const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
+  const safeLimit = Math.max(1, Math.min(RANK_PAGE_LIMIT_MAX, Math.trunc(Number(limit) || 50)));
+  const scope = { market, provider, quote, sortKey: safeSort };
+  let snapshot = getMarketRankOrderSnapshot(String(rankVersion || '').trim(), scope);
+  if (rankVersion && !snapshot) {
+    return {
+      ok: false,
+      status_code: 409,
+      version: STEP_VERSION,
+      schema_version: 'step1041_6_shared_full_market_rank_page_v2',
+      error: 'rank_version_expired_or_scope_mismatch',
+      rank_version: String(rankVersion || ''),
+      restart_from_offset: 0,
+      user_read_upstream_requests: 0,
+      reads_scale_with_users: false,
+    };
+  }
+  if (!snapshot) snapshot = getOrCreateCurrentMarketRankOrderSnapshot(scope);
+
+  const cacheKey = `${snapshot.rank_version}|${safeOffset}|${safeLimit}`;
+  const cached = rankedPageCache.get(cacheKey);
+  if (cached && Date.now() - cached.at <= RANK_RESPONSE_CACHE_TTL_MS) {
+    rankPageCacheHits += 1;
+    return { ...cached.payload, cache_hit: true, cache_age_ms: Date.now() - cached.at };
+  }
+
+  rankPageBuilds += 1;
+  const current = currentMarketRowsForRankScope({ market, provider, quote });
+  const pageOrder = snapshot.order.slice(safeOffset, safeOffset + safeLimit);
+  const page = pageOrder.map((entry, index) => ({
+    ...materializeMarketRankItem(entry, { market, provider, quote }, current),
+    rank_index: safeOffset + index + 1,
+  }));
+  const payload = {
+    ok: true,
+    version: STEP_VERSION,
+    schema_version: 'step1041_6_shared_full_market_rank_page_v2',
+    source: 'render_shared_market_light_rank_order_before_pagination',
+    market_type: market,
+    provider: provider || 'all',
+    quote_asset: compact(quote) || null,
+    sort: safeSort,
+    rank_version: snapshot.rank_version,
+    rank_snapshot_created_at: new Date(snapshot.created_at_ms).toISOString(),
+    rank_snapshot_ttl_ms: RANK_ORDER_SNAPSHOT_TTL_MS,
+    market_light_round: snapshot.market_light_round,
+    total_items: snapshot.order.length,
+    offset: safeOffset,
+    limit: safeLimit,
+    returned_items: page.length,
+    has_more: safeOffset + page.length < snapshot.order.length,
+    next_offset: safeOffset + page.length < snapshot.order.length ? safeOffset + page.length : null,
+    market_cap_index: {
+      ready: marketCapBySymbol.size > 0,
+      version: marketCapRankVersion,
+      rows: marketCapRows,
+      unique_symbols: marketCapUniqueSymbols,
+      ambiguous_symbols: marketCapDuplicateSymbols,
+      global_symbol_identity_rows: marketCapGlobalSymbolRows,
+      global_symbol_identity_ready: marketCapGlobalSymbolCounts.size > 0,
+      last_succeeded_at: marketCapLastSucceededAt,
+    },
+    read_only_shared: true,
+    user_read_upstream_requests: 0,
+    user_read_upstream_connections: 0,
+    reads_scale_with_users: false,
+    ranking_happens_before_pagination: true,
+    pagination_order_frozen_by_rank_version: true,
+    app_page_size_remains_50: true,
+    items: page,
+    generated_at: new Date().toISOString(),
+  };
+  rankedPageCache.set(cacheKey, { at: Date.now(), payload });
+  while (rankedPageCache.size > 96) rankedPageCache.delete(rankedPageCache.keys().next().value);
+  return { ...payload, cache_hit: false, cache_age_ms: 0 };
+}
+
+function coingeckoConfig() {
+  const proKey = String(process.env.COINGECKO_PRO_API_KEY || '').trim();
+  const demoKey = String(process.env.COINGECKO_DEMO_API_KEY || process.env.CG_DEMO_API_KEY || '').trim();
+  if (proKey) return { base: 'https://pro-api.coingecko.com/api/v3', headerName: 'x-cg-pro-api-key', key: proKey };
+  if (demoKey) return { base: 'https://api.coingecko.com/api/v3', headerName: 'x-cg-demo-api-key', key: demoKey };
+  return { base: 'https://api.coingecko.com/api/v3', headerName: '', key: '' };
+}
+
+async function fetchCoinGeckoMarketPage(page) {
+  const cfg = coingeckoConfig();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  timer.unref?.();
+  try {
+    const headers = { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.15.196.10 shared-market-cap-rank' };
+    if (cfg.headerName && cfg.key) headers[cfg.headerName] = cfg.key;
+    const url = `${cfg.base}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${MARKET_CAP_PAGE_SIZE}&page=${page}&sparkline=false`;
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok) throw new Error(`coingecko_market_cap_http_${response.status}`);
+    const payload = await response.json();
+    if (!Array.isArray(payload)) throw new Error('coingecko_market_cap_payload_invalid');
+    return payload;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshCoinGeckoGlobalSymbolCounts() {
+  const ageMs = marketCapGlobalSymbolListAt > 0 ? Date.now() - marketCapGlobalSymbolListAt : Number.POSITIVE_INFINITY;
+  if (marketCapGlobalSymbolCounts.size > 0 && ageMs <= MARKET_CAP_GLOBAL_SYMBOL_REFRESH_MS) return true;
+  const cfg = coingeckoConfig();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  timer.unref?.();
+  try {
+    const headers = { accept: 'application/json', 'user-agent': 'KakaWeb3/650.8.15.196.10 shared-market-cap-identity' };
+    if (cfg.headerName && cfg.key) headers[cfg.headerName] = cfg.key;
+    const response = await fetch(`${cfg.base}/coins/list?include_platform=false`, { headers, signal: controller.signal });
+    if (!response.ok) throw new Error(`coingecko_coin_list_http_${response.status}`);
+    const payload = await response.json();
+    if (!Array.isArray(payload) || payload.length < 1000) throw new Error('coingecko_coin_list_payload_invalid');
+    const next = new Map();
+    for (const raw of payload) {
+      const symbol = marketRankNormalizeBase(raw?.symbol);
+      if (!symbol) continue;
+      next.set(symbol, Number(next.get(symbol) || 0) + 1);
+    }
+    if (!next.size) throw new Error('coingecko_coin_list_symbol_index_empty');
+    marketCapGlobalSymbolCounts.clear();
+    for (const [symbol, count] of next.entries()) marketCapGlobalSymbolCounts.set(symbol, count);
+    marketCapGlobalSymbolListAt = Date.now();
+    marketCapGlobalSymbolRows = payload.length;
+    return true;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
+  if (marketCapRefreshInflight) return marketCapRefreshInflight;
+  const task = (async () => {
+    marketCapRefreshAttempts += 1;
+    marketCapLastStartedAt = new Date().toISOString();
+    try {
+      await refreshCoinGeckoGlobalSymbolCounts();
+      const all = [];
+      for (let page = 1; page <= MARKET_CAP_PAGES; page += 1) {
+        const rows = await fetchCoinGeckoMarketPage(page);
+        all.push(...rows);
+        if (page < MARKET_CAP_PAGES) await new Promise((resolve) => setTimeout(resolve, 4_200));
+      }
+      const candidatesBySymbol = new Map();
+      for (const raw of all) {
+        const symbol = marketRankNormalizeBase(raw?.symbol);
+        const rank = marketRankNumber(raw?.market_cap_rank);
+        const marketCap = marketRankNumber(raw?.market_cap);
+        const id = String(raw?.id || '').trim();
+        if (!symbol || rank == null || rank <= 0 || !id) continue;
+        const list = candidatesBySymbol.get(symbol) || [];
+        list.push({ coingecko_id: id, market_cap_rank: Math.trunc(rank), market_cap_usd: marketCap != null && marketCap >= 0 ? marketCap : null });
+        candidatesBySymbol.set(symbol, list);
+      }
+      const next = new Map();
+      const ambiguous = new Set();
+      for (const [symbol, candidates] of candidatesBySymbol.entries()) {
+        candidates.sort((a, b) => a.market_cap_rank - b.market_cap_rank || a.coingecko_id.localeCompare(b.coingecko_id));
+        const globalCount = Number(marketCapGlobalSymbolCounts.get(symbol) || 0);
+        if (candidates.length === 1 && globalCount === 1) next.set(symbol, candidates[0]);
+        else ambiguous.add(symbol);
+      }
+      if (!next.size) throw new Error('coingecko_market_cap_index_empty');
+      marketCapBySymbol.clear();
+      for (const [symbol, item] of next.entries()) marketCapBySymbol.set(symbol, item);
+      marketCapAmbiguousSymbols.clear();
+      for (const symbol of ambiguous) marketCapAmbiguousSymbols.add(symbol);
+      marketCapRows = all.length;
+      marketCapUniqueSymbols = next.size;
+      marketCapDuplicateSymbols = ambiguous.size;
+      marketCapRankVersion += 1;
+      marketCapLastSucceededAt = new Date().toISOString();
+      marketCapLastError = '';
+      marketCapRefreshSuccesses += 1;
+      if (marketCapRetryTimer) { clearTimeout(marketCapRetryTimer); marketCapRetryTimer = null; }
+      rankedPageCache.clear();
+      return true;
+    } catch (error) {
+      marketCapRefreshFailures += 1;
+      marketCapLastError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
+      if (!marketCapRetryTimer) {
+        marketCapRetryTimer = setTimeout(() => {
+          marketCapRetryTimer = null;
+          refreshMarketCapRankIndex({ reason: 'bounded_retry_after_failure' }).catch(() => {});
+        }, 30 * 60_000);
+        marketCapRetryTimer.unref?.();
+      }
+      return false;
+    }
+  })();
+  marketCapRefreshInflight = task;
+  try { return await task; }
+  finally { if (marketCapRefreshInflight === task) marketCapRefreshInflight = null; }
+}
+
+function startMarketCapRankCollector() {
+  if (marketCapRefreshTimer || marketCapRefreshInterval) return;
+  marketCapRefreshTimer = setTimeout(() => {
+    refreshMarketCapRankIndex({ reason: 'startup' }).catch(() => {});
+  }, MARKET_CAP_START_DELAY_MS);
+  marketCapRefreshTimer.unref?.();
+  marketCapRefreshInterval = setInterval(() => {
+    refreshMarketCapRankIndex({ reason: 'interval' }).catch(() => {});
+  }, MARKET_CAP_REFRESH_MS);
+  marketCapRefreshInterval.unref?.();
 }
 
 function snapshotPayload({ market = '', provider = '', includeRows = true, offset = 0, limit = null } = {}) {
@@ -2472,7 +3045,54 @@ export function getMarketLightSnapshotHealth() {
     enabled: started || process.env.KAKA_DISABLE_MARKET_LIGHT_SCANNER !== '1',
     mode: 'shared_primary_quote_full_directory_light_snapshot',
     snapshot_endpoint: SNAPSHOT_ROUTE,
+    ranked_page_endpoint: RANKED_PAGE_ROUTE,
     health_endpoint: HEALTH_ROUTE,
+    shared_rank_index: {
+      schema_version: 'step1041_6_shared_full_market_rank_page_v2',
+      ranking_happens_before_pagination: true,
+      pagination_order_frozen_by_rank_version: true,
+      page_limit_max: RANK_PAGE_LIMIT_MAX,
+      response_cache_ttl_ms: RANK_RESPONSE_CACHE_TTL_MS,
+      order_snapshot_ttl_ms: RANK_ORDER_SNAPSHOT_TTL_MS,
+      order_snapshot_max: RANK_ORDER_SNAPSHOT_MAX,
+      order_snapshot_entries: rankOrderSnapshots.size,
+      current_shared_rank_scopes: rankCurrentBySignature.size,
+      order_snapshot_builds: rankOrderSnapshotBuilds,
+      order_snapshot_hits: rankOrderSnapshotHits,
+      order_snapshot_expired: rankOrderSnapshotExpired,
+      reads: rankPageReads,
+      builds: rankPageBuilds,
+      cache_hits: rankPageCacheHits,
+      cache_entries: rankedPageCache.size,
+      supported_sorts: ['market_cap_desc','change_desc','change_asc','volume_desc'],
+      primary_quote_shared_rows_only: true,
+      user_reads_start_upstream: false,
+      reads_scale_with_users: false,
+      market_cap: {
+        mode: 'background_coingecko_top5000_market_cap_plus_global_unique_symbol_identity',
+        refresh_interval_ms: MARKET_CAP_REFRESH_MS,
+        pages_per_refresh: MARKET_CAP_PAGES,
+        page_size: MARKET_CAP_PAGE_SIZE,
+        requests_per_refresh_max: MARKET_CAP_PAGES + 1,
+        version: marketCapRankVersion,
+        ready: marketCapBySymbol.size > 0 && marketCapGlobalSymbolCounts.size > 0,
+        rows: marketCapRows,
+        unique_symbols: marketCapUniqueSymbols,
+        ambiguous_symbols_excluded: marketCapDuplicateSymbols,
+        global_symbol_identity_rows: marketCapGlobalSymbolRows,
+        global_symbol_identity_ready: marketCapGlobalSymbolCounts.size > 0,
+        global_symbol_identity_refresh_ms: MARKET_CAP_GLOBAL_SYMBOL_REFRESH_MS,
+        refresh_attempts: marketCapRefreshAttempts,
+        refresh_successes: marketCapRefreshSuccesses,
+        refresh_failures: marketCapRefreshFailures,
+        last_started_at: marketCapLastStartedAt,
+        last_succeeded_at: marketCapLastSucceededAt,
+        last_error: marketCapLastError,
+        bounded_retry_pending: Boolean(marketCapRetryTimer),
+        bounded_retry_after_failure_ms: 30 * 60_000,
+        per_user_upstream_requests: 0,
+      },
+    },
     spot_providers: SPOT_PROVIDERS,
     contract_providers: CONTRACT_PROVIDERS,
     primary_quote_by_market_provider: PRIMARY_QUOTE,
@@ -2689,7 +3309,7 @@ function sendJson(res, status, payload) {
 export async function handleMarketLightSnapshot(req, res, url) {
   const sectorHistoryRoute = url.pathname === '/api/crypto-sector-professional/history' ||
     url.pathname === '/api/crypto-sector-professional/history-health';
-  if (![SNAPSHOT_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
+  if (![SNAPSHOT_ROUTE, RANKED_PAGE_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -2720,6 +3340,39 @@ export async function handleMarketLightSnapshot(req, res, url) {
     return true;
   }
   const market = String(url.searchParams.get('market_type') || url.searchParams.get('market') || '').trim().toLowerCase();
+  if (url.pathname === RANKED_PAGE_ROUTE) {
+    if (!['spot', 'contract'].includes(market)) {
+      sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'market_type_required_for_rank_page' });
+      return true;
+    }
+    const provider = String(url.searchParams.get('provider') || '').trim().toLowerCase();
+    const allowedProviders = market === 'contract' ? CONTRACT_PROVIDERS : SPOT_PROVIDERS;
+    if (provider && provider !== 'all' && !allowedProviders.includes(provider)) {
+      sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider' });
+      return true;
+    }
+    const quote = String(url.searchParams.get('quote') || url.searchParams.get('quote_asset') || '').trim().toUpperCase();
+    const sort = String(url.searchParams.get('sort') || 'market_cap_desc').trim().toLowerCase();
+    const offset = Math.max(0, Math.trunc(Number(url.searchParams.get('offset') || 0) || 0));
+    const limit = Math.max(1, Math.min(RANK_PAGE_LIMIT_MAX, Math.trunc(Number(url.searchParams.get('limit') || 50) || 50)));
+    const rankVersion = String(url.searchParams.get('rank_version') || '').trim();
+    if (offset > 0 && !rankVersion) {
+      sendJson(res, 400, {
+        ok: false,
+        version: STEP_VERSION,
+        error: 'rank_version_required_after_first_page',
+        restart_from_offset: 0,
+        user_read_upstream_requests: 0,
+      });
+      return true;
+    }
+    rankPageReads += 1;
+    const payload = marketRankedPagePayload({ market, provider, quote, sort, offset, limit, rankVersion });
+    const statusCode = Number(payload?.status_code || 200);
+    if (payload && Object.prototype.hasOwnProperty.call(payload, 'status_code')) delete payload.status_code;
+    sendJson(res, statusCode, payload);
+    return true;
+  }
   const provider = String(url.searchParams.get('provider') || '').trim().toLowerCase();
   if (market && !['spot', 'contract'].includes(market)) {
     sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_market_type' });

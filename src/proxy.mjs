@@ -12,7 +12,7 @@ import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurre
 import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ticker.mjs';
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
-import { getMarketLightSnapshotHealth, startMarketLightBridge } from './market-light-bridge.mjs';
+import { getMarketLightSnapshotHealth, getMarketLightInternalSnapshot, startMarketLightBridge } from './market-light-bridge.mjs';
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
 import { getProjectFundamentalsHealth, handleProjectFundamentals, startProjectFundamentalsCollector } from './project-fundamentals.mjs';
@@ -33,7 +33,7 @@ import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, reque
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.196.9.2.1';
+const STEP_VERSION = '650.8.15.196.10';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -294,6 +294,213 @@ function fetchChildJson(pathname, timeoutMs = 4_000) {
   });
 }
 
+
+// Step1041.6: Reality stock-token ranking is composed in the parent from two
+// already-shared memories only: the hourly Bitget Reality identity catalog in the
+// exchange-assets collector and the 2.5s parent market-light bridge. User reads
+// never start Bitget requests and still receive at most 50 items per page.
+const REALITY_RANK_ROUTE = '/api/asset-klines/reality-ranked-page';
+const REALITY_RANK_PAGE_MAX = 50;
+const REALITY_RANK_TTL_MS = Math.max(60_000, Number(process.env.KAKA_REALITY_RANK_TTL_MS || 3 * 60_000));
+const REALITY_RANK_MAX = Math.max(2, Math.min(12, Number(process.env.KAKA_REALITY_RANK_MAX || 8)));
+const realityRankSnapshots = new Map();
+const realityRankCurrentBySort = new Map();
+let realityRankSeq = 0;
+let realityRankReads = 0;
+let realityRankBuilds = 0;
+let realityRankHits = 0;
+let realityCatalogBridgeCache = null;
+let realityCatalogBridgeCacheAt = 0;
+const REALITY_CATALOG_BRIDGE_CACHE_MS = 60_000;
+
+function realityRankSortKey(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  if (['change_desc','gainers','gain'].includes(value)) return 'change_desc';
+  if (['change_asc','losers','loss'].includes(value)) return 'change_asc';
+  if (['volume_desc','turnover_desc','volume'].includes(value)) return 'volume_desc';
+  return 'name_asc';
+}
+
+function realityFinite(value) {
+  const n = Number(value); return Number.isFinite(n) ? n : null;
+}
+
+function realityCompareNullable(a, b, descending = false) {
+  const av = realityFinite(a); const bv = realityFinite(b);
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  return descending ? bv - av : av - bv;
+}
+
+async function getRealityCatalogShared() {
+  if (realityCatalogBridgeCache && Date.now() - realityCatalogBridgeCacheAt <= REALITY_CATALOG_BRIDGE_CACHE_MS) {
+    return realityCatalogBridgeCache;
+  }
+  const payload = await requestIsolatedJson('exchange-assets', '/api/asset-klines/reality-map?offset=0&limit=1000', 8_000);
+  if (!payload?.ok || !Array.isArray(payload?.rows)) throw new Error('reality_shared_catalog_not_ready');
+  realityCatalogBridgeCache = payload;
+  realityCatalogBridgeCacheAt = Date.now();
+  return payload;
+}
+
+function realityMarketMap() {
+  const snapshot = getMarketLightInternalSnapshot({ market: 'spot', provider: 'bitget' });
+  const rows = Array.isArray(snapshot?.rows) ? snapshot.rows : [];
+  const map = new Map();
+  for (const row of rows) {
+    const symbol = String(row?.symbol || '').trim().toUpperCase();
+    if (symbol) map.set(symbol, row);
+  }
+  return { snapshot, map };
+}
+
+function pruneRealityRankSnapshots() {
+  const now = Date.now();
+  for (const [key, value] of realityRankSnapshots.entries()) {
+    if (now - Number(value?.created_at_ms || 0) > REALITY_RANK_TTL_MS) {
+      realityRankSnapshots.delete(key);
+      for (const [sort, version] of realityRankCurrentBySort.entries()) if (version === key) realityRankCurrentBySort.delete(sort);
+    }
+  }
+  if (realityRankSnapshots.size <= REALITY_RANK_MAX) return;
+  const oldest = [...realityRankSnapshots.entries()].sort((a,b)=>Number(a[1]?.created_at_ms||0)-Number(b[1]?.created_at_ms||0));
+  while (oldest.length > REALITY_RANK_MAX) {
+    const [key] = oldest.shift(); realityRankSnapshots.delete(key);
+    for (const [sort, version] of realityRankCurrentBySort.entries()) if (version === key) realityRankCurrentBySort.delete(sort);
+  }
+}
+
+async function createRealityRankSnapshot(sort) {
+  pruneRealityRankSnapshots();
+  const catalog = await getRealityCatalogShared();
+  const { snapshot: marketSnapshot, map: marketMap } = realityMarketMap();
+  const sortKey = realityRankSortKey(sort);
+  const rows = catalog.rows.map((catalogRow) => {
+    const symbol = String(catalogRow?.exchange_symbol || '').trim().toUpperCase();
+    const marketRow = marketMap.get(symbol) || null;
+    const change = realityFinite(marketRow?.price_change_percent_24h);
+    const volume = realityFinite(marketRow?.quote_volume_24h);
+    return {
+      rank_identity: `bitget|spot|${symbol}`,
+      exchange_symbol: symbol,
+      security_ticker: String(catalogRow?.security_ticker || '').trim().toUpperCase(),
+      change,
+      volume,
+    };
+  }).filter((row) => row.exchange_symbol);
+  rows.sort((a,b) => {
+    let cmp = 0;
+    if (sortKey === 'change_desc') cmp = realityCompareNullable(a.change,b.change,true);
+    else if (sortKey === 'change_asc') cmp = realityCompareNullable(a.change,b.change,false);
+    else if (sortKey === 'volume_desc') cmp = realityCompareNullable(a.volume,b.volume,true);
+    if (!cmp && sortKey !== 'name_asc') cmp = realityCompareNullable(a.volume,b.volume,true);
+    if (!cmp) cmp = a.security_ticker.localeCompare(b.security_ticker) || a.exchange_symbol.localeCompare(b.exchange_symbol);
+    return cmp;
+  });
+  realityRankSeq += 1;
+  const rankVersion = `rr-${Number(marketSnapshot?.round || marketSnapshot?.shared_round || 0)}-${realityRankSeq}`;
+  const snapshot = {
+    rank_version: rankVersion,
+    sort: sortKey,
+    created_at_ms: Date.now(),
+    source_round: Number(marketSnapshot?.round || marketSnapshot?.shared_round || 0),
+    catalog_generated_at: String(catalog?.generated_at || ''),
+    order: rows.map((row) => ({
+      rank_identity: row.rank_identity,
+      exchange_symbol: row.exchange_symbol,
+      security_ticker: row.security_ticker,
+      rank_metric_value: sortKey === 'change_desc' || sortKey === 'change_asc' ? row.change : sortKey === 'volume_desc' ? row.volume : null,
+    })),
+  };
+  realityRankSnapshots.set(rankVersion, snapshot);
+  realityRankCurrentBySort.set(sortKey, rankVersion);
+  realityRankBuilds += 1;
+  pruneRealityRankSnapshots();
+  return snapshot;
+}
+
+async function getOrCreateCurrentRealityRankSnapshot(sort) {
+  pruneRealityRankSnapshots();
+  const sortKey = realityRankSortKey(sort);
+  const version = realityRankCurrentBySort.get(sortKey);
+  const snapshot = version ? realityRankSnapshots.get(version) : null;
+  const market = realityMarketMap();
+  const currentRound = Number(market.snapshot?.round || market.snapshot?.shared_round || 0);
+  if (snapshot && snapshot.source_round === currentRound && Date.now() - Number(snapshot.created_at_ms || 0) <= REALITY_RANK_TTL_MS) {
+    realityRankHits += 1;
+    return snapshot;
+  }
+  return createRealityRankSnapshot(sortKey);
+}
+
+function getRealityRankSnapshot(rankVersion, sort) {
+  if (!rankVersion) return null;
+  pruneRealityRankSnapshots();
+  const snapshot = realityRankSnapshots.get(rankVersion);
+  if (!snapshot || snapshot.sort !== realityRankSortKey(sort)) return null;
+  realityRankHits += 1;
+  return snapshot;
+}
+
+async function handleRealityRankedPage(req, res, url) {
+  if (url.pathname !== REALITY_RANK_ROUTE) return false;
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, OPTIONS', 'cache-control': 'no-store' });
+    res.end(); return true;
+  }
+  if (req.method !== 'GET') {
+    res.writeHead(405, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ ok:false,version:STEP_VERSION,error:'method_not_allowed' })); return true;
+  }
+  realityRankReads += 1;
+  try {
+    const sort = realityRankSortKey(url.searchParams.get('sort'));
+    const offset = Math.max(0, Math.trunc(Number(url.searchParams.get('offset') || 0) || 0));
+    const limit = Math.max(1, Math.min(REALITY_RANK_PAGE_MAX, Math.trunc(Number(url.searchParams.get('limit') || 50) || 50)));
+    const requested = String(url.searchParams.get('rank_version') || '').trim();
+    if (offset > 0 && !requested) {
+      res.writeHead(400, { 'content-type':'application/json; charset=utf-8','cache-control':'no-store' });
+      res.end(JSON.stringify({ ok:false,version:STEP_VERSION,error:'rank_version_required_after_first_page',restart_from_offset:0,user_read_upstream_requests:0 })); return true;
+    }
+    let snapshot = getRealityRankSnapshot(requested, sort);
+    if (requested && !snapshot) {
+      res.writeHead(409, { 'content-type':'application/json; charset=utf-8','cache-control':'no-store' });
+      res.end(JSON.stringify({ ok:false,version:STEP_VERSION,error:'rank_version_expired_or_scope_mismatch',rank_version:requested,restart_from_offset:0,user_read_upstream_requests:0 })); return true;
+    }
+    if (!snapshot) snapshot = await getOrCreateCurrentRealityRankSnapshot(sort);
+    const catalog = await getRealityCatalogShared();
+    const catalogMap = new Map((catalog.rows || []).map((row) => [String(row?.exchange_symbol || '').trim().toUpperCase(), row]));
+    const market = realityMarketMap();
+    const pageOrder = snapshot.order.slice(offset, offset + limit);
+    const items = pageOrder.map((entry,index) => ({
+      rank_index: offset + index + 1,
+      rank_identity: entry.rank_identity,
+      rank_metric_value: entry.rank_metric_value,
+      catalog_row: catalogMap.get(entry.exchange_symbol) || null,
+      market_row: market.map.get(entry.exchange_symbol) || null,
+    }));
+    const body = {
+      ok:true,version:STEP_VERSION,data_version:1041010,schema_version:'step1041_6_reality_stock_token_rank_page_v1',
+      provider:'bitget',market_type:'spot',asset_class:'equity_token',product_kind:'reality_stock_token',sort,
+      rank_version:snapshot.rank_version,rank_snapshot_created_at:new Date(snapshot.created_at_ms).toISOString(),rank_snapshot_ttl_ms:REALITY_RANK_TTL_MS,
+      total_items:snapshot.order.length,offset,limit,returned_items:items.length,has_more:offset+items.length<snapshot.order.length,
+      next_offset:offset+items.length<snapshot.order.length?offset+items.length:null,
+      supported_sorts:['name_asc','change_desc','change_asc','volume_desc'],market_cap_sort_supported:false,
+      ranking_happens_before_pagination:true,pagination_order_frozen_by_rank_version:true,app_page_size_remains_50:true,
+      source:'bitget_reality_identity_catalog_plus_shared_market_light_tickers',read_only_shared:true,
+      user_read_upstream_requests:0,user_read_upstream_connections:0,reads_scale_with_users:false,
+      market_light_bridge_age_ms:market.snapshot?.isolated_bridge_age_ms ?? null,
+      catalog_user_read_upstream_requests:0,items,generated_at:new Date().toISOString(),
+    };
+    res.writeHead(200, { 'content-type':'application/json; charset=utf-8','cache-control':'no-store' });
+    res.end(JSON.stringify(body)); return true;
+  } catch (error) {
+    res.writeHead(503, { 'content-type':'application/json; charset=utf-8','cache-control':'no-store' });
+    res.end(JSON.stringify({ ok:false,version:STEP_VERSION,error:`reality_rank_not_ready:${String(error?.message||error)}`,user_read_upstream_requests:0 })); return true;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   // Step1004.12: Render Edge Caching will be enabled with Cacheable file types = All files.
@@ -348,6 +555,7 @@ const server = http.createServer(async (req, res) => {
       spot_current_snapshot_health: '/api/spot-market/health',
       spot_current_snapshot_state: getSpotCurrentSnapshotHealth(),
       market_light_current_snapshot: '/api/market-light/current-snapshot',
+      market_light_ranked_page: '/api/market-light/ranked-page',
       market_light_health: '/api/market-light/health',
       market_light_state: getMarketLightSnapshotHealth(),
       crypto_sector_professional_current_snapshot: '/api/crypto-sector-professional/current-snapshot',
@@ -360,9 +568,23 @@ const server = http.createServer(async (req, res) => {
       project_fundamentals_health: '/api/project-fundamentals/health',
       project_fundamentals_state: getProjectFundamentalsHealth(),
       stock_catalog_v2_current: '/api/stock-catalog-v2/current',
+      stock_catalog_v2_ranked_page: '/api/stock-catalog-v2/ranked-page',
       stock_catalog_v2_health: '/api/stock-catalog-v2/health',
       stock_catalog_v2_self_test: '/api/stock-catalog-v2/self-test',
       stock_catalog_v2_state: getStockCatalogV2Health(),
+      reality_stock_token_ranked_page: REALITY_RANK_ROUTE,
+      reality_stock_token_rank_state: {
+        reads: realityRankReads,
+        builds: realityRankBuilds,
+        hits: realityRankHits,
+        snapshots: realityRankSnapshots.size,
+        current_shared_sorts: realityRankCurrentBySort.size,
+        page_limit_max: REALITY_RANK_PAGE_MAX,
+        supported_sorts: ['name_asc','change_desc','change_asc','volume_desc'],
+        market_cap_sort_supported: false,
+        user_reads_start_upstream: false,
+        reads_scale_with_users: false,
+      },
       crypto_sector_professional_history_state:
         getMarketLightSnapshotHealth()?.crypto_sector_history || null,
       collector_isolation: getCollectorIsolationHealth(),
@@ -1057,6 +1279,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (await handleRealityRankedPage(req, res, url)) return;
   if (proxyIsolatedCollectorRequest(req, res, url)) return;
 
   const requestAbortController = new AbortController();
@@ -1152,5 +1375,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Step${STEP_VERSION}] proxy + Step1041.5.4.3.4.2.2.1 exact-pool background inflight assignment-order fix + Step1041.5.4.3.4.2.1 Binance first-real-data readiness + market-data-only Spot WS fix + Step1041.1 five-feed verified 50-hot/new-token/overview/pressure rollout-safe fix + Step1038.2.1 Solana Helius exact holders + Step1038 holder concentration/creator-owner/LP/token-security + Step1037.5 onchain shared near-realtime/metadata/ECB-FX + Step1037 exact-pool OHLCV/history/recent-trades + Step1036 recent-hot/search/pools foundation + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
+  console.log(`[Step${STEP_VERSION}] proxy + Step1041.6 shared rank-before-pagination + Step1041.5.4.3.4.2.2.1 exact-pool background inflight assignment-order fix + Step1041.5.4.3.4.2.1 Binance first-real-data readiness + market-data-only Spot WS fix + Step1041.1 five-feed verified 50-hot/new-token/overview/pressure rollout-safe fix + Step1038.2.1 Solana Helius exact holders + Step1038 holder concentration/creator-owner/LP/token-security + Step1037.5 onchain shared near-realtime/metadata/ECB-FX + Step1037 exact-pool OHLCV/history/recent-trades + Step1036 recent-hot/search/pools foundation + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
