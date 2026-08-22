@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-196.11.1",
+  "version": "650.8.15-196.11.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.196.11.1 K-line asset shared ranking + Binance Wallet Stock rankType40 hot order + prior global sorting fixes"
+  "description": "Kaka Web3 Render 650.8.15.196.11.2 watchlist exact-pool realtime batch + K-line asset shared ranking + prior global sorting fixes"
 }
