@@ -1,10 +1,10 @@
-// Step1041.6.4 / Render 650.8.15.196.11
+// Step1041.6.4 / Render 650.8.15.196.11.1
 // Shared ranking for exchange assets that have a verified official K-line capability.
 // Cash equities are intentionally excluded. User reads are memory-only and never start
 // exchange/Binance Wallet/Supabase upstream work. Binance Wallet rankType=40 supplies the
 // external mature "Popular" order for tokenized securities; it never substitutes product prices.
 
-const VERSION = '650.8.15.196.11';
+const VERSION = '650.8.15.196.11.1';
 const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1041_6_4_kline_asset_rank_page_v1';
 const ROUTE = '/api/asset-market/ranked-page';
@@ -120,14 +120,14 @@ function send(res,status,payload) {
   res.writeHead(status, {'content-type':'application/json; charset=utf-8','cache-control':'no-store','access-control-allow-origin':'*'});
   res.end(JSON.stringify(payload));
 }
-async function fetchJson(url, { headers = {}, label = 'upstream', method = 'GET', body = null } = {}) {
+async function fetchJson(url, { headers = {}, label = 'upstream', method = 'GET', body: requestBody = null } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const r = await fetch(url, { method, body, signal: controller.signal, headers: { accept:'application/json', 'accept-encoding':'identity', 'user-agent':`binance-web3/2.1 (Skill); KakaWeb3/${VERSION} ${label}`, ...(body ? {'content-type':'application/json'} : {}), ...headers } });
-    const body = await r.text();
-    if (!r.ok) throw new Error(`${label}_http_${r.status}:${body.slice(0,160)}`);
-    try { return JSON.parse(body); } catch { throw new Error(`${label}_invalid_json`); }
+    const r = await fetch(url, { method, body: requestBody, signal: controller.signal, headers: { accept:'application/json', 'accept-encoding':'identity', 'user-agent':`binance-web3/2.1 (Skill); KakaWeb3/${VERSION} ${label}`, ...(requestBody ? {'content-type':'application/json'} : {}), ...headers } });
+    const responseText = await r.text();
+    if (!r.ok) throw new Error(`${label}_http_${r.status}:${responseText.slice(0,160)}`);
+    try { return JSON.parse(responseText); } catch { throw new Error(`${label}_invalid_json`); }
   } finally { clearTimeout(timer); }
 }
 
