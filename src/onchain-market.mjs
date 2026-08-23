@@ -1,4 +1,4 @@
-// Step1042.1 / Render 650.8.15.197.1
+// Step1042.2 / Render 650.8.15.197.2
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.197.1';
+const VERSION = '650.8.15.197.2';
 const DATA_VERSION = 1042000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
@@ -44,7 +44,7 @@ const DEX_BASE = 'https://api.dexscreener.com';
 // Paid DEX Screener boosts/ads/CTO remain supplemental identity discovery only and never
 // participate in the hot rank score.
 const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
-const GECKO_MIN_GAP_MS = Math.max(6_200, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 6_500));
+const GECKO_MIN_GAP_MS = Math.max(12_500, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 15_000));
 const GECKO_MAX_QUEUE = Math.max(6, Math.min(32, Number(process.env.KAKA_GECKO_MAX_QUEUE || 20)));
 const GECKO_TIMEOUT_MS = Math.max(6_000, Math.min(25_000, Number(process.env.KAKA_GECKO_TIMEOUT_MS || 15_000)));
 const GECKO_NETWORK = Object.freeze({
@@ -286,6 +286,8 @@ const stats = {
   gecko_discovery_candidates: 0,
   gecko_discovery_ready_networks: [],
   gecko_discovery_failed_networks: [],
+  gecko_discovery_retried_networks: [],
+  gecko_discovery_error_by_network: {},
   binance_wallet_rank_started: 0,
   binance_wallet_rank_succeeded: 0,
   binance_wallet_rank_failed: 0,
@@ -3524,6 +3526,9 @@ async function fetchGeckoTrendingCandidates() {
   let succeeded = 0;
   const readyNetworks = [];
   const failedNetworks = [];
+  const retryNetworks = [];
+  const retriedNetworks = [];
+  const errorByNetwork = {};
   function appendPoolResources(network, payload, source) {
     let added = 0;
     for (const resource of Array.isArray(payload?.data) ? payload.data : []) {
@@ -3534,48 +3539,84 @@ async function fetchGeckoTrendingCandidates() {
     }
     return added;
   }
-
-  // Step1042.1: one GeckoTerminal Trending call per chain is the normal path.
-  // The public keyless API is ~10 calls/min and each response is cached, so doing both
-  // Trending + Top Pools for all nine chains serially made cold start unbounded in practice.
-  // Top Pools is now a per-chain fallback only when Trending returns no usable base token.
-  for (const network of Object.keys(NETWORKS)) {
-    const gtNetwork = GECKO_NETWORK[network];
-    if (!gtNetwork) continue;
-    let added = 0;
-    try {
-      const trending = await geckoFetchJson(
-        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/trending_pools?page=1&duration=24h`,
-        { priority: -30, label: `background_gt_trending_${network}` },
-      );
-      added = appendPoolResources(network, trending, 'geckoterminal_trending_pool_candidate');
-      if (added > 0) {
-        succeeded += 1;
-        readyNetworks.push(network);
-        continue;
-      }
-    } catch (_) {}
+  function ready(network) {
+    if (!readyNetworks.includes(network)) readyNetworks.push(network);
+    delete errorByNetwork[network];
+    succeeded = readyNetworks.length;
+  }
+  function recordError(network, stage, error) {
+    errorByNetwork[network] = `${stage}:${text(error?.message || error).replace(/\s+/g, ' ').slice(0, 220)}`;
+  }
+  async function topPoolsFallback(network, gtNetwork, retryTag = '') {
     try {
       const topPools = await geckoFetchJson(
         `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/pools?page=1`,
-        { priority: -32, label: `background_gt_top_pool_fallback_${network}` },
+        { priority: -32, label: `background_gt_top_pool_fallback_${network}${retryTag}` },
       );
-      added = appendPoolResources(network, topPools, 'geckoterminal_top_pool_candidate_fallback');
-      if (added > 0) {
-        succeeded += 1;
-        readyNetworks.push(network);
-      } else {
-        failedNetworks.push(network);
-      }
-    } catch (_) {
-      failedNetworks.push(network);
+      const added = appendPoolResources(network, topPools, 'geckoterminal_top_pool_candidate_fallback');
+      if (added > 0) { ready(network); return true; }
+      errorByNetwork[network] = 'top_pools_success_but_no_usable_base_token';
+      return false;
+    } catch (error) {
+      recordError(network, 'top_pools', error);
+      return false;
     }
+  }
+  async function trendingAttempt(network, { retry = false } = {}) {
+    const gtNetwork = GECKO_NETWORK[network];
+    if (!gtNetwork) return false;
+    try {
+      const trending = await geckoFetchJson(
+        `${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/trending_pools?page=1&duration=24h`,
+        { priority: retry ? -31 : -30, label: `background_gt_trending_${network}${retry ? '_retry1' : ''}` },
+      );
+      const added = appendPoolResources(network, trending, 'geckoterminal_trending_pool_candidate');
+      if (added > 0) { ready(network); return true; }
+      // A successful response with zero usable base tokens is semantically different from
+      // transport/rate-limit failure. Only this case is allowed to spend the Top Pools fallback.
+      errorByNetwork[network] = 'trending_success_but_no_usable_base_token';
+      return await topPoolsFallback(network, gtNetwork, retry ? '_after_retry1' : '');
+    } catch (error) {
+      recordError(network, retry ? 'trending_retry1' : 'trending', error);
+      return false;
+    }
+  }
+
+  // Step1042.2: public GeckoTerminal is documented as approximately 10 calls/minute and may
+  // fluctuate with network traffic. Render previously succeeded for the first five networks
+  // then lost the four trailing networks. Keep this lane deliberately below half that public
+  // ceiling (~4 calls/min by default). A transport/rate-limit failure does NOT immediately
+  // spend a second Top Pools call; failed networks receive exactly one delayed retry after the
+  // first pass. This prevents trailing-chain starvation while keeping the collector bounded.
+  for (const network of Object.keys(NETWORKS)) {
+    if (!GECKO_NETWORK[network]) continue;
+    const ok = await trendingAttempt(network);
+    if (!ok && errorByNetwork[network] && !errorByNetwork[network].includes('success_but_no_usable')) {
+      retryNetworks.push(network);
+    }
+  }
+  for (const network of retryNetworks) {
+    retriedNetworks.push(network);
+    const ok = await trendingAttempt(network, { retry: true });
+    if (!ok && !failedNetworks.includes(network)) failedNetworks.push(network);
+  }
+  for (const network of Object.keys(NETWORKS)) {
+    if (!readyNetworks.includes(network) && !failedNetworks.includes(network)) failedNetworks.push(network);
   }
   stats.gecko_discovery_cycles += 1;
   stats.gecko_discovery_candidates = candidates.length;
   stats.gecko_discovery_ready_networks = readyNetworks;
   stats.gecko_discovery_failed_networks = failedNetworks;
-  return { candidates, succeeded, ready_networks: readyNetworks, failed_networks: failedNetworks };
+  stats.gecko_discovery_retried_networks = retriedNetworks;
+  stats.gecko_discovery_error_by_network = { ...errorByNetwork };
+  return {
+    candidates,
+    succeeded,
+    ready_networks: readyNetworks,
+    failed_networks: failedNetworks,
+    retried_networks: retriedNetworks,
+    error_by_network: { ...errorByNetwork },
+  };
 }
 
 
@@ -4386,6 +4427,12 @@ function healthPayload() {
       gecko_fallback_only_when_trending_empty: true,
       gecko_ready_networks: stats.gecko_discovery_ready_networks,
       gecko_failed_networks: stats.gecko_discovery_failed_networks,
+      gecko_retried_networks: stats.gecko_discovery_retried_networks,
+      gecko_error_by_network: stats.gecko_discovery_error_by_network,
+      gecko_min_gap_ms: GECKO_MIN_GAP_MS,
+      gecko_default_requests_per_minute_ceiling: 60_000 / GECKO_MIN_GAP_MS,
+      gecko_transport_failure_top_pool_fallback: false,
+      gecko_failed_network_retry_max_per_cycle: 1,
       candidate_feed_count: STEP1041_CANDIDATE_FEED_COUNT,
       candidate_feeds: ['binance_wallet_trending_1h','geckoterminal_trending','geckoterminal_top_pool_fallback','top_boost','latest_boost','latest_profile','community_takeover','latest_ad'],
       paid_or_cto_presence_not_used_as_final_rank: true,
@@ -4597,7 +4644,8 @@ function runSelfTest() {
   t('step1040_no_wrongdoing_or_insider_claim', healthPayload().step1040_relationship_evidence.wrongdoing_claim_generated === false && healthPayload().step1040_relationship_evidence.insider_or_rat_trading_claim_generated === false);
   const finalOverview = buildStep1041Overview();
   t('step1042_public_hot_cap_50_internal_per_chain_30', STEP1041_HOT_MAX_ROWS === 50 && STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN === 30 && recentHotTokenRows([]).length === 0);
-  t('step1042_1_gecko_nine_chain_rate_bound', Object.keys(GECKO_NETWORK).length === 9 && 60_000 / GECKO_MIN_GAP_MS < 10);
+  t('step1042_2_gecko_nine_chain_conservative_rate_bound', Object.keys(GECKO_NETWORK).length === 9 && GECKO_MIN_GAP_MS >= 12_500 && 60_000 / GECKO_MIN_GAP_MS <= 4.8);
+  t('step1042_2_gecko_failure_retry_bounded', healthPayload().discovery.gecko_failed_network_retry_max_per_cycle === 1 && healthPayload().discovery.gecko_transport_failure_top_pool_fallback === false);
   t('step1041_overview_shared_only', finalOverview.no_user_upstream_build === true && finalOverview.volume_liquidity_are_sample_sums_not_whole_chain_totals === true);
   t('step1041_new_pool_semantics_fail_closed', STEP1041_NEW_POOL_MAX_AGE_MS === 7 * 24 * 60 * 60_000);
   t('step1041_pressure_contract_10_100_1000', JSON.stringify(healthPayload().step1041_final_productization.pressure_contract.users) === JSON.stringify([10,100,1000]));
