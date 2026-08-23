@@ -1,4 +1,4 @@
-// Step1042.2 / Render 650.8.15.197.2
+// Step1042.3 / Render 650.8.15.197.3
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
-const VERSION = '650.8.15.197.2';
+const VERSION = '650.8.15.197.3';
 const DATA_VERSION = 1042000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
@@ -270,6 +270,8 @@ const stats = {
   market_refresh_started: 0,
   market_refresh_succeeded: 0,
   market_refresh_failed: 0,
+  market_refresh_retained_networks_last: [],
+  market_refresh_retained_rows_last: 0,
   fx_refresh_started: 0,
   fx_refresh_succeeded: 0,
   fx_refresh_failed: 0,
@@ -369,6 +371,7 @@ let trendingSnapshot = [];
 let discoveryUpdatedAt = 0;
 let marketRefreshInflight = null;
 let marketUpdatedAt = 0;
+const marketNetworkUpdatedAt = new Map();
 const poolPriceFocus = new Map();
 const poolPriceSnapshot = new Map();
 let poolPriceRefreshInflight = null;
@@ -3725,6 +3728,16 @@ async function fetchDiscoveryCandidatePairs() {
   }
   return pairs;
 }
+function compareHotRows(a, b) {
+  const ar = Number(a?.binance_wallet_rank || 0);
+  const br = Number(b?.binance_wallet_rank || 0);
+  const aOfficial = ar > 0;
+  const bOfficial = br > 0;
+  if (aOfficial && bOfficial && ar !== br) return ar - br;
+  if (aOfficial !== bOfficial) return aOfficial ? -1 : 1;
+  return Number(b?.hot_score || 0) - Number(a?.hot_score || 0)
+    || poolLiquidity(b?.best_pool) - poolLiquidity(a?.best_pool);
+}
 function recentHotTokenRows(pairs) {
   const groups = new Map();
   for (const pair of pairs || []) {
@@ -3782,16 +3795,6 @@ function recentHotTokenRows(pairs) {
     });
     if (row?.token_market_fields_verified === true) rows.push(row);
   }
-  const compareHotRows = (a, b) => {
-    const ar = Number(a.binance_wallet_rank || 0);
-    const br = Number(b.binance_wallet_rank || 0);
-    const aOfficial = ar > 0;
-    const bOfficial = br > 0;
-    if (aOfficial && bOfficial && ar !== br) return ar - br;
-    if (aOfficial !== bOfficial) return aOfficial ? -1 : 1;
-    return Number(b.hot_score || 0) - Number(a.hot_score || 0)
-      || poolLiquidity(b.best_pool) - poolLiquidity(a.best_pool);
-  };
   const sorted = rows.sort(compareHotRows);
   // Step1042: keep bounded coverage PER CHAIN internally. The old global slice(50)
   // could starve newly-supported networks even when discovery succeeded. Thirty rows
@@ -3932,6 +3935,28 @@ function currentCandidateMetadata() {
   }
   return byKey;
 }
+function mergeCurrentMarketRowsWithRetained(freshRows, now = Date.now()) {
+  const freshNetworks = new Set((freshRows || []).map((row) => row?.network).filter(Boolean));
+  const retained = [];
+  const retainedNetworks = [];
+  for (const network of Object.keys(NETWORKS)) {
+    if (freshNetworks.has(network)) continue;
+    const previous = trendingSnapshot.filter((row) => row?.network === network);
+    if (!previous.length) continue;
+    const lastNetworkUpdate = Number(marketNetworkUpdatedAt.get(network) || 0);
+    const fallbackUpdate = Number(marketUpdatedAt || discoveryUpdatedAt || 0);
+    const baseUpdate = lastNetworkUpdate > 0 ? lastNetworkUpdate : fallbackUpdate;
+    const ageMs = baseUpdate > 0 ? Math.max(0, now - baseUpdate) : Number.POSITIVE_INFINITY;
+    if (ageMs > MARKET_RETAIN_MS) continue;
+    retained.push(...previous);
+    retainedNetworks.push(network);
+  }
+  return {
+    rows: [...(freshRows || []), ...retained].sort(compareHotRows),
+    retained_networks: retainedNetworks,
+    retained_rows: retained.length,
+  };
+}
 async function refreshCurrentMarketFields() {
   if (marketRefreshInflight || trendingSnapshot.length === 0) return marketRefreshInflight;
   marketRefreshInflight = (async () => {
@@ -3975,12 +4000,19 @@ async function refreshCurrentMarketFields() {
           }
         }
       }
-      const rows = recentHotTokenRows(refreshedPairs);
-      if (!rows.length) throw new Error('dexscreener_current_market_refresh_empty');
-      trendingSnapshot = rows;
-      marketUpdatedAt = Date.now();
+      const now = Date.now();
+      const freshRows = recentHotTokenRows(refreshedPairs);
+      const merged = mergeCurrentMarketRowsWithRetained(freshRows, now);
+      if (!merged.rows.length) throw new Error('dexscreener_current_market_refresh_empty');
+      trendingSnapshot = merged.rows;
+      for (const network of new Set(freshRows.map((row) => row.network).filter(Boolean))) {
+        marketNetworkUpdatedAt.set(network, now);
+      }
+      stats.market_refresh_retained_networks_last = merged.retained_networks;
+      stats.market_refresh_retained_rows_last = merged.retained_rows;
+      marketUpdatedAt = now;
       stats.market_refresh_succeeded += 1;
-      return rows.length;
+      return merged.rows.length;
     } catch (error) {
       stats.market_refresh_failed += 1;
       throw error;
@@ -4065,6 +4097,12 @@ async function refreshDiscovery() {
       trendingSnapshot = rows;
       discoveryUpdatedAt = Date.now();
       marketUpdatedAt = discoveryUpdatedAt;
+      marketNetworkUpdatedAt.clear();
+      for (const network of new Set(rows.map((row) => row.network).filter(Boolean))) {
+        marketNetworkUpdatedAt.set(network, discoveryUpdatedAt);
+      }
+      stats.market_refresh_retained_networks_last = [];
+      stats.market_refresh_retained_rows_last = 0;
       stats.background_cycles_succeeded += 1;
       stats.last_background_success_at = new Date().toISOString();
       stats.last_background_error = '';
@@ -4364,6 +4402,15 @@ function healthPayload() {
       retain_ms: MARKET_RETAIN_MS,
       age_ms: marketAgeMs,
       rows: trendingSnapshot.length,
+      per_network_verified_rows: Object.fromEntries(Object.keys(NETWORKS).map((network) => [network, trendingSnapshot.filter((row) => row?.network === network).length])),
+      per_network_age_ms: Object.fromEntries(Object.keys(NETWORKS).map((network) => {
+        const updated = Number(marketNetworkUpdatedAt.get(network) || 0);
+        return [network, updated > 0 ? Math.max(0, Date.now() - updated) : null];
+      })),
+      partial_empty_network_retain_previous_verified: true,
+      partial_empty_network_retain_max_ms: MARKET_RETAIN_MS,
+      retained_networks_last: stats.market_refresh_retained_networks_last,
+      retained_rows_last: stats.market_refresh_retained_rows_last,
       user_reads_start_upstream: false,
       fixed_background_rate_independent_of_user_count: true,
     },
@@ -4596,6 +4643,21 @@ function runSelfTest() {
   t('token_profile_metadata_parser', profileSynthetic?.icon_url.startsWith('https://') && profileSynthetic?.description === 'Hello' && profileSynthetic?.links?.length === 1);
   const fxSynthetic = parseEcbDailyFxXml(`<gesmes><Cube><Cube time='2026-08-19'><Cube currency='USD' rate='1.1605'/><Cube currency='JPY' rate='184.62'/><Cube currency='CNY' rate='7.8197'/></Cube></Cube></gesmes>`);
   t('ecb_fx_cross_rate_math', Math.abs(fxSynthetic.usd_to.CNY - (7.8197 / 1.1605)) < 1e-9 && Math.abs(fxSynthetic.usd_to.EUR - (1 / 1.1605)) < 1e-9);
+  const savedTrendingForRetainTest = trendingSnapshot;
+  const savedMarketUpdatedForRetainTest = marketUpdatedAt;
+  const savedLineaUpdatedForRetainTest = marketNetworkUpdatedAt.get('linea');
+  try {
+    trendingSnapshot = [{ network: 'linea', token: { address: '0x0000000000000000000000000000000000000011' }, hot_score: 1 }];
+    marketUpdatedAt = Date.now();
+    marketNetworkUpdatedAt.set('linea', marketUpdatedAt);
+    const retainedSynthetic = mergeCurrentMarketRowsWithRetained([], marketUpdatedAt + 1_000);
+    t('step1042_3_partial_market_refresh_retains_recent_verified_chain', retainedSynthetic.rows.length === 1 && retainedSynthetic.retained_networks.includes('linea'));
+  } finally {
+    trendingSnapshot = savedTrendingForRetainTest;
+    marketUpdatedAt = savedMarketUpdatedForRetainTest;
+    if (savedLineaUpdatedForRetainTest === undefined) marketNetworkUpdatedAt.delete('linea');
+    else marketNetworkUpdatedAt.set('linea', savedLineaUpdatedForRetainTest);
+  }
   t('market_refresh_fixed_background', MARKET_REFRESH_MS >= 30_000 && MARKET_REFRESH_MS < DISCOVERY_REFRESH_MS);
   t('fx_user_reads_do_not_start_upstream', healthPayload().fx_reference.user_reads_start_upstream === false);
   const holderSynthetic = normalizeHolderMetrics({ totalHolders: 1000, holderSupply: { top10: { supply: '100', supplyPercent: 10 }, top25: { supply: '200', supplyPercent: 20 }, top50: { supply: '300', supplyPercent: 30 } } });
