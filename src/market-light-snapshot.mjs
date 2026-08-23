@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.196.11.3.1';
+const STEP_VERSION = '650.8.15.197.3.1';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const WATCHLIST_TICKERS_ROUTE = '/api/market-light/watchlist-tickers';
@@ -2154,6 +2154,17 @@ function marketRankBaseFromRow(row) {
   return marketRankNormalizeBase(symbol);
 }
 
+// Step1042.3.1: shared full-market Rank must never expose a self-quoted
+// identity such as USDT/USDT. Keep this filter inside the Rank projection
+// rather than mutating the verified provider directory/snapshot counts.
+// This preserves exact coverage health while guaranteeing every sort/page
+// and every frozen rank_version excludes base==quote before pagination.
+function marketRankIsSelfQuotedRow(row) {
+  const base = marketRankBaseFromRow(row);
+  const quote = compact(row?.quote_asset ?? row?.quote_symbol);
+  return Boolean(base && quote && base === quote);
+}
+
 function marketRankNumber(value) {
   if (value == null) return null;
   if (typeof value === 'string' && !value.trim()) return null;
@@ -2221,6 +2232,7 @@ function buildMarketRankEntries({ market, provider = '', quote = '', sortKey }) 
     for (const row of rowsByKey.get(keyFor(market, providerName)) || []) {
       const rowQuote = compact(row?.quote_asset ?? row?.quote_symbol);
       if (quoteFilter && rowQuote !== quoteFilter) continue;
+      if (marketRankIsSelfQuotedRow(row)) continue;
       rows.push({ ...row });
     }
   }
@@ -2393,6 +2405,7 @@ function currentMarketRowsForRankScope({ market, provider = '', quote = '' }) {
     for (const row of rowsByKey.get(keyFor(market, providerName)) || []) {
       const rowQuote = compact(row?.quote_asset ?? row?.quote_symbol);
       if (quoteFilter && rowQuote !== quoteFilter) continue;
+      if (marketRankIsSelfQuotedRow(row)) continue;
       const symbol = compact(row?.symbol);
       if (!symbol) continue;
       exact.set(`${String(row?.provider || '').trim().toLowerCase()}|${market}|${symbol}`, row);
@@ -3438,8 +3451,12 @@ export function getMarketLightSnapshotHealth() {
     },
     shared_rank_index: {
       schema_version: 'step1041_6_shared_full_market_rank_page_v2',
+      implementation_revision: 'step1042_3_1_rank_self_pair_filter_v1',
       ranking_happens_before_pagination: true,
       pagination_order_frozen_by_rank_version: true,
+      self_pair_filter_before_rank_snapshot: true,
+      self_pair_filter_before_materialization: true,
+      self_pair_rule: 'normalized_base_asset_must_differ_from_quote_asset',
       page_limit_max: RANK_PAGE_LIMIT_MAX,
       response_cache_ttl_ms: RANK_RESPONSE_CACHE_TTL_MS,
       order_snapshot_ttl_ms: RANK_ORDER_SNAPSHOT_TTL_MS,
@@ -3842,4 +3859,5 @@ export const __marketLightStep1001_6Test = Object.freeze({
   binanceSpotDirectoryFromRows,
   normalizeRow,
   fieldCoverage,
+  marketRankIsSelfQuotedRow,
 });
