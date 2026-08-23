@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3';
+const STEP_VERSION = '650.8.15.197.3.3.1';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const DATA_HUB_SPOT_SUMMARY_ROUTE = '/api/market-light/data-hub-spot-summary';
