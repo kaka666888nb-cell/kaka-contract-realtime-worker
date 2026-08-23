@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.1';
+const STEP_VERSION = '650.8.15.197.3.2';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const WATCHLIST_TICKERS_ROUTE = '/api/market-light/watchlist-tickers';
@@ -691,7 +691,24 @@ function bitgetV3Row(item, market, observedAt) {
   const bid = positive(item?.bid1Price);
   const ask = positive(item?.ask1Price);
   const baseVolume = finite(item?.volume24h);
-  const quoteVolume = finite(item?.turnover24h);
+  // Step1042.3.2: Bitget UTA Reality/rToken tickers expose
+  // platformTurnover24h as the platform's true 24h turnover. The generic
+  // turnover24h field is not semantically comparable with ordinary spot
+  // quote turnover for these products and previously pushed RMRNA/RIVV/RGLD
+  // above BTC in global turnover ranking. The platform field is documented as
+  // rToken-only, so use it whenever Bitget actually supplies a non-empty value;
+  // ordinary spot/futures keep the existing turnover24h meaning.
+  const platformTurnoverRaw = item?.platformTurnover24h;
+  const platformTurnoverPresent =
+    market === 'spot' &&
+    platformTurnoverRaw != null &&
+    String(platformTurnoverRaw).trim() !== '';
+  const platformTurnover = platformTurnoverPresent
+    ? finite(platformTurnoverRaw)
+    : null;
+  const quoteVolume = platformTurnover != null
+    ? platformTurnover
+    : finite(item?.turnover24h);
   const oi = market === 'contract' ? finite(item?.openInterest) : null;
   return {
     provider: 'bitget',
@@ -708,6 +725,10 @@ function bitgetV3Row(item, market, observedAt) {
     volume_24h: baseVolume,
     base_volume_24h: baseVolume,
     quote_volume_24h: quoteVolume,
+    platform_turnover_24h: platformTurnover,
+    quote_volume_24h_source: platformTurnover != null
+      ? 'bitget_platformTurnover24h_reality'
+      : 'bitget_turnover24h',
     high_24h: finite(item?.highPrice24h),
     low_24h: finite(item?.lowPrice24h),
     best_bid: bid,
