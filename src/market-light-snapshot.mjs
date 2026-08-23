@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.1';
+const STEP_VERSION = '650.8.15.197.3.3.2';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const DATA_HUB_SPOT_SUMMARY_ROUTE = '/api/market-light/data-hub-spot-summary';
@@ -2288,10 +2288,29 @@ function buildDataHubSpotSummaryPayload() {
     .sort((a, b) => (marketRankNumber(b.quote_volume_24h) ?? -Infinity) - (marketRankNumber(a.quote_volume_24h) ?? -Infinity))
     .slice(0, DATA_HUB_SPOT_SUMMARY_LIMIT);
 
+  const amplitudePercent = (row) => {
+    const high = marketRankNumber(row?.high_24h);
+    const low = marketRankNumber(row?.low_24h);
+    if (high == null || low == null || !Number.isFinite(high) || !Number.isFinite(low) || low <= 0 || high < low) {
+      return null;
+    }
+    return (high - low) / low * 100;
+  };
+  const amplitude = [...movers]
+    .filter((row) => amplitudePercent(row) != null)
+    .sort((a, b) => (amplitudePercent(b) ?? -Infinity) - (amplitudePercent(a) ?? -Infinity))
+    .slice(0, DATA_HUB_SPOT_SUMMARY_LIMIT);
+  const absoluteMovers = [...movers]
+    .filter((row) => marketRankNumber(row.price_change_percent_24h) != null)
+    .sort((a, b) =>
+      Math.abs(marketRankNumber(b.price_change_percent_24h) ?? 0) -
+      Math.abs(marketRankNumber(a.price_change_percent_24h) ?? 0))
+    .slice(0, DATA_HUB_SPOT_SUMMARY_LIMIT);
+
   const payload = {
     ok: true,
     version: STEP_VERSION,
-    schema_version: 'step1042_1_2_4_data_hub_spot_summary_v1',
+    schema_version: 'step1042_1_2_7_data_hub_spot_summary_v2',
     source: 'render_shared_market_light_data_hub_spot_summary',
     market_type: 'spot',
     quote_asset: 'USDT',
@@ -2314,6 +2333,8 @@ function buildDataHubSpotSummaryPayload() {
     gainers,
     losers,
     turnover,
+    amplitude,
+    absolute_movers: absoluteMovers,
     read_only_shared: true,
     user_read_upstream_requests: 0,
     exchange_requests_started: 0,
