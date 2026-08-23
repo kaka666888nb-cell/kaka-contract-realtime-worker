@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-197.3.1",
+  "version": "650.8.15-197.3.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.197.3.1 Step1042.3.1 rank self-pair filter + stable multichain/onchain/realtime fixes"
+  "description": "Kaka Web3 Render 650.8.15.197.3.2 Step1042.3.2 Bitget Reality platform-turnover semantic fix + stable multichain/onchain/realtime fixes"
 }
