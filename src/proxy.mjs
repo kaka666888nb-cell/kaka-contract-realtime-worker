@@ -34,7 +34,7 @@ import { startKlineAssetRankCollector, handleKlineAssetRank, getKlineAssetRankHe
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.197.3.2';
+const STEP_VERSION = '650.8.15.197.3.3';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -558,6 +558,7 @@ const server = http.createServer(async (req, res) => {
       spot_current_snapshot_state: getSpotCurrentSnapshotHealth(),
       market_light_current_snapshot: '/api/market-light/current-snapshot',
       market_light_ranked_page: '/api/market-light/ranked-page',
+      market_light_data_hub_spot_summary: '/api/market-light/data-hub-spot-summary',
       market_light_health: '/api/market-light/health',
       market_light_state: getMarketLightSnapshotHealth(),
       crypto_sector_professional_current_snapshot: '/api/crypto-sector-professional/current-snapshot',

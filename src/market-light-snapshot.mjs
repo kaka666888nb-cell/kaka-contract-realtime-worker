@@ -2,9 +2,10 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.2';
+const STEP_VERSION = '650.8.15.197.3.3';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
+const DATA_HUB_SPOT_SUMMARY_ROUTE = '/api/market-light/data-hub-spot-summary';
 const WATCHLIST_TICKERS_ROUTE = '/api/market-light/watchlist-tickers';
 const HEALTH_ROUTE = '/api/market-light/health';
 const SECTOR_SNAPSHOT_ROUTE = '/api/crypto-sector-professional/current-snapshot';
@@ -238,6 +239,20 @@ let rankPageBuilds = 0;
 let rankPageCacheHits = 0;
 let rankOrderSnapshotBuilds = 0;
 let rankOrderSnapshotHits = 0;
+
+// Step1042.1.2.4: tiny server-side Data Hub spot summary. The App no longer
+// downloads/parses ~5k rows before it can paint market temperature and the
+// three basic market rankings. This summary is built only from the existing
+// shared market-light memory, cached per market-light round, and never starts
+// exchange work on user reads.
+let dataHubSpotSummaryCache = null;
+let dataHubSpotSummaryCacheRound = -1;
+let dataHubSpotSummaryReads = 0;
+let dataHubSpotSummaryBuilds = 0;
+let dataHubSpotSummaryCacheHits = 0;
+const DATA_HUB_SPOT_CURRENT_WINDOW_MS = 30 * 60_000;
+const DATA_HUB_SPOT_MOVER_MIN_TURNOVER = 100_000;
+const DATA_HUB_SPOT_SUMMARY_LIMIT = 20;
 let rankOrderSnapshotExpired = 0;
 
 let sectorSnapshotCache = null;
@@ -2157,6 +2172,160 @@ export function startMarketLightSnapshotScanner() {
 }
 
 
+
+function dataHubSpotSummaryIsLeveraged(row) {
+  const base = marketRankBaseFromRow(row);
+  return /(?:2|3|5)[LS]$/.test(base);
+}
+
+function dataHubSpotSummaryRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    provider: String(row.provider || '').trim().toLowerCase(),
+    market_type: 'spot',
+    symbol: compact(row.symbol),
+    base_asset: marketRankBaseFromRow(row),
+    quote_asset: compact(row.quote_asset ?? row.quote_symbol) || 'USDT',
+    price: marketRankNumber(row.price ?? row.last_price),
+    last_price: marketRankNumber(row.last_price ?? row.price),
+    price_change_percent_24h: marketRankNumber(row.price_change_percent_24h),
+    quote_volume_24h: marketRankNumber(row.quote_volume_24h),
+    high_24h: marketRankNumber(row.high_24h),
+    low_24h: marketRankNumber(row.low_24h),
+    source_time: row.source_time || row.updated_at || null,
+  };
+}
+
+function buildDataHubSpotSummaryPayload() {
+  if (dataHubSpotSummaryCache && dataHubSpotSummaryCacheRound === round) {
+    dataHubSpotSummaryCacheHits += 1;
+    return { ...dataHubSpotSummaryCache, cache_hit: true };
+  }
+  dataHubSpotSummaryBuilds += 1;
+  const now = Date.now();
+  const providers = ['binance', 'okx', 'bybit', 'bitget', 'gate'];
+  const verified = [];
+  const providerRows = [];
+  let staleExcludedCount = 0;
+  let allEligibleCount = 0;
+
+  for (const provider of providers) {
+    const meta = providerMeta(provider, 'spot');
+    const updatedMs = Date.parse(String(meta?.updated_at || ''));
+    const current = Number.isFinite(updatedMs) &&
+      updatedMs <= now + 5 * 60_000 &&
+      updatedMs >= now - DATA_HUB_SPOT_CURRENT_WINDOW_MS;
+    const sourceRows = rowsByKey.get(keyFor('spot', provider)) || [];
+    const rows = [];
+    for (const row of sourceRows) {
+      const quote = compact(row?.quote_asset ?? row?.quote_symbol);
+      if (quote !== 'USDT' || marketRankIsSelfQuotedRow(row)) continue;
+      allEligibleCount += 1;
+      if (!current) {
+        staleExcludedCount += 1;
+        continue;
+      }
+      if (dataHubSpotSummaryIsLeveraged(row)) continue;
+      const change = marketRankNumber(row?.price_change_percent_24h);
+      const normalized = dataHubSpotSummaryRow(row);
+      if (!normalized) continue;
+      verified.push(normalized);
+      if (change != null) rows.push(normalized);
+    }
+    if (!rows.length) continue;
+    let up = 0;
+    let down = 0;
+    let sum = 0;
+    for (const row of rows) {
+      const change = marketRankNumber(row.price_change_percent_24h) ?? 0;
+      if (change > 0) up += 1;
+      else if (change < 0) down += 1;
+      sum += change;
+    }
+    providerRows.push({
+      provider,
+      row_count: rows.length,
+      up,
+      flat: rows.length - up - down,
+      down,
+      up_share: up + down > 0 ? up / (up + down) : null,
+      average_change: rows.length ? sum / rows.length : null,
+      updated_at: meta?.updated_at || null,
+    });
+  }
+
+  const rowsWithChange = verified.filter((row) => marketRankNumber(row.price_change_percent_24h) != null);
+  let up = 0;
+  let down = 0;
+  for (const row of rowsWithChange) {
+    const change = marketRankNumber(row.price_change_percent_24h) ?? 0;
+    if (change > 0) up += 1;
+    else if (change < 0) down += 1;
+  }
+  const shares = providerRows.map((item) => marketRankNumber(item.up_share)).filter((v) => v != null);
+  const averages = providerRows.map((item) => marketRankNumber(item.average_change)).filter((v) => v != null);
+
+  const moverByAsset = new Map();
+  for (const row of rowsWithChange) {
+    const turnover = marketRankNumber(row.quote_volume_24h) ?? 0;
+    if (turnover < DATA_HUB_SPOT_MOVER_MIN_TURNOVER) continue;
+    const base = marketRankNormalizeBase(row.base_asset);
+    if (!base) continue;
+    const existing = moverByAsset.get(base);
+    if (!existing || turnover > (marketRankNumber(existing.quote_volume_24h) ?? 0)) {
+      moverByAsset.set(base, row);
+    }
+  }
+  const movers = [...moverByAsset.values()];
+  const gainers = [...movers]
+    .sort((a, b) => (marketRankNumber(b.price_change_percent_24h) ?? -Infinity) - (marketRankNumber(a.price_change_percent_24h) ?? -Infinity))
+    .slice(0, DATA_HUB_SPOT_SUMMARY_LIMIT);
+  const losers = [...movers]
+    .sort((a, b) => (marketRankNumber(a.price_change_percent_24h) ?? Infinity) - (marketRankNumber(b.price_change_percent_24h) ?? Infinity))
+    .slice(0, DATA_HUB_SPOT_SUMMARY_LIMIT);
+  const turnover = [...verified]
+    .filter((row) => marketRankNumber(row.quote_volume_24h) != null)
+    .sort((a, b) => (marketRankNumber(b.quote_volume_24h) ?? -Infinity) - (marketRankNumber(a.quote_volume_24h) ?? -Infinity))
+    .slice(0, DATA_HUB_SPOT_SUMMARY_LIMIT);
+
+  const payload = {
+    ok: true,
+    version: STEP_VERSION,
+    schema_version: 'step1042_1_2_4_data_hub_spot_summary_v1',
+    source: 'render_shared_market_light_data_hub_spot_summary',
+    market_type: 'spot',
+    quote_asset: 'USDT',
+    current_window_minutes: 30,
+    mover_min_turnover_usdt: DATA_HUB_SPOT_MOVER_MIN_TURNOVER,
+    market_light_round: round,
+    generated_at: new Date().toISOString(),
+    source_count: verified.length,
+    rows_with_change: rowsWithChange.length,
+    provider_coverage: providerRows.length,
+    all_eligible_count: allEligibleCount,
+    stale_excluded_count: staleExcludedCount,
+    mover_count: movers.length,
+    up,
+    flat: rowsWithChange.length - up - down,
+    down,
+    equal_weight_up_share: shares.length ? shares.reduce((a, b) => a + b, 0) / shares.length : null,
+    equal_weight_average_change: averages.length ? averages.reduce((a, b) => a + b, 0) / averages.length : null,
+    providers: providerRows,
+    gainers,
+    losers,
+    turnover,
+    read_only_shared: true,
+    user_read_upstream_requests: 0,
+    exchange_requests_started: 0,
+    exchange_connections_started: 0,
+    reads_scale_with_users: false,
+    cache_hit: false,
+  };
+  dataHubSpotSummaryCache = payload;
+  dataHubSpotSummaryCacheRound = round;
+  return { ...payload };
+}
+
 function marketRankNormalizeBase(raw) {
   let value = compact(raw);
   if (value === 'XBT') value = 'BTC';
@@ -3762,7 +3931,7 @@ function sendJson(res, status, payload) {
 export async function handleMarketLightSnapshot(req, res, url) {
   const sectorHistoryRoute = url.pathname === '/api/crypto-sector-professional/history' ||
     url.pathname === '/api/crypto-sector-professional/history-health';
-  if (![SNAPSHOT_ROUTE, RANKED_PAGE_ROUTE, WATCHLIST_TICKERS_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
+  if (![SNAPSHOT_ROUTE, RANKED_PAGE_ROUTE, DATA_HUB_SPOT_SUMMARY_ROUTE, WATCHLIST_TICKERS_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -3806,6 +3975,11 @@ export async function handleMarketLightSnapshot(req, res, url) {
     }
     watchlistTickerStats.user_reads += 1;
     sendJson(res, 200, watchlistTickerPayload(specs));
+    return true;
+  }
+  if (url.pathname === DATA_HUB_SPOT_SUMMARY_ROUTE) {
+    dataHubSpotSummaryReads += 1;
+    sendJson(res, 200, buildDataHubSpotSummaryPayload());
     return true;
   }
   const market = String(url.searchParams.get('market_type') || url.searchParams.get('market') || '').trim().toLowerCase();
