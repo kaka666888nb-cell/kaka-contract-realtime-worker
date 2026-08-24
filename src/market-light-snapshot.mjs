@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.2';
+const STEP_VERSION = '650.8.15.197.3.3.3';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const DATA_HUB_SPOT_SUMMARY_ROUTE = '/api/market-light/data-hub-spot-summary';
@@ -132,6 +132,19 @@ const BINANCE_SPOT_STREAM_ROW_TTL_MS = Math.max(30 * 60_000, Number(process.env.
 const BINANCE_SPOT_STREAM_BOOTSTRAP_MIN_ROWS = Math.max(20, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_STREAM_BOOTSTRAP_MIN_ROWS || 20));
 const BINANCE_SPOT_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_RECONNECT_MIN_MS || 2_000));
 const BINANCE_SPOT_RECONNECT_MAX_MS = Math.max(BINANCE_SPOT_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_RECONNECT_MAX_MS || 30_000));
+
+// Step1042.1.2.8.12: Binance Spot miniTicker has no BBO fields. Official Spot
+// WebSocket docs provide <symbol>@bookTicker and allow many symbol streams on one
+// connection. Keep a single shared market-data-only backend connection and subscribe
+// the current USDT identities already discovered by the existing miniTicker stream.
+// User reads never create a connection or subscription. The official per-connection
+// stream ceiling is 1024; health goes not-ready rather than silently claiming full
+// coverage if the live USDT universe ever exceeds that documented bound.
+const BINANCE_SPOT_BOOK_TICKER_WS_URL = 'wss://data-stream.binance.vision:443/stream';
+const BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS = Math.max(1, Math.min(1024, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS || 1024)));
+const BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS = Math.max(250, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS || 750));
+const BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS || 2_000));
+const BINANCE_SPOT_BOOK_TICKER_RECONNECT_MAX_MS = Math.max(BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_RECONNECT_MAX_MS || 30_000));
 
 // Step990: Binance USDⓈ-M exposes one official all-symbol best bid/ask stream.
 // Keep it as exactly one shared backend WebSocket, independent of user count.
@@ -357,6 +370,33 @@ const binanceSpotTicker = {
   baselineLastHttpStatus: null,
   baselineLastRetryAfterSeconds: null,
   baselineNextAllowedAt: 0,
+};
+
+const binanceSpotPublishedRows = new Map();
+let binanceSpotBookTickerBootstrapInvalidationTimer = null;
+let binanceSpotBookTickerSubscriptionSyncTimer = null;
+
+const binanceSpotBookTicker = {
+  socket: null,
+  connecting: null,
+  reconnectTimer: null,
+  reconnectAttempt: 0,
+  ready: false,
+  openedAt: 0,
+  lastMessageAt: 0,
+  lastError: '',
+  connectAttempts: 0,
+  messages: 0,
+  acceptedUpdates: 0,
+  rejectedUpdates: 0,
+  subscribeMessages: 0,
+  unsubscribeMessages: 0,
+  desiredSymbols: 0,
+  subscribedSymbols: new Set(),
+  limitExceededBy: 0,
+  firstBboAt: 0,
+  bboRows: new Map(),
+  publishedBootstrapPatches: 0,
 };
 
 const binanceContractBookTicker = {
@@ -1061,8 +1101,10 @@ async function buildProvider(provider, market, cycleRound) {
   totalBuilds += 1;
   if (provider === 'binance' && market === 'spot') {
     ensureBinanceSpotMiniTicker().catch(() => {});
+    ensureBinanceSpotBookTicker().catch(() => {});
     refreshBinanceSpotTickerBaseline().catch(() => false);
     const rows = refreshBinanceSpotStreamDerivedDirectory();
+    scheduleBinanceSpotBookTickerSubscriptionSync();
     const providerKey = keyFor(market, provider);
     const current = metaByKey.get(providerKey) || {};
     const streamFresh = binanceSpotTicker.lastMessageAt > 0 &&
@@ -1096,11 +1138,17 @@ async function buildProvider(provider, market, cycleRound) {
     }
     const verifiedDirectoryCount = Number(directoryCountByKey.get(providerKey) || 0);
     const verifiedDirectoryUpdatedAt = directoryUpdatedAtByKey.get(providerKey) || null;
-    rowsByKey.set(providerKey, rows.map((row) => ({
+    const publishedRows = rows.map((row) => ({
       ...row,
       shared_round: cycleRound,
       shared_observed_at: observedAt,
-    })));
+    }));
+    rowsByKey.set(providerKey, publishedRows);
+    binanceSpotPublishedRows.clear();
+    for (const row of publishedRows) {
+      const symbol = compact(row?.symbol);
+      if (symbol) binanceSpotPublishedRows.set(symbol, row);
+    }
     metaByKey.set(providerKey, {
       ...current,
       updated_at: observedAt,
@@ -1815,6 +1863,7 @@ async function openBinanceSpotMiniTicker() {
         const items = Array.isArray(payload) ? payload : [payload];
         binanceSpotTicker.messages += 1;
         binanceSpotTicker.lastMessageAt = Date.now();
+        let discoveredNewSymbol = false;
         for (const item of items) {
           const symbol = compact(item?.s ?? item?.symbol);
           if (!symbol || !symbol.endsWith('USDT')) {
@@ -1831,6 +1880,7 @@ async function openBinanceSpotMiniTicker() {
             binanceSpotTicker.rows.set(symbol, seeded);
             binanceSpotTicker.streamBootstrapNewRows += 1;
             binanceSpotTicker.acceptedUpdates += 1;
+            discoveredNewSymbol = true;
             continue;
           }
           const merged = binanceSpotMiniTickerPatch(item, existing);
@@ -1838,6 +1888,7 @@ async function openBinanceSpotMiniTicker() {
           binanceSpotTicker.rows.set(symbol, merged);
           binanceSpotTicker.acceptedUpdates += 1;
         }
+        if (discoveredNewSymbol) scheduleBinanceSpotBookTickerSubscriptionSync();
       } catch (error) {
         binanceSpotTicker.lastError = String(error?.message || error).slice(0, 320);
       }
@@ -1878,6 +1929,245 @@ async function ensureBinanceSpotMiniTicker() {
       binanceSpotTicker.connecting = null;
     });
   return await binanceSpotTicker.connecting;
+}
+
+function binanceSpotBookTickerPatch(raw, observedAt = new Date().toISOString()) {
+  if (!raw || typeof raw !== 'object') return null;
+  const symbol = compact(raw.s ?? raw.symbol);
+  if (!symbol || !symbol.endsWith('USDT')) return null;
+  const bestBid = positive(raw.b ?? raw.bestBid ?? raw.bidPrice);
+  const bestAsk = positive(raw.a ?? raw.bestAsk ?? raw.askPrice);
+  if (bestBid == null || bestAsk == null || bestAsk < bestBid) return null;
+  const bidQty = finite(raw.B ?? raw.bidQty ?? raw.bidQuantity);
+  const askQty = finite(raw.A ?? raw.askQty ?? raw.askQuantity);
+  return {
+    symbol,
+    best_bid: bestBid,
+    best_ask: bestAsk,
+    bid_price: bestBid,
+    ask_price: bestAsk,
+    bid_quantity: bidQty,
+    ask_quantity: askQty,
+    spread_percent: bestAsk > 0 ? ((bestAsk - bestBid) / bestAsk) * 100 : null,
+    bbo_source: 'binance_spot_official_book_ticker_stream',
+    bbo_transport: 'backend_shared_one_multi_symbol_websocket',
+    bbo_source_time: observedAt,
+    bbo_update_id: integer(raw.u ?? raw.updateId),
+    bbo_available_in_source: true,
+  };
+}
+
+function scheduleBinanceSpotBookTickerBootstrapCacheInvalidation() {
+  if (binanceSpotBookTickerBootstrapInvalidationTimer) return;
+  binanceSpotBookTickerBootstrapInvalidationTimer = setTimeout(() => {
+    binanceSpotBookTickerBootstrapInvalidationTimer = null;
+    // Only bootstrap transitions need to invalidate the heavyweight full snapshot.
+    // Ongoing real-time BBO updates are served from the exact watchlist route and must
+    // not churn the full-market serialized cache on every order-book tick.
+    responseCache.clear();
+  }, 180);
+  binanceSpotBookTickerBootstrapInvalidationTimer.unref?.();
+}
+
+function applyBinanceSpotBookTickerPatch(patch) {
+  const symbol = compact(patch?.symbol);
+  if (!symbol) return false;
+  const existing = binanceSpotTicker.rows.get(symbol);
+  if (!existing) return false;
+  const hadBbo = positive(existing.best_bid ?? existing.bid_price) != null &&
+    positive(existing.best_ask ?? existing.ask_price) != null;
+  const merged = { ...existing, ...patch };
+  binanceSpotTicker.rows.set(symbol, merged);
+  binanceSpotBookTicker.bboRows.set(symbol, { ...patch });
+
+  const published = binanceSpotPublishedRows.get(symbol);
+  if (published) {
+    const publishedHadBbo = positive(published.best_bid ?? published.bid_price) != null &&
+      positive(published.best_ask ?? published.ask_price) != null;
+    Object.assign(published, patch);
+    if (!publishedHadBbo) {
+      binanceSpotBookTicker.publishedBootstrapPatches += 1;
+      scheduleBinanceSpotBookTickerBootstrapCacheInvalidation();
+    }
+  }
+  if (!hadBbo && !binanceSpotBookTicker.firstBboAt) {
+    binanceSpotBookTicker.firstBboAt = Date.now();
+  }
+  return true;
+}
+
+function desiredBinanceSpotBookTickerSymbols() {
+  return [...binanceSpotTicker.rows.keys()]
+    .map(compact)
+    .filter((symbol) => symbol.endsWith('USDT'))
+    .sort();
+}
+
+function syncBinanceSpotBookTickerSubscriptions() {
+  const socket = binanceSpotBookTicker.socket;
+  if (!wsReady(socket) || !binanceSpotBookTicker.ready) return false;
+  const desired = desiredBinanceSpotBookTickerSymbols();
+  binanceSpotBookTicker.desiredSymbols = desired.length;
+  binanceSpotBookTicker.limitExceededBy = Math.max(0, desired.length - BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS);
+  const boundedDesired = desired.slice(0, BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS);
+  const desiredSet = new Set(boundedDesired);
+  const extras = [...binanceSpotBookTicker.subscribedSymbols].filter((symbol) => !desiredSet.has(symbol));
+  const missing = boundedDesired.filter((symbol) => !binanceSpotBookTicker.subscribedSymbols.has(symbol));
+  try {
+    if (extras.length) {
+      const id = `kaka-spot-bbo-unsub-${Date.now()}-${binanceSpotBookTicker.unsubscribeMessages + 1}`;
+      socket.send(JSON.stringify({
+        method: 'UNSUBSCRIBE',
+        params: extras.map((symbol) => `${symbol.toLowerCase()}@bookTicker`),
+        id,
+      }));
+      for (const symbol of extras) binanceSpotBookTicker.subscribedSymbols.delete(symbol);
+      binanceSpotBookTicker.unsubscribeMessages += 1;
+    }
+    if (missing.length) {
+      const id = `kaka-spot-bbo-sub-${Date.now()}-${binanceSpotBookTicker.subscribeMessages + 1}`;
+      socket.send(JSON.stringify({
+        method: 'SUBSCRIBE',
+        params: missing.map((symbol) => `${symbol.toLowerCase()}@bookTicker`),
+        id,
+      }));
+      for (const symbol of missing) binanceSpotBookTicker.subscribedSymbols.add(symbol);
+      binanceSpotBookTicker.subscribeMessages += 1;
+    }
+    if (binanceSpotBookTicker.limitExceededBy > 0) {
+      binanceSpotBookTicker.lastError = `binance_spot_book_ticker_stream_limit_exceeded:${desired.length}>${BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS}`;
+    } else {
+      binanceSpotBookTicker.lastError = '';
+    }
+    return true;
+  } catch (error) {
+    binanceSpotBookTicker.lastError = String(error?.message || error || 'binance_spot_book_ticker_subscription_sync_error').slice(0, 320);
+    return false;
+  }
+}
+
+function scheduleBinanceSpotBookTickerSubscriptionSync() {
+  if (binanceSpotBookTickerSubscriptionSyncTimer) return;
+  binanceSpotBookTickerSubscriptionSyncTimer = setTimeout(() => {
+    binanceSpotBookTickerSubscriptionSyncTimer = null;
+    syncBinanceSpotBookTickerSubscriptions();
+  }, BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS);
+  binanceSpotBookTickerSubscriptionSyncTimer.unref?.();
+}
+
+function scheduleBinanceSpotBookTickerReconnect() {
+  if (binanceSpotBookTicker.reconnectTimer) return;
+  const delay = Math.min(
+    BINANCE_SPOT_BOOK_TICKER_RECONNECT_MAX_MS,
+    BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS * (2 ** Math.min(binanceSpotBookTicker.reconnectAttempt, 5)),
+  );
+  binanceSpotBookTicker.reconnectAttempt += 1;
+  binanceSpotBookTicker.reconnectTimer = setTimeout(() => {
+    binanceSpotBookTicker.reconnectTimer = null;
+    ensureBinanceSpotBookTicker().catch(() => {});
+  }, delay);
+  binanceSpotBookTicker.reconnectTimer.unref?.();
+}
+
+async function openBinanceSpotBookTicker() {
+  const WebSocketCtor = await resolveWebSocketCtor();
+  binanceSpotBookTicker.connectAttempts += 1;
+  const socket = new WebSocketCtor(BINANCE_SPOT_BOOK_TICKER_WS_URL);
+  binanceSpotBookTicker.socket = socket;
+  binanceSpotBookTicker.ready = false;
+  binanceSpotBookTicker.lastError = '';
+  binanceSpotBookTicker.subscribedSymbols.clear();
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      closeWs(socket);
+      reject(new Error('binance_spot_book_ticker_connect_timeout'));
+    }, 12_000);
+    timeout.unref?.();
+
+    wsListen(socket, 'open', () => {
+      if (settled) return;
+      binanceSpotBookTicker.openedAt = Date.now();
+      binanceSpotBookTicker.reconnectAttempt = 0;
+      binanceSpotBookTicker.ready = true;
+      scheduleBinanceSpotBookTickerSubscriptionSync();
+      settled = true;
+      clearTimeout(timeout);
+      resolve(true);
+    });
+
+    wsListen(socket, 'message', async (event) => {
+      try {
+        const text = await wsMessageText(event);
+        const decoded = JSON.parse(text);
+        if (decoded && Object.prototype.hasOwnProperty.call(decoded, 'result') && decoded.id != null) {
+          if (decoded.result !== null) {
+            binanceSpotBookTicker.lastError = `binance_spot_book_ticker_subscribe_ack:${String(decoded.result).slice(0, 160)}`;
+          }
+          return;
+        }
+        if (decoded?.code != null && decoded?.msg) {
+          binanceSpotBookTicker.lastError = `binance_spot_book_ticker_control_error:${decoded.code}:${decoded.msg}`.slice(0, 320);
+          return;
+        }
+        const payload = decoded?.data ?? decoded;
+        const items = Array.isArray(payload) ? payload : [payload];
+        binanceSpotBookTicker.messages += 1;
+        binanceSpotBookTicker.lastMessageAt = Date.now();
+        for (const item of items) {
+          const patch = binanceSpotBookTickerPatch(item);
+          if (!patch || !applyBinanceSpotBookTickerPatch(patch)) {
+            binanceSpotBookTicker.rejectedUpdates += 1;
+            continue;
+          }
+          binanceSpotBookTicker.acceptedUpdates += 1;
+        }
+      } catch (error) {
+        binanceSpotBookTicker.lastError = String(error?.message || error).slice(0, 320);
+      }
+    });
+
+    wsListen(socket, 'error', (error) => {
+      binanceSpotBookTicker.lastError = String(error?.message || error || 'binance_spot_book_ticker_socket_error').slice(0, 320);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error('binance_spot_book_ticker_socket_error'));
+      }
+    });
+
+    wsListen(socket, 'close', () => {
+      binanceSpotBookTicker.ready = false;
+      binanceSpotBookTicker.subscribedSymbols.clear();
+      if (binanceSpotBookTicker.socket === socket) binanceSpotBookTicker.socket = null;
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error('binance_spot_book_ticker_closed_before_open'));
+      }
+      scheduleBinanceSpotBookTickerReconnect();
+    });
+  });
+}
+
+async function ensureBinanceSpotBookTicker() {
+  if (wsReady(binanceSpotBookTicker.socket) && binanceSpotBookTicker.ready) {
+    scheduleBinanceSpotBookTickerSubscriptionSync();
+    return true;
+  }
+  if (binanceSpotBookTicker.connecting) return await binanceSpotBookTicker.connecting;
+  binanceSpotBookTicker.connecting = openBinanceSpotBookTicker()
+    .catch((error) => {
+      binanceSpotBookTicker.lastError = String(error?.message || error).slice(0, 320);
+      scheduleBinanceSpotBookTickerReconnect();
+      return false;
+    })
+    .finally(() => {
+      binanceSpotBookTicker.connecting = null;
+    });
+  return await binanceSpotBookTicker.connecting;
 }
 
 function binanceContractBookTickerRow(raw) {
@@ -2115,6 +2405,7 @@ export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {})
   try {
     ensureCoinbaseTickerBatch().catch(() => {});
     ensureBinanceSpotMiniTicker().catch(() => {});
+    ensureBinanceSpotBookTicker().catch(() => {});
     refreshBinanceSpotTickerBaseline().catch(() => {});
     ensureBinanceContractBookTicker().catch(() => {});
     const targets = [
@@ -2151,6 +2442,7 @@ export function startMarketLightSnapshotScanner() {
   startMarketCapRankCollector();
   ensureCoinbaseTickerBatch().catch(() => {});
   ensureBinanceSpotMiniTicker().catch(() => {});
+  ensureBinanceSpotBookTicker().catch(() => {});
   refreshBinanceSpotTickerBaseline().catch(() => {});
   ensureBinanceContractBookTicker().catch(() => {});
   startWatchlistTickerFocusScheduler();
@@ -2166,6 +2458,9 @@ export function startMarketLightSnapshotScanner() {
   directoryInterval = setInterval(() => {
     refreshDirectoryCounts().catch(() => {});
     ensureCoinbaseTickerBatch().catch(() => {});
+    ensureBinanceSpotMiniTicker().catch(() => {});
+    ensureBinanceSpotBookTicker().catch(() => {});
+    scheduleBinanceSpotBookTickerSubscriptionSync();
     ensureBinanceContractBookTicker().catch(() => {});
   }, DIRECTORY_INTERVAL_MS);
   directoryInterval.unref?.();
@@ -3113,7 +3408,16 @@ function baseWatchlistTickerRow(spec) {
 function liveWatchlistTickerPatch(spec) {
   if (spec.provider === 'binance' && spec.market === 'spot') {
     const row = binanceSpotTicker.rows.get(spec.symbol);
-    return row ? { ...row, watchlist_realtime_source: 'binance_spot_shared_miniticker_websocket_1s' } : null;
+    if (!row) return null;
+    const bid = positive(row.best_bid ?? row.bid_price);
+    const ask = positive(row.best_ask ?? row.ask_price);
+    return {
+      ...row,
+      watchlist_realtime_source: bid != null && ask != null
+        ? 'binance_spot_shared_miniticker_plus_bookticker_websockets'
+        : 'binance_spot_shared_miniticker_websocket_waiting_bookticker_bbo',
+      watchlist_realtime_bbo_ready: bid != null && ask != null && ask >= bid,
+    };
   }
   if (spec.provider === 'binance' && spec.market === 'contract') {
     // Step1041.6.3.1.5.1: do NOT use binance-contract-market's 60s ticker snapshot as
@@ -3270,6 +3574,8 @@ function watchlistTickerPayload(specs) {
     reads_scale_with_users: false,
     fixed_background_focus_refresh: true,
     binance_spot_shared_stream: true,
+    binance_spot_shared_book_ticker_stream: true,
+    binance_spot_user_reads_start_connections: false,
     binance_contract_persistent_shared_stream: true,
     coinbase_spot_shared_stream: true,
     generated_at: new Date().toISOString(),
@@ -3654,7 +3960,7 @@ export function getMarketLightSnapshotHealth() {
       user_reads_start_upstream: false,
       user_read_upstream_requests: 0,
       fixed_background_refresh_independent_of_user_count: true,
-      binance_spot_source: 'existing_shared_miniticker_websocket',
+      binance_spot_source: 'existing_shared_miniticker_plus_shared_multi_symbol_bookticker_websockets',
       binance_contract_source: 'existing_persistent_usdm_shared_websocket',
       coinbase_spot_source: 'existing_public_ticker_batch_websocket',
       other_provider_source: 'fixed_background_exact_focus_ticker_batches',
@@ -3768,7 +4074,10 @@ export function getMarketLightSnapshotHealth() {
       scan_interval_seconds: Math.round(SCAN_INTERVAL_MS / 1000),
       approximate_batch_attempts_per_cycle: 10,
       approximate_batch_attempts_per_minute_at_default_interval: Math.round((60_000 / SCAN_INTERVAL_MS) * 10 * 10) / 10,
-      binance_spot_shared_market_ws_connections: 1,
+      binance_spot_shared_market_ws_connections: 2,
+      binance_spot_shared_miniticker_ws_connections: 1,
+      binance_spot_shared_multi_symbol_book_ticker_ws_connections: 1,
+      binance_spot_book_ticker_documented_stream_cap_per_connection: BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS,
       binance_spot_market_data_only_rest_baseline_requests_per_6h_max_when_explicitly_enabled: 1,
       binance_spot_market_data_only_rest_weight_per_baseline: 80,
       binance_spot_average_rest_weight_per_minute_default: 0,
@@ -3784,7 +4093,7 @@ export function getMarketLightSnapshotHealth() {
       note: 'collector budget only; shared caches/governors may reduce physical upstream calls further',
     },
     full_market_light_source_notes: {
-      binance_spot: 'one official data-stream.binance.vision !miniTicker@arr shared stream bootstraps live USDT identities and 24h price/volume with zero REST dependency; the data-api ticker/24hr baseline is disabled by default and can only be explicitly enabled as low-frequency completeness/BBO enrichment; it never gates readiness',
+      binance_spot: 'one official data-stream.binance.vision !miniTicker@arr shared stream bootstraps live USDT identities and 24h price/volume, plus one fixed backend multi-symbol <symbol>@bookTicker websocket for real-time best bid/ask; user reads start neither stream and do not scale exchange connections; optional data-api ticker/24hr baseline stays disabled by default',
       binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot + official USDⓈ-M !bookTicker one shared websocket for all-symbol BBO',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
@@ -3883,6 +4192,51 @@ export function getMarketLightSnapshotHealth() {
       per_user_connections: 0,
       user_reads_start_connections: false,
       reads_scale_with_users: false,
+    },
+    binance_spot_book_ticker_shared_ws: {
+      ready: wsReady(binanceSpotBookTicker.socket) && binanceSpotBookTicker.ready &&
+        binanceSpotBookTicker.desiredSymbols > 0 &&
+        binanceSpotBookTicker.limitExceededBy === 0 &&
+        binanceSpotBookTicker.subscribedSymbols.size === binanceSpotBookTicker.desiredSymbols &&
+        binanceSpotBookTicker.bboRows.size > 0 &&
+        binanceSpotBookTicker.lastMessageAt > 0 &&
+        Date.now() - binanceSpotBookTicker.lastMessageAt <= STALE_MS,
+      source: 'binance_spot_official_symbol_book_ticker_multi_stream_shared_websocket',
+      url: BINANCE_SPOT_BOOK_TICKER_WS_URL,
+      stream_pattern: '<symbol>@bookTicker',
+      update_speed: 'real_time',
+      connected: wsReady(binanceSpotBookTicker.socket) && binanceSpotBookTicker.ready,
+      desired_symbols: binanceSpotBookTicker.desiredSymbols,
+      subscribed_streams: binanceSpotBookTicker.subscribedSymbols.size,
+      documented_stream_cap_per_connection: BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS,
+      limit_exceeded_by: binanceSpotBookTicker.limitExceededBy,
+      subscription_complete: binanceSpotBookTicker.limitExceededBy === 0 &&
+        binanceSpotBookTicker.desiredSymbols > 0 &&
+        binanceSpotBookTicker.subscribedSymbols.size === binanceSpotBookTicker.desiredSymbols,
+      bbo_rows: binanceSpotBookTicker.bboRows.size,
+      btcusdt_bbo_ready: (() => {
+        const row = binanceSpotTicker.rows.get('BTCUSDT');
+        const bid = positive(row?.best_bid ?? row?.bid_price);
+        const ask = positive(row?.best_ask ?? row?.ask_price);
+        return bid != null && ask != null && ask >= bid;
+      })(),
+      first_bbo_at: binanceSpotBookTicker.firstBboAt ? new Date(binanceSpotBookTicker.firstBboAt).toISOString() : null,
+      opened_at: binanceSpotBookTicker.openedAt ? new Date(binanceSpotBookTicker.openedAt).toISOString() : null,
+      last_message_at: binanceSpotBookTicker.lastMessageAt ? new Date(binanceSpotBookTicker.lastMessageAt).toISOString() : null,
+      connect_attempts: binanceSpotBookTicker.connectAttempts,
+      subscribe_messages: binanceSpotBookTicker.subscribeMessages,
+      unsubscribe_messages: binanceSpotBookTicker.unsubscribeMessages,
+      messages: binanceSpotBookTicker.messages,
+      accepted_updates: binanceSpotBookTicker.acceptedUpdates,
+      rejected_updates: binanceSpotBookTicker.rejectedUpdates,
+      published_bootstrap_patches: binanceSpotBookTicker.publishedBootstrapPatches,
+      last_error: binanceSpotBookTicker.lastError,
+      one_shared_backend_connection: true,
+      user_read_upstream_requests: 0,
+      user_read_upstream_connections: 0,
+      user_reads_start_connections: false,
+      reads_scale_with_users: false,
+      rest_bbo_polling_required: false,
     },
     binance_contract_all_book_ticker: {
       source: 'binance_usdm_all_book_tickers_shared_websocket',
