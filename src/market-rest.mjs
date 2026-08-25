@@ -46,6 +46,50 @@ const marketUniverseCache = new Map();
 const marketTickerCache = new Map();
 const marketCacheInflight = new Map();
 
+// Step1042.1.2.8.16.7.6:
+// Bitget long-period contract Kline pagination is expensive only on a cold exact key.
+// Share it across users and bound memory; user count never multiplies the same build.
+const BITGET_LONG_KLINE_CACHE_TTL_MS = 15 * 60_000;
+const BITGET_LONG_KLINE_CACHE_MAX = 192;
+const bitgetLongKlineCache = new Map();
+const bitgetLongKlineInflight = new Map();
+
+function pruneBitgetLongKlineCache() {
+  const now = Date.now();
+  for (const [key, entry] of bitgetLongKlineCache.entries()) {
+    if (Number(entry?.expiresAt || 0) <= now) bitgetLongKlineCache.delete(key);
+  }
+  while (bitgetLongKlineCache.size > BITGET_LONG_KLINE_CACHE_MAX) {
+    const oldest = bitgetLongKlineCache.keys().next().value;
+    if (oldest == null) break;
+    bitgetLongKlineCache.delete(oldest);
+  }
+}
+
+async function sharedBitgetLongKlineResult(key, loader) {
+  pruneBitgetLongKlineCache();
+  const cached = bitgetLongKlineCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.rows;
+  const running = bitgetLongKlineInflight.get(key);
+  if (running) return await running;
+
+  const task = Promise.resolve().then(loader);
+  bitgetLongKlineInflight.set(key, task);
+  try {
+    const rows = await task;
+    bitgetLongKlineCache.set(key, {
+      rows,
+      expiresAt: Date.now() + BITGET_LONG_KLINE_CACHE_TTL_MS,
+    });
+    pruneBitgetLongKlineCache();
+    return rows;
+  } finally {
+    if (bitgetLongKlineInflight.get(key) === task) {
+      bitgetLongKlineInflight.delete(key);
+    }
+  }
+}
+
 // Step788.1:
 // Verify exact provider + market + symbol against the official directory
 // before any Kline or trade-history upstream request.
@@ -2036,43 +2080,158 @@ async function fetchBitgetContractKlines({ displaySymbol, nativeSymbol, quote, i
   const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 1000));
   const nearCurrent = Number(end) >= Date.now() - intervalMs(interval) * 2;
   const alignedEnd = alignedKlineEnd(end, interval);
-  const urls = [
-    `https://api.bitget.com/api/v2/mix/market/candles?symbol=${encodeURIComponent(nativeSymbol)}` +
-      `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
-      `${nearCurrent ? '' : `&endTime=${alignedEnd}`}&limit=${safeLimit}`,
-    `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(nativeSymbol)}` +
-      `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
-      `&endTime=${alignedEnd}&limit=${Math.min(200, safeLimit)}`,
-  ];
-  let lastError = null;
-  for (const url of urls) {
-    try {
-      const payload = await jsonFetch(url, 15_000);
-      if (String(payload?.code || '00000') !== '00000') {
-        lastError = new Error(`bitget kline code=${payload?.code} msg=${payload?.msg || ''}`);
-        continue;
-      }
-      const data = payloadRows(payload);
-      if (!data.length) {
-        lastError = new Error(`bitget empty kline result symbol=${nativeSymbol} productType=${productType}`);
-        continue;
-      }
-      const rows = data
-        .map((a) => krow('bitget', 'contract', displaySymbol, interval, [a[0],a[1],a[2],a[3],a[4],a[5],a[6],0]))
-        .filter(Boolean)
-        .map((row) => ({
-          ...row,
-          raw_symbol: nativeSymbol,
-          native_symbol: nativeSymbol,
-          quote_asset: quote,
-          source: 'bitget_official_usdc_contract_kline_render',
-        }));
-      if (rows.length) return rows;
-    } catch (error) {
-      lastError = error;
+  const longInterval = ['3d', '1w', '1M'].includes(interval);
+
+  const normalizeBitgetRows = (data, source) =>
+    (Array.isArray(data) ? data : [])
+      .map((a) =>
+        krow(
+          'bitget',
+          'contract',
+          displaySymbol,
+          interval,
+          [a[0], a[1], a[2], a[3], a[4], a[5], a[6], 0],
+        ),
+      )
+      .filter(Boolean)
+      .map((row) => ({
+        ...row,
+        raw_symbol: nativeSymbol,
+        native_symbol: nativeSymbol,
+        quote_asset: quote,
+        source,
+      }));
+
+  const readBitget = async (url) => {
+    const payload = await jsonFetch(url, 15_000);
+    if (String(payload?.code || '00000') !== '00000') {
+      throw new Error(
+        `bitget kline code=${payload?.code} msg=${payload?.msg || ''}`,
+      );
     }
+    return payloadRows(payload);
+  };
+
+  if (!longInterval) {
+    const urls = [
+      `https://api.bitget.com/api/v2/mix/market/candles?symbol=${encodeURIComponent(nativeSymbol)}` +
+        `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
+        `${nearCurrent ? '' : `&endTime=${alignedEnd}`}&limit=${safeLimit}`,
+      `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(nativeSymbol)}` +
+        `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
+        `&endTime=${alignedEnd}&limit=${Math.min(200, safeLimit)}`,
+    ];
+    let lastError = null;
+    for (const url of urls) {
+      try {
+        const data = await readBitget(url);
+        if (!data.length) {
+          lastError = new Error(
+            `bitget empty kline result symbol=${nativeSymbol} productType=${productType}`,
+          );
+          continue;
+        }
+        const rows = normalizeBitgetRows(
+          data,
+          `bitget_official_${String(quote || '').toLowerCase()}_contract_kline_render`,
+        );
+        if (rows.length) return rows;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ||
+      new Error(`bitget contract kline unavailable for ${displaySymbol}`);
   }
-  throw lastError || new Error(`bitget contract kline unavailable for ${displaySymbol}`);
+
+  // Bitget v2 history-candles documents a maximum query span of 90 days.
+  // Keep every build bounded to at most 8 official calls:
+  //   current page (when near now) + at most 7 older 89-day windows.
+  // This gives enough first/deep page depth without turning one user request
+  // into an unbounded multi-year upstream crawl.
+  const targetRows = Math.min(
+    safeLimit,
+    interval === '1M' ? 24 : interval === '1w' ? 52 : 60,
+  );
+  const cacheEndKey = nearCurrent ? 'current' : String(alignedEnd);
+  const cacheKey =
+    `bitget_long_kline:${nativeSymbol}:${productType}:${interval}:` +
+    `${cacheEndKey}:${targetRows}`;
+
+  return await sharedBitgetLongKlineResult(cacheKey, async () => {
+    const collected = [];
+    let calls = 0;
+    let pageEnd = alignedEnd;
+    let lastError = null;
+
+    if (nearCurrent && calls < 8) {
+      try {
+        const currentUrl =
+          `https://api.bitget.com/api/v2/mix/market/candles?symbol=${encodeURIComponent(nativeSymbol)}` +
+          `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
+          `&limit=${Math.min(1000, Math.max(targetRows, 100))}`;
+        const current = await readBitget(currentUrl);
+        calls += 1;
+        const currentRows = normalizeBitgetRows(
+          current,
+          `bitget_official_${String(quote || '').toLowerCase()}_contract_kline_render_90d_paged`,
+        );
+        if (currentRows.length) {
+          collected.push(...currentRows);
+          const oldest = Math.min(
+            ...currentRows.map((row) => Number(row.open_time_ms)),
+          );
+          if (Number.isFinite(oldest) && oldest > 1) pageEnd = oldest - 1;
+        }
+      } catch (error) {
+        calls += 1;
+        lastError = error;
+      }
+    }
+
+    const historyWindowMs = 89 * 86_400_000;
+    while (
+      calls < 8 &&
+      new Set(collected.map((row) => row.open_time_ms)).size < targetRows &&
+      pageEnd > 1
+    ) {
+      const pageStart = Math.max(0, pageEnd - historyWindowMs);
+      const historyUrl =
+        `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(nativeSymbol)}` +
+        `&productType=${encodeURIComponent(productType)}&granularity=${encodeURIComponent(bar)}` +
+        `&startTime=${pageStart}&endTime=${pageEnd}&limit=200`;
+      try {
+        const data = await readBitget(historyUrl);
+        calls += 1;
+        if (!data.length) break;
+        const pageRows = normalizeBitgetRows(
+          data,
+          `bitget_official_${String(quote || '').toLowerCase()}_contract_kline_render_90d_paged`,
+        );
+        if (!pageRows.length) break;
+        collected.push(...pageRows);
+        const oldest = Math.min(
+          ...pageRows.map((row) => Number(row.open_time_ms)),
+        );
+        if (!Number.isFinite(oldest) || oldest <= 1 || oldest >= pageEnd) break;
+        pageEnd = oldest - 1;
+      } catch (error) {
+        calls += 1;
+        lastError = error;
+        break;
+      }
+    }
+
+    const rows = [...new Map(
+      collected.map((row) => [row.open_time_ms, row]),
+    ).values()]
+      .sort((a, b) => a.open_time_ms - b.open_time_ms)
+      .slice(-safeLimit);
+
+    if (rows.length) return rows;
+    throw lastError ||
+      new Error(`bitget contract long kline unavailable for ${displaySymbol}`);
+  });
 }
 
 async function fetchBybitContractKlines({

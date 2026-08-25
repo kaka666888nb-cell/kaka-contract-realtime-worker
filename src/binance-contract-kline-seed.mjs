@@ -11,6 +11,10 @@ const SNAPSHOT_TABLE = 'app_market_backend_snapshots';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 const DATA_BASE = 'https://data.binance.vision/data/futures/um';
+// Step1042.1.2.8.16.7.6:
+// Binance native 3D Klines are not Unix-epoch-3d-floor anchored.
+// Production/native evidence is UTC dates ...15,18,21,24..., i.e. epoch + 1 day.
+const BINANCE_NATIVE_3D_ANCHOR_OFFSET_MS = 86_400_000;
 const CACHE_TTL_MS = 15 * 60_000;
 const MAX_PERSIST_ROWS = 1500;
 const MAX_DAILY_FILES = 16;
@@ -136,6 +140,13 @@ function intervalMs(interval) {
 // Calendar months also must not be treated as fixed 30-day epoch buckets.
 function canonicalBucketOpenMs(valueMs, interval) {
   const ms = Math.max(0, Number(valueMs) || 0);
+  if (interval === '3d') {
+    const step = intervalMs('3d');
+    return (
+      Math.floor((ms - BINANCE_NATIVE_3D_ANCHOR_OFFSET_MS) / step) * step +
+      BINANCE_NATIVE_3D_ANCHOR_OFFSET_MS
+    );
+  }
   if (interval === '1w') {
     const date = new Date(ms);
     const mondayOffset = (date.getUTCDay() + 6) % 7;
@@ -183,7 +194,7 @@ function canonicalBucketDistance(fromOpenMs, toOpenMs, interval) {
 }
 
 function canonicalLongIntervalOpen(openMs, interval) {
-  if (interval !== '1w' && interval !== '1M') return true;
+  if (interval !== '3d' && interval !== '1w' && interval !== '1M') return true;
   return Number(openMs) === canonicalBucketOpenMs(openMs, interval);
 }
 
@@ -1323,6 +1334,7 @@ export function getBinanceContractKlineSeedHealth() {
     })(),
     edge_kline_relay: getBinanceContractKlineRelayHealth(),
     direct_binance_rest_used_by_kline: false,
+    three_day_bucket_anchor: 'binance_native_epoch_plus_1d_00_utc',
     weekly_bucket_anchor: 'monday_00_utc_binance_native',
     monthly_bucket_anchor: 'calendar_month_00_utc',
     persisted_noncanonical_long_interval_rows_filtered: true,
