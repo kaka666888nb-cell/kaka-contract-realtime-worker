@@ -13,7 +13,7 @@ const DEEP_CONTRACT_KEYS = Object.freeze([
 ]);
 
 const PARENT_SPOT_KEYS = Object.freeze([
-  'symbol', 'base_asset', 'quote_asset', 'quote_symbol',
+  'symbol', 'raw_symbol', 'native_symbol', 'base_asset', 'quote_asset', 'quote_symbol',
   'last_price', 'price', 'price_change_percent_24h',
   'base_volume_24h', 'quote_volume_24h', 'high_24h', 'low_24h',
   'best_bid', 'best_ask', 'bid_price', 'ask_price', 'spread_percent',
@@ -21,10 +21,19 @@ const PARENT_SPOT_KEYS = Object.freeze([
 ]);
 
 const PARENT_CONTRACT_KEYS = Object.freeze([
-  'symbol', 'base_asset', 'quote_asset', 'quote_symbol',
-  'quote_volume_24h', 'price_change_percent_24h',
-  'last_price', 'price', 'mark_price', 'index_price',
-  'source_time', 'cached_at', 'updated_at',
+  'symbol', 'raw_symbol', 'native_symbol', 'base_asset', 'quote_asset', 'quote_symbol',
+  'last_price', 'price', 'price_change_percent_24h',
+  'volume_24h', 'base_volume_24h', 'quote_volume_24h', 'quote_volume_usd_24h',
+  'high_24h', 'low_24h',
+  'best_bid', 'best_ask', 'bid_price', 'ask_price', 'spread_percent',
+  'mark_price', 'index_price',
+  'funding_rate', 'next_funding_time', 'next_funding_time_ms',
+  'funding_interval_hours', 'funding_cap', 'basis_rate', 'basis_value',
+  'provider_total_size',
+  'open_interest', 'open_interest_value', 'open_interest_unit', 'open_interest_value_unit',
+  'single_open_interest', 'single_open_interest_value', 'single_open_interest_unit',
+  'single_open_interest_value_unit', 'single_open_interest_source',
+  'source', 'transport', 'source_time', 'cached_at', 'updated_at',
 ]);
 
 const SLOW_BITGET_SPOT_KEYS = Object.freeze(['symbol']);

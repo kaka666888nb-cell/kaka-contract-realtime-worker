@@ -147,7 +147,17 @@ const binanceMarketRestStats = {
   inflight_hits: 0,
   cache_misses: 0,
   cache_evictions: 0,
+  primary_quote_ticker_shared_bridge_reads: 0,
+  primary_quote_ticker_shared_bridge_hits: 0,
+  primary_quote_ticker_shared_bridge_empty: 0,
+  primary_quote_ticker_isolated_fallback_reads: 0,
+  primary_quote_ticker_isolated_fallback_hits: 0,
+  primary_quote_ticker_isolated_fallback_failures: 0,
 };
+
+const PRIMARY_QUOTE_SHARED_TICKER_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const MARKET_REST_IS_MARKET_LIGHT_COLLECTOR =
+  String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || '').trim() === 'market-light';
 
 function pruneBinanceSharedCache() {
   const now = Date.now();
@@ -1629,6 +1639,80 @@ async function coinbaseTicker(symbol) {
   return row;
 }
 
+async function primaryQuoteSharedTickerRows(provider, market, wanted, requestedQuote) {
+  // Step1042.1.5: ordinary/user-facing primary USDT ticker reads must reuse the
+  // already-running market-light collector. The market-light collector itself
+  // is the only role allowed to reach the provider ticker endpoint here.
+  if (
+    MARKET_REST_IS_MARKET_LIGHT_COLLECTOR ||
+    requestedQuote !== 'USDT' ||
+    !PRIMARY_QUOTE_SHARED_TICKER_PROVIDERS.has(provider)
+  ) return null;
+
+  binanceMarketRestStats.primary_quote_ticker_shared_bridge_reads += 1;
+  const wantedSet = new Set(wanted);
+  const normalizeRows = (payload) => (Array.isArray(payload?.rows) ? payload.rows : [])
+    .map((raw) => {
+      const symbol = compact(raw?.symbol);
+      if (!symbol) return null;
+      const [, quote] = split(symbol);
+      if (quote !== requestedQuote) return null;
+      if (wantedSet.size && !wantedSet.has(symbol)) return null;
+      return {
+        ...raw,
+        provider,
+        market_type: market,
+        symbol,
+        raw_symbol: compact(raw?.raw_symbol || raw?.native_symbol || symbol),
+        native_symbol: compact(raw?.native_symbol || raw?.raw_symbol || symbol),
+        source: raw?.source || `${provider}_market_light_shared_ticker`,
+        cached_at: raw?.cached_at || payload?.cached_at || payload?.updated_at || new Date().toISOString(),
+        read_only_shared: true,
+        user_upstream_requests: 0,
+        user_upstream_connections: 0,
+        reads_scale_with_users: false,
+        ticker_read_transport: 'market_light_parent_bridge',
+      };
+    })
+    .filter(Boolean);
+
+  const { getMarketLightInternalSnapshot } = await import('./market-light-bridge.mjs');
+  let snapshot = getMarketLightInternalSnapshot({ market, provider });
+  let rows = normalizeRows(snapshot);
+  if (rows.length > 0) {
+    binanceMarketRestStats.primary_quote_ticker_shared_bridge_hits += 1;
+    return rows;
+  }
+
+  // A parent bridge can be between polls during startup/handover. One localhost
+  // read of the already-built isolated snapshot is allowed; it starts zero
+  // exchange requests and does not scale provider traffic with users.
+  binanceMarketRestStats.primary_quote_ticker_isolated_fallback_reads += 1;
+  try {
+    const { requestIsolatedJson } = await import('./collector-isolation.mjs');
+    snapshot = await requestIsolatedJson(
+      'market-light',
+      `/api/market-light/current-snapshot?market_type=${encodeURIComponent(market)}&provider=${encodeURIComponent(provider)}&include_rows=1&limit=5000`,
+      5_000,
+    );
+    rows = normalizeRows(snapshot).map((row) => ({
+      ...row,
+      ticker_read_transport: 'market_light_isolated_snapshot_fallback',
+    }));
+    if (rows.length > 0) {
+      binanceMarketRestStats.primary_quote_ticker_isolated_fallback_hits += 1;
+      return rows;
+    }
+  } catch (_) {
+    binanceMarketRestStats.primary_quote_ticker_isolated_fallback_failures += 1;
+  }
+
+  // Fail closed to honest empty/shared-stale behavior. Never let a user read
+  // fall through to a direct provider ticker request for the primary USDT path.
+  binanceMarketRestStats.primary_quote_ticker_shared_bridge_empty += 1;
+  return [];
+}
+
 async function tickers(provider, market, wantedSymbols = []) {
   assertProviderMarket(provider, market);
   const wanted = [...new Set(
@@ -1673,6 +1757,11 @@ async function tickers(provider, market, wantedSymbols = []) {
     wanted,
     provider === 'coinbase' ? 'USD' : 'USDT',
   );
+
+  const sharedPrimaryRows = await primaryQuoteSharedTickerRows(
+    provider, market, wanted, requestedQuote,
+  );
+  if (sharedPrimaryRows !== null) return sharedPrimaryRows;
 
   if (provider === 'coinbase') {
     if (!wanted.length) return [];
@@ -4208,6 +4297,13 @@ export function getBinanceMarketRestHealth() {
     mixed_quote_ticker_max_quote_groups: 8,
     mixed_quote_ticker_merge_identity:
       'provider_market_symbol',
+    step1042_1_5_primary_usdt_ticker_market_light_shared: true,
+    primary_usdt_ticker_user_reads_start_exchange_requests: false,
+    primary_usdt_ticker_user_reads_start_exchange_connections: false,
+    primary_usdt_ticker_reads_scale_with_users: false,
+    primary_usdt_ticker_direct_provider_fallback_from_user_read: false,
+    primary_usdt_ticker_shared_providers: [...PRIMARY_QUOTE_SHARED_TICKER_PROVIDERS],
+    primary_usdt_ticker_market_light_collector_keeps_official_upstream_ownership: true,
     okx_usdc_contract_identity_retired_after_official_delisting: true,
     okx_current_contract_quotes: ['USDT', 'USD'],
     gate_spot_history_uses_bounded_backward_time_windows: true,
@@ -4491,6 +4587,7 @@ export async function handleMarketApi(req, res, url) {
       const all = await tickers(provider, market, wanted);
       const wantedSet = new Set(wanted);
       const rows = wantedSet.size ? all.filter((item) => wantedSet.has(item.symbol)) : all.slice(0, 120);
+      const sharedOnly = rows.length > 0 && rows.every((row) => row?.read_only_shared === true);
       send(res, 200, {
         ok: true,
         provider,
@@ -4498,6 +4595,11 @@ export async function handleMarketApi(req, res, url) {
         rows,
         source: rows[0]?.source || `${provider}_official_public_ticker_render`,
         cached_at: rows[0]?.cached_at || new Date().toISOString(),
+        read_only_shared: sharedOnly,
+        user_upstream_requests: sharedOnly ? 0 : null,
+        user_upstream_connections: sharedOnly ? 0 : null,
+        reads_scale_with_users: sharedOnly ? false : null,
+        ticker_read_transport: sharedOnly ? (rows[0]?.ticker_read_transport || 'market_light_shared') : 'provider_path',
       });
       return true;
     }

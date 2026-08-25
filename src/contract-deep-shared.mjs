@@ -3,7 +3,7 @@ import { getContractDepthSharedOrderbook } from './contract-depth.mjs';
 import { getContractFlowInternalFocusSnapshot, reconcileContractFlowFocusPool } from './contract-flow.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 
-const VERSION = '650.8.15.7';
+const VERSION = '650.8.15.8';
 const SNAPSHOT_ROUTE = '/api/contract-deep-shared/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-deep-shared/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -21,6 +21,7 @@ const SCAN_INTERVAL_MS = 15_000;
 const STARTUP_DELAY_MS = 12_000;
 const DEPTH_STALE_MS = Math.max(95_000, Number(process.env.KAKA_DEEP_DEPTH_STALE_MS || 120_000));
 const FOCUS_HANDOVER_GRACE_MS = Math.max(30_000, Number(process.env.KAKA_DEEP_FOCUS_HANDOVER_GRACE_MS || 90_000));
+const TRANSIENT_LAST_GOOD_GRACE_MS = Math.max(FOCUS_HANDOVER_GRACE_MS, Number(process.env.KAKA_DEEP_TRANSIENT_LAST_GOOD_GRACE_MS || 10 * 60_000));
 const RESPONSE_CACHE_TTL_MS = 8_000;
 const FLOW_RECONCILE_MIN_INTERVAL_MS = 60_000;
 
@@ -51,6 +52,7 @@ let lastGoodCompleteAt = 0;
 let lastGoodCompleteSignature = '';
 let focusHandoverCount = 0;
 let focusHandoverServedReads = 0;
+let transientLastGoodServedReads = 0;
 
 const cursors = Object.fromEntries(PROVIDERS.map((provider) => [provider, 0]));
 const depthState = new Map();
@@ -672,6 +674,34 @@ function currentPayload() {
     return { ...clone(fallback), cache_hit: false, cache_age_ms: 0 };
   }
 
+  const sameFocusTransientDegradation =
+    Boolean(lastGoodCompletePayload) &&
+    Boolean(lastGoodCompleteSignature) &&
+    focus.ready === true &&
+    lastGoodCompleteSignature === desiredFocusSignature &&
+    handoverAgeMs != null &&
+    handoverAgeMs <= TRANSIENT_LAST_GOOD_GRACE_MS;
+  if (sameFocusTransientDegradation) {
+    transientLastGoodServedReads += 1;
+    const fallback = {
+      ...clone(lastGoodCompletePayload),
+      ready: true,
+      live_ready: false,
+      transient_degraded: true,
+      transient_degraded_serving_last_good: true,
+      transient_degraded_age_ms: handoverAgeMs,
+      transient_degraded_grace_ms: TRANSIENT_LAST_GOOD_GRACE_MS,
+      transient_live_depth_fresh_rows: depthFreshRows,
+      transient_live_depth_refresh_error_rows: depthRefreshErrorRows,
+      transient_live_depth_missing_rows: depthMissingRows,
+      transient_live_flow_active_rows: Number(flow.active_rows || 0),
+      transient_live_flow_connected_rows: Number(flow.connected_rows || 0),
+      transient_policy: 'preserve_last_complete_real_same_focus_while_bounded_background_recovery_continues',
+    };
+    responseCache = { at: Date.now(), payload: fallback };
+    return { ...clone(fallback), cache_hit: false, cache_age_ms: 0 };
+  }
+
   responseCache = { at: Date.now(), payload };
   return { ...clone(payload), cache_hit: false, cache_age_ms: 0 };
 }
@@ -718,6 +748,11 @@ export function getContractDeepSharedHealth() {
     focus_handover_grace_seconds: Math.round(FOCUS_HANDOVER_GRACE_MS / 1000),
     focus_handover_count: focusHandoverCount,
     focus_handover_served_reads: focusHandoverServedReads,
+    step1042_1_5_same_focus_transient_last_good_enabled: true,
+    transient_last_good_grace_seconds: Math.round(TRANSIENT_LAST_GOOD_GRACE_MS / 1000),
+    transient_last_good_served_reads: transientLastGoodServedReads,
+    transient_last_good_preserves_only_complete_verified_payload: true,
+    transient_last_good_does_not_start_user_exchange_work: true,
     desired_focus_round: payload.desired_focus_round,
     active_focus_round: payload.active_focus_round,
     desired_focus_signature: payload.desired_focus_signature,

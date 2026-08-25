@@ -2,7 +2,7 @@ import { tickers } from './market-rest.mjs';
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.167';
+const VERSION = '650.8.15.168';
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 
 const CACHE_TTL_MS = 20_000;
@@ -35,6 +35,11 @@ const stats = {
   queue_rejections: 0,
   cache_evictions: 0,
   upstream_ticker_builds: 0,
+  market_light_reuse_builds: 0,
+  market_light_bridge_wait_retries: 0,
+  isolated_market_light_fallback_reads: 0,
+  isolated_market_light_fallback_hits: 0,
+  isolated_market_light_fallback_failures: 0,
   binance_market_light_reuse_builds: 0,
   binance_bridge_wait_retries: 0,
   binance_isolated_market_light_fallback_reads: 0,
@@ -191,49 +196,50 @@ function releaseBuildSlot(provider) {
 
 async function buildExactTicker(provider, symbol) {
   let rows;
-  if (provider === 'binance') {
-    // Step1031.2: exact Binance USDT ticker is projected from the shared
-    // market-light WebSocket snapshot. No per-user or per-symbol REST build.
-    let shared = getMarketLightInternalSnapshot({
-      market: 'spot',
-      provider: 'binance',
-    });
+  if (provider !== 'coinbase') {
+    // Step1042.1.5: all five crypto spot providers reuse the fixed background
+    // market-light snapshot. Exact user reads no longer start provider REST.
+    let shared = getMarketLightInternalSnapshot({ market: 'spot', provider });
     rows = Array.isArray(shared?.rows)
       ? shared.rows.filter((row) => symbolKey(row?.symbol) === symbol)
       : [];
-    stats.binance_market_light_reuse_builds += 1;
+    stats.market_light_reuse_builds += 1;
+    if (provider === 'binance') stats.binance_market_light_reuse_builds += 1;
+
     for (let retry = 0; rows.length === 0 && retry < 2; retry += 1) {
       await new Promise((resolve) => setTimeout(resolve, 300));
-      stats.binance_bridge_wait_retries += 1;
-      shared = getMarketLightInternalSnapshot({
-        market: 'spot',
-        provider: 'binance',
-      });
+      stats.market_light_bridge_wait_retries += 1;
+      if (provider === 'binance') stats.binance_bridge_wait_retries += 1;
+      shared = getMarketLightInternalSnapshot({ market: 'spot', provider });
       rows = Array.isArray(shared?.rows)
         ? shared.rows.filter((row) => symbolKey(row?.symbol) === symbol)
         : [];
     }
+
     if (rows.length === 0) {
-      // Step1032.2: the parent bridge is a low-pressure projection and may be
-      // between polls immediately after navigation. Read the already-built
-      // isolated market-light snapshot once before declaring an exact symbol
-      // unavailable. This is localhost-only and starts zero exchange requests.
-      stats.binance_isolated_market_light_fallback_reads += 1;
+      stats.isolated_market_light_fallback_reads += 1;
+      if (provider === 'binance') stats.binance_isolated_market_light_fallback_reads += 1;
       try {
         const isolated = await requestIsolatedJson(
           'market-light',
-          '/api/market-light/current-snapshot?market_type=spot&provider=binance&include_rows=1&limit=5000',
+          `/api/market-light/current-snapshot?market_type=spot&provider=${encodeURIComponent(provider)}&include_rows=1&limit=5000`,
           5_000,
         );
         rows = Array.isArray(isolated?.rows)
           ? isolated.rows.filter((row) => symbolKey(row?.symbol) === symbol)
           : [];
-        if (rows.length > 0) stats.binance_isolated_market_light_fallback_hits += 1;
+        if (rows.length > 0) {
+          stats.isolated_market_light_fallback_hits += 1;
+          if (provider === 'binance') stats.binance_isolated_market_light_fallback_hits += 1;
+        }
       } catch (_) {
-        stats.binance_isolated_market_light_fallback_failures += 1;
+        stats.isolated_market_light_fallback_failures += 1;
+        if (provider === 'binance') stats.binance_isolated_market_light_fallback_failures += 1;
       }
     }
   } else {
+    // Coinbase remains an exact official product read because the parent bridge
+    // intentionally does not copy the several-thousand-product Coinbase set.
     stats.upstream_ticker_builds += 1;
     rows = await tickers(provider, 'spot', [symbol]);
   }
@@ -251,6 +257,9 @@ async function buildExactTicker(provider, symbol) {
       market_type: 'spot',
       symbol,
       price,
+      read_only_shared: provider !== 'coinbase' ? true : raw?.read_only_shared,
+      user_upstream_requests: provider !== 'coinbase' ? 0 : raw?.user_upstream_requests,
+      reads_scale_with_users: provider !== 'coinbase' ? false : raw?.reads_scale_with_users,
     };
   }
   return null;
@@ -365,7 +374,7 @@ export function getSpotExactTickerHealth() {
     endpoint: '/api/spot-market/exact-ticker',
     health_endpoint: '/api/spot-market/exact-ticker-health',
     providers: [...PROVIDERS],
-    mode: 'backend_shared_exact_provider_spot_symbol_ticker_binance_market_light_reuse',
+    mode: 'backend_shared_exact_provider_spot_symbol_ticker_five_crypto_venues_market_light_reuse_coinbase_exact_official',
     cache_ttl_seconds: Math.round(CACHE_TTL_MS / 1000),
     stale_seconds: Math.round(STALE_MS / 1000),
     negative_ttl_seconds: Math.round(NEGATIVE_TTL_MS / 1000),
@@ -383,6 +392,12 @@ export function getSpotExactTickerHealth() {
     provider_bulkheads: buildBulkheadHealth(),
     same_exact_key_reads_share_cache_and_inflight: true,
     fresh_snapshot_reads_start_exchange_requests: false,
+    step1042_1_5_five_crypto_spot_exact_market_light_shared: true,
+    non_coinbase_exact_ticker_user_exchange_requests: 0,
+    non_coinbase_exact_ticker_user_exchange_connections: 0,
+    non_coinbase_exact_ticker_reads_scale_with_users: false,
+    non_coinbase_exact_ticker_direct_provider_fallback: false,
+    coinbase_exact_ticker_parent_bridge_intentionally_disabled_for_memory_bound: true,
     binance_exact_ticker_source: 'shared_market_light_websocket_snapshot',
     binance_exact_ticker_rest_requests: 0,
     binance_exact_ticker_user_scaled_requests: 0,
