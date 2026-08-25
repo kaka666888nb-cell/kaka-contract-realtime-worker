@@ -27,9 +27,9 @@ const STAGE_TABLE = 'kaka_exchange_stock_catalog_v2_stage';
 // than a wide 6h safety window through a bounded RPC, so active refreshes are never touched.
 const STAGE_RETENTION_RPC = 'kaka_cleanup_stock_catalog_v2_stage_retention_batch';
 const STAGE_RETENTION_MS = 6 * 60 * 60_000;
-const STAGE_RETENTION_INTERVAL_MS = 5 * 60_000;
+const STAGE_RETENTION_INTERVAL_MS = 15 * 60_000;
 const STAGE_RETENTION_BATCH = 5_000;
-const STAGE_RETENTION_MAX_BATCHES_PER_RUN = 6;
+const STAGE_RETENTION_MAX_BATCHES_PER_RUN = 1;
 
 const STATE_TABLE = 'kaka_exchange_stock_catalog_v2_state';
 const COMMIT_RPC = 'kaka_exchange_stock_catalog_v2_commit';
