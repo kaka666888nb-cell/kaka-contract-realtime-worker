@@ -2368,7 +2368,15 @@ async function fetchNativeMarketKlines(provider, market, symbol, interval, end, 
     let pages = 0;
     while (rows.length < limit && pages < maxPages) {
       const wanted = Math.min(maxPoints, Math.max(1, limit - rows.length));
-      const pageFrom = Math.max(0, pageTo - (wanted + 5) * seconds);
+      // Step1042.1.2.8.16.7.7.2: Gate spot candlesticks rejects from/to
+      // windows whose implied point count is too broad.  The old +5 overlap
+      // could turn an otherwise valid 1000-point daily page into a 1006-point
+      // request when the App asked for deep 3D/1W history (the exact path seen
+      // in RMX2202 logs).  Keep the overlap only when it still fits inside the
+      // provider's published per-request point ceiling; inclusive endpoints use
+      // requestPoints-1 intervals.  Contract keeps the same bounded rule.
+      const requestPoints = Math.min(maxPoints, Math.max(1, wanted + 5));
+      const pageFrom = Math.max(0, pageTo - Math.max(0, requestPoints - 1) * seconds);
       const urls = endpointPaths.map((base) =>
         `${base}?${key}=${encodeURIComponent(gateId(symbol))}` +
         `&interval=${encodeURIComponent(bar)}&from=${pageFrom}&to=${pageTo}`,
@@ -3782,7 +3790,14 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
   const sourceLimit = Math.min(5000, limit * factor + factor * 4);
   const sourceRows = await fetchNativeMarketKlines(provider, market, symbol, sourceInterval, end, sourceLimit);
   if (sourceInterval === interval) return sourceRows.slice(-limit);
-  return aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
+  const aggregated = aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
+  if (provider === 'gate' && market === 'spot' && (interval === '3d' || interval === '1w')) {
+    return aggregated.map((row) => ({
+      ...row,
+      source: 'gate_official_public_kline_render_bounded_range_paged_v2',
+    }));
+  }
+  return aggregated;
 }
 
 
