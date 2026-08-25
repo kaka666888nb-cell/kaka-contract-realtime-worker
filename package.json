@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-197.3.3.5",
+  "version": "650.8.15-197.3.3.6",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.197.3.3.5 Step1042.1.2.8.16.7.7.1 Bitget long Kline continuity wrapper: exact-open overlap pagination + shared singleflight + bounded gap repair; existing proxy/market-rest preserved"
+  "description": "Kaka Web3 Render 650.8.15.197.3.3.6 Step1042.1.2.8.16.7.7.2 Gate spot long-Kline bounded range pagination; Bitget long-Kline continuity wrapper preserved"
 }
