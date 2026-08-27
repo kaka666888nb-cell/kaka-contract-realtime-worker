@@ -18,10 +18,10 @@ const OFFICIAL_SOURCES = Object.freeze([
     id: 'binance',
     provider: 'binance',
     display_name: 'Binance',
-    roots: ['https://www.binance.com/en/support/announcement'],
+    roots: ['https://www.binance.com/en/support/announcement/list/48'],
     allowed_hosts: ['binance.com', 'www.binance.com'],
     include: [
-      /alpha\s*(airdrop|box|points|tge|token)/i,
+      /alpha.{0,80}(airdrop|box|points|tge|token|reward|competition|campaign)/i,
       /hodler\s*airdrops?/i,
       /launchpool/i,
       /\bairdrop\b/i,
@@ -125,6 +125,8 @@ const state = {
   upstreamFailures: 0,
   detailRequests: 0,
   persistedRows: 0,
+  persistSuccesses: 0,
+  persistFailures: 0,
   sourceStates: {},
 };
 
@@ -551,7 +553,7 @@ async function hydrateCandidate(source, candidate, known) {
   const period = extractPeriod(combinedText);
   const startAt = candidate.start_at || period.start_at;
   const endAt = candidate.end_at || period.end_at;
-  const publishedAt = candidate.published_at || extractPublishedAt(detailHtml, detailText) || nowIso();
+  const publishedAt = candidate.published_at || extractPublishedAt(detailHtml, detailText) || null;
   const reward = extractRewardText(candidate.title, combinedText);
   return {
     ...base,
@@ -617,7 +619,9 @@ async function collectSource(source) {
   const rows = [];
   for (const [id, candidate] of candidates) {
     const known = knownById.get(id) || null;
-    const needsDetail = !known || !text(known.published_at);
+    // Bybit's documented V5 announcements endpoint is the authoritative structured source.
+    // Do not fan out to article-detail pages just to fill optional fields.
+    const needsDetail = source.provider !== 'bybit' && (!known || !text(known.published_at));
     if (needsDetail && detailBudget <= 0) {
       const structuredSummary = normalizeWhitespace(candidate.description);
       const startAt = candidate.start_at || known?.start_at || null;
@@ -682,6 +686,7 @@ async function persistRows(rows) {
     body: JSON.stringify(payload),
   });
   state.persistedRows += payload.length;
+  state.persistSuccesses++;
   state.lastPersistAt = nowIso();
   return Array.isArray(result) ? result : payload;
 }
@@ -715,6 +720,7 @@ async function refreshOnce({ force = false } = {}) {
             const persisted = await persistRows(rows);
             if (persisted.length) mergePublicSnapshot(persisted);
           } catch (error) {
+            state.persistFailures++;
             state.lastError = `persist:${String(error?.message || error)}`;
           }
         }
@@ -777,6 +783,8 @@ function publicHealth() {
     upstream_failures: state.upstreamFailures,
     detail_requests: state.detailRequests,
     persisted_rows: state.persistedRows,
+    persist_successes: state.persistSuccesses,
+    persist_failures: state.persistFailures,
     public_reads: state.publicReads,
     public_snapshot_loaded: state.publicSnapshotLoaded,
     public_snapshot_rows: state.publicSnapshotRows,
