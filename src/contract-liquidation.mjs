@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.7';
+const STEP_VERSION = '650.8.15.197.3.3.10';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -62,6 +62,7 @@ const LIQUIDATION_GATE_COVERAGE_TABLE = 'app_contract_liquidation_gate_1m_covera
 const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_step997_cache';
 const LIQUIDATION_STEP997_HISTORY_RPC = 'kaka_contract_liquidation_history_step997';
 const LIQUIDATION_WINDOW_SUMMARY_RPC = 'kaka_contract_liquidation_window_summary_step1041_5_4';
+const LIQUIDATION_24H_SUMMARY_RPC = 'kaka_contract_liquidation_24h_summary_step1043';
 const LIQUIDATION_MINUTE_RETENTION_HOURS = 30;
 const STEP997_HISTORY_INTERVALS = Object.freeze({
   '1m': { canonical: '1m', durationMs: MINUTE_BUCKET_MS, base: 'minute', maxHours: 24 },
@@ -900,6 +901,34 @@ async function readLiquidationWindowSummaryStep104154({ provider = '', symbol = 
   };
 }
 
+
+// Step1043: authoritative latest-24-closed-hours aggregation. This is a
+// server-only Supabase RPC over the existing shared 1m liquidation cache.
+// User reads never start exchange requests or connections.
+async function readLiquidation24hSummaryStep1043({ provider = '', symbol = '' } = {}) {
+  const safeProvider = normalizeProvider(provider);
+  const safeSymbol = compactSymbol(symbol);
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${LIQUIDATION_24H_SUMMARY_RPC}`, {
+    method: 'POST',
+    headers: liquidationSupabaseHeaders({ 'content-type': 'application/json', accept: 'application/json' }),
+    body: JSON.stringify({
+      p_provider: safeProvider || null,
+      p_symbol: safeSymbol || null,
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const rawText = await response.text();
+  if (!response.ok) throw new Error(`liquidation_24h_summary_rpc_http_${response.status}:${rawText.slice(0, 220)}`);
+  const decoded = JSON.parse(rawText);
+  const row = Array.isArray(decoded) && decoded[0] && typeof decoded[0] === 'object' ? decoded[0] : null;
+  if (!row) throw new Error('liquidation_24h_summary_empty');
+  return {
+    ...row,
+    source: String(row.source || ''),
+    twenty_four_hour_pairs: Array.isArray(row.twenty_four_hour_pairs) ? row.twenty_four_hour_pairs : [],
+  };
+}
+
 async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', symbol = '', limit = 2500 } = {}) {
   if (!LIQUIDATION_PERSISTENCE_ENABLED) throw new Error('liquidation_history_persistence_disabled');
   const spec = canonicalStep997HistoryInterval(interval);
@@ -942,11 +971,77 @@ async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', s
     }).filter(Boolean);
     let windowSummary = null;
     let windowSummaryError = '';
+    let window24hSummary = null;
+    let window24hSummaryError = '';
     if (spec.base === 'hour') {
-      try {
-        windowSummary = await readLiquidationWindowSummaryStep104154({ provider: safeProvider, symbol: safeSymbol });
-      } catch (error) {
-        windowSummaryError = String(error?.message || error).slice(0, 320);
+      const [compactResult, dayResult] = await Promise.allSettled([
+        readLiquidationWindowSummaryStep104154({ provider: safeProvider, symbol: safeSymbol }),
+        readLiquidation24hSummaryStep1043({ provider: safeProvider, symbol: safeSymbol }),
+      ]);
+      if (compactResult.status === 'fulfilled') {
+        windowSummary = compactResult.value;
+      } else {
+        windowSummaryError = String(compactResult.reason?.message || compactResult.reason).slice(0, 320);
+      }
+      if (dayResult.status === 'fulfilled') {
+        const candidate = dayResult.value;
+        const expectedDaySource = 'supabase_step1043_all_provider_usdt_exact_recent_1m_24h_window_summary_v1';
+        const dayTotal = Number(candidate?.twenty_four_hour_total_notional);
+        const dayLong = Number(candidate?.twenty_four_hour_long_notional);
+        const dayShort = Number(candidate?.twenty_four_hour_short_notional);
+        const dayEvents = Number(candidate?.twenty_four_hour_event_count);
+        const sideTolerance = Math.max(0.05, Math.abs(dayTotal) * 1e-7);
+        if (candidate?.source !== expectedDaySource ||
+            !Number.isFinite(dayTotal) || dayTotal < 0 ||
+            !Number.isFinite(dayLong) || dayLong < 0 ||
+            !Number.isFinite(dayShort) || dayShort < 0 ||
+            !Number.isFinite(dayEvents) || dayEvents < 0 ||
+            Math.abs((dayLong + dayShort) - dayTotal) > sideTolerance) {
+          window24hSummaryError = 'liquidation_24h_summary_invalid';
+        } else {
+          window24hSummary = candidate;
+        }
+      } else {
+        window24hSummaryError = String(dayResult.reason?.message || dayResult.reason).slice(0, 320);
+      }
+      // Preserve the already-proven 1H/6H summary if the new 24H RPC is
+      // unavailable or if the two parallel RPCs crossed an hour boundary.
+      // Only same-anchor, monotonic windows are exposed as one combined authority.
+      if (windowSummary && window24hSummary) {
+        const oneSixAnchorMs = Date.parse(String(windowSummary.anchor_end || ''));
+        const dayAnchorMs = Date.parse(String(window24hSummary.anchor_end || ''));
+        const sixTotal = Number(windowSummary.six_hour_total_notional);
+        const sixEvents = Number(windowSummary.six_hour_event_count);
+        const dayTotal = Number(window24hSummary.twenty_four_hour_total_notional);
+        const dayEvents = Number(window24hSummary.twenty_four_hour_event_count);
+        const anchorsMatch = Number.isFinite(oneSixAnchorMs) &&
+            Number.isFinite(dayAnchorMs) && oneSixAnchorMs === dayAnchorMs;
+        const monotonic = Number.isFinite(sixTotal) && Number.isFinite(sixEvents) &&
+            dayTotal >= sixTotal && dayEvents >= sixEvents;
+        if (anchorsMatch && monotonic) {
+          windowSummary = {
+            ...windowSummary,
+            twenty_four_hour_start: window24hSummary.twenty_four_hour_start,
+            twenty_four_hour_total_notional: window24hSummary.twenty_four_hour_total_notional,
+            twenty_four_hour_long_notional: window24hSummary.twenty_four_hour_long_notional,
+            twenty_four_hour_short_notional: window24hSummary.twenty_four_hour_short_notional,
+            twenty_four_hour_event_count: window24hSummary.twenty_four_hour_event_count,
+            twenty_four_hour_long_count: window24hSummary.twenty_four_hour_long_count,
+            twenty_four_hour_short_count: window24hSummary.twenty_four_hour_short_count,
+            twenty_four_distinct_hours: window24hSummary.twenty_four_distinct_hours,
+            twenty_four_hour_pairs: window24hSummary.twenty_four_hour_pairs,
+            twenty_four_latest_minute_bucket_end: window24hSummary.latest_minute_bucket_end,
+            twenty_four_source: window24hSummary.source,
+            twenty_four_ready: true,
+            one_six_source: windowSummary.source,
+            source: 'render_step1043_combined_1h_6h_24h_authoritative_window_summary_v1',
+          };
+        } else {
+          window24hSummaryError = anchorsMatch
+              ? 'liquidation_24h_summary_non_monotonic'
+              : 'liquidation_24h_summary_anchor_mismatch';
+          window24hSummary = null;
+        }
       }
     }
     const providers = [...new Set(rows.map((row) => row.provider))].sort();
@@ -972,6 +1067,10 @@ async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', s
       window_summary_ready: windowSummary != null,
       window_summary_rpc: LIQUIDATION_WINDOW_SUMMARY_RPC,
       window_summary_error: windowSummaryError || null,
+      window_24h_summary: window24hSummary,
+      window_24h_summary_ready: window24hSummary != null,
+      window_24h_summary_rpc: LIQUIDATION_24H_SUMMARY_RPC,
+      window_24h_summary_error: window24hSummaryError || null,
       detail_rows_may_be_postgrest_capped: rows.length >= 1000,
       window_summary_not_affected_by_detail_row_cap: true,
       cache_hit: false,
