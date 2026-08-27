@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.10';
+const STEP_VERSION = '650.8.15.197.3.3.11';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -63,6 +63,7 @@ const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_step997_cache
 const LIQUIDATION_STEP997_HISTORY_RPC = 'kaka_contract_liquidation_history_step997';
 const LIQUIDATION_WINDOW_SUMMARY_RPC = 'kaka_contract_liquidation_window_summary_step1041_5_4';
 const LIQUIDATION_24H_SUMMARY_RPC = 'kaka_contract_liquidation_24h_summary_step1043';
+const LIQUIDATION_WINDOWS_STEP1043_1_RPC = 'kaka_contract_liquidation_windows_step1043_1';
 const LIQUIDATION_MINUTE_RETENTION_HOURS = 30;
 const STEP997_HISTORY_INTERVALS = Object.freeze({
   '1m': { canonical: '1m', durationMs: MINUTE_BUCKET_MS, base: 'minute', maxHours: 24 },
@@ -905,6 +906,36 @@ async function readLiquidationWindowSummaryStep104154({ provider = '', symbol = 
 // Step1043: authoritative latest-24-closed-hours aggregation. This is a
 // server-only Supabase RPC over the existing shared 1m liquidation cache.
 // User reads never start exchange requests or connections.
+async function readLiquidationWindowsStep10431({ provider = '', symbol = '' } = {}) {
+  const safeProvider = normalizeProvider(provider);
+  const safeSymbol = compactSymbol(symbol);
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${LIQUIDATION_WINDOWS_STEP1043_1_RPC}`, {
+    method: 'POST',
+    headers: liquidationSupabaseHeaders({ 'content-type': 'application/json', accept: 'application/json' }),
+    body: JSON.stringify({
+      p_provider: safeProvider || null,
+      p_symbol: safeSymbol || null,
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const rawText = await response.text();
+  if (!response.ok) throw new Error(`liquidation_windows_step1043_1_rpc_http_${response.status}:${rawText.slice(0, 220)}`);
+  const decoded = JSON.parse(rawText);
+  const row = Array.isArray(decoded) && decoded[0] && typeof decoded[0] === 'object' ? decoded[0] : null;
+  if (!row) throw new Error('liquidation_windows_step1043_1_empty');
+  return {
+    ...row,
+    source: String(row.source || ''),
+    one_hour_platforms: Array.isArray(row.one_hour_platforms) ? row.one_hour_platforms : [],
+    six_hour_pairs: Array.isArray(row.six_hour_pairs) ? row.six_hour_pairs : [],
+    twenty_four_hour_pairs: Array.isArray(row.twenty_four_hour_pairs) ? row.twenty_four_hour_pairs : [],
+    twenty_four_hour_largest_event: row.twenty_four_hour_largest_event && typeof row.twenty_four_hour_largest_event === 'object'
+      ? row.twenty_four_hour_largest_event
+      : {},
+    twenty_four_hourly_trend: Array.isArray(row.twenty_four_hourly_trend) ? row.twenty_four_hourly_trend : [],
+  };
+}
+
 async function readLiquidation24hSummaryStep1043({ provider = '', symbol = '' } = {}) {
   const safeProvider = normalizeProvider(provider);
   const safeSymbol = compactSymbol(symbol);
@@ -974,6 +1005,50 @@ async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', s
     let window24hSummary = null;
     let window24hSummaryError = '';
     if (spec.base === 'hour') {
+      // Step1043.1: prefer one server-side RPC that anchors 1H/4H/6H/12H/24H,
+      // largest event, top pairs and 24 closed hourly trend to the same closed hour.
+      // If it is unavailable during deployment/rollback, preserve the proven Step1043 path below.
+      try {
+        const candidate = await readLiquidationWindowsStep10431({ provider: safeProvider, symbol: safeSymbol });
+        const expectedSource = 'supabase_step1043_1_all_provider_usdt_exact_closed_1h_4h_6h_12h_24h_v1';
+        const values = {
+          one: Number(candidate?.one_hour_total_notional),
+          four: Number(candidate?.four_hour_total_notional),
+          six: Number(candidate?.six_hour_total_notional),
+          twelve: Number(candidate?.twelve_hour_total_notional),
+          day: Number(candidate?.twenty_four_hour_total_notional),
+          oneEvents: Number(candidate?.one_hour_event_count),
+          fourEvents: Number(candidate?.four_hour_event_count),
+          sixEvents: Number(candidate?.six_hour_event_count),
+          twelveEvents: Number(candidate?.twelve_hour_event_count),
+          dayEvents: Number(candidate?.twenty_four_hour_event_count),
+          dayLong: Number(candidate?.twenty_four_hour_long_notional),
+          dayShort: Number(candidate?.twenty_four_hour_short_notional),
+        };
+        const finiteNonNegative = Object.values(values).every((value) => Number.isFinite(value) && value >= 0);
+        const monotonic = values.one <= values.four && values.four <= values.six &&
+          values.six <= values.twelve && values.twelve <= values.day &&
+          values.oneEvents <= values.fourEvents && values.fourEvents <= values.sixEvents &&
+          values.sixEvents <= values.twelveEvents && values.twelveEvents <= values.dayEvents;
+        const sideTolerance = Math.max(0.05, Math.abs(values.day) * 1e-7);
+        const sidesMatch = Math.abs((values.dayLong + values.dayShort) - values.day) <= sideTolerance;
+        const trend = Array.isArray(candidate?.twenty_four_hourly_trend) ? candidate.twenty_four_hourly_trend : [];
+        const fullDay = Number(candidate?.twenty_four_distinct_hours) === 24 && trend.length === 24;
+        if (candidate?.source !== expectedSource || !finiteNonNegative || !monotonic || !sidesMatch || !fullDay) {
+          throw new Error('liquidation_windows_step1043_1_invalid');
+        }
+        windowSummary = {
+          ...candidate,
+          twenty_four_ready: true,
+          twenty_four_source: candidate.source,
+          one_six_source: candidate.source,
+          source: 'render_step1043_1_combined_1h_4h_6h_12h_24h_authoritative_window_summary_v1',
+        };
+      } catch (step10431Error) {
+        windowSummaryError = String(step10431Error?.message || step10431Error).slice(0, 320);
+      }
+
+      if (!windowSummary) {
       const [compactResult, dayResult] = await Promise.allSettled([
         readLiquidationWindowSummaryStep104154({ provider: safeProvider, symbol: safeSymbol }),
         readLiquidation24hSummaryStep1043({ provider: safeProvider, symbol: safeSymbol }),
@@ -1043,6 +1118,7 @@ async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', s
           window24hSummary = null;
         }
       }
+      }
     }
     const providers = [...new Set(rows.map((row) => row.provider))].sort();
     const pairs = new Set(rows.map((row) => `${row.provider}|${row.symbol}`));
@@ -1065,7 +1141,9 @@ async function readStep997UnifiedHistory({ interval, hours = 6, provider = '', s
       aggregation_rpc: LIQUIDATION_STEP997_HISTORY_RPC,
       window_summary: windowSummary,
       window_summary_ready: windowSummary != null,
-      window_summary_rpc: LIQUIDATION_WINDOW_SUMMARY_RPC,
+      window_summary_rpc: windowSummary?.source === 'render_step1043_1_combined_1h_4h_6h_12h_24h_authoritative_window_summary_v1'
+        ? LIQUIDATION_WINDOWS_STEP1043_1_RPC
+        : LIQUIDATION_WINDOW_SUMMARY_RPC,
       window_summary_error: windowSummaryError || null,
       window_24h_summary: window24hSummary,
       window_24h_summary_ready: window24hSummary != null,
