@@ -1,6 +1,6 @@
 import http from 'node:http';
 
-const STEP_VERSION = '650.8.15.197.3.3.13';
+const STEP_VERSION = '650.8.15.197.3.3.14';
 const WRAPPER_SCHEMA = 'step1042_1_2_8_16_7_7_1_bitget_long_kline_continuity_v1';
 const LONG_INTERVALS = new Set(['3d', '1w', '1M']);
 const CACHE_TTL_MS = 15 * 60_000;

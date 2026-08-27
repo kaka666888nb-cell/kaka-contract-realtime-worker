@@ -1,4 +1,4 @@
-const STEP_SCHEMA = 'step1044_1_x_cost_filtered_celebrity_hall_v2';
+const STEP_SCHEMA = 'step1044_1_2_x_shared_snapshot_celebrity_hall_v3';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const X_API_BEARER_TOKEN = String(process.env.X_API_BEARER_TOKEN || '').trim();
@@ -9,7 +9,7 @@ const SETTINGS_TABLE = 'app_social_watch_settings';
 const ACCOUNTS_TABLE = 'app_social_watch_accounts';
 const EVENTS_TABLE = 'app_social_watch_events';
 const NOTIFICATIONS_TABLE = 'app_notifications';
-const DEFAULT_CONFIG_REFRESH_MS = 30_000;
+const DEFAULT_CONFIG_REFRESH_MS = 60_000;
 const MIN_CONFIG_REFRESH_MS = 15_000;
 const MAX_CONFIG_REFRESH_MS = 3_600_000;
 const STREAM_RECONNECT_MAX_MS = 60_000;
@@ -17,6 +17,9 @@ const STREAM_STALL_MS = 35_000;
 const RULE_BATCH_SIZE = 25;
 const X_USAGE_MIN_REFRESH_MS = 5 * 60_000;
 const DEFAULT_X_USAGE_REFRESH_MS = 10 * 60_000;
+const PUBLIC_EVENT_CACHE_LIMIT = 1000;
+const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
+const PUBLIC_EVENT_RELOAD_MS = 30 * 60_000;
 const MARKET_FOCUS_KEYWORDS = [
   'Bitcoin', 'BTC', 'crypto', 'Ethereum', 'ETH', 'DOGE', 'Dogecoin', 'stablecoin',
   'ETF', 'SEC', 'Fed', 'FOMC', 'tariff', 'sanction', 'regulation', 'market',
@@ -73,6 +76,11 @@ const state = {
   xPostReads: 0,
   userReadXRequests: 0,
   xUsageReads: 0,
+  publicSnapshotLoaded: false,
+  publicSnapshotLoadedAt: null,
+  publicSnapshotAccounts: 0,
+  publicSnapshotEvents: 0,
+  publicSnapshotDbReads: 0,
 };
 
 let settingsTimer = null;
@@ -81,6 +89,10 @@ let streamLoopPromise = null;
 let stopping = false;
 let desiredAccountsByTag = new Map();
 let lastConfigSignature = '';
+let publicAccountsSnapshot = [];
+let publicEventsSnapshot = [];
+let publicEventsLoadPromise = null;
+let publicEventsLoadedAtMs = 0;
 
 function nowIso() { return new Date().toISOString(); }
 function text(v) { return String(v ?? '').trim(); }
@@ -180,6 +192,92 @@ function accountRuleValue(account) {
   if (account.include_replies !== true) parts.push('-is:reply');
   return parts.join(' ');
 }
+function publicAccountView(account) {
+  return {
+    id: text(account?.id),
+    source: text(account?.source) || 'x',
+    handle: normalizeHandle(account?.handle),
+    display_name: text(account?.display_name),
+    category: text(account?.category),
+    role_title: text(account?.role_title),
+    sort_order: Math.trunc(finiteNumber(account?.sort_order, 100)),
+    last_post_at: text(account?.last_post_at) || null,
+  };
+}
+function refreshPublicAccountsSnapshot(accounts) {
+  const previousIds = publicAccountsSnapshot.map((row) => text(row?.id)).filter(Boolean).sort().join(',');
+  publicAccountsSnapshot = (Array.isArray(accounts) ? accounts : [])
+    .filter((a) => a?.source === 'x' && a?.is_active === true && a?.public_visible === true && normalizeHandle(a?.handle))
+    .sort((a, b) => {
+      const bySort = finiteNumber(a?.sort_order, 100) - finiteNumber(b?.sort_order, 100);
+      if (bySort !== 0) return bySort;
+      return text(a?.created_at).localeCompare(text(b?.created_at));
+    })
+    .slice(0, 200)
+    .map(publicAccountView);
+  const visibleIds = new Set(publicAccountsSnapshot.map((row) => text(row.id)).filter(Boolean));
+  if (publicEventsSnapshot.length) {
+    publicEventsSnapshot = publicEventsSnapshot.filter((row) => visibleIds.has(text(row?.watch_account_id))).slice(0, PUBLIC_EVENT_CACHE_LIMIT);
+  }
+  state.publicSnapshotAccounts = publicAccountsSnapshot.length;
+  state.publicSnapshotEvents = publicEventsSnapshot.length;
+  const nextIds = publicAccountsSnapshot.map((row) => text(row?.id)).filter(Boolean).sort().join(',');
+  if (previousIds !== nextIds) {
+    state.publicSnapshotLoaded = false;
+    publicEventsLoadedAtMs = 0;
+  }
+}
+function publicEventView(row) {
+  return {
+    id: row?.id ?? null,
+    watch_account_id: text(row?.watch_account_id),
+    source: text(row?.source) || 'x',
+    source_post_id: text(row?.source_post_id),
+    author_handle: normalizeHandle(row?.author_handle),
+    author_name: text(row?.author_name),
+    content: text(row?.content),
+    post_url: text(row?.post_url),
+    published_at: text(row?.published_at),
+    language: text(row?.language) || null,
+    notification_created: row?.notification_created === true,
+  };
+}
+async function loadPublicEventsSnapshot({ force = false } = {}) {
+  const age = Date.now() - publicEventsLoadedAtMs;
+  if (!force && state.publicSnapshotLoaded && age >= 0 && age < PUBLIC_EVENT_RELOAD_MS) return false;
+  if (publicEventsLoadPromise) return publicEventsLoadPromise;
+  publicEventsLoadPromise = (async () => {
+    const ids = publicAccountsSnapshot.map((row) => text(row.id)).filter((id) => /^[0-9a-fA-F-]{36}$/.test(id));
+    if (!ids.length) {
+      publicEventsSnapshot = [];
+      publicEventsLoadedAtMs = Date.now();
+      state.publicSnapshotLoaded = true;
+      state.publicSnapshotLoadedAt = nowIso();
+      state.publicSnapshotEvents = 0;
+      return true;
+    }
+    const inFilter = encodeURIComponent(`(${ids.join(',')})`);
+    const rows = await supabaseFetch(
+      `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,post_url,published_at,language,notification_created&order=published_at.desc&limit=${PUBLIC_EVENT_CACHE_LIMIT}`,
+    );
+    state.publicSnapshotDbReads++;
+    publicEventsSnapshot = (Array.isArray(rows) ? rows : []).map(publicEventView).slice(0, PUBLIC_EVENT_CACHE_LIMIT);
+    publicEventsLoadedAtMs = Date.now();
+    state.publicSnapshotLoaded = true;
+    state.publicSnapshotLoadedAt = nowIso();
+    state.publicSnapshotEvents = publicEventsSnapshot.length;
+    return true;
+  })();
+  try { return await publicEventsLoadPromise; }
+  finally { publicEventsLoadPromise = null; }
+}
+async function ensurePublicSnapshotReady() {
+  if (!state.lastConfigSyncAt) await readConfig();
+  if (!state.publicSnapshotLoaded || Date.now() - publicEventsLoadedAtMs >= PUBLIC_EVENT_RELOAD_MS) {
+    await loadPublicEventsSnapshot();
+  }
+}
+
 function currentEstimatedCostUsd() {
   const posts = finiteNumber(state.usageProjectPosts, NaN);
   if (!Number.isFinite(posts) || !Number.isFinite(POST_READ_REFERENCE_USD)) return null;
@@ -264,6 +362,12 @@ function publicHealth() {
     rule_sync_next_allowed_at: state.ruleSyncNextAllowedAt,
     x_post_reads: state.xPostReads,
     x_usage_reads: state.xUsageReads,
+    public_snapshot_loaded: state.publicSnapshotLoaded,
+    public_snapshot_loaded_at: state.publicSnapshotLoadedAt,
+    public_snapshot_accounts: state.publicSnapshotAccounts,
+    public_snapshot_events: state.publicSnapshotEvents,
+    public_snapshot_db_reads: state.publicSnapshotDbReads,
+    user_read_supabase_requests: 0,
   };
 }
 
@@ -338,6 +442,7 @@ async function readConfig() {
   state.usageRefreshMs = clampInt(settings.usage_refresh_minutes, 5, 1440, 10) * 60_000;
   updateBudgetMode();
   state.totalAccounts = accounts.length;
+  refreshPublicAccountsSnapshot(accounts);
 
   const activeCandidates = accounts
     .filter((a) => a?.is_active === true && normalizeHandle(a?.handle))
@@ -560,6 +665,16 @@ async function insertEvent(account, post, tag) {
   if (!row) return false;
   state.dailyPostsPersisted++;
   state.lastPersistAt = nowIso();
+  if (account?.public_visible === true) {
+    publicEventsSnapshot = [
+      publicEventView({ id: row.id, ...body, notification_created: false }),
+      ...publicEventsSnapshot.filter((item) => text(item?.source_post_id) !== postId),
+    ].slice(0, PUBLIC_EVENT_CACHE_LIMIT);
+    state.publicSnapshotLoaded = true;
+    state.publicSnapshotLoadedAt = nowIso();
+    publicEventsLoadedAtMs = Date.now();
+    state.publicSnapshotEvents = publicEventsSnapshot.length;
+  }
 
   let notificationId = null;
   const shouldNotify = state.autoAppNotification && account.notify_app !== false;
@@ -730,9 +845,10 @@ async function configTick() {
       try { await refreshXUsage(); } catch (error) { state.lastError = `usage:${String(error?.message || error)}`; }
     }
     const changed = await readConfig();
+    try { await loadPublicEventsSnapshot(); } catch (error) { state.lastError = `public_snapshot:${String(error?.message || error)}`; }
     const nextAllowedMs = Date.parse(state.ruleSyncNextAllowedAt || '');
     const canSyncRules = !Number.isFinite(nextAllowedMs) || Date.now() >= nextAllowedMs;
-    const periodicDue = !state.lastRuleSyncAt || Date.now() - Date.parse(state.lastRuleSyncAt || 0) > 10 * 60_000;
+    const periodicDue = !state.lastRuleSyncAt || Date.now() - Date.parse(state.lastRuleSyncAt || 0) > 60 * 60_000;
     if (canSyncRules && (changed || periodicDue)) {
       try {
         await syncRules();
@@ -785,31 +901,22 @@ export function getSocialWatchHealth() {
 }
 
 async function readLatestEvents(limit) {
-  const safeLimit = clampInt(limit, 1, 100, 30);
-  const rows = await supabaseFetch(
-    `${EVENTS_TABLE}?select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,post_url,published_at,language,notification_created&order=published_at.desc&limit=${safeLimit}`,
-  );
-  return Array.isArray(rows) ? rows : [];
+  await ensurePublicSnapshotReady();
+  const safeLimit = clampInt(limit, 1, PUBLIC_ENDPOINT_MAX_LIMIT, 30);
+  return publicEventsSnapshot.slice(0, safeLimit);
 }
 
 async function readPublicAccounts() {
-  const rows = await supabaseFetch(
-    `${ACCOUNTS_TABLE}?source=eq.x&is_active=eq.true&public_visible=eq.true&select=id,source,handle,display_name,category,role_title,sort_order,last_post_at&order=sort_order.asc,created_at.asc&limit=200`,
-  );
-  return Array.isArray(rows) ? rows : [];
+  await ensurePublicSnapshotReady();
+  return publicAccountsSnapshot.map((row) => ({ ...row }));
 }
 
 async function readPublicEvents(limit, accounts) {
-  const safeLimit = clampInt(limit, 1, 100, 80);
-  const ids = (Array.isArray(accounts) ? accounts : [])
-    .map((row) => text(row?.id))
-    .filter((id) => /^[0-9a-fA-F-]{36}$/.test(id));
-  if (!ids.length) return [];
-  const inFilter = encodeURIComponent(`(${ids.join(',')})`);
-  const rows = await supabaseFetch(
-    `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=watch_account_id,source,source_post_id,author_handle,author_name,content,post_url,published_at,language&order=published_at.desc&limit=${safeLimit}`,
-  );
-  return Array.isArray(rows) ? rows : [];
+  await ensurePublicSnapshotReady();
+  const safeLimit = clampInt(limit, 1, PUBLIC_ENDPOINT_MAX_LIMIT, 80);
+  const ids = new Set((Array.isArray(accounts) ? accounts : []).map((row) => text(row?.id)).filter(Boolean));
+  if (!ids.size) return [];
+  return publicEventsSnapshot.filter((row) => ids.has(text(row?.watch_account_id))).slice(0, safeLimit);
 }
 
 export async function handleSocialWatch(req, res, url) {
@@ -830,6 +937,8 @@ export async function handleSocialWatch(req, res, url) {
         row_count: rows.length,
         user_read_x_requests: 0,
         x_requests_scale_with_users: false,
+        user_read_supabase_requests: 0,
+        shared_public_snapshot: true,
         time: nowIso(),
       });
     } catch (error) {
@@ -838,6 +947,8 @@ export async function handleSocialWatch(req, res, url) {
         schema: STEP_SCHEMA,
         error: String(error?.message || error),
         user_read_x_requests: 0,
+        user_read_supabase_requests: 0,
+        shared_public_snapshot: true,
         time: nowIso(),
       });
     }
@@ -854,6 +965,8 @@ export async function handleSocialWatch(req, res, url) {
         row_count: rows.length,
         user_read_x_requests: 0,
         x_requests_scale_with_users: false,
+        user_read_supabase_requests: 0,
+        shared_public_snapshot: true,
         time: nowIso(),
       });
     } catch (error) {
@@ -862,6 +975,8 @@ export async function handleSocialWatch(req, res, url) {
         schema: STEP_SCHEMA,
         error: String(error?.message || error),
         user_read_x_requests: 0,
+        user_read_supabase_requests: 0,
+        shared_public_snapshot: true,
         time: nowIso(),
       });
     }
