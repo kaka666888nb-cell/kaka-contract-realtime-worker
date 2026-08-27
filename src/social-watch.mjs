@@ -1,4 +1,4 @@
-const STEP_SCHEMA = 'step1044_x_configurable_celebrity_watch_v1';
+const STEP_SCHEMA = 'step1044_1_x_cost_filtered_celebrity_hall_v2';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const X_API_BEARER_TOKEN = String(process.env.X_API_BEARER_TOKEN || '').trim();
@@ -15,6 +15,14 @@ const MAX_CONFIG_REFRESH_MS = 3_600_000;
 const STREAM_RECONNECT_MAX_MS = 60_000;
 const STREAM_STALL_MS = 35_000;
 const RULE_BATCH_SIZE = 25;
+const X_USAGE_MIN_REFRESH_MS = 5 * 60_000;
+const DEFAULT_X_USAGE_REFRESH_MS = 10 * 60_000;
+const MARKET_FOCUS_KEYWORDS = [
+  'Bitcoin', 'BTC', 'crypto', 'Ethereum', 'ETH', 'DOGE', 'Dogecoin', 'stablecoin',
+  'ETF', 'SEC', 'Fed', 'FOMC', 'tariff', 'sanction', 'regulation', 'market',
+  'liquidity', 'inflation', 'Treasury', 'payment', 'Web3',
+  '比特币', '加密', '监管', '利率', '关税',
+];
 
 const state = {
   started: false,
@@ -23,8 +31,18 @@ const state = {
   xTokenConfigured: Boolean(X_API_BEARER_TOKEN),
   configRefreshMs: DEFAULT_CONFIG_REFRESH_MS,
   maxActiveAccounts: 100,
-  maxDailyPosts: 500,
+  maxDailyPosts: 80,
   autoAppNotification: true,
+  monthlySoftBudgetUsd: 5,
+  monthlyRestrictBudgetUsd: 7,
+  monthlyStopBudgetUsd: 9,
+  usageRefreshMs: DEFAULT_X_USAGE_REFRESH_MS,
+  usageLastCheckedAt: null,
+  usageProjectPosts: null,
+  usageProjectCap: null,
+  estimatedBillingPostCostUsd: null,
+  budgetMode: 'normal',
+  budgetWarning: false,
   activeAccounts: 0,
   totalAccounts: 0,
   managedRules: 0,
@@ -54,6 +72,7 @@ const state = {
   ruleSyncNextAllowedAt: null,
   xPostReads: 0,
   userReadXRequests: 0,
+  xUsageReads: 0,
 };
 
 let settingsTimer = null;
@@ -83,7 +102,7 @@ function xHeaders(extra = {}) {
   return {
     authorization: `Bearer ${X_API_BEARER_TOKEN}`,
     accept: 'application/json',
-    'user-agent': 'KakaWeb3-Step1044-SocialWatch/1.0',
+    'user-agent': 'KakaWeb3-Step1044.1-SocialWatch/2.0',
     ...extra,
   };
 }
@@ -99,13 +118,85 @@ function normalizeHandle(raw) {
   return /^[A-Za-z0-9_]{1,15}$/.test(v) ? v : '';
 }
 function ruleTag(id) { return `${RULE_TAG_PREFIX}${text(id)}`; }
+function monitorMode(raw) {
+  const value = text(raw).toLowerCase();
+  return ['all_main', 'market_focus', 'keywords_only'].includes(value) ? value : 'all_main';
+}
+function budgetPriority(raw) {
+  const value = text(raw).toLowerCase();
+  return ['core', 'normal', 'secondary'].includes(value) ? value : 'normal';
+}
+function splitKeywords(raw) {
+  const values = text(raw)
+    .split(/[\n,，;；]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return [...new Set(values)].slice(0, 40);
+}
+function keywordRuleTerm(raw) {
+  let value = text(raw).replace(/[\\"]/g, '').replace(/[()]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!value) return '';
+  if (value.length > 48) value = value.slice(0, 48).trim();
+  if (!value) return '';
+  if (/^[#$@][^\s]+$/.test(value)) return value;
+  return value.includes(' ') ? `"${value}"` : value;
+}
+function keywordGroup(values, maxChars = 300) {
+  const terms = values.map(keywordRuleTerm).filter(Boolean);
+  const kept = [];
+  let used = 2;
+  for (const term of terms) {
+    const extra = term.length + (kept.length ? 4 : 0);
+    if (used + extra > maxChars) break;
+    kept.push(term);
+    used += extra;
+  }
+  return kept.length ? `(${kept.join(' OR ')})` : '';
+}
+function exclusionTerms(raw) {
+  return splitKeywords(raw)
+    .map(keywordRuleTerm)
+    .filter(Boolean)
+    .map((term) => `-${term}`);
+}
 function accountRuleValue(account) {
   const handle = normalizeHandle(account.handle);
   if (!handle) return '';
+  const mode = monitorMode(account.monitor_mode);
   const parts = [`from:${handle}`];
+  if (mode === 'market_focus') {
+    const group = keywordGroup([...MARKET_FOCUS_KEYWORDS, ...splitKeywords(account.include_keywords)]);
+    if (group) parts.push(group);
+  } else if (mode === 'keywords_only') {
+    const group = keywordGroup(splitKeywords(account.include_keywords));
+    if (!group) return '';
+    parts.push(group);
+  }
+  for (const excluded of exclusionTerms(account.exclude_keywords)) {
+    if ([...parts, excluded, '-is:retweet', '-is:reply'].join(' ').length > 480) break;
+    parts.push(excluded);
+  }
   if (account.include_reposts !== true) parts.push('-is:retweet');
   if (account.include_replies !== true) parts.push('-is:reply');
   return parts.join(' ');
+}
+function currentEstimatedCostUsd() {
+  const posts = finiteNumber(state.usageProjectPosts, NaN);
+  if (!Number.isFinite(posts) || !Number.isFinite(POST_READ_REFERENCE_USD)) return null;
+  return Number((posts * POST_READ_REFERENCE_USD).toFixed(4));
+}
+function updateBudgetMode() {
+  state.estimatedBillingPostCostUsd = currentEstimatedCostUsd();
+  const cost = state.estimatedBillingPostCostUsd;
+  if (!Number.isFinite(cost)) {
+    state.budgetMode = 'normal';
+    state.budgetWarning = false;
+    return;
+  }
+  state.budgetWarning = cost >= state.monthlySoftBudgetUsd;
+  if (cost >= state.monthlyStopBudgetUsd) state.budgetMode = 'stopped';
+  else if (cost >= state.monthlyRestrictBudgetUsd) state.budgetMode = 'restricted';
+  else state.budgetMode = 'normal';
 }
 function resetDailyIfNeeded() {
   const today = new Date().toISOString().slice(0, 10);
@@ -131,6 +222,16 @@ function publicHealth() {
     max_active_accounts: state.maxActiveAccounts,
     max_daily_posts: state.maxDailyPosts,
     auto_app_notification: state.autoAppNotification,
+    monthly_soft_budget_usd: state.monthlySoftBudgetUsd,
+    monthly_restrict_budget_usd: state.monthlyRestrictBudgetUsd,
+    monthly_stop_budget_usd: state.monthlyStopBudgetUsd,
+    usage_refresh_minutes: Math.round(state.usageRefreshMs / 60_000),
+    usage_last_checked_at: state.usageLastCheckedAt,
+    usage_project_posts: state.usageProjectPosts,
+    usage_project_cap: state.usageProjectCap,
+    estimated_billing_post_cost_usd: state.estimatedBillingPostCostUsd,
+    budget_mode: state.budgetMode,
+    budget_warning: state.budgetWarning,
     stream_connected: state.streamConnected,
     stream_connecting: state.streamConnecting,
     stream_reconnects: state.streamReconnects,
@@ -162,6 +263,7 @@ function publicHealth() {
     rule_sync_failures: state.ruleSyncFailures,
     rule_sync_next_allowed_at: state.ruleSyncNextAllowedAt,
     x_post_reads: state.xPostReads,
+    x_usage_reads: state.xUsageReads,
   };
 }
 
@@ -188,6 +290,35 @@ async function xFetch(path, init = {}) {
   return response;
 }
 
+async function refreshXUsage({ force = false } = {}) {
+  if (!state.xTokenConfigured) return false;
+  const lastMs = Date.parse(state.usageLastCheckedAt || '');
+  if (!force && Number.isFinite(lastMs) && Date.now() - lastMs < state.usageRefreshMs) return false;
+  const response = await xFetch('/2/usage/tweets?days=30&usage.fields=cap_reset_day,daily_client_app_usage,daily_project_usage,project_cap,project_id,project_usage');
+  state.xUsageReads++;
+  const raw = await response.text();
+  let payload = {};
+  try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { payload = {}; }
+  if (!response.ok) throw new Error(`social_watch_x_usage_http_${response.status}:${text(raw).slice(0, 280)}`);
+  const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
+  let posts = finiteNumber(data.project_usage, NaN);
+  if (!Number.isFinite(posts)) {
+    const daily = data.daily_project_usage;
+    const rows = Array.isArray(daily)
+      ? daily
+      : Array.isArray(daily?.usage)
+        ? daily.usage
+        : [];
+    posts = rows.reduce((sum, row) => sum + finiteNumber(row?.usage ?? row?.tweets_consumed, 0), 0);
+  }
+  state.usageProjectPosts = Number.isFinite(posts) ? Math.max(0, Math.trunc(posts)) : null;
+  const cap = finiteNumber(data.project_cap, NaN);
+  state.usageProjectCap = Number.isFinite(cap) ? Math.max(0, Math.trunc(cap)) : null;
+  state.usageLastCheckedAt = nowIso();
+  updateBudgetMode();
+  return true;
+}
+
 async function readConfig() {
   const [settingsRows, accountRows] = await Promise.all([
     supabaseFetch(`${SETTINGS_TABLE}?id=eq.default&select=*`),
@@ -199,12 +330,23 @@ async function readConfig() {
   state.enabled = settings.enabled !== false;
   state.autoAppNotification = settings.auto_app_notification !== false;
   state.maxActiveAccounts = clampInt(settings.max_active_accounts, 1, 1000, 100);
-  state.maxDailyPosts = clampInt(settings.max_daily_posts, 1, 100000, 500);
+  state.maxDailyPosts = clampInt(settings.max_daily_posts, 1, 100000, 80);
   state.configRefreshMs = clampInt(settings.config_refresh_seconds, 15, 3600, 30) * 1000;
+  state.monthlySoftBudgetUsd = Math.max(0.01, finiteNumber(settings.monthly_soft_budget_usd, 5));
+  state.monthlyRestrictBudgetUsd = Math.max(state.monthlySoftBudgetUsd, finiteNumber(settings.monthly_restrict_budget_usd, 7));
+  state.monthlyStopBudgetUsd = Math.max(state.monthlyRestrictBudgetUsd + 0.01, finiteNumber(settings.monthly_stop_budget_usd, 9));
+  state.usageRefreshMs = clampInt(settings.usage_refresh_minutes, 5, 1440, 10) * 60_000;
+  updateBudgetMode();
   state.totalAccounts = accounts.length;
-  const valid = accounts
+
+  const activeCandidates = accounts
     .filter((a) => a?.is_active === true && normalizeHandle(a?.handle))
     .slice(0, state.maxActiveAccounts);
+  const valid = state.budgetMode === 'stopped'
+    ? []
+    : state.budgetMode === 'restricted'
+      ? activeCandidates.filter((a) => budgetPriority(a?.budget_priority) === 'core')
+      : activeCandidates;
   state.activeAccounts = valid.length;
   desiredAccountsByTag = new Map(valid.map((a) => [ruleTag(a.id), a]));
   state.lastConfigSyncAt = nowIso();
@@ -214,33 +356,64 @@ async function readConfig() {
     auto: state.autoAppNotification,
     max: state.maxActiveAccounts,
     cap: state.maxDailyPosts,
+    budgetMode: state.budgetMode,
+    budgetSoft: state.monthlySoftBudgetUsd,
+    budgetRestrict: state.monthlyRestrictBudgetUsd,
+    budgetStop: state.monthlyStopBudgetUsd,
     accounts: valid.map((a) => ({
       id: a.id,
       handle: normalizeHandle(a.handle),
       replies: a.include_replies === true,
       reposts: a.include_reposts === true,
       notify: a.notify_app !== false,
+      mode: monitorMode(a.monitor_mode),
+      include: text(a.include_keywords),
+      exclude: text(a.exclude_keywords),
+      priority: budgetPriority(a.budget_priority),
     })),
   });
   const changed = sig !== lastConfigSignature;
   lastConfigSignature = sig;
 
-  // Keep paused statuses understandable in the admin page.
   const activeIds = new Set(valid.map((a) => text(a.id)));
+  const candidateIds = new Set(activeCandidates.map((a) => text(a.id)));
+  const overflowIds = new Set(accounts
+    .filter((a) => a?.is_active === true && normalizeHandle(a?.handle))
+    .slice(state.maxActiveAccounts)
+    .map((a) => text(a.id)));
+
+  const pausedByBudget = accounts.filter((a) =>
+    a?.is_active === true &&
+    candidateIds.has(text(a?.id)) &&
+    !activeIds.has(text(a?.id)) &&
+    (state.budgetMode === 'stopped' || state.budgetMode === 'restricted') &&
+    (text(a?.rule_status) !== 'paused_budget' || text(a?.rule_id))
+  );
   const overflowActive = accounts.filter((a) =>
     a?.is_active === true &&
-    !activeIds.has(text(a?.id)) &&
+    overflowIds.has(text(a?.id)) &&
     (text(a?.rule_status) !== 'paused_limit' || text(a?.rule_id))
   );
+  const invalidKeyword = activeCandidates.filter((a) =>
+    monitorMode(a?.monitor_mode) === 'keywords_only' &&
+    splitKeywords(a?.include_keywords).length === 0 &&
+    activeIds.has(text(a?.id))
+  );
+  const invalidKeywordIds = new Set(invalidKeyword.map((a) => text(a.id)));
+  for (const id of invalidKeywordIds) desiredAccountsByTag.delete(ruleTag(id));
+  state.activeAccounts = desiredAccountsByTag.size;
+
   const inactive = accounts.filter((a) =>
     a?.is_active !== true &&
     (text(a?.rule_status) !== 'paused' || text(a?.rule_id))
   );
   await Promise.all([
-    ...overflowActive.map((a) => updateAccountStatus(a.id, { rule_status: 'paused_limit', rule_id: null })),
-    ...inactive.map((a) => updateAccountStatus(a.id, { rule_status: 'paused', rule_id: null })),
+    ...pausedByBudget.map((a) => updateAccountStatus(a.id, { rule_status: 'paused_budget', rule_id: null, last_error: null })),
+    ...overflowActive.map((a) => updateAccountStatus(a.id, { rule_status: 'paused_limit', rule_id: null, last_error: null })),
+    ...invalidKeyword.map((a) => updateAccountStatus(a.id, { rule_status: 'waiting_keywords', rule_id: null, last_error: null })),
+    ...inactive.map((a) => updateAccountStatus(a.id, { rule_status: 'paused', rule_id: null, last_error: null })),
   ]).catch(() => undefined);
-  return changed;
+  return changed || invalidKeyword.length > 0;
 }
 
 async function updateAccountStatus(id, fields) {
@@ -553,6 +726,9 @@ async function streamLoop() {
 async function configTick() {
   if (stopping || !state.supabaseConfigured) return;
   try {
+    if (state.xTokenConfigured) {
+      try { await refreshXUsage(); } catch (error) { state.lastError = `usage:${String(error?.message || error)}`; }
+    }
     const changed = await readConfig();
     const nextAllowedMs = Date.parse(state.ruleSyncNextAllowedAt || '');
     const canSyncRules = !Number.isFinite(nextAllowedMs) || Date.now() >= nextAllowedMs;
@@ -611,7 +787,27 @@ export function getSocialWatchHealth() {
 async function readLatestEvents(limit) {
   const safeLimit = clampInt(limit, 1, 100, 30);
   const rows = await supabaseFetch(
-    `${EVENTS_TABLE}?select=id,source_post_id,author_handle,author_name,content,post_url,published_at,language,notification_created&order=published_at.desc&limit=${safeLimit}`,
+    `${EVENTS_TABLE}?select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,post_url,published_at,language,notification_created&order=published_at.desc&limit=${safeLimit}`,
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function readPublicAccounts() {
+  const rows = await supabaseFetch(
+    `${ACCOUNTS_TABLE}?source=eq.x&is_active=eq.true&public_visible=eq.true&select=id,source,handle,display_name,category,role_title,sort_order,last_post_at&order=sort_order.asc,created_at.asc&limit=200`,
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function readPublicEvents(limit, accounts) {
+  const safeLimit = clampInt(limit, 1, 100, 80);
+  const ids = (Array.isArray(accounts) ? accounts : [])
+    .map((row) => text(row?.id))
+    .filter((id) => /^[0-9a-fA-F-]{36}$/.test(id));
+  if (!ids.length) return [];
+  const inFilter = encodeURIComponent(`(${ids.join(',')})`);
+  const rows = await supabaseFetch(
+    `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=watch_account_id,source,source_post_id,author_handle,author_name,content,post_url,published_at,language&order=published_at.desc&limit=${safeLimit}`,
   );
   return Array.isArray(rows) ? rows : [];
 }
@@ -621,9 +817,36 @@ export async function handleSocialWatch(req, res, url) {
     json(res, 200, { ok: true, social_watch: publicHealth(), time: nowIso() });
     return true;
   }
+  if (url.pathname === '/api/social-watch/public') {
+    try {
+      const accounts = await readPublicAccounts();
+      const rows = await readPublicEvents(url.searchParams.get('limit') || 80, accounts);
+      json(res, 200, {
+        ok: true,
+        schema: STEP_SCHEMA,
+        accounts,
+        rows,
+        account_count: accounts.length,
+        row_count: rows.length,
+        user_read_x_requests: 0,
+        x_requests_scale_with_users: false,
+        time: nowIso(),
+      });
+    } catch (error) {
+      json(res, 503, {
+        ok: false,
+        schema: STEP_SCHEMA,
+        error: String(error?.message || error),
+        user_read_x_requests: 0,
+        time: nowIso(),
+      });
+    }
+    return true;
+  }
   if (url.pathname === '/api/social-watch/latest') {
     try {
-      const rows = await readLatestEvents(url.searchParams.get('limit'));
+      const accounts = await readPublicAccounts();
+      const rows = await readPublicEvents(url.searchParams.get('limit') || 30, accounts);
       json(res, 200, {
         ok: true,
         schema: STEP_SCHEMA,
