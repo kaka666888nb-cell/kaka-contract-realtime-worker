@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-197.3.3.12",
+  "version": "650.8.15-197.3.3.13",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.197.3.3.12 Step1044 configurable X celebrity/critical-account shared filtered-stream monitor; admin links -> shared dedupe -> in-app notifications; user reads start zero X requests"
+  "description": "Kaka Web3 Render 650.8.15.197.3.3.13 Step1044.1 cost-filtered X celebrity hall; keyword modes + budget guard + safe user feed; user reads start zero X requests"
 }
