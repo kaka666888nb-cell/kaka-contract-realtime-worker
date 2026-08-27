@@ -1,0 +1,862 @@
+const STEP_SCHEMA = 'step1045_official_airdrop_shared_v1';
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const EVENTS_TABLE = 'app_airdrop_events';
+const DEFAULT_REFRESH_MS = 10 * 60_000;
+const MIN_REFRESH_MS = 3 * 60_000;
+const MAX_REFRESH_MS = 60 * 60_000;
+const SOURCE_TIMEOUT_MS = 12_000;
+const DETAIL_TIMEOUT_MS = 10_000;
+const MAX_DETAIL_FETCHES_PER_SOURCE = 4;
+const PUBLIC_CACHE_LIMIT = 600;
+const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
+const DB_RELOAD_MS = 30 * 60_000;
+const HTML_MAX_BYTES = 3 * 1024 * 1024;
+
+const OFFICIAL_SOURCES = Object.freeze([
+  {
+    id: 'binance',
+    provider: 'binance',
+    display_name: 'Binance',
+    roots: ['https://www.binance.com/en/support/announcement'],
+    allowed_hosts: ['binance.com', 'www.binance.com'],
+    include: [
+      /alpha\s*(airdrop|box|points|tge|token)/i,
+      /hodler\s*airdrops?/i,
+      /launchpool/i,
+      /\bairdrop\b/i,
+    ],
+    exclude: [/delist/i, /maintenance/i],
+  },
+  {
+    id: 'okx',
+    provider: 'okx',
+    display_name: 'OKX',
+    roots: [
+      'https://www.okx.com/zh-hans/help/section/latest-events',
+      'https://www.okx.com/zh-hans/help/section/announcements-jumpstart',
+    ],
+    allowed_hosts: ['okx.com', 'www.okx.com'],
+    include: [
+      /jumpstart/i,
+      /空投/i,
+      /奖励/i,
+      /瓜分/i,
+      /活动/i,
+      /airdrop/i,
+      /reward/i,
+    ],
+    exclude: [/vip\s*直升/i, /费率/i, /maintenance/i, /维护/i],
+  },
+  {
+    id: 'bybit',
+    provider: 'bybit',
+    display_name: 'Bybit',
+    json_roots: [
+      'https://api.bybit.com/v5/announcements/index?locale=en-US&type=latest_activities&limit=50',
+    ],
+    roots: ['https://announcements.bybit.com/en/'],
+    allowed_hosts: ['api.bybit.com', 'announcements.bybit.com', 'bybit.com', 'www.bybit.com'],
+    include: [
+      /launchpool/i,
+      /alpha.*(airdrop|reward|points?|quest|competition)/i,
+      /(airdrop|reward|prize pool|token splash)/i,
+    ],
+    exclude: [/removal/i, /delist/i, /maintenance/i],
+  },
+  {
+    id: 'bitget',
+    provider: 'bitget',
+    display_name: 'Bitget',
+    roots: [
+      'https://www.bitget.com/support/sections/4413154768537',
+      'https://www.bitget.com/support/',
+    ],
+    allowed_hosts: ['bitget.com', 'www.bitget.com'],
+    include: [
+      /poolx/i,
+      /candybomb/i,
+      /launchpool/i,
+      /\bairdrop\b/i,
+      /空投/i,
+    ],
+    exclude: [/maintenance/i, /delist/i],
+  },
+  {
+    id: 'gate',
+    provider: 'gate',
+    display_name: 'Gate',
+    roots: [
+      'https://www.gate.com/zh/announcements/latest',
+      'https://www.gate.com/zh/announcements',
+      'https://www.gate.com/announcements',
+    ],
+    allowed_hosts: ['gate.com', 'www.gate.com'],
+    include: [
+      /hodler\s*airdrop/i,
+      /candydrop/i,
+      /launchpool/i,
+      /vip\s*airdrop/i,
+      /空投/i,
+    ],
+    exclude: [/双周报/i, /biweekly/i, /maintenance/i],
+  },
+]);
+
+const state = {
+  started: false,
+  enabled: String(process.env.KAKA_AIRDROP_WATCH_ENABLED || '1') !== '0',
+  supabaseConfigured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
+  refreshMs: clampInt(process.env.KAKA_AIRDROP_REFRESH_SECONDS, MIN_REFRESH_MS / 1000, MAX_REFRESH_MS / 1000, DEFAULT_REFRESH_MS / 1000) * 1000,
+  refreshes: 0,
+  refreshFailures: 0,
+  refreshInFlight: false,
+  lastRefreshStartedAt: null,
+  lastRefreshCompletedAt: null,
+  lastPersistAt: null,
+  lastDbLoadAt: null,
+  lastError: null,
+  publicReads: 0,
+  publicSnapshotLoaded: false,
+  publicSnapshotRows: 0,
+  publicSnapshotDbReads: 0,
+  upstreamRequests: 0,
+  upstreamNotModified: 0,
+  upstreamFailures: 0,
+  detailRequests: 0,
+  persistedRows: 0,
+  sourceStates: {},
+};
+
+let timer = null;
+let stopping = false;
+let publicSnapshot = [];
+let dbLoadedAtMs = 0;
+let refreshPromise = null;
+const conditionalHeaders = new Map();
+
+function nowIso() { return new Date().toISOString(); }
+function text(v) { return String(v ?? '').trim(); }
+function finiteNumber(v, fallback = 0) { const n = Number(v); return Number.isFinite(n) ? n : fallback; }
+function clampInt(v, min, max, fallback) {
+  const n = Math.trunc(finiteNumber(v, fallback));
+  return Math.max(min, Math.min(max, n));
+}
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function json(res, status, body, { cacheSeconds = 0 } = {}) {
+  const headers = { 'content-type': 'application/json; charset=utf-8' };
+  if (cacheSeconds > 0) {
+    headers['cache-control'] = `public, max-age=${cacheSeconds}, stale-while-revalidate=${Math.max(cacheSeconds * 4, 60)}`;
+    headers['cdn-cache-control'] = `public, max-age=${cacheSeconds}`;
+  } else {
+    headers['cache-control'] = 'no-store';
+  }
+  res.writeHead(status, headers);
+  res.end(JSON.stringify(body));
+}
+function authHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    'content-type': 'application/json',
+    ...extra,
+  };
+}
+function normalizeWhitespace(v) { return text(v).replace(/\s+/g, ' ').trim(); }
+function decodeHtmlEntities(raw) {
+  return text(raw)
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)));
+}
+function stripHtml(raw) {
+  return normalizeWhitespace(decodeHtmlEntities(text(raw)
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')));
+}
+function safeUrl(raw, baseUrl) {
+  const value = decodeHtmlEntities(text(raw)).replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
+  if (!value || value.startsWith('javascript:') || value.startsWith('#')) return '';
+  try {
+    const u = new URL(value, baseUrl);
+    if (!['http:', 'https:'].includes(u.protocol)) return '';
+    u.hash = '';
+    return u.toString();
+  } catch (_) { return ''; }
+}
+function hostAllowed(urlValue, source) {
+  try {
+    const host = new URL(urlValue).hostname.toLowerCase();
+    return source.allowed_hosts.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+  } catch (_) { return false; }
+}
+function canonicalUrl(raw) {
+  try {
+    const u = new URL(raw);
+    for (const key of [...u.searchParams.keys()]) {
+      if (/^(utm_|ref$|ref_|source$|campaign$|from$)/i.test(key)) u.searchParams.delete(key);
+    }
+    u.hash = '';
+    return u.toString().replace(/\/$/, '');
+  } catch (_) { return text(raw); }
+}
+function hashString(value) {
+  // Stable non-cryptographic fingerprint; enough for source event identity fallback.
+  let h1 = 0x811c9dc5;
+  for (const ch of text(value)) {
+    h1 ^= ch.codePointAt(0);
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+  }
+  return h1.toString(16).padStart(8, '0');
+}
+function sourceEventId(provider, urlValue, title) {
+  const u = canonicalUrl(urlValue);
+  const path = (() => { try { return new URL(u).pathname; } catch (_) { return ''; } })();
+  const idMatch = path.match(/(?:detail|article|articles)[\/-]([A-Za-z0-9_-]{8,})/i) || path.match(/([A-Fa-f0-9]{24,})/);
+  if (idMatch?.[1]) return `${provider}:${idMatch[1]}`;
+  return `${provider}:${hashString(`${u}|${normalizeWhitespace(title).toLowerCase()}`)}`;
+}
+function titleMatches(source, title) {
+  const value = normalizeWhitespace(title);
+  if (!value || value.length < 8) return false;
+  if (source.exclude.some((rx) => rx.test(value))) return false;
+  return source.include.some((rx) => rx.test(value));
+}
+function categoryFor(provider, title) {
+  const value = normalizeWhitespace(title);
+  if (provider === 'binance') {
+    if (/alpha\s*box/i.test(value)) return 'alpha_box';
+    if (/alpha/i.test(value)) return 'alpha';
+    if (/hodler\s*airdrops?/i.test(value)) return 'hodler_airdrop';
+    if (/launchpool/i.test(value)) return 'launchpool';
+  }
+  if (provider === 'okx') {
+    if (/jumpstart/i.test(value)) return 'jumpstart';
+    if (/空投|airdrop/i.test(value)) return 'airdrop';
+    return 'campaign';
+  }
+  if (provider === 'bybit') {
+    if (/launchpool/i.test(value)) return 'launchpool';
+    if (/alpha/i.test(value)) return 'alpha';
+    if (/airdrop/i.test(value)) return 'airdrop';
+    return 'campaign';
+  }
+  if (provider === 'bitget') {
+    if (/poolx/i.test(value)) return 'poolx';
+    if (/candybomb/i.test(value)) return 'candybomb';
+    if (/launchpool/i.test(value)) return 'launchpool';
+    return 'airdrop';
+  }
+  if (provider === 'gate') {
+    if (/hodler\s*airdrop/i.test(value)) return 'hodler_airdrop';
+    if (/candydrop/i.test(value)) return 'candydrop';
+    if (/launchpool/i.test(value)) return 'launchpool';
+    if (/vip\s*airdrop/i.test(value)) return 'vip_airdrop';
+    return 'airdrop';
+  }
+  return 'airdrop';
+}
+function projectSymbolFromTitle(title) {
+  const value = normalizeWhitespace(title);
+  const pairs = [...value.matchAll(/\(([A-Z0-9][A-Z0-9._-]{1,14})\)/g)].map((m) => m[1]);
+  if (pairs.length) return pairs[pairs.length - 1];
+  const x = value.match(/\bx\s+([A-Z][A-Z0-9._-]{1,14})\b/i);
+  if (x?.[1]) return x[1].toUpperCase();
+  return null;
+}
+function extractRewardText(title, detailText) {
+  const value = `${normalizeWhitespace(title)} ${normalizeWhitespace(detailText)}`;
+  const patterns = [
+    /(?:share|瓜分|奖池|奖励|空投总量|total\s+airdrop|reward\s+pool|campaign\s+pool)[^\n。；;]{0,60}?([\d,.]+\s*(?:[KMBT]\s*)?[A-Z][A-Z0-9._-]{1,14})/i,
+    /([\d,.]+\s*(?:[KMBT]\s*)?(?:USDT|USDC|BTC|ETH|BNB|BGB|GT|OKB|MNT|[A-Z]{2,12}))\s*(?:reward|prize|airdrop|奖池|奖励|空投)/i,
+  ];
+  for (const rx of patterns) {
+    const m = value.match(rx);
+    if (m?.[1]) return normalizeWhitespace(m[1]).slice(0, 80);
+  }
+  return null;
+}
+function extractEligibilityText(detailText) {
+  // Conservative only: never turn generic footer/navigation wording into a user eligibility claim.
+  const value = normalizeWhitespace(detailText).slice(0, 8_000);
+  if (!value) return null;
+  const sentences = value.split(/(?<=[。.!?；;])\s+/).filter((s) => s.length >= 12 && s.length <= 420);
+  const chosen = sentences.filter((s) => /(eligib(?:le|ility)|to\s+participate|participation\s+requirement|complete\s+kyc|identity\s+verification|hold\s+at\s+least|stake\s+at\s+least|lock\s+at\s+least|参与资格|参与要求|需完成.{0,16}(?:认证|交易|申购|质押)|持有至少|质押至少|锁定至少)/i.test(s));
+  return chosen.slice(0, 2).join(' ').slice(0, 320) || null;
+}
+function parseDateCandidate(raw) {
+  const value = normalizeWhitespace(raw)
+    .replace(/年/g, '-')
+    .replace(/月/g, '-')
+    .replace(/日/g, ' ')
+    .replace(/[年月]/g, '-')
+    .replace(/\s+/g, ' ');
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+function extractPublishedAt(html, plain) {
+  const candidates = [];
+  for (const rx of [
+    /(?:article:published_time|datePublished)["'\s:=]+(?:content=["'])?([^"'<]{8,40})/i,
+    /"datePublished"\s*:\s*"([^"]+)"/i,
+    /<time\b[^>]*datetime=["']([^"']+)["']/i,
+  ]) {
+    const m = html.match(rx);
+    if (m?.[1]) candidates.push(m[1]);
+  }
+  const dateMatches = plain.match(/(?:20\d{2})[-/.年]\s?\d{1,2}[-/.月]\s?\d{1,2}(?:日)?(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?(?:\s*\(?(?:UTC(?:[+-]\d{1,2})?|GMT(?:[+-]\d{1,2})?)\)?)?/gi) || [];
+  candidates.push(...dateMatches.slice(0, 3));
+  for (const candidate of candidates) {
+    const parsed = parseDateCandidate(candidate);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+function extractPeriod(detailText) {
+  const value = normalizeWhitespace(detailText);
+  if (!value) return { start_at: null, end_at: null };
+  const datePattern = '(20\\d{2}[-/.年]\\s?\\d{1,2}[-/.月]\\s?\\d{1,2}(?:日)?(?:[ T]\\d{1,2}:\\d{2}(?::\\d{2})?)?(?:\\s*\\(?(?:UTC(?:[+-]\\d{1,2})?|GMT(?:[+-]\\d{1,2})?)\\)?)?)';
+  const range = new RegExp(`(?:promotion|event|locking|campaign|活动|锁定|申购|质押)[^。;]{0,40}?${datePattern}\\s*(?:–|—|-|to|至|~|～)\\s*${datePattern}`, 'i');
+  const m = value.match(range);
+  if (m) {
+    return { start_at: parseDateCandidate(m[1]), end_at: parseDateCandidate(m[2]) };
+  }
+  const endRx = new RegExp(`(?:end(?:s|ing)?|结束时间|截止时间)[^。;]{0,20}?${datePattern}`, 'i');
+  const endMatch = value.match(endRx);
+  return { start_at: null, end_at: endMatch?.[1] ? parseDateCandidate(endMatch[1]) : null };
+}
+function statusFor(startAt, endAt) {
+  const now = Date.now();
+  const start = Date.parse(startAt || '');
+  const end = Date.parse(endAt || '');
+  if (Number.isFinite(end) && end < now) return 'ended';
+  if (Number.isFinite(start) && start > now) return 'upcoming';
+  if ((Number.isFinite(start) && start <= now) || (Number.isFinite(end) && end >= now)) return 'active';
+  return 'announced';
+}
+function isoFromEpoch(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const ms = n < 10_000_000_000 ? n * 1000 : n;
+  try { return new Date(ms).toISOString(); } catch (_) { return null; }
+}
+function extractBybitApiCandidates(raw, source) {
+  let payload = null;
+  try { payload = JSON.parse(raw); } catch (_) { return []; }
+  const list = payload?.result?.list || payload?.retResult?.list || payload?.data?.list || [];
+  if (!Array.isArray(list)) return [];
+  const rows = [];
+  for (const item of list) {
+    const title = normalizeWhitespace(item?.title);
+    const sourceUrl = canonicalUrl(item?.url);
+    if (!titleMatches(source, title) || !sourceUrl || !hostAllowed(sourceUrl, source)) continue;
+    rows.push({
+      title,
+      source_url: sourceUrl,
+      description: normalizeWhitespace(item?.description).slice(0, 1200) || null,
+      published_at: isoFromEpoch(item?.publishTime ?? item?.dateTimestamp),
+      start_at: isoFromEpoch(item?.startDataTimestamp),
+      end_at: isoFromEpoch(item?.endDataTimestamp),
+    });
+  }
+  return rows.slice(0, 80);
+}
+function extractCandidates(html, source, baseUrl) {
+  const found = new Map();
+  const add = (href, rawTitle) => {
+    const title = stripHtml(rawTitle);
+    if (!titleMatches(source, title)) return;
+    const urlValue = canonicalUrl(safeUrl(href, baseUrl));
+    if (!urlValue || !hostAllowed(urlValue, source)) return;
+    if (urlValue === canonicalUrl(baseUrl)) return;
+    const key = `${urlValue}|${title.toLowerCase()}`;
+    if (!found.has(key)) found.set(key, { title, source_url: urlValue });
+  };
+  for (const match of html.matchAll(/<a\b([^>]*?)href=["']([^"']+)["']([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    add(match[2], match[4]);
+  }
+  // Common SSR/Next payload shapes. These are deliberately conservative: a title
+  // still has to pass provider-specific official-event keywords and the URL must stay
+  // on the provider's official domain.
+  for (const match of html.matchAll(/"(?:title|name|headline)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"[\s\S]{0,800}?"(?:url|href|link|slug)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gi)) {
+    add(match[2], match[1].replace(/\\n/g, ' ').replace(/\\"/g, '"'));
+  }
+  for (const match of html.matchAll(/"(?:url|href|link|slug)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"[\s\S]{0,800}?"(?:title|name|headline)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gi)) {
+    add(match[1], match[2].replace(/\\n/g, ' ').replace(/\\"/g, '"'));
+  }
+  return [...found.values()].slice(0, 80);
+}
+function publicEventView(row) {
+  return {
+    id: row?.id ?? null,
+    provider: text(row?.provider),
+    provider_name: text(row?.provider_name),
+    category: text(row?.category) || 'airdrop',
+    source_event_id: text(row?.source_event_id),
+    title: text(row?.title),
+    project_symbol: text(row?.project_symbol) || null,
+    reward_text: text(row?.reward_text) || null,
+    eligibility_text: text(row?.eligibility_text) || null,
+    start_at: text(row?.start_at) || null,
+    end_at: text(row?.end_at) || null,
+    published_at: text(row?.published_at) || null,
+    source_url: text(row?.source_url),
+    status: statusFor(row?.start_at, row?.end_at),
+    raw_summary: text(row?.raw_summary) || null,
+    fetched_at: text(row?.fetched_at) || null,
+  };
+}
+function sortSnapshot(rows) {
+  const score = (row) => {
+    const status = text(row?.status);
+    const statusScore = status === 'active' ? 4 : status === 'upcoming' ? 3 : status === 'announced' ? 2 : 1;
+    const when = Date.parse(row?.published_at || row?.start_at || '') || 0;
+    return [statusScore, when];
+  };
+  return rows.sort((a, b) => {
+    const sa = score(a); const sb = score(b);
+    if (sb[0] !== sa[0]) return sb[0] - sa[0];
+    return sb[1] - sa[1];
+  });
+}
+function mergePublicSnapshot(rows) {
+  const byKey = new Map();
+  for (const oldRow of publicSnapshot) {
+    const row = publicEventView(oldRow);
+    const key = row.source_event_id || `${row.provider}|${row.source_url}`;
+    if (key) byKey.set(key, row);
+  }
+  for (const incoming of rows) {
+    const row = publicEventView(incoming);
+    const key = row.source_event_id || `${row.provider}|${row.source_url}`;
+    if (!key) continue;
+    const previous = byKey.get(key) || {};
+    byKey.set(key, { ...previous, ...row });
+  }
+  publicSnapshot = sortSnapshot([...byKey.values()]).slice(0, PUBLIC_CACHE_LIMIT);
+  state.publicSnapshotRows = publicSnapshot.length;
+  state.publicSnapshotLoaded = true;
+}
+async function supabaseFetch(path, init = {}) {
+  if (!state.supabaseConfigured) throw new Error('airdrop_watch_supabase_not_configured');
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...init,
+    headers: { ...authHeaders(), ...(init.headers || {}) },
+  });
+  const raw = await response.text();
+  let payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch (_) { payload = raw; }
+  if (!response.ok) throw new Error(`airdrop_watch_supabase_http_${response.status}:${text(raw).slice(0, 260)}`);
+  return payload;
+}
+async function loadDbSnapshot({ force = false } = {}) {
+  if (!state.supabaseConfigured) return false;
+  if (!force && dbLoadedAtMs && Date.now() - dbLoadedAtMs < DB_RELOAD_MS) return false;
+  const rows = await supabaseFetch(`${EVENTS_TABLE}?select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,fetched_at&order=published_at.desc.nullslast,fetched_at.desc&limit=${PUBLIC_CACHE_LIMIT}`);
+  state.publicSnapshotDbReads++;
+  mergePublicSnapshot(Array.isArray(rows) ? rows : []);
+  dbLoadedAtMs = Date.now();
+  state.lastDbLoadAt = nowIso();
+  return true;
+}
+async function fetchHtml(urlValue, sourceId, { detail = false } = {}) {
+  const timeoutMs = detail ? DETAIL_TIMEOUT_MS : SOURCE_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), timeoutMs);
+  const conditional = conditionalHeaders.get(urlValue) || {};
+  const headers = {
+    accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.8,zh-CN;q=0.6',
+    'user-agent': 'Mozilla/5.0 (compatible; KakaWeb3-OfficialAirdropWatch/1.0; +https://kakaweb3.app)',
+    ...conditional,
+  };
+  state.upstreamRequests++;
+  if (detail) state.detailRequests++;
+  try {
+    const response = await fetch(urlValue, { headers, signal: controller.signal, redirect: 'follow' });
+    const sourceState = state.sourceStates[sourceId] ||= {};
+    sourceState.last_http_status = response.status;
+    sourceState.last_request_at = nowIso();
+    if (response.status === 304) {
+      state.upstreamNotModified++;
+      return { notModified: true, html: '', finalUrl: urlValue };
+    }
+    if (!response.ok) throw new Error(`official_http_${response.status}`);
+    const etag = text(response.headers.get('etag'));
+    const lastModified = text(response.headers.get('last-modified'));
+    const nextConditional = {};
+    if (etag) nextConditional['if-none-match'] = etag;
+    if (lastModified) nextConditional['if-modified-since'] = lastModified;
+    if (Object.keys(nextConditional).length) conditionalHeaders.set(urlValue, nextConditional);
+    const reader = response.body?.getReader?.();
+    if (!reader) {
+      const raw = await response.text();
+      return { notModified: false, html: raw.slice(0, HTML_MAX_BYTES), finalUrl: response.url || urlValue };
+    }
+    const decoder = new TextDecoder();
+    let total = 0;
+    let body = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value?.byteLength || 0;
+      if (total > HTML_MAX_BYTES) break;
+      body += decoder.decode(value, { stream: true });
+    }
+    try { reader.cancel(); } catch (_) {}
+    return { notModified: false, html: body, finalUrl: response.url || urlValue };
+  } catch (error) {
+    state.upstreamFailures++;
+    const sourceState = state.sourceStates[sourceId] ||= {};
+    sourceState.failures = finiteNumber(sourceState.failures, 0) + 1;
+    sourceState.last_error = String(error?.name === 'AbortError' ? 'official_timeout' : error?.message || error);
+    throw error;
+  } finally {
+    clearTimeout(timerId);
+  }
+}
+async function hydrateCandidate(source, candidate, known) {
+  const base = {
+    provider: source.provider,
+    provider_name: source.display_name,
+    category: categoryFor(source.provider, candidate.title),
+    source_event_id: sourceEventId(source.provider, candidate.source_url, candidate.title),
+    title: normalizeWhitespace(candidate.title).slice(0, 600),
+    project_symbol: projectSymbolFromTitle(candidate.title),
+    source_url: canonicalUrl(candidate.source_url),
+    source_domain: (() => { try { return new URL(candidate.source_url).hostname; } catch (_) { return ''; } })(),
+    fetched_at: nowIso(),
+  };
+  if (known && text(known.published_at)) {
+    // Timestamp-enriched rows do not refetch their detail page on every refresh.
+    return { ...known, ...base, fetched_at: nowIso() };
+  }
+  let detailHtml = '';
+  try {
+    const detail = await fetchHtml(candidate.source_url, source.id, { detail: true });
+    detailHtml = detail.html || '';
+  } catch (_) {
+    // Keep the official listing row even if detail fetch is temporarily unavailable.
+  }
+  const detailText = stripHtml(detailHtml);
+  const structuredSummary = normalizeWhitespace(candidate.description);
+  const combinedText = [structuredSummary, detailText].filter(Boolean).join(' ');
+  const period = extractPeriod(combinedText);
+  const startAt = candidate.start_at || period.start_at;
+  const endAt = candidate.end_at || period.end_at;
+  const publishedAt = candidate.published_at || extractPublishedAt(detailHtml, detailText) || nowIso();
+  const reward = extractRewardText(candidate.title, combinedText);
+  return {
+    ...base,
+    reward_text: reward,
+    eligibility_text: extractEligibilityText(combinedText),
+    start_at: startAt,
+    end_at: endAt,
+    published_at: publishedAt,
+    status: statusFor(startAt, endAt),
+    raw_summary: combinedText ? combinedText.slice(0, 600) : null,
+  };
+}
+async function collectSource(source) {
+  const sourceState = state.sourceStates[source.id] ||= {
+    provider: source.provider,
+    roots: (source.roots?.length || 0) + (source.json_roots?.length || 0),
+    refreshes: 0,
+    failures: 0,
+    last_error: null,
+    last_success_at: null,
+    last_candidate_count: 0,
+    last_new_detail_fetches: 0,
+  };
+  const knownById = new Map(publicSnapshot.filter((row) => row.provider === source.provider).map((row) => [row.source_event_id, row]));
+  const candidatesByKey = new Map();
+  let structuredSourceHealthy = false;
+  for (const root of source.json_roots || []) {
+    try {
+      const result = await fetchHtml(root, source.id);
+      structuredSourceHealthy = true;
+      if (result.notModified) continue;
+      const extracted = source.provider === 'bybit'
+        ? extractBybitApiCandidates(result.html, source)
+        : [];
+      for (const candidate of extracted) {
+        const id = sourceEventId(source.provider, candidate.source_url, candidate.title);
+        if (!candidatesByKey.has(id)) candidatesByKey.set(id, candidate);
+      }
+    } catch (error) {
+      sourceState.last_error = String(error?.message || error);
+    }
+  }
+  // Bybit exposes a documented public announcement API. The HTML page is only
+  // a fallback when that official structured source is unavailable, avoiding
+  // a redundant webpage request on every normal refresh.
+  if (!structuredSourceHealthy) {
+    for (const root of source.roots || []) {
+      try {
+        const result = await fetchHtml(root, source.id);
+        if (result.notModified) continue;
+        for (const candidate of extractCandidates(result.html, source, result.finalUrl || root)) {
+          const id = sourceEventId(source.provider, candidate.source_url, candidate.title);
+          if (!candidatesByKey.has(id)) candidatesByKey.set(id, candidate);
+        }
+      } catch (error) {
+        sourceState.last_error = String(error?.message || error);
+      }
+    }
+  }
+  const candidates = [...candidatesByKey.entries()].slice(0, 80);
+  sourceState.last_candidate_count = candidates.length;
+  let detailBudget = MAX_DETAIL_FETCHES_PER_SOURCE;
+  const rows = [];
+  for (const [id, candidate] of candidates) {
+    const known = knownById.get(id) || null;
+    const needsDetail = !known || !text(known.published_at);
+    if (needsDetail && detailBudget <= 0) {
+      const structuredSummary = normalizeWhitespace(candidate.description);
+      const startAt = candidate.start_at || known?.start_at || null;
+      const endAt = candidate.end_at || known?.end_at || null;
+      const publishedAt = candidate.published_at || known?.published_at || null;
+      rows.push({
+        ...(known || {}),
+        provider: source.provider,
+        provider_name: source.display_name,
+        category: categoryFor(source.provider, candidate.title),
+        source_event_id: id,
+        title: normalizeWhitespace(candidate.title).slice(0, 600),
+        project_symbol: projectSymbolFromTitle(candidate.title),
+        reward_text: extractRewardText(candidate.title, structuredSummary) || known?.reward_text || null,
+        eligibility_text: extractEligibilityText(structuredSummary) || known?.eligibility_text || null,
+        start_at: startAt,
+        end_at: endAt,
+        published_at: publishedAt,
+        source_url: canonicalUrl(candidate.source_url),
+        source_domain: (() => { try { return new URL(candidate.source_url).hostname; } catch (_) { return ''; } })(),
+        status: statusFor(startAt, endAt),
+        raw_summary: structuredSummary ? structuredSummary.slice(0, 600) : (known?.raw_summary || null),
+        fetched_at: nowIso(),
+      });
+      continue;
+    }
+    if (needsDetail) detailBudget--;
+    rows.push(await hydrateCandidate(source, candidate, known));
+  }
+  sourceState.last_new_detail_fetches = MAX_DETAIL_FETCHES_PER_SOURCE - detailBudget;
+  sourceState.refreshes = finiteNumber(sourceState.refreshes, 0) + 1;
+  if (rows.length || sourceState.last_error == null) {
+    sourceState.last_success_at = nowIso();
+    if (rows.length) sourceState.last_error = null;
+  }
+  return rows;
+}
+async function persistRows(rows) {
+  if (!rows.length || !state.supabaseConfigured) return [];
+  const payload = rows.map((row) => ({
+    provider: row.provider,
+    provider_name: row.provider_name,
+    category: row.category,
+    source_event_id: row.source_event_id,
+    title: row.title,
+    project_symbol: row.project_symbol,
+    reward_text: row.reward_text,
+    eligibility_text: row.eligibility_text,
+    start_at: row.start_at,
+    end_at: row.end_at,
+    published_at: row.published_at,
+    source_url: row.source_url,
+    source_domain: row.source_domain,
+    status: statusFor(row.start_at, row.end_at),
+    raw_summary: row.raw_summary,
+    fetched_at: nowIso(),
+    updated_at: nowIso(),
+  }));
+  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,fetched_at`, {
+    method: 'POST',
+    headers: { prefer: 'resolution=merge-duplicates,return=representation' },
+    body: JSON.stringify(payload),
+  });
+  state.persistedRows += payload.length;
+  state.lastPersistAt = nowIso();
+  return Array.isArray(result) ? result : payload;
+}
+async function refreshOnce({ force = false } = {}) {
+  if (refreshPromise && !force) return refreshPromise;
+  refreshPromise = (async () => {
+    if (!state.enabled || stopping) return false;
+    state.refreshInFlight = true;
+    state.lastRefreshStartedAt = nowIso();
+    try {
+      if (!state.publicSnapshotLoaded) {
+        try { await loadDbSnapshot({ force: true }); } catch (error) { state.lastError = `db_load:${String(error?.message || error)}`; }
+      }
+      const rows = [];
+      // Run sources sequentially to keep outbound pressure flat and bounded.
+      for (const source of OFFICIAL_SOURCES) {
+        if (stopping) break;
+        try {
+          rows.push(...await collectSource(source));
+        } catch (error) {
+          const sourceState = state.sourceStates[source.id] ||= {};
+          sourceState.last_error = String(error?.message || error);
+          sourceState.failures = finiteNumber(sourceState.failures, 0) + 1;
+        }
+        await sleep(250);
+      }
+      if (rows.length) {
+        mergePublicSnapshot(rows);
+        if (state.supabaseConfigured) {
+          try {
+            const persisted = await persistRows(rows);
+            if (persisted.length) mergePublicSnapshot(persisted);
+          } catch (error) {
+            state.lastError = `persist:${String(error?.message || error)}`;
+          }
+        }
+      }
+      state.refreshes++;
+      state.lastRefreshCompletedAt = nowIso();
+      if (!state.lastError?.startsWith('persist:')) state.lastError = null;
+      return true;
+    } catch (error) {
+      state.refreshFailures++;
+      state.lastError = String(error?.message || error);
+      return false;
+    } finally {
+      state.refreshInFlight = false;
+    }
+  })();
+  try { return await refreshPromise; }
+  finally { refreshPromise = null; }
+}
+function scheduleNext(delayMs = state.refreshMs) {
+  if (timer) clearTimeout(timer);
+  if (stopping || !state.enabled) return;
+  const jitter = Math.round(Math.min(45_000, delayMs * 0.08) * (Math.random() - 0.5));
+  timer = setTimeout(async () => {
+    await refreshOnce();
+    scheduleNext(state.refreshMs);
+  }, Math.max(5_000, delayMs + jitter));
+  timer.unref?.();
+}
+function publicHealth() {
+  const sources = {};
+  for (const source of OFFICIAL_SOURCES) {
+    sources[source.id] = {
+      provider: source.provider,
+      official_only: true,
+      structured_official_api: Boolean(source.json_roots?.length),
+      root_count: (source.roots?.length || 0) + (source.json_roots?.length || 0),
+      ...(state.sourceStates[source.id] || {}),
+    };
+  }
+  return {
+    schema: STEP_SCHEMA,
+    started: state.started,
+    enabled: state.enabled,
+    supabase_configured: state.supabaseConfigured,
+    refresh_seconds: Math.round(state.refreshMs / 1000),
+    refresh_in_flight: state.refreshInFlight,
+    refreshes: state.refreshes,
+    refresh_failures: state.refreshFailures,
+    last_refresh_started_at: state.lastRefreshStartedAt,
+    last_refresh_completed_at: state.lastRefreshCompletedAt,
+    last_persist_at: state.lastPersistAt,
+    last_db_load_at: state.lastDbLoadAt,
+    last_error: state.lastError,
+    official_source_count: OFFICIAL_SOURCES.length,
+    official_sources: OFFICIAL_SOURCES.map((s) => s.provider),
+    sources,
+    upstream_requests: state.upstreamRequests,
+    upstream_not_modified: state.upstreamNotModified,
+    upstream_failures: state.upstreamFailures,
+    detail_requests: state.detailRequests,
+    persisted_rows: state.persistedRows,
+    public_reads: state.publicReads,
+    public_snapshot_loaded: state.publicSnapshotLoaded,
+    public_snapshot_rows: state.publicSnapshotRows,
+    public_snapshot_db_reads: state.publicSnapshotDbReads,
+    user_read_upstream_requests: 0,
+    user_read_supabase_requests: 0,
+    upstream_requests_scale_with_users: false,
+    official_domain_whitelist_only: true,
+    stale_snapshot_preserved_on_failure: true,
+  };
+}
+function filteredRows(url) {
+  const limit = clampInt(url.searchParams.get('limit'), 1, PUBLIC_ENDPOINT_MAX_LIMIT, 80);
+  const provider = text(url.searchParams.get('provider')).toLowerCase();
+  const status = text(url.searchParams.get('status')).toLowerCase();
+  let rows = publicSnapshot;
+  if (provider && provider !== 'all') rows = rows.filter((row) => row.provider === provider);
+  if (status && status !== 'all') rows = rows.filter((row) => row.status === status);
+  return rows.slice(0, limit).map((row) => ({ ...row }));
+}
+
+export function startAirdropWatch() {
+  if (state.started) return;
+  state.started = true;
+  stopping = false;
+  if (!state.enabled) return;
+  // DB is only a startup/history seed. Public reads never query Supabase directly.
+  loadDbSnapshot({ force: true }).catch((error) => {
+    state.lastError = `db_load:${String(error?.message || error)}`;
+  });
+  scheduleNext(3_000);
+}
+
+export function stopAirdropWatch() {
+  stopping = true;
+  if (timer) clearTimeout(timer);
+  timer = null;
+}
+
+export function getAirdropWatchHealth() {
+  return publicHealth();
+}
+
+export async function handleAirdropWatch(req, res, url) {
+  if (url.pathname === '/api/airdrop-watch/health') {
+    json(res, 200, { ok: true, airdrop_watch: publicHealth(), time: nowIso() });
+    return true;
+  }
+  if (url.pathname === '/api/airdrop-watch/public') {
+    state.publicReads++;
+    if (!state.publicSnapshotLoaded && state.supabaseConfigured) {
+      try { await loadDbSnapshot({ force: true }); } catch (_) {}
+    }
+    const rows = filteredRows(url);
+    json(res, 200, {
+      ok: true,
+      schema: STEP_SCHEMA,
+      rows,
+      row_count: rows.length,
+      providers: OFFICIAL_SOURCES.map((source) => ({ key: source.provider, name: source.display_name })),
+      shared_public_snapshot: true,
+      official_only: true,
+      user_read_upstream_requests: 0,
+      user_read_supabase_requests: 0,
+      upstream_requests_scale_with_users: false,
+      last_refresh_at: state.lastRefreshCompletedAt,
+      time: nowIso(),
+    }, { cacheSeconds: 15 });
+    return true;
+  }
+  return false;
+}
+
+// Test-only pure helpers. Importing this module never starts collectors; proxy.mjs owns startup.
+export const __airdropWatchTest = Object.freeze({
+  extractCandidates,
+  extractBybitApiCandidates,
+  categoryFor,
+  projectSymbolFromTitle,
+  extractRewardText,
+  statusFor,
+  sources: OFFICIAL_SOURCES,
+});

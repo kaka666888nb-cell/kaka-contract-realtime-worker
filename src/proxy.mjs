@@ -31,11 +31,12 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, requestIsolatedJson, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
 import { startKlineAssetRankCollector, handleKlineAssetRank, getKlineAssetRankHealth } from './kline-asset-rank.mjs';
 import { getSocialWatchHealth, handleSocialWatch, startSocialWatch, stopSocialWatch } from './social-watch.mjs';
+import { getAirdropWatchHealth, handleAirdropWatch, startAirdropWatch, stopAirdropWatch } from './airdrop-watch.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.197.3.3.14';
+const STEP_VERSION = '650.8.15.197.3.3.15';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -49,6 +50,7 @@ startProjectFundamentalsCollector();
 startStockCatalogV2Collector();
 startKlineAssetRankCollector({ requestIsolatedJson, getMarketLightInternalSnapshot });
 startSocialWatch();
+startAirdropWatch();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -536,6 +538,7 @@ const server = http.createServer(async (req, res) => {
       service: 'kaka-contract-realtime-worker',
       version: STEP_VERSION,
       social_watch: getSocialWatchHealth(),
+      airdrop_watch: getAirdropWatchHealth(),
       step1028_7_http_transport: {
         keep_alive_timeout_ms: server.keepAliveTimeout,
         headers_timeout_ms: server.headersTimeout,
@@ -1290,6 +1293,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (await handleSocialWatch(req, res, url)) return;
+  if (await handleAirdropWatch(req, res, url)) return;
   if (await handleRealityRankedPage(req, res, url)) return;
   if (await handleKlineAssetRank(req, res, url)) return;
   if (proxyIsolatedCollectorRequest(req, res, url)) return;
@@ -1372,6 +1376,7 @@ function shutdown(signal) {
   shuttingDown = true;
   stopCollectorIsolationSupervisor();
   stopSocialWatch();
+  stopAirdropWatch();
   beginBinanceRestShutdown(`shutdown:${signal}`);
   console.log(`[Step${STEP_VERSION}] shutdown ${signal}; new Binance REST blocked immediately`);
   server.close(() => {
