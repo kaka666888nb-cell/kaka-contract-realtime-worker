@@ -30,6 +30,7 @@ import {
 import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGovernorSelfTest } from './provider-request-governor.mjs';
 import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, requestIsolatedJson, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
 import { startKlineAssetRankCollector, handleKlineAssetRank, getKlineAssetRankHealth } from './kline-asset-rank.mjs';
+import { getSocialWatchHealth, handleSocialWatch, startSocialWatch, stopSocialWatch } from './social-watch.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
@@ -47,6 +48,7 @@ startContractBasisScanner();
 startProjectFundamentalsCollector();
 startStockCatalogV2Collector();
 startKlineAssetRankCollector({ requestIsolatedJson, getMarketLightInternalSnapshot });
+startSocialWatch();
 let shuttingDown = false;
 
 const child = spawn(process.execPath, ['src/server.mjs'], {
@@ -533,6 +535,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: 'kaka-contract-realtime-worker',
       version: STEP_VERSION,
+      social_watch: getSocialWatchHealth(),
       step1028_7_http_transport: {
         keep_alive_timeout_ms: server.keepAliveTimeout,
         headers_timeout_ms: server.headersTimeout,
@@ -1286,6 +1289,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (await handleSocialWatch(req, res, url)) return;
   if (await handleRealityRankedPage(req, res, url)) return;
   if (await handleKlineAssetRank(req, res, url)) return;
   if (proxyIsolatedCollectorRequest(req, res, url)) return;
@@ -1367,6 +1371,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   stopCollectorIsolationSupervisor();
+  stopSocialWatch();
   beginBinanceRestShutdown(`shutdown:${signal}`);
   console.log(`[Step${STEP_VERSION}] shutdown ${signal}; new Binance REST blocked immediately`);
   server.close(() => {
