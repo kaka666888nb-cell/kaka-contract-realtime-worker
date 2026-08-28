@@ -1,5 +1,5 @@
 import { contentTranslationHash, getSharedTranslationHealth, translateContentFields, translationNeedsWork } from './content-translation.mjs';
-const STEP_SCHEMA = 'step1045_airdrop_native_detail_v1';
+const STEP_SCHEMA = 'step1046_2_4_1_airdrop_native_detail_media_v2';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const EVENTS_TABLE = 'app_airdrop_events';
@@ -279,6 +279,45 @@ function safeUrl(raw, baseUrl) {
     return u.toString();
   } catch (_) { return ''; }
 }
+function normalizeContentMediaItems(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const rows = [];
+  for (const value of raw) {
+    if (!value || typeof value !== 'object') continue;
+    const kind = text(value.kind || value.type).toLowerCase() || 'image';
+    const url = text(value.url || value.media_url);
+    const previewUrl = text(value.preview_url || value.preview_image_url || value.thumbnail_url) || url;
+    if (!url && !previewUrl) continue;
+    const key = `${kind}|${url}|${previewUrl}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ ...value, kind, url, preview_url: previewUrl });
+    if (rows.length >= 8) break;
+  }
+  return rows;
+}
+function officialPageMediaItems(html, baseUrl) {
+  const urls = [];
+  const add = (raw) => {
+    const urlValue = safeUrl(raw, baseUrl);
+    if (!urlValue || urls.includes(urlValue)) return;
+    urls.push(urlValue);
+  };
+  for (const match of text(html).matchAll(/<meta\b([^>]*?)>/gi)) {
+    const attrs = match[1] || '';
+    const key = text((attrs.match(/\b(?:property|name)=["']([^"']+)["']/i) || [])[1]).toLowerCase();
+    const content = (attrs.match(/\bcontent=["']([^"']+)["']/i) || [])[1] || '';
+    if (['og:image','og:image:url','twitter:image','twitter:image:src'].includes(key)) add(content);
+  }
+  for (const match of text(html).matchAll(/"image"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gi)) {
+    add(match[1].replace(/\\\//g, '/'));
+  }
+  return urls.slice(0, 4).map((url) => ({
+    kind: 'image', url, preview_url: url, source: 'official_page_metadata',
+  }));
+}
+
 function hostAllowed(urlValue, source) {
   try {
     const host = new URL(urlValue).hostname.toLowerCase();
@@ -560,6 +599,7 @@ function publicEventView(row) {
     content_text: normalizeContentText(row?.content_text) || null,
     content_fetched_at: text(row?.content_fetched_at) || null,
     content_available: contentUsableForProvider(provider, row?.content_text),
+    media_items: normalizeContentMediaItems(row?.media_items),
     translations: translationFresh && row?.translations && typeof row.translations === 'object' && !Array.isArray(row.translations) ? row.translations : {},
     translation_source_hash: text(row?.translation_source_hash) || null,
     translation_updated_at: text(row?.translation_updated_at) || null,
@@ -599,6 +639,9 @@ function mergePublicSnapshot(rows) {
       content_text: incomingHasContent ? row.content_text : (previous.content_text || null),
       content_fetched_at: incomingHasContent ? row.content_fetched_at : (previous.content_fetched_at || null),
       content_available: incomingHasContent || contentUsableForProvider(row.provider, previous.content_text),
+      media_items: normalizeContentMediaItems(row.media_items).length
+        ? normalizeContentMediaItems(row.media_items)
+        : normalizeContentMediaItems(previous.media_items),
       translations: row.translation_source_hash ? row.translations : (previous.translations || {}),
       translation_source_hash: row.translation_source_hash || previous.translation_source_hash || null,
       translation_updated_at: row.translation_updated_at || previous.translation_updated_at || null,
@@ -623,7 +666,7 @@ async function supabaseFetch(path, init = {}) {
 async function loadDbSnapshot({ force = false } = {}) {
   if (!state.supabaseConfigured) return false;
   if (!force && dbLoadedAtMs && Date.now() - dbLoadedAtMs < DB_RELOAD_MS) return false;
-  const rows = await supabaseFetch(`${EVENTS_TABLE}?select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,translations,translation_source_hash,translation_updated_at,fetched_at&order=published_at.desc.nullslast,fetched_at.desc&limit=${PUBLIC_CACHE_LIMIT}`);
+  const rows = await supabaseFetch(`${EVENTS_TABLE}?select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at&order=published_at.desc.nullslast,fetched_at.desc&limit=${PUBLIC_CACHE_LIMIT}`);
   state.publicSnapshotDbReads++;
   mergePublicSnapshot(Array.isArray(rows) ? rows : []);
   dbLoadedAtMs = Date.now();
@@ -634,7 +677,7 @@ async function fetchHtml(urlValue, sourceId, { detail = false, content = false }
   const timeoutMs = detail ? DETAIL_TIMEOUT_MS : SOURCE_TIMEOUT_MS;
   const controller = new AbortController();
   const timerId = setTimeout(() => controller.abort(), timeoutMs);
-  const conditional = conditionalHeaders.get(urlValue) || {};
+  const conditional = content ? {} : (conditionalHeaders.get(urlValue) || {});
   const headers = {
     accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
     'accept-language': 'en-US,en;q=0.8,zh-CN;q=0.6',
@@ -660,7 +703,7 @@ async function fetchHtml(urlValue, sourceId, { detail = false, content = false }
     const nextConditional = {};
     if (etag) nextConditional['if-none-match'] = etag;
     if (lastModified) nextConditional['if-modified-since'] = lastModified;
-    if (Object.keys(nextConditional).length) conditionalHeaders.set(urlValue, nextConditional);
+    if (!content && Object.keys(nextConditional).length) conditionalHeaders.set(urlValue, nextConditional);
     const reader = response.body?.getReader?.();
     if (!reader) {
       const raw = await response.text();
@@ -730,6 +773,9 @@ async function hydrateCandidate(source, candidate, known) {
     published_at: publishedAt,
     status: statusFor(startAt, endAt),
     raw_summary: combinedText ? combinedText.slice(0, 600) : (known?.raw_summary || null),
+    media_items: officialPageMediaItems(detailHtml, candidate.source_url).length
+      ? officialPageMediaItems(detailHtml, candidate.source_url)
+      : normalizeContentMediaItems(known?.media_items),
     content_text: contentUsable(known?.content_text) ? known.content_text : null,
     content_fetched_at: contentUsable(known?.content_text) ? (known.content_fetched_at || null) : null,
   };
@@ -770,6 +816,7 @@ function rowsFromSocialXEvents(events, source) {
       raw_summary: content.slice(0, 600),
       content_text: content.slice(0, CONTENT_TEXT_MAX_CHARS),
       content_fetched_at: nowIso(),
+      media_items: normalizeContentMediaItems(event?.media_items),
       fetched_at: nowIso(),
     });
   }
@@ -786,7 +833,7 @@ async function collectSocialXSource(source, sourceState) {
     state.sharedBridgeReads++;
     sourceState.bridge_reads = finiteNumber(sourceState.bridge_reads, 0) + 1;
     const events = await supabaseFetch(
-      `${SOCIAL_EVENTS_TABLE}?source=eq.x&author_handle=in.(${handleFilter})&select=source_post_id,author_handle,author_name,content,post_url,published_at&order=published_at.desc&limit=100`,
+      `${SOCIAL_EVENTS_TABLE}?source=eq.x&author_handle=in.(${handleFilter})&select=source_post_id,author_handle,author_name,content,post_url,published_at,media_items&order=published_at.desc&limit=100`,
     );
     rows = rowsFromSocialXEvents(events, source);
     if (rows.length || attempt === firstCycleAttempts - 1) break;
@@ -877,6 +924,9 @@ async function collectSource(source) {
       source_domain: (() => { try { return new URL(candidate.source_url).hostname; } catch (_) { return ''; } })(),
       status: statusFor(startAt, endAt),
       raw_summary: structuredSummary ? structuredSummary.slice(0, 600) : (known?.raw_summary || null),
+      media_items: normalizeContentMediaItems(candidate.media_items).length
+        ? normalizeContentMediaItems(candidate.media_items)
+        : normalizeContentMediaItems(known?.media_items),
       content_text: contentUsableForProvider(source.provider, known?.content_text)
         ? known.content_text
         : (source.provider === 'bybit' && contentUsableForProvider('bybit', structuredSummary) ? structuredSummary : null),
@@ -912,7 +962,9 @@ async function enrichSourceContent(source, rows) {
           content_text: contentUsableForProvider(source.provider, previous?.content_text) ? previous.content_text : null,
           content_fetched_at: contentUsableForProvider(source.provider, previous?.content_text) ? previous.content_fetched_at : null,
         };
-    if (contentUsableForProvider(source.provider, row?.content_text) || budget <= 0) {
+    const rowHasContent = contentUsableForProvider(source.provider, row?.content_text);
+    const rowHasMedia = normalizeContentMediaItems(row?.media_items).length > 0;
+    if ((rowHasContent && rowHasMedia) || budget <= 0) {
       out.push(row);
       continue;
     }
@@ -936,7 +988,9 @@ async function enrichSourceContent(source, rows) {
       const detail = await fetchHtml(row.source_url, source.id, { detail: true, content: true });
       const detailHtml = detail.html || '';
       const contentText = htmlArticleText(detailHtml);
-      if (!contentUsable(contentText)) throw new Error('official_content_too_small');
+      const fetchedMediaItems = officialPageMediaItems(detailHtml, row.source_url);
+      const fetchedContentUsable = contentUsable(contentText);
+      if (!rowHasContent && !fetchedContentUsable && fetchedMediaItems.length === 0) throw new Error('official_content_and_media_too_small');
       const detailText = stripHtml(detailHtml);
       const period = extractPeriod(contentText || detailText);
       const publishedAt = row.published_at || extractPublishedAt(detailHtml, detailText) || null;
@@ -951,8 +1005,11 @@ async function enrichSourceContent(source, rows) {
         published_at: publishedAt,
         status: statusFor(startAt, endAt),
         raw_summary: row.raw_summary || contentText.slice(0, 600),
-        content_text: contentText,
-        content_fetched_at: nowIso(),
+        media_items: fetchedMediaItems.length
+          ? fetchedMediaItems
+          : normalizeContentMediaItems(row.media_items),
+        content_text: fetchedContentUsable ? contentText : row.content_text,
+        content_fetched_at: fetchedContentUsable ? nowIso() : row.content_fetched_at,
       });
       contentRetryAfter.delete(retryKey);
       sourceState.content_last_error = null;
@@ -1011,11 +1068,12 @@ async function persistRows(rows) {
     raw_summary: row.raw_summary,
     content_text: contentUsableForProvider(row.provider, row.content_text) ? normalizeContentText(row.content_text).slice(0, CONTENT_TEXT_MAX_CHARS) : null,
     content_fetched_at: contentUsableForProvider(row.provider, row.content_text) ? (row.content_fetched_at || nowIso()) : null,
+    media_items: normalizeContentMediaItems(row.media_items),
     fetched_at: nowIso(),
     updated_at: nowIso(),
   });
   });
-  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,translations,translation_source_hash,translation_updated_at,fetched_at`, {
+  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at`, {
     method: 'POST',
     headers: { prefer: 'resolution=merge-duplicates,return=representation' },
     body: JSON.stringify(payload),
@@ -1286,6 +1344,9 @@ function publicHealth() {
     content_enrich_requests: state.contentEnrichRequests,
     content_enrich_failures: state.contentEnrichFailures,
     content_rows: publicSnapshot.filter((row) => contentUsableForProvider(row?.provider, row?.content_text)).length,
+    media_items_supported: true,
+    media_source_policy: 'official_page_metadata_or_shared_x_only',
+    media_rows: publicSnapshot.filter((row) => normalizeContentMediaItems(row?.media_items).length > 0).length,
     detail_reads: state.detailReads,
     persisted_rows: state.persistedRows,
     persist_successes: state.persistSuccesses,

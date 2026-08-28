@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { contentTranslationHash, getSharedTranslationHealth, translateContentFields, translationNeedsWork } from './content-translation.mjs';
-const STEP_SCHEMA = 'step1044_1_2_x_shared_snapshot_celebrity_hall_v3';
-const NATIVE_DETAIL_SCHEMA = 'step1045_4_celebrity_native_detail_v1';
+const STEP_SCHEMA = 'step1046_2_4_1_x_shared_snapshot_celebrity_media_v4';
+const NATIVE_DETAIL_SCHEMA = 'step1046_2_4_1_celebrity_native_detail_media_v2';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const X_API_BEARER_TOKEN = String(process.env.X_API_BEARER_TOKEN || '').trim();
@@ -33,6 +33,8 @@ const PUBLIC_AVATAR_RETRY_MS = 60 * 60_000;
 const PUBLIC_AVATAR_MIRROR_BUCKET = 'app-assets';
 const PUBLIC_AVATAR_MIRROR_MAX_BYTES = 2 * 1024 * 1024;
 const PUBLIC_AVATAR_MIRROR_FETCH_TIMEOUT_MS = 12_000;
+const PUBLIC_POST_MEDIA_MIRROR_MAX_BYTES = 8 * 1024 * 1024;
+const PUBLIC_POST_MEDIA_MIRROR_FETCH_TIMEOUT_MS = 12_000;
 const MARKET_FOCUS_KEYWORDS = [
   'Bitcoin', 'BTC', 'crypto', 'Ethereum', 'ETH', 'DOGE', 'Dogecoin', 'stablecoin',
   'ETF', 'SEC', 'Fed', 'FOMC', 'tariff', 'sanction', 'regulation', 'market',
@@ -158,6 +160,44 @@ function postFullText(post) {
       : articleBody;
   }
   return text(note.text || post?.text);
+}
+
+function normalizeXMediaItems(post, includesMedia = []) {
+  const mediaByKey = new Map((Array.isArray(includesMedia) ? includesMedia : [])
+    .map((item) => [text(item?.media_key), item])
+    .filter(([key]) => Boolean(key)));
+  const attachmentKeys = Array.isArray(post?.attachments?.media_keys) ? post.attachments.media_keys : [];
+  // X Articles can expose cover/body media via article.* expansions rather than attachments.
+  // If there are no attachment keys, consume the expanded media set as the Article relation.
+  const keys = attachmentKeys.length ? attachmentKeys : [...mediaByKey.keys()];
+  const rows = [];
+  for (const keyValue of keys.slice(0, 4)) {
+    const key = text(keyValue);
+    const media = mediaByKey.get(key);
+    if (!media) continue;
+    const rawType = text(media?.type).toLowerCase();
+    const kind = rawType === 'photo' ? 'image' : (rawType || 'image');
+    const sourceUrl = text(media?.url);
+    const sourcePreview = text(media?.preview_image_url) || sourceUrl;
+    if (!sourceUrl && !sourcePreview) continue;
+    rows.push({
+      kind,
+      media_key: key,
+      url: kind === 'image' ? sourceUrl : '',
+      preview_url: sourcePreview,
+      source_url: sourceUrl || null,
+      source_preview_url: sourcePreview || null,
+      width: finiteNumber(media?.width, 0) || null,
+      height: finiteNumber(media?.height, 0) || null,
+      alt_text: text(media?.alt_text) || null,
+      duration_ms: finiteNumber(media?.duration_ms, 0) || null,
+      source: 'x_api_v2',
+    });
+  }
+  return rows;
+}
+function withXMedia(post, includesMedia = []) {
+  return { ...(post || {}), _kaka_media_items: normalizeXMediaItems(post, includesMedia) };
 }
 
 function finiteNumber(v, fallback = 0) { const n = Number(v); return Number.isFinite(n) ? n : fallback; }
@@ -326,6 +366,7 @@ function publicEventView(row) {
     post_url: text(row?.post_url),
     published_at: text(row?.published_at),
     language: text(row?.language) || null,
+    media_items: Array.isArray(row?.media_items) ? row.media_items.slice(0, 4) : [],
     notification_created: row?.notification_created === true,
   };
 }
@@ -345,7 +386,7 @@ async function loadPublicEventsSnapshot({ force = false } = {}) {
     }
     const inFilter = encodeURIComponent(`(${ids.join(',')})`);
     const rows = await supabaseFetch(
-      `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,translations,translation_source_hash,translation_updated_at,post_url,published_at,language,notification_created&order=published_at.desc&limit=${PUBLIC_EVENT_CACHE_LIMIT}`,
+      `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,media_items,translations,translation_source_hash,translation_updated_at,post_url,published_at,language,notification_created&order=published_at.desc&limit=${PUBLIC_EVENT_CACHE_LIMIT}`,
     );
     state.publicSnapshotDbReads++;
     publicEventsSnapshot = (Array.isArray(rows) ? rows : []).map(publicEventView).slice(0, PUBLIC_EVENT_CACHE_LIMIT);
@@ -464,6 +505,10 @@ function publicHealth() {
     avatar_supabase_mirror_accounts: publicAccountsSnapshot.filter((row) => text(row?.profile_image_source) === 'x_shared_supabase_mirror').length,
     public_snapshot_events: state.publicSnapshotEvents,
     public_snapshot_db_reads: state.publicSnapshotDbReads,
+    content_media_supported: true,
+    content_media_source: 'x_api_v2_attachments_and_article_expansions',
+    content_media_preview_mirror: 'supabase_app_assets',
+    content_media_rows: publicEventsSnapshot.filter((row) => Array.isArray(row?.media_items) && row.media_items.length > 0).length,
     airdrop_bridge_accounts: state.airdropBridgeAccounts,
     airdrop_recent_backfill_completed: state.airdropRecentBackfillCompleted,
     airdrop_recent_backfill_at: state.airdropRecentBackfillAt,
@@ -657,6 +702,77 @@ function avatarMirrorStoragePath(handle, sourceUrl) {
 
 function encodedStoragePath(path) {
   return text(path).split('/').filter(Boolean).map((part) => encodeURIComponent(part)).join('/');
+}
+
+function socialPostMediaStoragePath(postId, mediaKey, sourceUrl) {
+  const safePostId = text(postId).replace(/[^0-9A-Za-z_-]/g, '') || 'unknown';
+  const safeMediaKey = text(mediaKey).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 80) || 'media';
+  const hash = createHash('sha256').update(text(sourceUrl)).digest('hex').slice(0, 20);
+  return `celebrity-post-media/x/${safePostId}/${safeMediaKey}-${hash}.img`;
+}
+
+async function mirrorSocialPostMediaItem(postId, item, index) {
+  const kind = text(item?.kind).toLowerCase() || 'image';
+  const sourceUrl = text(item?.preview_url) || text(item?.url);
+  if (!/^https:\/\//i.test(sourceUrl)) return item;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PUBLIC_POST_MEDIA_MIRROR_FETCH_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(sourceUrl, {
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: {
+        accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        'user-agent': 'KakaWeb3-SharedCelebrityPostMediaMirror/1.0',
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response?.ok) throw new Error(`social_watch_post_media_source_http_${response?.status || 0}`);
+  const contentType = text(response.headers.get('content-type')).split(';')[0].trim().toLowerCase();
+  if (!contentType.startsWith('image/')) throw new Error(`social_watch_post_media_source_type:${contentType || 'unknown'}`);
+  const declaredBytes = finiteNumber(response.headers.get('content-length'), 0);
+  if (declaredBytes > PUBLIC_POST_MEDIA_MIRROR_MAX_BYTES) throw new Error('social_watch_post_media_source_too_large');
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!bytes.length || bytes.length > PUBLIC_POST_MEDIA_MIRROR_MAX_BYTES) throw new Error('social_watch_post_media_invalid_bytes');
+
+  const objectPath = socialPostMediaStoragePath(postId, text(item?.media_key) || String(index), sourceUrl);
+  const encodedPath = encodedStoragePath(objectPath);
+  const upload = await fetch(`${SUPABASE_URL}/storage/v1/object/${PUBLIC_AVATAR_MIRROR_BUCKET}/${encodedPath}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'content-type': contentType,
+      'cache-control': '31536000',
+      'x-upsert': 'true',
+    },
+    body: bytes,
+  });
+  const raw = await upload.text();
+  if (!upload.ok) throw new Error(`social_watch_post_media_storage_http_${upload.status}:${text(raw).slice(0, 180)}`);
+  const mirroredUrl = `${SUPABASE_URL}/storage/v1/object/public/${PUBLIC_AVATAR_MIRROR_BUCKET}/${encodedPath}`;
+  return {
+    ...item,
+    source_url: text(item?.source_url) || text(item?.url) || null,
+    source_preview_url: text(item?.source_preview_url) || text(item?.preview_url) || null,
+    url: kind === 'image' ? mirroredUrl : (text(item?.url) || ''),
+    preview_url: mirroredUrl,
+    mirrored: true,
+    mirrored_at: nowIso(),
+  };
+}
+
+async function prepareSocialPostMedia(postId, post) {
+  const source = Array.isArray(post?._kaka_media_items) ? post._kaka_media_items.slice(0, 4) : [];
+  if (!source.length) return [];
+  const rows = await Promise.all(source.map(async (item, index) => {
+    try { return await mirrorSocialPostMediaItem(postId, item, index); }
+    catch (_) { return item; }
+  }));
+  return rows.filter((item) => text(item?.url) || text(item?.preview_url)).slice(0, 4);
 }
 
 async function mirrorPublicProfileImage(handle, sourceUrl) {
@@ -1048,8 +1164,9 @@ async function backfillOfficialAirdropRecentOnce() {
   const params = new URLSearchParams({
     query: `${handleGroup} ${keywordClause} -is:retweet -is:reply`,
     max_results: String(AIRDROP_RECENT_BACKFILL_MAX_RESULTS),
-    'tweet.fields': 'id,text,note_tweet,article,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
-    expansions: 'author_id',
+    'tweet.fields': 'id,text,note_tweet,article,attachments,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
+    expansions: 'author_id,attachments.media_keys,article.cover_media,article.media_entities',
+    'media.fields': 'media_key,type,url,preview_image_url,width,height,alt_text,duration_ms',
     'user.fields': 'id,username,name',
   });
   const lastPostTimes = accounts
@@ -1073,6 +1190,7 @@ async function backfillOfficialAirdropRecentOnce() {
     const usernameByAuthorId = new Map(users.map((user) => [text(user?.id), normalizeHandle(user?.username)]));
     const accountByHandle = new Map(accounts.map((account) => [normalizeHandle(account.handle).toLowerCase(), account]));
     const posts = Array.isArray(payload?.data) ? payload.data : [];
+    const mediaIncludes = Array.isArray(payload?.includes?.media) ? payload.includes.media : [];
     state.airdropRecentBackfillPosts += posts.length;
     state.xPostReads += posts.length;
     state.dailyPostsReceived += posts.length;
@@ -1082,7 +1200,7 @@ async function backfillOfficialAirdropRecentOnce() {
         const handle = usernameByAuthorId.get(text(post?.author_id));
         const account = accountByHandle.get(text(handle).toLowerCase());
         if (!account) return false;
-        return insertEvent(account, post, ruleTag(account.id));
+        return insertEvent(account, withXMedia(post, mediaIncludes), ruleTag(account.id));
       }));
       insertedCount += results.filter(Boolean).length;
     }
@@ -1124,6 +1242,7 @@ async function insertEvent(account, post, tag) {
   if (!postId || !handle) return false;
   const postUrl = `https://x.com/${handle}/status/${postId}`;
   const publishedAt = text(post?.created_at) || nowIso();
+  const mediaItems = await prepareSocialPostMedia(postId, post);
   const body = {
     watch_account_id: account.id,
     source: 'x',
@@ -1134,6 +1253,7 @@ async function insertEvent(account, post, tag) {
     post_url: postUrl,
     published_at: publishedAt,
     language: text(post?.lang) || null,
+    media_items: mediaItems,
     matched_rule_tag: tag,
   };
   const inserted = await supabaseFetch(
@@ -1231,7 +1351,7 @@ async function handleStreamPayload(payload) {
   if (!account) return;
   state.lastEventHandle = normalizeHandle(account.handle);
   try {
-    await insertEvent(account, post, tag);
+    await insertEvent(account, withXMedia(post, payload?.includes?.media), tag);
   } catch (error) {
     state.lastError = `event:${String(error?.message || error)}`;
     updateAccountStatus(account.id, { last_error: state.lastError }).catch(() => undefined);
@@ -1244,7 +1364,9 @@ async function handleStreamPayload(payload) {
 
 async function consumeStream(signal) {
   const params = new URLSearchParams({
-    'tweet.fields': 'id,text,note_tweet,article,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
+    'tweet.fields': 'id,text,note_tweet,article,attachments,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
+    expansions: 'attachments.media_keys,article.cover_media,article.media_entities',
+    'media.fields': 'media_key,type,url,preview_image_url,width,height,alt_text,duration_ms',
   });
   const response = await xFetch(`/2/tweets/search/stream?${params.toString()}`, { signal });
   state.lastXHttpStatus = response.status;
