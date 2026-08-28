@@ -1,3 +1,4 @@
+import { contentTranslationHash, getSharedTranslationHealth, translateContentFields } from './content-translation.mjs';
 const STEP_SCHEMA = 'step1044_1_2_x_shared_snapshot_celebrity_hall_v3';
 const NATIVE_DETAIL_SCHEMA = 'step1045_4_celebrity_native_detail_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
@@ -25,6 +26,7 @@ const AIRDROP_OFFICIAL_X_HANDLES = new Set(['binance', 'binancewallet']);
 const AIRDROP_RECENT_BACKFILL_MAX_RESULTS = 10;
 const AIRDROP_RECENT_BACKFILL_MAX_ATTEMPTS = 3;
 const AIRDROP_RECENT_BACKFILL_WINDOW_MS = 7 * 24 * 60 * 60_000;
+const TRANSLATION_BACKFILL_PER_TICK = 3;
 const MARKET_FOCUS_KEYWORDS = [
   'Bitcoin', 'BTC', 'crypto', 'Ethereum', 'ETH', 'DOGE', 'Dogecoin', 'stablecoin',
   'ETF', 'SEC', 'Fed', 'FOMC', 'tariff', 'sanction', 'regulation', 'market',
@@ -102,6 +104,13 @@ const state = {
   airdropRecentBackfillPosts: 0,
   airdropRecentBackfillInserted: 0,
   airdropRecentBackfillError: null,
+  translationRuns: 0,
+  translationRowsTranslated: 0,
+  translationFailures: 0,
+  translationDbWrites: 0,
+  translationLastRunAt: null,
+  translationLastSuccessAt: null,
+  translationLastError: null,
 };
 
 let settingsTimer = null;
@@ -114,6 +123,7 @@ let publicAccountsSnapshot = [];
 let publicEventsSnapshot = [];
 let publicEventsLoadPromise = null;
 let publicEventsLoadedAtMs = 0;
+let translationBackfillInFlight = false;
 
 function nowIso() { return new Date().toISOString(); }
 function text(v) { return String(v ?? '').trim(); }
@@ -262,6 +272,8 @@ function refreshPublicAccountsSnapshot(accounts) {
   }
 }
 function publicEventView(row) {
+  const translationHash = contentTranslationHash({ content: text(row?.content) });
+  const translationFresh = text(row?.translation_source_hash) === translationHash;
   return {
     id: row?.id ?? null,
     watch_account_id: text(row?.watch_account_id),
@@ -270,6 +282,10 @@ function publicEventView(row) {
     author_handle: normalizeHandle(row?.author_handle),
     author_name: text(row?.author_name),
     content: text(row?.content),
+    translations: translationFresh && row?.translations && typeof row.translations === 'object' && !Array.isArray(row.translations) ? row.translations : {},
+    translation_source_hash: text(row?.translation_source_hash) || null,
+    translation_updated_at: text(row?.translation_updated_at) || null,
+    translation_pending: Boolean(text(row?.content)) && !translationFresh,
     post_url: text(row?.post_url),
     published_at: text(row?.published_at),
     language: text(row?.language) || null,
@@ -292,7 +308,7 @@ async function loadPublicEventsSnapshot({ force = false } = {}) {
     }
     const inFilter = encodeURIComponent(`(${ids.join(',')})`);
     const rows = await supabaseFetch(
-      `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,post_url,published_at,language,notification_created&order=published_at.desc&limit=${PUBLIC_EVENT_CACHE_LIMIT}`,
+      `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,translations,translation_source_hash,translation_updated_at,post_url,published_at,language,notification_created&order=published_at.desc&limit=${PUBLIC_EVENT_CACHE_LIMIT}`,
     );
     state.publicSnapshotDbReads++;
     publicEventsSnapshot = (Array.isArray(rows) ? rows : []).map(publicEventView).slice(0, PUBLIC_EVENT_CACHE_LIMIT);
@@ -422,6 +438,18 @@ function publicHealth() {
     native_detail_shared_snapshot: true,
     native_detail_user_x_requests: 0,
     native_detail_user_supabase_requests: 0,
+    auto_translation: {
+      shared_background_only: true,
+      user_translation_requests: 0,
+      runs: state.translationRuns,
+      rows_translated: state.translationRowsTranslated,
+      failures: state.translationFailures,
+      db_writes: state.translationDbWrites,
+      last_run_at: state.translationLastRunAt,
+      last_success_at: state.translationLastSuccessAt,
+      last_error: state.translationLastError,
+      shared_service: getSharedTranslationHealth(),
+    },
     full_text_fields: ['text', 'note_tweet', 'article'],
   };
 }
@@ -437,6 +465,66 @@ async function supabaseFetch(path, init = {}) {
   try { payload = raw ? JSON.parse(raw) : null; } catch (_) { payload = raw; }
   if (!response.ok) throw new Error(`social_watch_supabase_http_${response.status}:${text(raw).slice(0, 280)}`);
   return payload;
+}
+
+
+async function translateSocialPublicSnapshot() {
+  if (translationBackfillInFlight || !state.supabaseConfigured || !publicEventsSnapshot.length) return false;
+  translationBackfillInFlight = true;
+  state.translationRuns++;
+  state.translationLastRunAt = nowIso();
+  try {
+    const candidates = publicEventsSnapshot
+      .filter((row) => {
+        const content = text(row?.content);
+        if (!content) return false;
+        return text(row?.translation_source_hash) !== contentTranslationHash({ content });
+      })
+      .slice(0, TRANSLATION_BACKFILL_PER_TICK);
+    for (const candidate of candidates) {
+      const postId = text(candidate?.source_post_id);
+      if (!/^[0-9]{1,24}$/.test(postId)) continue;
+      try {
+        const result = await translateContentFields({
+          fields: { content: text(candidate.content) },
+          existingTranslations: candidate.translations,
+          existingSourceHash: text(candidate.translation_source_hash),
+        });
+        if (!result.changed) continue;
+        const updatedAt = nowIso();
+        await supabaseFetch(`${EVENTS_TABLE}?source=eq.x&source_post_id=eq.${encodeURIComponent(postId)}`, {
+          method: 'PATCH',
+          headers: { Prefer: 'return=minimal' },
+          body: JSON.stringify({
+            translations: result.translations,
+            translation_source_hash: result.source_hash,
+            translation_updated_at: updatedAt,
+          }),
+        });
+        state.translationDbWrites++;
+        state.translationRowsTranslated++;
+        state.translationLastSuccessAt = updatedAt;
+        state.translationLastError = null;
+        publicEventsSnapshot = publicEventsSnapshot.map((row) =>
+          text(row?.source_post_id) === postId
+            ? publicEventView({
+                ...row,
+                translations: result.translations,
+                translation_source_hash: result.source_hash,
+                translation_updated_at: updatedAt,
+              })
+            : row,
+        );
+      } catch (error) {
+        state.translationFailures++;
+        state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
+      }
+    }
+    state.publicSnapshotEvents = publicEventsSnapshot.length;
+    return true;
+  } finally {
+    translationBackfillInFlight = false;
+  }
 }
 
 async function xFetch(path, init = {}) {
@@ -831,6 +919,7 @@ async function insertEvent(account, post, tag) {
     state.publicSnapshotLoadedAt = nowIso();
     publicEventsLoadedAtMs = Date.now();
     state.publicSnapshotEvents = publicEventsSnapshot.length;
+    translateSocialPublicSnapshot().catch((error) => { state.translationLastError = String(error?.message || error); });
   }
 
   let notificationId = null;
@@ -1003,6 +1092,7 @@ async function configTick() {
     }
     const changed = await readConfig();
     try { await loadPublicEventsSnapshot(); } catch (error) { state.lastError = `public_snapshot:${String(error?.message || error)}`; }
+    translateSocialPublicSnapshot().catch((error) => { state.translationLastError = String(error?.message || error); });
     const nextAllowedMs = Date.parse(state.ruleSyncNextAllowedAt || '');
     const canSyncRules = !Number.isFinite(nextAllowedMs) || Date.now() >= nextAllowedMs;
     const periodicDue = !state.lastRuleSyncAt || Date.now() - Date.parse(state.lastRuleSyncAt || 0) > 60 * 60_000;

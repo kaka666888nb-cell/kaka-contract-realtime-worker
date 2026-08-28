@@ -1,3 +1,4 @@
+import { contentTranslationHash, getSharedTranslationHealth, translateContentFields } from './content-translation.mjs';
 const STEP_SCHEMA = 'step1045_airdrop_native_detail_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -18,6 +19,8 @@ const PUBLIC_CACHE_LIMIT = 600;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
 const DB_RELOAD_MS = 30 * 60_000;
 const HTML_MAX_BYTES = 3 * 1024 * 1024;
+const TRANSLATION_TICK_MS = 60_000;
+const TRANSLATION_ROWS_PER_TICK = 5;
 
 const OFFICIAL_SOURCES = Object.freeze([
   {
@@ -143,10 +146,19 @@ const state = {
   persistedRows: 0,
   persistSuccesses: 0,
   persistFailures: 0,
+  translationRuns: 0,
+  translationRowsTranslated: 0,
+  translationFailures: 0,
+  translationDbWrites: 0,
+  translationLastRunAt: null,
+  translationLastSuccessAt: null,
+  translationLastError: null,
   sourceStates: {},
 };
 
 let timer = null;
+let translationTimer = null;
+let translationBackfillInFlight = false;
 let stopping = false;
 let publicSnapshot = [];
 let dbLoadedAtMs = 0;
@@ -519,6 +531,8 @@ function extractCandidates(html, source, baseUrl) {
 function publicEventView(row) {
   const provider = text(row?.provider).toLowerCase();
   const title = text(row?.title);
+  const translationHash = contentTranslationHash(translationFieldsForAirdrop(row));
+  const translationFresh = text(row?.translation_source_hash) === translationHash;
   return {
     id: row?.id ?? null,
     provider,
@@ -541,6 +555,10 @@ function publicEventView(row) {
     content_text: normalizeContentText(row?.content_text) || null,
     content_fetched_at: text(row?.content_fetched_at) || null,
     content_available: contentUsableForProvider(provider, row?.content_text),
+    translations: translationFresh && row?.translations && typeof row.translations === 'object' && !Array.isArray(row.translations) ? row.translations : {},
+    translation_source_hash: text(row?.translation_source_hash) || null,
+    translation_updated_at: text(row?.translation_updated_at) || null,
+    translation_pending: !translationFresh,
     fetched_at: text(row?.fetched_at) || null,
   };
 }
@@ -576,6 +594,9 @@ function mergePublicSnapshot(rows) {
       content_text: incomingHasContent ? row.content_text : (previous.content_text || null),
       content_fetched_at: incomingHasContent ? row.content_fetched_at : (previous.content_fetched_at || null),
       content_available: incomingHasContent || contentUsableForProvider(row.provider, previous.content_text),
+      translations: row.translation_source_hash ? row.translations : (previous.translations || {}),
+      translation_source_hash: row.translation_source_hash || previous.translation_source_hash || null,
+      translation_updated_at: row.translation_updated_at || previous.translation_updated_at || null,
     });
   }
   publicSnapshot = sortSnapshot([...byKey.values()]).slice(0, PUBLIC_CACHE_LIMIT);
@@ -597,7 +618,7 @@ async function supabaseFetch(path, init = {}) {
 async function loadDbSnapshot({ force = false } = {}) {
   if (!state.supabaseConfigured) return false;
   if (!force && dbLoadedAtMs && Date.now() - dbLoadedAtMs < DB_RELOAD_MS) return false;
-  const rows = await supabaseFetch(`${EVENTS_TABLE}?select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,fetched_at&order=published_at.desc.nullslast,fetched_at.desc&limit=${PUBLIC_CACHE_LIMIT}`);
+  const rows = await supabaseFetch(`${EVENTS_TABLE}?select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,translations,translation_source_hash,translation_updated_at,fetched_at&order=published_at.desc.nullslast,fetched_at.desc&limit=${PUBLIC_CACHE_LIMIT}`);
   state.publicSnapshotDbReads++;
   mergePublicSnapshot(Array.isArray(rows) ? rows : []);
   dbLoadedAtMs = Date.now();
@@ -989,7 +1010,7 @@ async function persistRows(rows) {
     updated_at: nowIso(),
   });
   });
-  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,fetched_at`, {
+  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,translations,translation_source_hash,translation_updated_at,fetched_at`, {
     method: 'POST',
     headers: { prefer: 'resolution=merge-duplicates,return=representation' },
     body: JSON.stringify(payload),
@@ -999,6 +1020,107 @@ async function persistRows(rows) {
   state.lastPersistAt = nowIso();
   return Array.isArray(result) ? result : payload;
 }
+function translationFieldsForAirdrop(row) {
+  const content = normalizeContentText(row?.content_text);
+  const summary = text(row?.raw_summary);
+  return {
+    title: text(row?.title),
+    reward_text: text(row?.reward_text),
+    eligibility_text: text(row?.eligibility_text),
+    ...(content ? { content } : (summary ? { raw_summary: summary } : {})),
+  };
+}
+function translationPriority(row) {
+  let score = 0;
+  const provider = text(row?.provider).toLowerCase();
+  const category = text(row?.category).toLowerCase();
+  const status = text(row?.status).toLowerCase();
+  if (provider === 'binance' && ['alpha', 'alpha_box'].includes(category)) score += 100000;
+  if (status === 'active') score += 30000;
+  else if (status === 'upcoming') score += 20000;
+  else if (status === 'announced') score += 10000;
+  const when = Date.parse(row?.published_at || row?.start_at || '') || 0;
+  score += Math.floor(when / 1_000_000_000);
+  return score;
+}
+async function translateAirdropSnapshot() {
+  if (translationBackfillInFlight || !state.supabaseConfigured || !publicSnapshot.length) return false;
+  translationBackfillInFlight = true;
+  state.translationRuns++;
+  state.translationLastRunAt = nowIso();
+  try {
+    const pending = publicSnapshot
+      .filter((row) => text(row?.source_event_id))
+      .filter((row) => text(row?.translation_source_hash) !== contentTranslationHash(translationFieldsForAirdrop(row)))
+      .sort((a, b) => translationPriority(b) - translationPriority(a));
+    // Provider-balanced backlog: each cycle prioritizes one missing row from every
+    // official provider so no platform waits behind a large OKX/Gate history set.
+    const candidates = [];
+    for (const source of OFFICIAL_SOURCES) {
+      const candidate = pending.find((row) => row.provider === source.provider && !candidates.includes(row));
+      if (candidate) candidates.push(candidate);
+      if (candidates.length >= TRANSLATION_ROWS_PER_TICK) break;
+    }
+    for (const candidate of pending) {
+      if (candidates.length >= TRANSLATION_ROWS_PER_TICK) break;
+      if (!candidates.includes(candidate)) candidates.push(candidate);
+    }
+    for (const candidate of candidates) {
+      const provider = text(candidate.provider).toLowerCase();
+      const sourceEventId = text(candidate.source_event_id);
+      if (!provider || !sourceEventId) continue;
+      try {
+        const result = await translateContentFields({
+          fields: translationFieldsForAirdrop(candidate),
+          existingTranslations: candidate.translations,
+          existingSourceHash: text(candidate.translation_source_hash),
+        });
+        if (!result.changed) continue;
+        const updatedAt = nowIso();
+        await supabaseFetch(`${EVENTS_TABLE}?provider=eq.${encodeURIComponent(provider)}&source_event_id=eq.${encodeURIComponent(sourceEventId)}`, {
+          method: 'PATCH',
+          headers: { prefer: 'return=minimal' },
+          body: JSON.stringify({
+            translations: result.translations,
+            translation_source_hash: result.source_hash,
+            translation_updated_at: updatedAt,
+          }),
+        });
+        state.translationDbWrites++;
+        state.translationRowsTranslated++;
+        state.translationLastSuccessAt = updatedAt;
+        state.translationLastError = null;
+        publicSnapshot = publicSnapshot.map((row) =>
+          row.provider === provider && row.source_event_id === sourceEventId
+            ? publicEventView({
+                ...row,
+                translations: result.translations,
+                translation_source_hash: result.source_hash,
+                translation_updated_at: updatedAt,
+              })
+            : row,
+        );
+      } catch (error) {
+        state.translationFailures++;
+        state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
+      }
+    }
+    state.publicSnapshotRows = publicSnapshot.length;
+    return true;
+  } finally {
+    translationBackfillInFlight = false;
+  }
+}
+function scheduleTranslationTick(delayMs = TRANSLATION_TICK_MS) {
+  if (stopping || !state.enabled) return;
+  if (translationTimer) clearTimeout(translationTimer);
+  translationTimer = setTimeout(async () => {
+    try { await translateAirdropSnapshot(); }
+    finally { if (!stopping) scheduleTranslationTick(); }
+  }, Math.max(5_000, delayMs));
+  translationTimer.unref?.();
+}
+
 async function refreshOnce({ force = false } = {}) {
   if (refreshPromise && !force) return refreshPromise;
   refreshPromise = (async () => {
@@ -1038,6 +1160,7 @@ async function refreshOnce({ force = false } = {}) {
       state.refreshes++;
       state.lastRefreshCompletedAt = nowIso();
       if (!state.lastError?.startsWith('persist:')) state.lastError = null;
+      scheduleTranslationTick(5_000);
       return true;
     } catch (error) {
       state.refreshFailures++;
@@ -1110,6 +1233,18 @@ function publicHealth() {
     user_read_upstream_requests: 0,
     user_read_supabase_requests: 0,
     upstream_requests_scale_with_users: false,
+    auto_translation: {
+      shared_background_only: true,
+      user_translation_requests: 0,
+      runs: state.translationRuns,
+      rows_translated: state.translationRowsTranslated,
+      failures: state.translationFailures,
+      db_writes: state.translationDbWrites,
+      last_run_at: state.translationLastRunAt,
+      last_success_at: state.translationLastSuccessAt,
+      last_error: state.translationLastError,
+      shared_service: getSharedTranslationHealth(),
+    },
     official_domain_whitelist_only: true,
     stale_snapshot_preserved_on_failure: true,
   };
@@ -1132,9 +1267,12 @@ export function startAirdropWatch() {
   stopping = false;
   if (!state.enabled) return;
   // DB is only a startup/history seed. Public reads never query Supabase directly.
-  loadDbSnapshot({ force: true }).catch((error) => {
-    state.lastError = `db_load:${String(error?.message || error)}`;
-  });
+  loadDbSnapshot({ force: true })
+    .then(() => scheduleTranslationTick(5_000))
+    .catch((error) => {
+      state.lastError = `db_load:${String(error?.message || error)}`;
+      scheduleTranslationTick(15_000);
+    });
   scheduleNext(3_000);
 }
 
@@ -1142,6 +1280,8 @@ export function stopAirdropWatch() {
   stopping = true;
   if (timer) clearTimeout(timer);
   timer = null;
+  if (translationTimer) clearTimeout(translationTimer);
+  translationTimer = null;
 }
 
 export function getAirdropWatchHealth() {
