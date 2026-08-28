@@ -1,0 +1,81 @@
+name: Step1046.2.4.1 Render content media build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1046-media-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Decode pinned builder
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, pathlib
+          src = pathlib.Path('.github/step1046_builder.ps1.gz.b64')
+          if not src.exists():
+              raise SystemExit('temporary builder payload missing')
+          raw = gzip.decompress(base64.b64decode(src.read_text().strip()))
+          pathlib.Path('/tmp/step1046_builder.ps1').write_bytes(raw)
+          print('builder bytes', len(raw))
+          PY
+
+      - name: Build candidate from pinned stable commit
+        shell: bash
+        run: |
+          mkdir -p /tmp/step1046_out /tmp/step1046_extract
+          pwsh -NoProfile -File /tmp/step1046_builder.ps1 -OutputDir /tmp/step1046_out
+          unzip -q /tmp/step1046_out/KakaWeb3_Step1046_2_4_1_Render_Content_Media_CANDIDATE.zip -d /tmp/step1046_extract
+          test -f /tmp/step1046_extract/src/social-watch.mjs
+          test -f /tmp/step1046_extract/src/airdrop-watch.mjs
+          cp /tmp/step1046_extract/src/social-watch.mjs src/social-watch.mjs
+          cp /tmp/step1046_extract/src/airdrop-watch.mjs src/airdrop-watch.mjs
+          rm -f .github/step1046_builder.ps1.gz.b64
+
+      - name: Static safety gate
+        shell: bash
+        run: |
+          node --check src/social-watch.mjs
+          node --check src/airdrop-watch.mjs
+          grep -q "step1046_2_4_1_x_shared_snapshot_celebrity_media_v4" src/social-watch.mjs
+          grep -q "step1046_2_4_1_airdrop_native_detail_media_v2" src/airdrop-watch.mjs
+          grep -q "media_items" src/social-watch.mjs
+          grep -q "media_items" src/airdrop-watch.mjs
+          python3 - <<'PY'
+          import subprocess
+          allowed = {
+              'src/social-watch.mjs',
+              'src/airdrop-watch.mjs',
+              '.github/step1046_builder.ps1.gz.b64',
+          }
+          changed = set(filter(None, subprocess.check_output(['git','diff','--name-only'], text=True).splitlines()))
+          print('changed:', sorted(changed))
+          bad = changed - allowed
+          if bad:
+              raise SystemExit(f'unexpected changed files: {sorted(bad)}')
+          if 'src/social-watch.mjs' not in changed or 'src/airdrop-watch.mjs' not in changed:
+              raise SystemExit('expected Render source changes missing')
+          PY
+
+      - name: Commit deploy sources
+        shell: bash
+        run: |
+          git config user.name 'Kaka Step1046 Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add src/social-watch.mjs src/airdrop-watch.mjs
+          git add -u .github/step1046_builder.ps1.gz.b64
+          git commit -m 'Step1046.2.4.1 content media for Celebrity Hall and Airdrop'
+          git push origin main
