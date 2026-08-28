@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-197.3.3.21",
+  "version": "650.8.15-197.3.3.21.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.197.3.3.21 Step1045.6 unified shared zh/en translation for Celebrity Hall, Airdrop, recent News and public Articles; Google-only backend translation cache"
+  "description": "Kaka Web3 Render 650.8.15.197.3.3.21.1 Step1045.6.1 Google translation diagnostics + title-first bounded news/airdrop translation under external daily quota"
 }
