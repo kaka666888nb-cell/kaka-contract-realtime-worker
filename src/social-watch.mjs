@@ -247,6 +247,9 @@ function accountRuleValue(account) {
   return parts.join(' ');
 }
 function publicAccountView(account) {
+  const overrideUrl = text(account?.avatar_override_url);
+  const manualOverride = account?.avatar_override_enabled === true && Boolean(overrideUrl);
+  const xProfileUrl = text(account?.profile_image_url);
   return {
     id: text(account?.id),
     source: text(account?.source) || 'x',
@@ -254,8 +257,10 @@ function publicAccountView(account) {
     display_name: text(account?.display_name),
     category: text(account?.category),
     role_title: text(account?.role_title),
-    profile_image_url: text(account?.profile_image_url) || null,
+    profile_image_url: manualOverride ? overrideUrl : (xProfileUrl || null),
+    profile_image_source: manualOverride ? 'admin_override' : (xProfileUrl ? 'x_shared_profile' : 'fallback_initial'),
     profile_image_checked_at: text(account?.profile_image_checked_at) || null,
+    avatar_override_updated_at: manualOverride ? (text(account?.avatar_override_updated_at) || null) : null,
     sort_order: Math.trunc(finiteNumber(account?.sort_order, 100)),
     last_post_at: text(account?.last_post_at) || null,
   };
@@ -433,6 +438,9 @@ function publicHealth() {
     public_snapshot_loaded: state.publicSnapshotLoaded,
     public_snapshot_loaded_at: state.publicSnapshotLoadedAt,
     public_snapshot_accounts: state.publicSnapshotAccounts,
+    avatar_manual_override_supported: true,
+    avatar_effective_priority: 'admin_override_then_x_shared_profile',
+    avatar_manual_override_accounts: publicAccountsSnapshot.filter((row) => text(row?.profile_image_source) === 'admin_override').length,
     public_snapshot_events: state.publicSnapshotEvents,
     public_snapshot_db_reads: state.publicSnapshotDbReads,
     airdrop_bridge_accounts: state.airdropBridgeAccounts,
