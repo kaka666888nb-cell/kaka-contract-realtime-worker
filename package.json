@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-197.3.3.18.2",
+  "version": "650.8.15-197.3.3.19",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.197.3.3.18.2 Step1045.3.1 native airdrop detail + provider taxonomy; background official-content enrichment + zero user upstream requests"
+  "description": "Kaka Web3 Render 650.8.15.197.3.3.19 Step1045.4 content native detail/search/filter/share; celebrity long-form shared snapshot + zero user upstream requests"
 }
