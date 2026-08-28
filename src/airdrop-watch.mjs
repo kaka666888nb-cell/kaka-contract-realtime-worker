@@ -12,6 +12,7 @@ const MAX_DETAIL_FETCHES_PER_SOURCE = 0;
 const CONTENT_ENRICH_FETCHES_PER_SOURCE = 3;
 const CONTENT_TEXT_MAX_CHARS = 24_000;
 const CONTENT_MIN_CHARS = 80;
+const BYBIT_STRUCTURED_CONTENT_MIN_CHARS = 20;
 const CONTENT_RETRY_MS = 6 * 60 * 60_000;
 const PUBLIC_CACHE_LIMIT = 600;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
@@ -239,6 +240,15 @@ function normalizeContentText(raw) {
 function contentUsable(value) {
   const v = normalizeContentText(value);
   if (v.length < CONTENT_MIN_CHARS) return false;
+  if (/captcha|access denied|cloudflare|enable javascript|verify you are human/i.test(v.slice(0, 800))) return false;
+  return true;
+}
+function contentUsableForProvider(provider, value) {
+  const v = normalizeContentText(value);
+  const minChars = text(provider).toLowerCase() === 'bybit'
+    ? BYBIT_STRUCTURED_CONTENT_MIN_CHARS
+    : CONTENT_MIN_CHARS;
+  if (v.length < minChars) return false;
   if (/captcha|access denied|cloudflare|enable javascript|verify you are human/i.test(v.slice(0, 800))) return false;
   return true;
 }
@@ -530,7 +540,7 @@ function publicEventView(row) {
     raw_summary: text(row?.raw_summary) || null,
     content_text: normalizeContentText(row?.content_text) || null,
     content_fetched_at: text(row?.content_fetched_at) || null,
-    content_available: contentUsable(row?.content_text),
+    content_available: contentUsableForProvider(provider, row?.content_text),
     fetched_at: text(row?.fetched_at) || null,
   };
 }
@@ -559,13 +569,13 @@ function mergePublicSnapshot(rows) {
     const key = row.source_event_id || `${row.provider}|${row.source_url}`;
     if (!key) continue;
     const previous = byKey.get(key) || {};
-    const incomingHasContent = contentUsable(row.content_text);
+    const incomingHasContent = contentUsableForProvider(row.provider, row.content_text);
     byKey.set(key, {
       ...previous,
       ...row,
       content_text: incomingHasContent ? row.content_text : (previous.content_text || null),
       content_fetched_at: incomingHasContent ? row.content_fetched_at : (previous.content_fetched_at || null),
-      content_available: incomingHasContent || contentUsable(previous.content_text),
+      content_available: incomingHasContent || contentUsableForProvider(row.provider, previous.content_text),
     });
   }
   publicSnapshot = sortSnapshot([...byKey.values()]).slice(0, PUBLIC_CACHE_LIMIT);
@@ -841,8 +851,12 @@ async function collectSource(source) {
       source_domain: (() => { try { return new URL(candidate.source_url).hostname; } catch (_) { return ''; } })(),
       status: statusFor(startAt, endAt),
       raw_summary: structuredSummary ? structuredSummary.slice(0, 600) : (known?.raw_summary || null),
-      content_text: contentUsable(known?.content_text) ? known.content_text : null,
-      content_fetched_at: contentUsable(known?.content_text) ? known.content_fetched_at : null,
+      content_text: contentUsableForProvider(source.provider, known?.content_text)
+        ? known.content_text
+        : (source.provider === 'bybit' && contentUsableForProvider('bybit', structuredSummary) ? structuredSummary : null),
+      content_fetched_at: contentUsableForProvider(source.provider, known?.content_text)
+        ? known.content_fetched_at
+        : (source.provider === 'bybit' && contentUsableForProvider('bybit', structuredSummary) ? nowIso() : null),
       fetched_at: nowIso(),
     });
   }
@@ -865,14 +879,20 @@ async function enrichSourceContent(source, rows) {
     .map((item) => [item.source_event_id, item]));
   for (const rawRow of rows) {
     const previous = priorByKey.get(rawRow?.source_event_id) || {};
-    const row = contentUsable(rawRow?.content_text)
+    const row = contentUsableForProvider(source.provider, rawRow?.content_text)
       ? rawRow
       : {
           ...rawRow,
-          content_text: contentUsable(previous?.content_text) ? previous.content_text : null,
-          content_fetched_at: contentUsable(previous?.content_text) ? previous.content_fetched_at : null,
+          content_text: contentUsableForProvider(source.provider, previous?.content_text) ? previous.content_text : null,
+          content_fetched_at: contentUsableForProvider(source.provider, previous?.content_text) ? previous.content_fetched_at : null,
         };
-    if (contentUsable(row?.content_text) || budget <= 0) {
+    if (contentUsableForProvider(source.provider, row?.content_text) || budget <= 0) {
+      out.push(row);
+      continue;
+    }
+    if (source.provider === 'bybit') {
+      // Bybit's documented Announcement API already provides official description/time fields.
+      // The public article frontend is JS-rendered and can hang in Render; never fan out to it.
       out.push(row);
       continue;
     }
@@ -940,12 +960,12 @@ async function persistRows(rows) {
   const priorByKey = new Map(publicSnapshot.map((item) => [item.source_event_id, item]));
   const payload = rows.map((rawRow) => {
     const previous = priorByKey.get(rawRow?.source_event_id) || {};
-    const row = contentUsable(rawRow?.content_text)
+    const row = contentUsableForProvider(rawRow?.provider, rawRow?.content_text)
       ? rawRow
       : {
           ...rawRow,
-          content_text: contentUsable(previous?.content_text) ? previous.content_text : null,
-          content_fetched_at: contentUsable(previous?.content_text) ? previous.content_fetched_at : null,
+          content_text: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_text : null,
+          content_fetched_at: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_fetched_at : null,
         };
     return ({
     provider: row.provider,
@@ -963,8 +983,8 @@ async function persistRows(rows) {
     source_domain: row.source_domain,
     status: statusFor(row.start_at, row.end_at),
     raw_summary: row.raw_summary,
-    content_text: contentUsable(row.content_text) ? normalizeContentText(row.content_text).slice(0, CONTENT_TEXT_MAX_CHARS) : null,
-    content_fetched_at: contentUsable(row.content_text) ? (row.content_fetched_at || nowIso()) : null,
+    content_text: contentUsableForProvider(row.provider, row.content_text) ? normalizeContentText(row.content_text).slice(0, CONTENT_TEXT_MAX_CHARS) : null,
+    content_fetched_at: contentUsableForProvider(row.provider, row.content_text) ? (row.content_fetched_at || nowIso()) : null,
     fetched_at: nowIso(),
     updated_at: nowIso(),
   });
@@ -1049,6 +1069,7 @@ function publicHealth() {
       structured_official_api: Boolean(source.json_roots?.length),
       structured_official_x: Boolean(source.social_x_handles?.length),
       official_x_handles: source.social_x_handles || [],
+      native_content_mode: source.provider === 'bybit' ? 'documented_announcement_api_description' : (source.social_x_handles?.length ? 'official_x_post' : 'official_article_html'),
       root_count: (source.roots?.length || 0) + (source.json_roots?.length || 0) + (source.social_x_handles?.length || 0),
       ...(state.sourceStates[source.id] || {}),
     };
@@ -1076,7 +1097,7 @@ function publicHealth() {
     detail_requests: state.detailRequests,
     content_enrich_requests: state.contentEnrichRequests,
     content_enrich_failures: state.contentEnrichFailures,
-    content_rows: publicSnapshot.filter((row) => contentUsable(row?.content_text)).length,
+    content_rows: publicSnapshot.filter((row) => contentUsableForProvider(row?.provider, row?.content_text)).length,
     detail_reads: state.detailReads,
     persisted_rows: state.persistedRows,
     persist_successes: state.persistSuccesses,
@@ -1188,6 +1209,7 @@ export const __airdropWatchTest = Object.freeze({
   extractRewardText,
   htmlArticleText,
   contentUsable,
+  contentUsableForProvider,
   publicEventView,
   statusFor,
   sources: OFFICIAL_SOURCES,
