@@ -5,7 +5,17 @@ const GOOGLE_API_KEY = String(process.env.KAKA_GOOGLE_TRANSLATION_API_KEY || pro
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const USAGE_TABLE = 'app_content_translation_usage';
+const DAILY_USAGE_TABLE = 'app_content_translation_daily_usage';
 const MONTHLY_CHAR_LIMIT = Math.max(50_000, Math.min(5_000_000, Number(process.env.KAKA_TRANSLATION_MONTHLY_CHAR_LIMIT || 450000) || 450000));
+const DAILY_SOFT_CHAR_LIMIT = Math.max(5_000, Math.min(100_000, Number(process.env.KAKA_TRANSLATION_DAILY_SOFT_CHAR_LIMIT || 14000) || 14000));
+const DAILY_BUCKET_LIMITS = Object.freeze({
+  news_title: Math.max(1000, Number(process.env.KAKA_TRANSLATION_DAILY_NEWS_TITLE_CHARS || 11500) || 11500),
+  airdrop: Math.max(200, Number(process.env.KAKA_TRANSLATION_DAILY_AIRDROP_CHARS || 1000) || 1000),
+  social: Math.max(100, Number(process.env.KAKA_TRANSLATION_DAILY_SOCIAL_CHARS || 500) || 500),
+  article: Math.max(100, Number(process.env.KAKA_TRANSLATION_DAILY_ARTICLE_CHARS || 500) || 500),
+  news_body: Math.max(0, Number(process.env.KAKA_TRANSLATION_DAILY_NEWS_BODY_CHARS || 500) || 500),
+  legacy_bootstrap: 0,
+});
 const REQUEST_TIMEOUT_MS = Math.max(3000, Math.min(20000, Number(process.env.KAKA_TRANSLATION_TIMEOUT_MS || 10000) || 10000));
 const MAX_FIELD_CHARS = Math.max(1200, Math.min(60000, Number(process.env.KAKA_TRANSLATION_MAX_FIELD_CHARS || 30000) || 30000));
 const SEGMENT_CHARS = Math.max(1200, Math.min(5000, Number(process.env.KAKA_TRANSLATION_SEGMENT_CHARS || 3800) || 3800));
@@ -43,6 +53,13 @@ const state = {
   monthly_char_limit: MONTHLY_CHAR_LIMIT,
   monthly_characters_used: 0,
   monthly_requests: 0,
+  daily_soft_char_limit: DAILY_SOFT_CHAR_LIMIT,
+  daily_characters_used: 0,
+  daily_requests: 0,
+  daily_by_bucket: {},
+  daily_budget_day_key: null,
+  daily_budget_persistence_healthy: true,
+  daily_bucket_limits: { ...DAILY_BUCKET_LIMITS },
   usage_persistence_configured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
   usage_persistence_healthy: true,
 };
@@ -52,6 +69,8 @@ let lastProviderRequestAtMs = 0;
 let cooldownUntilMs = 0;
 let usageLoadedMonth = '';
 let usageLoadPromise = null;
+let dailyUsageLoadedKey = '';
+let dailyUsageLoadPromise = null;
 
 function text(value) { return String(value ?? '').trim(); }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
@@ -102,6 +121,15 @@ function targetForSource(sourceLanguage) {
 function googleLanguage(locale) { return locale === 'zh' ? 'zh-CN' : 'en'; }
 
 function monthKey() { return new Date().toISOString().slice(0, 7); }
+function pacificDayKey() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date());
+}
+function normalizeBudgetBucket(value) {
+  const key = text(value).toLowerCase();
+  return Object.prototype.hasOwnProperty.call(DAILY_BUCKET_LIMITS, key) ? key : 'airdrop';
+}
 function usageHeaders(extra = {}) {
   return {
     apikey: SUPABASE_SERVICE_ROLE_KEY,
@@ -138,6 +166,94 @@ async function ensureUsageLoaded() {
   })().finally(() => { usageLoadPromise = null; });
   return usageLoadPromise;
 }
+async function ensureDailyUsageLoaded() {
+  const day = pacificDayKey();
+  if (dailyUsageLoadedKey === day) return;
+  if (dailyUsageLoadPromise) return dailyUsageLoadPromise;
+  dailyUsageLoadPromise = (async () => {
+    state.daily_characters_used = 0;
+    state.daily_requests = 0;
+    state.daily_by_bucket = {};
+    state.daily_budget_day_key = day;
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const response = await fetch(`${SUPABASE_URL}/rest/v1/${DAILY_USAGE_TABLE}?day_key=eq.${encodeURIComponent(day)}&select=bucket,characters_used,requests`, { headers: usageHeaders({ accept: 'application/json' }) });
+        const raw = await response.text();
+        if (!response.ok) throw new Error(`translation_daily_usage_http_${response.status}:${raw.slice(0, 180)}`);
+        let rows = [];
+        try { rows = raw ? JSON.parse(raw) : []; } catch (_) {}
+        for (const row of Array.isArray(rows) ? rows : []) {
+          const bucket = normalizeBudgetBucket(row?.bucket);
+          const chars = Math.max(0, Number(row?.characters_used || 0) || 0);
+          const requests = Math.max(0, Number(row?.requests || 0) || 0);
+          state.daily_by_bucket[bucket] = (state.daily_by_bucket[bucket] || 0) + chars;
+          state.daily_characters_used += chars;
+          state.daily_requests += requests;
+        }
+        state.daily_budget_persistence_healthy = true;
+      } catch (error) {
+        state.daily_budget_persistence_healthy = false;
+        state.last_error = String(error?.message || error);
+        throw error;
+      }
+    }
+    dailyUsageLoadedKey = day;
+  })().finally(() => { dailyUsageLoadPromise = null; });
+  return dailyUsageLoadPromise;
+}
+
+function assertDailyBudget(bucket, chargeChars) {
+  const normalized = normalizeBudgetBucket(bucket);
+  const bucketUsed = Math.max(0, Number(state.daily_by_bucket?.[normalized] || 0) || 0);
+  const bucketLimit = Math.max(0, Number(DAILY_BUCKET_LIMITS[normalized] || 0) || 0);
+  if (state.daily_characters_used + chargeChars > DAILY_SOFT_CHAR_LIMIT) {
+    const error = new Error(`translation_daily_soft_budget_exhausted:${state.daily_characters_used}/${DAILY_SOFT_CHAR_LIMIT}`);
+    error.code = 'TRANSLATION_DAILY_BUDGET';
+    throw error;
+  }
+  if (bucketUsed + chargeChars > bucketLimit) {
+    const error = new Error(`translation_daily_bucket_budget_exhausted:${normalized}:${bucketUsed}/${bucketLimit}`);
+    error.code = 'TRANSLATION_BUCKET_BUDGET';
+    throw error;
+  }
+  return normalized;
+}
+
+async function persistDailyUsage(bucket, deltaChars) {
+  const normalized = normalizeBudgetBucket(bucket);
+  const day = pacificDayKey();
+  const nextChars = Math.max(0, Number(state.daily_by_bucket?.[normalized] || 0) || 0) + deltaChars;
+  state.daily_by_bucket[normalized] = nextChars;
+  state.daily_characters_used += deltaChars;
+  state.daily_requests += 1;
+  state.daily_budget_day_key = day;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+  const currentRows = await fetch(`${SUPABASE_URL}/rest/v1/${DAILY_USAGE_TABLE}?day_key=eq.${encodeURIComponent(day)}&bucket=eq.${encodeURIComponent(normalized)}&select=characters_used,requests&limit=1`, { headers: usageHeaders({ accept: 'application/json' }) });
+  const currentRaw = await currentRows.text();
+  if (!currentRows.ok) throw new Error(`translation_daily_usage_read_http_${currentRows.status}:${currentRaw.slice(0, 180)}`);
+  let current = null;
+  try { current = (JSON.parse(currentRaw) || [])[0] || null; } catch (_) {}
+  const dbChars = Math.max(0, Number(current?.characters_used || 0) || 0) + deltaChars;
+  const dbRequests = Math.max(0, Number(current?.requests || 0) || 0) + 1;
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${DAILY_USAGE_TABLE}?on_conflict=day_key,bucket`, {
+    method: 'POST',
+    headers: usageHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    body: JSON.stringify({
+      day_key: day,
+      bucket: normalized,
+      characters_used: dbChars,
+      requests: dbRequests,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  if (!response.ok) {
+    const raw = await response.text();
+    state.daily_budget_persistence_healthy = false;
+    throw new Error(`translation_daily_usage_persist_http_${response.status}:${raw.slice(0, 180)}`);
+  }
+  state.daily_budget_persistence_healthy = true;
+}
+
 async function persistUsage(deltaChars) {
   state.monthly_characters_used += deltaChars;
   state.monthly_requests += 1;
@@ -231,7 +347,7 @@ function openCooldown(message, response = null) {
   let untilMs = Date.now() + RETRY_COOLDOWN_MS;
   const header = Number(response?.headers?.get?.('retry-after') || 0);
   if (Number.isFinite(header) && header > 0) untilMs = Math.max(untilMs, Date.now() + header * 1000);
-  if (/daily limit exceeded/i.test(message)) untilMs = nextPacificMidnightMs();
+  if (/daily limit exceeded|user.?rate.?limit.?exceeded|userRateLimitExceeded/i.test(message)) untilMs = nextPacificMidnightMs();
   cooldownUntilMs = untilMs;
   state.cooldown_until = new Date(cooldownUntilMs).toISOString();
   state.cooldown_reason = message;
@@ -239,10 +355,12 @@ function openCooldown(message, response = null) {
   state.last_error = message;
 }
 
-async function translateGoogleSegment(value, source, target) {
+async function translateGoogleSegment(value, source, target, budgetBucket = 'airdrop') {
   if (!GOOGLE_API_KEY) throw new Error('translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY');
   await ensureUsageLoaded();
+  await ensureDailyUsageLoaded();
   const chargeChars = Array.from(value).length;
+  const normalizedBucket = assertDailyBudget(budgetBucket, chargeChars);
   if (state.monthly_characters_used + chargeChars > MONTHLY_CHAR_LIMIT) {
     const error = new Error(`translation_monthly_budget_exhausted:${state.monthly_characters_used}/${MONTHLY_CHAR_LIMIT}`);
     state.last_error = error.message;
@@ -284,6 +402,7 @@ async function translateGoogleSegment(value, source, target) {
       const translated = decodeHtmlEntities(payload?.data?.translations?.[0]?.translatedText || '');
       if (!translated) throw new Error('google_translation_empty');
       await persistUsage(chargeChars);
+      await persistDailyUsage(normalizedBucket, chargeChars);
       state.provider_last_success_at = new Date().toISOString();
       state.provider_consecutive_failures = 0;
       state.cooldown_reason = null;
@@ -304,11 +423,11 @@ async function translateGoogleSegment(value, source, target) {
   });
 }
 
-async function translateField(raw, source, target) {
+async function translateField(raw, source, target, budgetBucket = 'airdrop') {
   const segments = splitText(raw);
   if (!segments.length) return '';
   const translated = [];
-  for (const segment of segments) translated.push(await translateGoogleSegment(segment, source, target));
+  for (const segment of segments) translated.push(await translateGoogleSegment(segment, source, target, budgetBucket));
   return normalizeWhitespace(translated.join('\n\n'));
 }
 
@@ -343,7 +462,7 @@ export function translationNeedsWork({ fields, existingTranslations = {}, existi
   return false;
 }
 
-export async function translateContentFields({ fields, existingTranslations = {}, existingSourceHash = '', onlyFields = null, maxSourceChars = Number.POSITIVE_INFINITY }) {
+export async function translateContentFields({ fields, existingTranslations = {}, existingSourceHash = '', onlyFields = null, maxSourceChars = Number.POSITIVE_INFINITY, budgetBucket = 'airdrop' }) {
   const normalizedFields = {};
   for (const [key, value] of Object.entries(fields || {})) {
     const clean = normalizeWhitespace(value);
@@ -380,7 +499,7 @@ export async function translateContentFields({ fields, existingTranslations = {}
     const jobChars = Array.from(job.value).length;
     if (translatedSourceChars + jobChars > maxSourceChars) continue;
     try {
-      const translated = await translateField(job.value, job.source, job.target);
+      const translated = await translateField(job.value, job.source, job.target, budgetBucket);
       if (!translated) continue;
       next[job.target] ||= {};
       next[job.target][job.field] = translated;
@@ -411,5 +530,8 @@ export function getSharedTranslationHealth() {
     provider_auth_mode: 'x_goog_api_key_header',
     cooldown_until: cooldownUntilMs > Date.now() ? new Date(cooldownUntilMs).toISOString() : null,
     provider_ready: Boolean(GOOGLE_API_KEY) && state.provider_consecutive_failures === 0 && cooldownUntilMs <= Date.now(),
+    daily_budget_ready: state.daily_characters_used < DAILY_SOFT_CHAR_LIMIT,
+    daily_budget_remaining: Math.max(0, DAILY_SOFT_CHAR_LIMIT - state.daily_characters_used),
+    daily_bucket_remaining: Object.fromEntries(Object.entries(DAILY_BUCKET_LIMITS).map(([key, limit]) => [key, Math.max(0, limit - Math.max(0, Number(state.daily_by_bucket?.[key] || 0) || 0))])),
   };
 }

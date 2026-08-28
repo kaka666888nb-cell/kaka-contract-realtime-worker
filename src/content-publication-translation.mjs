@@ -5,7 +5,7 @@ import {
   translationNeedsWork,
 } from './content-translation.mjs';
 
-const SCHEMA = 'step1045_6_1_publication_shared_translation_v1';
+const SCHEMA = 'step1045_6_2_publication_daily_budget_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const NEWS_TABLE = 'app_newsflashes';
@@ -133,7 +133,7 @@ async function persist(table, id, result) {
   return updatedAt;
 }
 
-async function translateRow({ table, row, fields, kind, onlyFields = null, maxSourceChars = Number.POSITIVE_INFINITY }) {
+async function translateRow({ table, row, fields, kind, onlyFields = null, maxSourceChars = Number.POSITIVE_INFINITY, budgetBucket = 'article' }) {
   const id = text(row?.id);
   if (!id) return false;
   const result = await translateContentFields({
@@ -142,6 +142,7 @@ async function translateRow({ table, row, fields, kind, onlyFields = null, maxSo
     existingSourceHash: text(row?.translation_source_hash),
     onlyFields,
     maxSourceChars,
+    budgetBucket,
   });
   if (!result.changed || result.translated_fields < 1) return false;
   await persist(table, id, result);
@@ -167,6 +168,10 @@ async function runOnce() {
     state.last_error = 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY';
     return false;
   }
+  if (service.daily_budget_ready === false) {
+    state.last_error = 'translation_daily_soft_budget_locked';
+    return false;
+  }
   inFlight = true;
   state.runs++;
   state.last_run_at = nowIso();
@@ -184,7 +189,7 @@ async function runOnce() {
     // never waits behind a continuously-arriving news stream.
     for (const row of pendingArticles.slice(0, ARTICLES_PER_TICK)) {
       try {
-        await translateRow({ table: ARTICLES_TABLE, row, fields: articleFields, kind: 'article', maxSourceChars: 12_000 });
+        await translateRow({ table: ARTICLES_TABLE, row, fields: articleFields, kind: 'article', maxSourceChars: 12_000, budgetBucket: 'article' });
       } catch (error) {
         state.failures++;
         state.last_error = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
@@ -197,7 +202,7 @@ async function runOnce() {
     // every historical/full body (~43k source chars/day).
     for (const row of pendingNewsTitles.slice(0, NEWS_TITLE_PER_TICK)) {
       try {
-        await translateRow({ table: NEWS_TABLE, row, fields: newsFields, kind: 'news_title', onlyFields: ['title'], maxSourceChars: 600 });
+        await translateRow({ table: NEWS_TABLE, row, fields: newsFields, kind: 'news_title', onlyFields: ['title'], maxSourceChars: 600, budgetBucket: 'news_title' });
       } catch (error) {
         state.failures++;
         state.last_error = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
@@ -210,7 +215,7 @@ async function runOnce() {
     if (pendingNewsTitles.length === 0 && NEWS_BODY_PER_TICK > 0) {
       for (const row of pendingNewsBodies.slice(0, NEWS_BODY_PER_TICK)) {
         try {
-          await translateRow({ table: NEWS_TABLE, row, fields: newsFields, kind: 'news_body', onlyFields: ['content'], maxSourceChars: 1200 });
+          await translateRow({ table: NEWS_TABLE, row, fields: newsFields, kind: 'news_body', onlyFields: ['content'], maxSourceChars: 1200, budgetBucket: 'news_body' });
         } catch (error) {
           state.failures++;
           state.last_error = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);

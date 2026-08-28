@@ -470,7 +470,9 @@ async function supabaseFetch(path, init = {}) {
 
 async function translateSocialPublicSnapshot() {
   if (translationBackfillInFlight || !state.supabaseConfigured || !publicEventsSnapshot.length) return false;
-  if (!getSharedTranslationHealth().configured) { state.translationLastError = 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY'; return false; }
+  const translationHealth = getSharedTranslationHealth();
+  if (!translationHealth.configured) { state.translationLastError = 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY'; return false; }
+  if (translationHealth.daily_budget_ready === false || Number(translationHealth.daily_bucket_remaining?.social || 0) <= 0) { state.translationLastError = 'translation_daily_social_budget_locked'; return false; }
   translationBackfillInFlight = true;
   state.translationRuns++;
   state.translationLastRunAt = nowIso();
@@ -490,6 +492,7 @@ async function translateSocialPublicSnapshot() {
           fields: { content: text(candidate.content) },
           existingTranslations: candidate.translations,
           existingSourceHash: text(candidate.translation_source_hash),
+          budgetBucket: 'social',
         });
         if (!result.changed) continue;
         const updatedAt = nowIso();
@@ -519,6 +522,7 @@ async function translateSocialPublicSnapshot() {
       } catch (error) {
         state.translationFailures++;
         state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
+        if (['TRANSLATION_DAILY_BUDGET','TRANSLATION_BUCKET_BUDGET','TRANSLATION_COOLDOWN'].includes(String(error?.code || ''))) break;
       }
     }
     state.publicSnapshotEvents = publicEventsSnapshot.length;
