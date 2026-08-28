@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-197.3.3.24",
+  "version": "650.8.15-197.3.3.24.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -30,5 +30,5 @@
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "description": "Kaka Web3 Render 650.8.15.197.3.3.23 Step1045.9 Chinese-first auto translation + shared on-demand public-content translation"
+  "description": "Kaka Web3 Render 650.8.15.197.3.3.23 Step1045.10.1 liquidation history shared summary fast path + Step1045.9 translation baseline"
 }
