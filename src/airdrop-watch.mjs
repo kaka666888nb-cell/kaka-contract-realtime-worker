@@ -21,7 +21,8 @@ const DB_RELOAD_MS = 30 * 60_000;
 const HTML_MAX_BYTES = 3 * 1024 * 1024;
 const TRANSLATION_TICK_MS = 60_000;
 const TRANSLATION_ROWS_PER_TICK = 5;
-const TRANSLATION_DETAIL_ROWS_PER_TICK = 1;
+const TRANSLATION_DETAIL_ROWS_PER_TICK = 2;
+const AUTO_SHORT_DETAIL_CHARS = Math.max(200, Math.min(2000, Number(process.env.KAKA_AIRDROP_AUTO_SHORT_DETAIL_CHARS || 900) || 900));
 const TRANSLATION_WINDOW_ROWS = Math.max(25, Math.min(100, Number(process.env.KAKA_AIRDROP_TRANSLATION_WINDOW_ROWS || 60) || 60));
 
 const OFFICIAL_SOURCES = Object.freeze([
@@ -1051,7 +1052,7 @@ async function translateAirdropSnapshot() {
   if (translationBackfillInFlight || !state.supabaseConfigured || !publicSnapshot.length) return false;
   const translationHealth = getSharedTranslationHealth();
   if (!translationHealth.configured) { state.translationLastError = 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY'; return false; }
-  if (translationHealth.daily_budget_ready === false || Number(translationHealth.daily_bucket_remaining?.airdrop || 0) <= 0) { state.translationLastError = 'translation_daily_airdrop_budget_locked'; return false; }
+  if (translationHealth.daily_budget_ready === false || translationHealth.auto_daily_budget_ready === false) { state.translationLastError = 'translation_auto_zh_budget_locked'; return false; }
   translationBackfillInFlight = true;
   state.translationRuns++;
   state.translationLastRunAt = nowIso();
@@ -1068,6 +1069,7 @@ async function translateAirdropSnapshot() {
       existingTranslations: row?.translations,
       existingSourceHash: text(row?.translation_source_hash),
       requiredFields: ['title'],
+      targetLocale: 'zh',
     }));
     const titleCandidates = [];
     for (const source of OFFICIAL_SOURCES) {
@@ -1121,41 +1123,50 @@ async function translateAirdropSnapshot() {
           existingSourceHash: text(candidate.translation_source_hash),
           onlyFields: ['title'],
           maxSourceChars: 700,
-          budgetBucket: 'airdrop',
+          budgetBucket: 'auto_zh',
+          targetLocale: 'zh',
         });
         await persistTranslation(candidate, result, 'title');
       } catch (error) {
         state.translationFailures++;
         state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
-        if (['TRANSLATION_COOLDOWN','TRANSLATION_DAILY_BUDGET','TRANSLATION_BUCKET_BUDGET'].includes(String(error?.code || ''))) break;
+        if (['TRANSLATION_COOLDOWN','TRANSLATION_DAILY_BUDGET','TRANSLATION_AUTO_DAILY_BUDGET','TRANSLATION_BUCKET_BUDGET'].includes(String(error?.code || ''))) break;
       }
     }
 
-    // Only after the five-provider title baseline is caught up do we spend a
-    // small amount of spare quota on long detail fields.  This keeps the
-    // user's 15k/day Google hard limit meaningful.
+    // Chinese-first short-detail rule: after titles are caught up, auto-translate only
+    // genuinely short English activity details. Long official bodies keep their Chinese
+    // title warm, while the body is translated once on explicit user tap and then shared.
     if (pendingTitles.length === 0 && TRANSLATION_DETAIL_ROWS_PER_TICK > 0) {
-      const pendingDetails = translationWindow.filter((row) => translationNeedsWork({
-        fields: translationFieldsForAirdrop(row),
-        existingTranslations: row?.translations,
-        existingSourceHash: text(row?.translation_source_hash),
-        requiredFields: ['reward_text', 'eligibility_text', 'content', 'raw_summary'],
-      }));
+      const detailFields = ['reward_text', 'eligibility_text', 'content', 'raw_summary'];
+      const pendingDetails = translationWindow.filter((row) => {
+        const fields = translationFieldsForAirdrop(row);
+        const detailChars = detailFields.reduce((sum, key) => sum + Array.from(text(fields[key])).length, 0);
+        if (detailChars <= 0 || detailChars > AUTO_SHORT_DETAIL_CHARS) return false;
+        return translationNeedsWork({
+          fields,
+          existingTranslations: row?.translations,
+          existingSourceHash: text(row?.translation_source_hash),
+          requiredFields: detailFields,
+          targetLocale: 'zh',
+        });
+      });
       for (const candidate of pendingDetails.slice(0, TRANSLATION_DETAIL_ROWS_PER_TICK)) {
         try {
           const result = await translateContentFields({
             fields: translationFieldsForAirdrop(candidate),
             existingTranslations: candidate.translations,
             existingSourceHash: text(candidate.translation_source_hash),
-            onlyFields: ['reward_text', 'eligibility_text', 'content', 'raw_summary'],
-            maxSourceChars: 1600,
-            budgetBucket: 'airdrop',
+            onlyFields: detailFields,
+            maxSourceChars: AUTO_SHORT_DETAIL_CHARS,
+            budgetBucket: 'auto_zh',
+            targetLocale: 'zh',
           });
           await persistTranslation(candidate, result, 'detail');
         } catch (error) {
           state.translationFailures++;
           state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
-          break;
+          if (['TRANSLATION_COOLDOWN','TRANSLATION_DAILY_BUDGET','TRANSLATION_AUTO_DAILY_BUDGET'].includes(String(error?.code || ''))) break;
         }
       }
     }
@@ -1288,8 +1299,12 @@ function publicHealth() {
     user_read_supabase_requests: 0,
     upstream_requests_scale_with_users: false,
     auto_translation: {
-      shared_background_only: true,
-      user_translation_requests: 0,
+      shared_background_only: false,
+      shared_background_and_on_demand: true,
+      policy: 'english_to_chinese_title_plus_short_detail_auto',
+      chinese_to_english_auto: false,
+      short_detail_max_chars: AUTO_SHORT_DETAIL_CHARS,
+      user_translation_requests: getSharedTranslationHealth().user_translation_requests,
       runs: state.translationRuns,
       rows_translated: state.translationRowsTranslated,
       title_rows_translated: state.translationTitleRowsTranslated,

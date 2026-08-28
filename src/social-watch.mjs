@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { contentTranslationHash, getSharedTranslationHealth, translateContentFields } from './content-translation.mjs';
+import { contentTranslationHash, getSharedTranslationHealth, translateContentFields, translationNeedsWork } from './content-translation.mjs';
 const STEP_SCHEMA = 'step1044_1_2_x_shared_snapshot_celebrity_hall_v3';
 const NATIVE_DETAIL_SCHEMA = 'step1045_4_celebrity_native_detail_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
@@ -503,8 +503,12 @@ function publicHealth() {
     native_detail_user_x_requests: 0,
     native_detail_user_supabase_requests: 0,
     auto_translation: {
-      shared_background_only: true,
-      user_translation_requests: 0,
+      shared_background_only: false,
+      shared_background_and_on_demand: true,
+      policy: 'english_to_chinese_full_shared_auto_only',
+      chinese_to_english_auto: false,
+      target_locale: 'zh',
+      user_translation_requests: getSharedTranslationHealth().user_translation_requests,
       runs: state.translationRuns,
       rows_translated: state.translationRowsTranslated,
       failures: state.translationFailures,
@@ -536,16 +540,24 @@ async function translateSocialPublicSnapshot() {
   if (translationBackfillInFlight || !state.supabaseConfigured || !publicEventsSnapshot.length) return false;
   const translationHealth = getSharedTranslationHealth();
   if (!translationHealth.configured) { state.translationLastError = 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY'; return false; }
-  if (translationHealth.daily_budget_ready === false || Number(translationHealth.daily_bucket_remaining?.social || 0) <= 0) { state.translationLastError = 'translation_daily_social_budget_locked'; return false; }
+  if (translationHealth.daily_budget_ready === false || translationHealth.auto_daily_budget_ready === false) { state.translationLastError = 'translation_auto_zh_budget_locked'; return false; }
   translationBackfillInFlight = true;
   state.translationRuns++;
   state.translationLastRunAt = nowIso();
   try {
+    // Chinese-first product rule: Celebrity Hall English posts are translated to Chinese
+    // in the shared background. Chinese posts are never auto-translated to English.
     const candidates = publicEventsSnapshot
       .filter((row) => {
         const content = text(row?.content);
         if (!content) return false;
-        return text(row?.translation_source_hash) !== contentTranslationHash({ content });
+        return translationNeedsWork({
+          fields: { content },
+          existingTranslations: row?.translations,
+          existingSourceHash: text(row?.translation_source_hash),
+          requiredFields: ['content'],
+          targetLocale: 'zh',
+        });
       })
       .slice(0, TRANSLATION_BACKFILL_PER_TICK);
     for (const candidate of candidates) {
@@ -556,7 +568,9 @@ async function translateSocialPublicSnapshot() {
           fields: { content: text(candidate.content) },
           existingTranslations: candidate.translations,
           existingSourceHash: text(candidate.translation_source_hash),
-          budgetBucket: 'social',
+          budgetBucket: 'auto_zh',
+          targetLocale: 'zh',
+          maxSourceChars: 5000,
         });
         if (!result.changed) continue;
         const updatedAt = nowIso();
@@ -586,7 +600,7 @@ async function translateSocialPublicSnapshot() {
       } catch (error) {
         state.translationFailures++;
         state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
-        if (['TRANSLATION_DAILY_BUDGET','TRANSLATION_BUCKET_BUDGET','TRANSLATION_COOLDOWN'].includes(String(error?.code || ''))) break;
+        if (['TRANSLATION_DAILY_BUDGET','TRANSLATION_AUTO_DAILY_BUDGET','TRANSLATION_BUCKET_BUDGET','TRANSLATION_COOLDOWN'].includes(String(error?.code || ''))) break;
       }
     }
     state.publicSnapshotEvents = publicEventsSnapshot.length;
