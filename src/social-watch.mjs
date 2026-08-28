@@ -1,4 +1,5 @@
 const STEP_SCHEMA = 'step1044_1_2_x_shared_snapshot_celebrity_hall_v3';
+const NATIVE_DETAIL_SCHEMA = 'step1045_4_celebrity_native_detail_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const X_API_BEARER_TOKEN = String(process.env.X_API_BEARER_TOKEN || '').trim();
@@ -116,6 +117,19 @@ let publicEventsLoadedAtMs = 0;
 
 function nowIso() { return new Date().toISOString(); }
 function text(v) { return String(v ?? '').trim(); }
+function postFullText(post) {
+  const article = post?.article && typeof post.article === 'object' ? post.article : {};
+  const note = post?.note_tweet && typeof post.note_tweet === 'object' ? post.note_tweet : {};
+  const articleBody = text(article.text || article.plain_text);
+  if (articleBody) {
+    const articleTitle = text(article.title);
+    return articleTitle && !articleBody.toLowerCase().startsWith(articleTitle.toLowerCase())
+      ? `${articleTitle}\n\n${articleBody}`
+      : articleBody;
+  }
+  return text(note.text || post?.text);
+}
+
 function finiteNumber(v, fallback = 0) { const n = Number(v); return Number.isFinite(n) ? n : fallback; }
 function clampInt(v, min, max, fallback) {
   const n = Math.trunc(finiteNumber(v, fallback));
@@ -404,6 +418,11 @@ function publicHealth() {
     airdrop_recent_backfill_inserted: state.airdropRecentBackfillInserted,
     airdrop_recent_backfill_error: state.airdropRecentBackfillError,
     user_read_supabase_requests: 0,
+    native_detail_schema: NATIVE_DETAIL_SCHEMA,
+    native_detail_shared_snapshot: true,
+    native_detail_user_x_requests: 0,
+    native_detail_user_supabase_requests: 0,
+    full_text_fields: ['text', 'note_tweet', 'article'],
   };
 }
 
@@ -703,7 +722,7 @@ async function backfillOfficialAirdropRecentOnce() {
   const params = new URLSearchParams({
     query: `${handleGroup} ${keywordClause} -is:retweet -is:reply`,
     max_results: String(AIRDROP_RECENT_BACKFILL_MAX_RESULTS),
-    'tweet.fields': 'id,text,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
+    'tweet.fields': 'id,text,note_tweet,article,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
     expansions: 'author_id',
     'user.fields': 'id,username,name',
   });
@@ -785,7 +804,7 @@ async function insertEvent(account, post, tag) {
     source_post_id: postId,
     author_handle: handle,
     author_name: text(account.display_name),
-    content: text(post?.text),
+    content: postFullText(post),
     post_url: postUrl,
     published_at: publishedAt,
     language: text(post?.lang) || null,
@@ -819,7 +838,7 @@ async function insertEvent(account, post, tag) {
   if (shouldNotify) {
     const displayName = text(account.display_name) || `@${handle}`;
     const title = `${displayName} · X 新动态`;
-    const content = notificationText(post?.text);
+    const content = notificationText(postFullText(post));
     try {
       const notificationRows = await supabaseFetch(`${NOTIFICATIONS_TABLE}?select=id`, {
         method: 'POST',
@@ -898,7 +917,7 @@ async function handleStreamPayload(payload) {
 
 async function consumeStream(signal) {
   const params = new URLSearchParams({
-    'tweet.fields': 'id,text,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
+    'tweet.fields': 'id,text,note_tweet,article,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
   });
   const response = await xFetch(`/2/tweets/search/stream?${params.toString()}`, { signal });
   state.lastXHttpStatus = response.status;
@@ -1042,22 +1061,30 @@ export function getSocialWatchHealth() {
 }
 
 async function readLatestEvents(limit) {
-  await ensurePublicSnapshotReady();
   const safeLimit = clampInt(limit, 1, PUBLIC_ENDPOINT_MAX_LIMIT, 30);
   return publicEventsSnapshot.slice(0, safeLimit);
 }
 
 async function readPublicAccounts() {
-  await ensurePublicSnapshotReady();
   return publicAccountsSnapshot.map((row) => ({ ...row }));
 }
 
 async function readPublicEvents(limit, accounts) {
-  await ensurePublicSnapshotReady();
   const safeLimit = clampInt(limit, 1, PUBLIC_ENDPOINT_MAX_LIMIT, 80);
   const ids = new Set((Array.isArray(accounts) ? accounts : []).map((row) => text(row?.id)).filter(Boolean));
   if (!ids.size) return [];
   return publicEventsSnapshot.filter((row) => ids.has(text(row?.watch_account_id))).slice(0, safeLimit);
+}
+
+async function readPublicEventDetail(sourcePostId, accounts) {
+  const id = text(sourcePostId);
+  if (!/^[0-9]{1,24}$/.test(id)) return null;
+  const visibleIds = new Set((Array.isArray(accounts) ? accounts : []).map((row) => text(row?.id)).filter(Boolean));
+  if (!visibleIds.size) return null;
+  const row = publicEventsSnapshot.find((item) =>
+    text(item?.source_post_id) === id && visibleIds.has(text(item?.watch_account_id))
+  );
+  return row ? { ...row } : null;
 }
 
 export async function handleSocialWatch(req, res, url) {
@@ -1086,6 +1113,45 @@ export async function handleSocialWatch(req, res, url) {
       json(res, 503, {
         ok: false,
         schema: STEP_SCHEMA,
+        error: String(error?.message || error),
+        user_read_x_requests: 0,
+        user_read_supabase_requests: 0,
+        shared_public_snapshot: true,
+        time: nowIso(),
+      });
+    }
+    return true;
+  }
+  if (url.pathname === '/api/social-watch/public/detail') {
+    try {
+      const accounts = await readPublicAccounts();
+      const row = await readPublicEventDetail(url.searchParams.get('source_post_id') || '', accounts);
+      if (!row) {
+        json(res, 404, {
+          ok: false,
+          schema: NATIVE_DETAIL_SCHEMA,
+          error: 'celebrity_event_not_found',
+          user_read_x_requests: 0,
+          user_read_supabase_requests: 0,
+          shared_public_snapshot: true,
+          time: nowIso(),
+        });
+        return true;
+      }
+      json(res, 200, {
+        ok: true,
+        schema: NATIVE_DETAIL_SCHEMA,
+        row,
+        user_read_x_requests: 0,
+        x_requests_scale_with_users: false,
+        user_read_supabase_requests: 0,
+        shared_public_snapshot: true,
+        time: nowIso(),
+      });
+    } catch (error) {
+      json(res, 503, {
+        ok: false,
+        schema: NATIVE_DETAIL_SCHEMA,
         error: String(error?.message || error),
         user_read_x_requests: 0,
         user_read_supabase_requests: 0,
