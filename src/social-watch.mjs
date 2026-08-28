@@ -20,6 +20,10 @@ const DEFAULT_X_USAGE_REFRESH_MS = 10 * 60_000;
 const PUBLIC_EVENT_CACHE_LIMIT = 1000;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
 const PUBLIC_EVENT_RELOAD_MS = 30 * 60_000;
+const AIRDROP_OFFICIAL_X_HANDLES = new Set(['binance', 'binancewallet']);
+const AIRDROP_RECENT_BACKFILL_MAX_RESULTS = 10;
+const AIRDROP_RECENT_BACKFILL_MAX_ATTEMPTS = 3;
+const AIRDROP_RECENT_BACKFILL_WINDOW_MS = 7 * 24 * 60 * 60_000;
 const MARKET_FOCUS_KEYWORDS = [
   'Bitcoin', 'BTC', 'crypto', 'Ethereum', 'ETH', 'DOGE', 'Dogecoin', 'stablecoin',
   'ETF', 'SEC', 'Fed', 'FOMC', 'tariff', 'sanction', 'regulation', 'market',
@@ -49,6 +53,12 @@ const state = {
   activeAccounts: 0,
   totalAccounts: 0,
   managedRules: 0,
+  allActiveAccounts: 0,
+  allTotalAccounts: 0,
+  allManagedRules: 0,
+  internalActiveAccounts: 0,
+  internalTotalAccounts: 0,
+  internalManagedRules: 0,
   streamConnected: false,
   streamConnecting: false,
   streamReconnects: 0,
@@ -81,6 +91,16 @@ const state = {
   publicSnapshotAccounts: 0,
   publicSnapshotEvents: 0,
   publicSnapshotDbReads: 0,
+  airdropBridgeAccounts: 0,
+  airdropRecentBackfillCompleted: false,
+  airdropRecentBackfillAt: null,
+  airdropRecentBackfillRequests: 0,
+  airdropRecentBackfillAttempts: 0,
+  airdropRecentBackfillNextAllowedAt: null,
+  airdropRecentBackfillExhausted: false,
+  airdropRecentBackfillPosts: 0,
+  airdropRecentBackfillInserted: 0,
+  airdropRecentBackfillError: null,
 };
 
 let settingsTimer = null;
@@ -316,6 +336,12 @@ function publicHealth() {
     active_accounts: state.activeAccounts,
     total_accounts: state.totalAccounts,
     managed_rules: state.managedRules,
+    all_active_accounts: state.allActiveAccounts,
+    all_total_accounts: state.allTotalAccounts,
+    all_managed_rules: state.allManagedRules,
+    internal_active_accounts: state.internalActiveAccounts,
+    internal_total_accounts: state.internalTotalAccounts,
+    internal_managed_rules: state.internalManagedRules,
     config_refresh_seconds: Math.round(state.configRefreshMs / 1000),
     max_active_accounts: state.maxActiveAccounts,
     max_daily_posts: state.maxDailyPosts,
@@ -367,6 +393,16 @@ function publicHealth() {
     public_snapshot_accounts: state.publicSnapshotAccounts,
     public_snapshot_events: state.publicSnapshotEvents,
     public_snapshot_db_reads: state.publicSnapshotDbReads,
+    airdrop_bridge_accounts: state.airdropBridgeAccounts,
+    airdrop_recent_backfill_completed: state.airdropRecentBackfillCompleted,
+    airdrop_recent_backfill_at: state.airdropRecentBackfillAt,
+    airdrop_recent_backfill_requests: state.airdropRecentBackfillRequests,
+    airdrop_recent_backfill_attempts: state.airdropRecentBackfillAttempts,
+    airdrop_recent_backfill_next_allowed_at: state.airdropRecentBackfillNextAllowedAt,
+    airdrop_recent_backfill_exhausted: state.airdropRecentBackfillExhausted,
+    airdrop_recent_backfill_posts: state.airdropRecentBackfillPosts,
+    airdrop_recent_backfill_inserted: state.airdropRecentBackfillInserted,
+    airdrop_recent_backfill_error: state.airdropRecentBackfillError,
     user_read_supabase_requests: 0,
   };
 }
@@ -441,7 +477,9 @@ async function readConfig() {
   state.monthlyStopBudgetUsd = Math.max(state.monthlyRestrictBudgetUsd + 0.01, finiteNumber(settings.monthly_stop_budget_usd, 9));
   state.usageRefreshMs = clampInt(settings.usage_refresh_minutes, 5, 1440, 10) * 60_000;
   updateBudgetMode();
-  state.totalAccounts = accounts.length;
+  state.allTotalAccounts = accounts.length;
+  state.totalAccounts = accounts.filter((account) => account?.public_visible === true).length;
+  state.internalTotalAccounts = state.allTotalAccounts - state.totalAccounts;
   refreshPublicAccountsSnapshot(accounts);
 
   const activeCandidates = accounts
@@ -452,8 +490,11 @@ async function readConfig() {
     : state.budgetMode === 'restricted'
       ? activeCandidates.filter((a) => budgetPriority(a?.budget_priority) === 'core')
       : activeCandidates;
-  state.activeAccounts = valid.length;
+  state.allActiveAccounts = valid.length;
+  state.activeAccounts = valid.filter((account) => account?.public_visible === true).length;
+  state.internalActiveAccounts = state.allActiveAccounts - state.activeAccounts;
   desiredAccountsByTag = new Map(valid.map((a) => [ruleTag(a.id), a]));
+  state.airdropBridgeAccounts = valid.filter((a) => AIRDROP_OFFICIAL_X_HANDLES.has(normalizeHandle(a?.handle).toLowerCase())).length;
   state.lastConfigSyncAt = nowIso();
 
   const sig = JSON.stringify({
@@ -506,7 +547,9 @@ async function readConfig() {
   );
   const invalidKeywordIds = new Set(invalidKeyword.map((a) => text(a.id)));
   for (const id of invalidKeywordIds) desiredAccountsByTag.delete(ruleTag(id));
-  state.activeAccounts = desiredAccountsByTag.size;
+  state.allActiveAccounts = desiredAccountsByTag.size;
+  state.activeAccounts = [...desiredAccountsByTag.values()].filter((account) => account?.public_visible === true).length;
+  state.internalActiveAccounts = state.allActiveAccounts - state.activeAccounts;
 
   const inactive = accounts.filter((a) =>
     a?.is_active !== true &&
@@ -579,6 +622,8 @@ async function syncRules() {
       }).catch(() => undefined);
     }
     state.managedRules = 0;
+    state.allManagedRules = 0;
+    state.internalManagedRules = 0;
     state.lastRuleSyncAt = nowIso();
     state.ruleSyncFailures = 0;
     state.ruleSyncNextAllowedAt = null;
@@ -613,7 +658,9 @@ async function syncRules() {
 
   const finalRules = await listXRules();
   const finalManaged = finalRules.filter((r) => text(r?.tag).startsWith(RULE_TAG_PREFIX));
-  state.managedRules = finalManaged.length;
+  state.allManagedRules = finalManaged.length;
+  state.managedRules = finalManaged.filter((rule) => desiredAccountsByTag.get(text(rule?.tag))?.public_visible === true).length;
+  state.internalManagedRules = state.allManagedRules - state.managedRules;
   state.lastRuleSyncAt = nowIso();
   state.ruleSyncFailures = 0;
   state.ruleSyncNextAllowedAt = null;
@@ -627,6 +674,97 @@ async function syncRules() {
       last_error: rule ? null : 'X rule pending',
     });
   }));
+}
+
+
+async function backfillOfficialAirdropRecentOnce() {
+  if (state.airdropRecentBackfillCompleted || state.airdropRecentBackfillExhausted || !state.enabled || !state.xTokenConfigured) return false;
+  if (state.budgetMode === 'stopped' || state.dailyCapReached) return false;
+  const nextAllowedMs = Date.parse(state.airdropRecentBackfillNextAllowedAt || '');
+  if (Number.isFinite(nextAllowedMs) && Date.now() < nextAllowedMs) return false;
+  const accounts = [...desiredAccountsByTag.values()]
+    .filter((account) => AIRDROP_OFFICIAL_X_HANDLES.has(normalizeHandle(account?.handle).toLowerCase()));
+  state.airdropBridgeAccounts = accounts.length;
+  if (!accounts.length) return false;
+
+  const handles = accounts.map((account) => normalizeHandle(account.handle)).filter(Boolean);
+  const handleGroup = handles.length === 1
+    ? `from:${handles[0]}`
+    : `(${handles.map((handle) => `from:${handle}`).join(' OR ')})`;
+  const keywordValues = [...new Set(accounts.flatMap((account) => splitKeywords(account.include_keywords)))];
+  const keywordClause = keywordGroup(keywordValues, 330);
+  if (!keywordClause) {
+    state.airdropRecentBackfillError = 'airdrop_recent_backfill_keywords_empty';
+    state.airdropRecentBackfillCompleted = true;
+    state.airdropRecentBackfillAt = nowIso();
+    return false;
+  }
+
+  const params = new URLSearchParams({
+    query: `${handleGroup} ${keywordClause} -is:retweet -is:reply`,
+    max_results: String(AIRDROP_RECENT_BACKFILL_MAX_RESULTS),
+    'tweet.fields': 'id,text,created_at,author_id,lang,conversation_id,edit_history_tweet_ids,referenced_tweets',
+    expansions: 'author_id',
+    'user.fields': 'id,username,name',
+  });
+  const lastPostTimes = accounts
+    .map((account) => Date.parse(text(account?.last_post_at)))
+    .filter(Number.isFinite);
+  const earliestAllowed = Date.now() - AIRDROP_RECENT_BACKFILL_WINDOW_MS + 60_000;
+  const startMs = lastPostTimes.length
+    ? Math.max(earliestAllowed, Math.min(...lastPostTimes) - 2 * 60_000)
+    : earliestAllowed;
+  params.set('start_time', new Date(startMs).toISOString());
+
+  try {
+    state.airdropRecentBackfillAttempts++;
+    const response = await xFetch(`/2/tweets/search/recent?${params.toString()}`);
+    state.airdropRecentBackfillRequests++;
+    const raw = await response.text();
+    let payload = {};
+    try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { payload = {}; }
+    if (!response.ok) throw new Error(`social_watch_x_recent_http_${response.status}:${text(raw).slice(0, 280)}`);
+    const users = Array.isArray(payload?.includes?.users) ? payload.includes.users : [];
+    const usernameByAuthorId = new Map(users.map((user) => [text(user?.id), normalizeHandle(user?.username)]));
+    const accountByHandle = new Map(accounts.map((account) => [normalizeHandle(account.handle).toLowerCase(), account]));
+    const posts = Array.isArray(payload?.data) ? payload.data : [];
+    state.airdropRecentBackfillPosts += posts.length;
+    state.xPostReads += posts.length;
+    state.dailyPostsReceived += posts.length;
+    let insertedCount = 0;
+    for (const batch of chunks(posts, 3)) {
+      const results = await Promise.all(batch.map(async (post) => {
+        const handle = usernameByAuthorId.get(text(post?.author_id));
+        const account = accountByHandle.get(text(handle).toLowerCase());
+        if (!account) return false;
+        return insertEvent(account, post, ruleTag(account.id));
+      }));
+      insertedCount += results.filter(Boolean).length;
+    }
+    if (state.dailyPostsReceived >= state.maxDailyPosts) {
+      state.dailyCapReached = true;
+      if (streamAbort) streamAbort.abort('social_watch_daily_cap');
+    }
+    state.airdropRecentBackfillInserted += insertedCount;
+    state.airdropRecentBackfillError = null;
+    state.airdropRecentBackfillNextAllowedAt = null;
+    state.airdropRecentBackfillExhausted = false;
+    state.airdropRecentBackfillCompleted = true;
+    state.airdropRecentBackfillAt = nowIso();
+    return true;
+  } catch (error) {
+    state.airdropRecentBackfillError = String(error?.message || error);
+    state.airdropRecentBackfillAt = nowIso();
+    if (state.airdropRecentBackfillAttempts >= AIRDROP_RECENT_BACKFILL_MAX_ATTEMPTS) {
+      state.airdropRecentBackfillExhausted = true;
+      state.airdropRecentBackfillNextAllowedAt = null;
+    } else {
+      const retryMs = 30_000 * (2 ** Math.max(0, state.airdropRecentBackfillAttempts - 1));
+      state.airdropRecentBackfillNextAllowedAt = new Date(Date.now() + retryMs).toISOString();
+    }
+    // A failed recent-search seed must never stop the already-running filtered stream.
+    return false;
+  }
 }
 
 function notificationText(content) {
@@ -858,6 +996,9 @@ async function configTick() {
         state.ruleSyncNextAllowedAt = new Date(Date.now() + waitMs).toISOString();
         throw error;
       }
+    }
+    if (!state.airdropRecentBackfillCompleted && state.xTokenConfigured) {
+      try { await backfillOfficialAirdropRecentOnce(); } catch (error) { state.airdropRecentBackfillError = String(error?.message || error); }
     }
     if (!state.lastError?.startsWith('stream')) state.lastError = null;
   } catch (error) {

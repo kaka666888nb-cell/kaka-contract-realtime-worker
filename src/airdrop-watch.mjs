@@ -2,6 +2,7 @@ const STEP_SCHEMA = 'step1045_official_airdrop_shared_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const EVENTS_TABLE = 'app_airdrop_events';
+const SOCIAL_EVENTS_TABLE = 'app_social_watch_events';
 const DEFAULT_REFRESH_MS = 10 * 60_000;
 const MIN_REFRESH_MS = 3 * 60_000;
 const MAX_REFRESH_MS = 60 * 60_000;
@@ -18,12 +19,17 @@ const OFFICIAL_SOURCES = Object.freeze([
     id: 'binance',
     provider: 'binance',
     display_name: 'Binance',
-    roots: ['https://www.binance.com/en/support/announcement/list/48'],
-    allowed_hosts: ['binance.com', 'www.binance.com'],
+    // Binance announcement HTML is Cloudflare-challenged from Render (HTTP 202).
+    // Reuse the existing official X filtered-stream collector instead of scraping
+    // or relying on undocumented Binance BAPI endpoints.
+    social_x_handles: ['binance', 'BinanceWallet'],
+    allowed_hosts: ['x.com', 'www.x.com'],
     include: [
-      /alpha.{0,80}(airdrop|box|points|tge|token|reward|competition|campaign)/i,
+      /alpha.{0,100}(airdrop|box|points|tge|token|reward|competition|campaign)/i,
       /hodler\s*airdrops?/i,
       /launchpool/i,
+      /token\s+generation\s+event/i,
+      /\btge\b/i,
       /\bairdrop\b/i,
     ],
     exclude: [/delist/i, /maintenance/i],
@@ -120,6 +126,7 @@ const state = {
   publicSnapshotLoaded: false,
   publicSnapshotRows: 0,
   publicSnapshotDbReads: 0,
+  sharedBridgeReads: 0,
   upstreamRequests: 0,
   upstreamNotModified: 0,
   upstreamFailures: 0,
@@ -199,6 +206,21 @@ function hostAllowed(urlValue, source) {
     return source.allowed_hosts.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
   } catch (_) { return false; }
 }
+
+function officialXHandleFromUrl(urlValue) {
+  try {
+    const u = new URL(urlValue);
+    if (!['x.com', 'www.x.com'].includes(u.hostname.toLowerCase())) return '';
+    const handle = (u.pathname.split('/').filter(Boolean)[0] || '').replace(/^@/, '');
+    return /^[A-Za-z0-9_]{1,15}$/.test(handle) ? handle : '';
+  } catch (_) { return ''; }
+}
+function officialXUrlAllowed(urlValue, source) {
+  if (!hostAllowed(urlValue, source)) return false;
+  const allowed = new Set((source.social_x_handles || []).map((handle) => text(handle).toLowerCase()));
+  return allowed.has(officialXHandleFromUrl(urlValue).toLowerCase());
+}
+
 function canonicalUrl(raw) {
   try {
     const u = new URL(raw);
@@ -276,12 +298,13 @@ function projectSymbolFromTitle(title) {
 function extractRewardText(title, detailText) {
   const value = `${normalizeWhitespace(title)} ${normalizeWhitespace(detailText)}`;
   const patterns = [
+    /(?:claim|receive|get|领取|可领取)[^\d]{0,30}([\d,.]+\s*(?:[KMBT]\s*)?[A-Z][A-Z0-9._-]{1,14})/i,
     /(?:share|瓜分|奖池|奖励|空投总量|total\s+airdrop|reward\s+pool|campaign\s+pool)[^\n。；;]{0,60}?([\d,.]+\s*(?:[KMBT]\s*)?[A-Z][A-Z0-9._-]{1,14})/i,
     /([\d,.]+\s*(?:[KMBT]\s*)?(?:USDT|USDC|BTC|ETH|BNB|BGB|GT|OKB|MNT|[A-Z]{2,12}))\s*(?:reward|prize|airdrop|奖池|奖励|空投)/i,
   ];
   for (const rx of patterns) {
     const m = value.match(rx);
-    if (m?.[1]) return normalizeWhitespace(m[1]).slice(0, 80);
+    if (m?.[1]) return normalizeWhitespace(m[1]).replace(/[.,;:!?。；，]+$/, '').slice(0, 80);
   }
   return null;
 }
@@ -566,10 +589,77 @@ async function hydrateCandidate(source, candidate, known) {
     raw_summary: combinedText ? combinedText.slice(0, 600) : null,
   };
 }
+
+function rowsFromSocialXEvents(events, source) {
+  const handles = (source.social_x_handles || []).map((handle) => text(handle)).filter(Boolean);
+  const allowedHandles = new Set(handles.map((handle) => handle.toLowerCase()));
+  const rows = [];
+  const seen = new Set();
+  for (const event of Array.isArray(events) ? events : []) {
+    const postId = text(event?.source_post_id);
+    const authorHandle = text(event?.author_handle);
+    const content = normalizeWhitespace(event?.content);
+    const postUrl = canonicalUrl(event?.post_url);
+    if (!postId || !content || !allowedHandles.has(authorHandle.toLowerCase())) continue;
+    if (!officialXUrlAllowed(postUrl, source) || !titleMatches(source, content)) continue;
+    const id = `${source.provider}:x:${postId}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const period = extractPeriod(content);
+    const publishedAt = text(event?.published_at) || null;
+    rows.push({
+      provider: source.provider,
+      provider_name: source.display_name,
+      category: categoryFor(source.provider, content),
+      source_event_id: id,
+      title: content.slice(0, 600),
+      project_symbol: projectSymbolFromTitle(content),
+      reward_text: extractRewardText(content, content),
+      eligibility_text: extractEligibilityText(content),
+      start_at: period.start_at,
+      end_at: period.end_at,
+      published_at: publishedAt,
+      source_url: postUrl,
+      source_domain: (() => { try { return new URL(postUrl).hostname; } catch (_) { return ''; } })(),
+      status: statusFor(period.start_at, period.end_at),
+      raw_summary: content.slice(0, 600),
+      fetched_at: nowIso(),
+    });
+  }
+  return rows.slice(0, 80);
+}
+
+async function collectSocialXSource(source, sourceState) {
+  const handles = (source.social_x_handles || []).map((handle) => text(handle)).filter(Boolean);
+  if (!handles.length || !state.supabaseConfigured) return [];
+  const handleFilter = handles.join(',');
+  const firstCycleAttempts = finiteNumber(sourceState.refreshes, 0) === 0 ? 6 : 1;
+  let rows = [];
+  for (let attempt = 0; attempt < firstCycleAttempts; attempt++) {
+    state.sharedBridgeReads++;
+    sourceState.bridge_reads = finiteNumber(sourceState.bridge_reads, 0) + 1;
+    const events = await supabaseFetch(
+      `${SOCIAL_EVENTS_TABLE}?source=eq.x&author_handle=in.(${handleFilter})&select=source_post_id,author_handle,author_name,content,post_url,published_at&order=published_at.desc&limit=100`,
+    );
+    rows = rowsFromSocialXEvents(events, source);
+    if (rows.length || attempt === firstCycleAttempts - 1) break;
+    // The social watcher has to sync two new X rules and seed recent posts first.
+    // Only the first collector cycle waits, and only on shared Supabase reads.
+    await sleep(3_000);
+  }
+  sourceState.last_candidate_count = rows.length;
+  sourceState.last_new_detail_fetches = 0;
+  sourceState.last_http_status = 'shared_x';
+  sourceState.refreshes = finiteNumber(sourceState.refreshes, 0) + 1;
+  sourceState.last_success_at = nowIso();
+  sourceState.last_error = null;
+  return rows;
+}
+
 async function collectSource(source) {
   const sourceState = state.sourceStates[source.id] ||= {
     provider: source.provider,
-    roots: (source.roots?.length || 0) + (source.json_roots?.length || 0),
+    roots: (source.roots?.length || 0) + (source.json_roots?.length || 0) + (source.social_x_handles?.length || 0),
     refreshes: 0,
     failures: 0,
     last_error: null,
@@ -577,6 +667,7 @@ async function collectSource(source) {
     last_candidate_count: 0,
     last_new_detail_fetches: 0,
   };
+  if (source.social_x_handles?.length) return collectSocialXSource(source, sourceState);
   const knownById = new Map(publicSnapshot.filter((row) => row.provider === source.provider).map((row) => [row.source_event_id, row]));
   const candidatesByKey = new Map();
   let structuredSourceHealthy = false;
@@ -619,9 +710,9 @@ async function collectSource(source) {
   const rows = [];
   for (const [id, candidate] of candidates) {
     const known = knownById.get(id) || null;
-    // Bybit's documented V5 announcements endpoint is the authoritative structured source.
-    // Do not fan out to article-detail pages just to fill optional fields.
-    const needsDetail = source.provider !== 'bybit' && (!known || !text(known.published_at));
+    // Bybit has a documented structured announcement API; Gate listing rows are
+    // sufficient for the activity feed. Neither needs detail-page fan-out for optional fields.
+    const needsDetail = !['bybit', 'gate'].includes(source.provider) && (!known || !text(known.published_at));
     if (needsDetail && detailBudget <= 0) {
       const structuredSummary = normalizeWhitespace(candidate.description);
       const startAt = candidate.start_at || known?.start_at || null;
@@ -757,7 +848,9 @@ function publicHealth() {
       provider: source.provider,
       official_only: true,
       structured_official_api: Boolean(source.json_roots?.length),
-      root_count: (source.roots?.length || 0) + (source.json_roots?.length || 0),
+      structured_official_x: Boolean(source.social_x_handles?.length),
+      official_x_handles: source.social_x_handles || [],
+      root_count: (source.roots?.length || 0) + (source.json_roots?.length || 0) + (source.social_x_handles?.length || 0),
       ...(state.sourceStates[source.id] || {}),
     };
   }
@@ -789,6 +882,7 @@ function publicHealth() {
     public_snapshot_loaded: state.publicSnapshotLoaded,
     public_snapshot_rows: state.publicSnapshotRows,
     public_snapshot_db_reads: state.publicSnapshotDbReads,
+    shared_bridge_reads: state.sharedBridgeReads,
     user_read_upstream_requests: 0,
     user_read_supabase_requests: 0,
     upstream_requests_scale_with_users: false,
@@ -862,6 +956,8 @@ export async function handleAirdropWatch(req, res, url) {
 export const __airdropWatchTest = Object.freeze({
   extractCandidates,
   extractBybitApiCandidates,
+  rowsFromSocialXEvents,
+  officialXUrlAllowed,
   categoryFor,
   projectSymbolFromTitle,
   extractRewardText,
