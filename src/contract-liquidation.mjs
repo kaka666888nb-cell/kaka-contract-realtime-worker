@@ -166,6 +166,23 @@ const LIQUIDATION_PERSIST_MAX_FUTURE_MS = 24 * HOUR_BUCKET_MS;
 const LIQUIDATION_HISTORY_CACHE_TTL_MS = 5 * 60_000;
 const LIQUIDATION_HISTORY_STALE_MS = 30 * 60_000;
 const LIQUIDATION_HISTORY_CACHE_MAX = 64;
+// Step1045.10.1: user-facing liquidation history needs only the authoritative
+// closed-window summary for first paint. Keep one shared background-warmed
+// all-provider summary in Render memory so public reads never wait for the
+// 1000-row detail RPC and never scale Supabase work with user count.
+const LIQUIDATION_WINDOW_FAST_CACHE_TTL_MS = 10 * 60_000;
+const LIQUIDATION_WINDOW_FAST_STALE_MS = 2 * 60 * 60_000;
+const LIQUIDATION_WINDOW_FAST_REFRESH_MS = 10 * 60_000;
+let liquidationWindowFastCache = { cachedAt: 0, payload: null };
+let liquidationWindowFastInflight = null;
+const liquidationWindowFastHealth = {
+  refreshes: 0,
+  successes: 0,
+  failures: 0,
+  last_refresh_started_at: null,
+  last_success_at: null,
+  last_error: '',
+};
 const liquidationPersistQueue = new Map();
 const liquidationPersistGate = new Map();
 const liquidationMinutePersistQueue = new Map();
@@ -935,6 +952,92 @@ async function readLiquidationWindowsStep10431({ provider = '', symbol = '' } = 
     twenty_four_hourly_trend: Array.isArray(row.twenty_four_hourly_trend) ? row.twenty_four_hourly_trend : [],
   };
 }
+
+function normalizeLiquidationWindowFastSummary(candidate) {
+  const expectedSource = 'supabase_step1043_1_all_provider_usdt_exact_closed_1h_4h_6h_12h_24h_v1';
+  const values = {
+    one: Number(candidate?.one_hour_total_notional),
+    four: Number(candidate?.four_hour_total_notional),
+    six: Number(candidate?.six_hour_total_notional),
+    twelve: Number(candidate?.twelve_hour_total_notional),
+    day: Number(candidate?.twenty_four_hour_total_notional),
+    oneEvents: Number(candidate?.one_hour_event_count),
+    fourEvents: Number(candidate?.four_hour_event_count),
+    sixEvents: Number(candidate?.six_hour_event_count),
+    twelveEvents: Number(candidate?.twelve_hour_event_count),
+    dayEvents: Number(candidate?.twenty_four_hour_event_count),
+    dayLong: Number(candidate?.twenty_four_hour_long_notional),
+    dayShort: Number(candidate?.twenty_four_hour_short_notional),
+  };
+  const finiteNonNegative = Object.values(values).every((value) => Number.isFinite(value) && value >= 0);
+  const monotonic = values.one <= values.four && values.four <= values.six &&
+    values.six <= values.twelve && values.twelve <= values.day &&
+    values.oneEvents <= values.fourEvents && values.fourEvents <= values.sixEvents &&
+    values.sixEvents <= values.twelveEvents && values.twelveEvents <= values.dayEvents;
+  const sideTolerance = Math.max(0.05, Math.abs(values.day) * 1e-7);
+  const sidesMatch = Math.abs((values.dayLong + values.dayShort) - values.day) <= sideTolerance;
+  const trend = Array.isArray(candidate?.twenty_four_hourly_trend) ? candidate.twenty_four_hourly_trend : [];
+  const fullDay = Number(candidate?.twenty_four_distinct_hours) === 24 && trend.length === 24;
+  if (candidate?.source !== expectedSource || !finiteNonNegative || !monotonic || !sidesMatch || !fullDay) {
+    throw new Error('liquidation_windows_step1043_1_invalid');
+  }
+  return {
+    ...candidate,
+    twenty_four_ready: true,
+    twenty_four_source: candidate.source,
+    one_six_source: candidate.source,
+    source: 'render_step1043_1_combined_1h_4h_6h_12h_24h_authoritative_window_summary_v1',
+  };
+}
+
+function liquidationWindowFastSnapshot() {
+  const payload = liquidationWindowFastCache.payload;
+  const cachedAt = Number(liquidationWindowFastCache.cachedAt || 0);
+  if (!payload || cachedAt <= 0) return null;
+  const ageMs = Math.max(0, Date.now() - cachedAt);
+  if (ageMs > LIQUIDATION_WINDOW_FAST_STALE_MS) return null;
+  return {
+    payload,
+    cached_at: new Date(cachedAt).toISOString(),
+    cache_age_ms: ageMs,
+    cache_stale: ageMs > LIQUIDATION_WINDOW_FAST_CACHE_TTL_MS,
+  };
+}
+
+async function refreshLiquidationWindowFastCache() {
+  if (!LIQUIDATION_PERSISTENCE_ENABLED) return null;
+  if (liquidationWindowFastInflight) return liquidationWindowFastInflight;
+  liquidationWindowFastInflight = (async () => {
+    liquidationWindowFastHealth.refreshes += 1;
+    liquidationWindowFastHealth.last_refresh_started_at = new Date().toISOString();
+    try {
+      const candidate = await readLiquidationWindowsStep10431({ provider: '', symbol: '' });
+      const payload = normalizeLiquidationWindowFastSummary(candidate);
+      liquidationWindowFastCache = { cachedAt: Date.now(), payload };
+      liquidationWindowFastHealth.successes += 1;
+      liquidationWindowFastHealth.last_success_at = new Date().toISOString();
+      liquidationWindowFastHealth.last_error = '';
+      return payload;
+    } catch (error) {
+      liquidationWindowFastHealth.failures += 1;
+      liquidationWindowFastHealth.last_error = String(error?.message || error).slice(0, 320);
+      throw error;
+    }
+  })().finally(() => { liquidationWindowFastInflight = null; });
+  return liquidationWindowFastInflight;
+}
+
+// Background-only shared warmup. Public reads consume this memory snapshot and
+// never start a Supabase or exchange request. Closed-hour summary changes slowly,
+// so ten-minute refresh is bounded and independent of user count.
+const liquidationWindowFastStartupTimer = setTimeout(() => {
+  refreshLiquidationWindowFastCache().catch(() => {});
+}, 1000);
+liquidationWindowFastStartupTimer.unref?.();
+const liquidationWindowFastRefreshTimer = setInterval(() => {
+  refreshLiquidationWindowFastCache().catch(() => {});
+}, LIQUIDATION_WINDOW_FAST_REFRESH_MS);
+liquidationWindowFastRefreshTimer.unref?.();
 
 async function readLiquidation24hSummaryStep1043({ provider = '', symbol = '' } = {}) {
   const safeProvider = normalizeProvider(provider);
@@ -4357,6 +4460,68 @@ export async function handleContractLiquidation(req, res, url) {
     const symbolFilter = compactSymbol(url.searchParams.get('symbol'));
     if (providerFilter && !SUPPORTED_PROVIDERS.has(providerFilter)) {
       sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider: providerFilter });
+      return true;
+    }
+    const summaryOnly = ['1', 'true', 'yes'].includes(String(url.searchParams.get('summary_only') || '').trim().toLowerCase());
+    if (summaryOnly) {
+      // Step1045.10.1: this fast path is intentionally all-provider only. It is
+      // memory-only on user reads; a background timer owns Supabase refreshes.
+      if (providerFilter || symbolFilter) {
+        sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'summary_only_filters_not_supported' });
+        return true;
+      }
+      const snapshot = liquidationWindowFastSnapshot();
+      const sharedCacheMeta = {
+        ready: Boolean(snapshot),
+        cached_at: snapshot?.cached_at || null,
+        cache_age_ms: snapshot?.cache_age_ms ?? null,
+        cache_stale: snapshot?.cache_stale ?? true,
+        ttl_ms: LIQUIDATION_WINDOW_FAST_CACHE_TTL_MS,
+        stale_ms: LIQUIDATION_WINDOW_FAST_STALE_MS,
+        refresh_interval_ms: LIQUIDATION_WINDOW_FAST_REFRESH_MS,
+        refreshes: liquidationWindowFastHealth.refreshes,
+        successes: liquidationWindowFastHealth.successes,
+        failures: liquidationWindowFastHealth.failures,
+        last_success_at: liquidationWindowFastHealth.last_success_at,
+        last_error: liquidationWindowFastHealth.last_error || null,
+        background_warmed: true,
+        user_reads_start_supabase_requests: false,
+        user_reads_start_exchange_requests: false,
+        reads_scale_with_users: false,
+      };
+      if (!snapshot) {
+        sendJson(res, 503, {
+          ok: false,
+          version: STEP_VERSION,
+          error: 'liquidation_window_summary_shared_snapshot_pending',
+          summary_only: true,
+          shared_summary_cache: sharedCacheMeta,
+          retry_after_ms: 1200,
+        });
+        return true;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        version: STEP_VERSION,
+        source: 'render_step1045_10_1_shared_liquidation_window_summary_fast_v1',
+        market_type: 'contract',
+        summary_only: true,
+        rows: [],
+        row_count: 0,
+        window_summary: snapshot.payload,
+        window_summary_ready: true,
+        detail_rows_deferred: true,
+        detail_rows_required_for_user_first_paint: false,
+        cache_hit: true,
+        cache_stale: snapshot.cache_stale,
+        cache_age_ms: snapshot.cache_age_ms,
+        shared_summary_cache: sharedCacheMeta,
+        exchange_requests_started: 0,
+        user_reads_start_exchange_requests: false,
+        user_reads_start_supabase_requests: false,
+        reads_scale_with_users: false,
+        timestamp_ms: Date.now(),
+      });
       return true;
     }
     try {
