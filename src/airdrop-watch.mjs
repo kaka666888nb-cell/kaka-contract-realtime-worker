@@ -1,4 +1,4 @@
-import { contentTranslationHash, getSharedTranslationHealth, translateContentFields } from './content-translation.mjs';
+import { contentTranslationHash, getSharedTranslationHealth, translateContentFields, translationNeedsWork } from './content-translation.mjs';
 const STEP_SCHEMA = 'step1045_airdrop_native_detail_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -21,6 +21,7 @@ const DB_RELOAD_MS = 30 * 60_000;
 const HTML_MAX_BYTES = 3 * 1024 * 1024;
 const TRANSLATION_TICK_MS = 60_000;
 const TRANSLATION_ROWS_PER_TICK = 5;
+const TRANSLATION_DETAIL_ROWS_PER_TICK = 1;
 const TRANSLATION_WINDOW_ROWS = Math.max(25, Math.min(100, Number(process.env.KAKA_AIRDROP_TRANSLATION_WINDOW_ROWS || 60) || 60));
 
 const OFFICIAL_SOURCES = Object.freeze([
@@ -149,6 +150,8 @@ const state = {
   persistFailures: 0,
   translationRuns: 0,
   translationRowsTranslated: 0,
+  translationTitleRowsTranslated: 0,
+  translationDetailRowsTranslated: 0,
   translationFailures: 0,
   translationDbWrites: 0,
   translationLastRunAt: null,
@@ -1051,64 +1054,105 @@ async function translateAirdropSnapshot() {
   state.translationRuns++;
   state.translationLastRunAt = nowIso();
   try {
-    // Translate only the bounded hot/relevant window. Do not drain the entire
-    // historical airdrop archive just because a translation provider is available.
+    // Keep a bounded hot/relevant window only.  Phase 1 is title-first and
+    // provider-balanced so Binance/OKX/Bybit/Bitget/Gate all become readable
+    // before long article bodies can consume the daily translation quota.
     const translationWindow = [...publicSnapshot]
       .filter((row) => text(row?.source_event_id))
       .sort((a, b) => translationPriority(b) - translationPriority(a))
       .slice(0, TRANSLATION_WINDOW_ROWS);
-    const pending = translationWindow
-      .filter((row) => text(row?.translation_source_hash) !== contentTranslationHash(translationFieldsForAirdrop(row)));
-    // Provider-balanced backlog: each cycle prioritizes one missing row from every
-    // official provider so no platform waits behind a large OKX/Gate history set.
-    const candidates = [];
+    const pendingTitles = translationWindow.filter((row) => translationNeedsWork({
+      fields: translationFieldsForAirdrop(row),
+      existingTranslations: row?.translations,
+      existingSourceHash: text(row?.translation_source_hash),
+      requiredFields: ['title'],
+    }));
+    const titleCandidates = [];
     for (const source of OFFICIAL_SOURCES) {
-      const candidate = pending.find((row) => row.provider === source.provider && !candidates.includes(row));
-      if (candidate) candidates.push(candidate);
-      if (candidates.length >= TRANSLATION_ROWS_PER_TICK) break;
+      const candidate = pendingTitles.find((row) => row.provider === source.provider && !titleCandidates.includes(row));
+      if (candidate) titleCandidates.push(candidate);
+      if (titleCandidates.length >= TRANSLATION_ROWS_PER_TICK) break;
     }
-    for (const candidate of pending) {
-      if (candidates.length >= TRANSLATION_ROWS_PER_TICK) break;
-      if (!candidates.includes(candidate)) candidates.push(candidate);
+    for (const candidate of pendingTitles) {
+      if (titleCandidates.length >= TRANSLATION_ROWS_PER_TICK) break;
+      if (!titleCandidates.includes(candidate)) titleCandidates.push(candidate);
     }
-    for (const candidate of candidates) {
+
+    const persistTranslation = async (candidate, result, kind) => {
       const provider = text(candidate.provider).toLowerCase();
       const sourceEventId = text(candidate.source_event_id);
-      if (!provider || !sourceEventId) continue;
+      if (!provider || !sourceEventId || !result.changed || result.translated_fields < 1) return false;
+      const updatedAt = nowIso();
+      await supabaseFetch(`${EVENTS_TABLE}?provider=eq.${encodeURIComponent(provider)}&source_event_id=eq.${encodeURIComponent(sourceEventId)}`, {
+        method: 'PATCH',
+        headers: { prefer: 'return=minimal' },
+        body: JSON.stringify({
+          translations: result.translations,
+          translation_source_hash: result.source_hash,
+          translation_updated_at: updatedAt,
+        }),
+      });
+      state.translationDbWrites++;
+      state.translationRowsTranslated++;
+      if (kind === 'title') state.translationTitleRowsTranslated++;
+      else state.translationDetailRowsTranslated++;
+      state.translationLastSuccessAt = updatedAt;
+      state.translationLastError = null;
+      publicSnapshot = publicSnapshot.map((row) =>
+        row.provider === provider && row.source_event_id === sourceEventId
+          ? publicEventView({
+              ...row,
+              translations: result.translations,
+              translation_source_hash: result.source_hash,
+              translation_updated_at: updatedAt,
+            })
+          : row,
+      );
+      return true;
+    };
+
+    for (const candidate of titleCandidates) {
       try {
         const result = await translateContentFields({
           fields: translationFieldsForAirdrop(candidate),
           existingTranslations: candidate.translations,
           existingSourceHash: text(candidate.translation_source_hash),
+          onlyFields: ['title'],
+          maxSourceChars: 700,
         });
-        if (!result.changed) continue;
-        const updatedAt = nowIso();
-        await supabaseFetch(`${EVENTS_TABLE}?provider=eq.${encodeURIComponent(provider)}&source_event_id=eq.${encodeURIComponent(sourceEventId)}`, {
-          method: 'PATCH',
-          headers: { prefer: 'return=minimal' },
-          body: JSON.stringify({
-            translations: result.translations,
-            translation_source_hash: result.source_hash,
-            translation_updated_at: updatedAt,
-          }),
-        });
-        state.translationDbWrites++;
-        state.translationRowsTranslated++;
-        state.translationLastSuccessAt = updatedAt;
-        state.translationLastError = null;
-        publicSnapshot = publicSnapshot.map((row) =>
-          row.provider === provider && row.source_event_id === sourceEventId
-            ? publicEventView({
-                ...row,
-                translations: result.translations,
-                translation_source_hash: result.source_hash,
-                translation_updated_at: updatedAt,
-              })
-            : row,
-        );
+        await persistTranslation(candidate, result, 'title');
       } catch (error) {
         state.translationFailures++;
         state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
+        if (error?.code === 'TRANSLATION_COOLDOWN') break;
+      }
+    }
+
+    // Only after the five-provider title baseline is caught up do we spend a
+    // small amount of spare quota on long detail fields.  This keeps the
+    // user's 15k/day Google hard limit meaningful.
+    if (pendingTitles.length === 0 && TRANSLATION_DETAIL_ROWS_PER_TICK > 0) {
+      const pendingDetails = translationWindow.filter((row) => translationNeedsWork({
+        fields: translationFieldsForAirdrop(row),
+        existingTranslations: row?.translations,
+        existingSourceHash: text(row?.translation_source_hash),
+        requiredFields: ['reward_text', 'eligibility_text', 'content', 'raw_summary'],
+      }));
+      for (const candidate of pendingDetails.slice(0, TRANSLATION_DETAIL_ROWS_PER_TICK)) {
+        try {
+          const result = await translateContentFields({
+            fields: translationFieldsForAirdrop(candidate),
+            existingTranslations: candidate.translations,
+            existingSourceHash: text(candidate.translation_source_hash),
+            onlyFields: ['reward_text', 'eligibility_text', 'content', 'raw_summary'],
+            maxSourceChars: 1600,
+          });
+          await persistTranslation(candidate, result, 'detail');
+        } catch (error) {
+          state.translationFailures++;
+          state.translationLastError = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
+          break;
+        }
       }
     }
     state.publicSnapshotRows = publicSnapshot.length;
@@ -1244,6 +1288,8 @@ function publicHealth() {
       user_translation_requests: 0,
       runs: state.translationRuns,
       rows_translated: state.translationRowsTranslated,
+      title_rows_translated: state.translationTitleRowsTranslated,
+      detail_rows_translated: state.translationDetailRowsTranslated,
       failures: state.translationFailures,
       db_writes: state.translationDbWrites,
       last_run_at: state.translationLastRunAt,
@@ -1251,6 +1297,7 @@ function publicHealth() {
       last_error: state.translationLastError,
       hot_window_rows: TRANSLATION_WINDOW_ROWS,
       rows_per_tick: TRANSLATION_ROWS_PER_TICK,
+      detail_rows_per_tick: TRANSLATION_DETAIL_ROWS_PER_TICK,
       shared_service: getSharedTranslationHealth(),
     },
     official_domain_whitelist_only: true,

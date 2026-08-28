@@ -30,6 +30,16 @@ const state = {
   last_success_at: null,
   last_error: GOOGLE_API_KEY ? null : 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY',
   cooldown_until: null,
+  cooldown_reason: null,
+  cooldown_opened_at: null,
+  provider_auth_mode: 'x_goog_api_key_header',
+  provider_last_http_status: null,
+  provider_last_http_error: null,
+  provider_last_error_at: null,
+  provider_last_success_at: null,
+  provider_last_response_ms: null,
+  provider_failures: 0,
+  provider_consecutive_failures: 0,
   monthly_char_limit: MONTHLY_CHAR_LIMIT,
   monthly_characters_used: 0,
   monthly_requests: 0,
@@ -196,12 +206,36 @@ async function fetchWithTimeout(url, init = {}) {
   finally { clearTimeout(timer); }
 }
 
+function nextPacificMidnightMs() {
+  // Google daily Translation quotas reset at midnight Pacific Time.  Use Intl so
+  // DST is handled by the runtime rather than hard-coding PST/PDT offsets.
+  const now = new Date();
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(now).filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+  const pacificTodayUtcGuess = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), 12, 0, 0);
+  let probe = new Date(pacificTodayUtcGuess + 24 * 60 * 60_000);
+  for (let i = 0; i < 4; i++) {
+    const pp = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+    }).formatToParts(probe).filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+    const deltaMinutes = Number(pp.hour) * 60 + Number(pp.minute);
+    probe = new Date(probe.getTime() - deltaMinutes * 60_000 - Number(pp.second) * 1000);
+    if (Number(pp.hour) === 0 && Number(pp.minute) === 0) break;
+  }
+  return Math.max(Date.now() + RETRY_COOLDOWN_MS, probe.getTime() + 2 * 60_000);
+}
 function openCooldown(message, response = null) {
-  let ms = RETRY_COOLDOWN_MS;
+  let untilMs = Date.now() + RETRY_COOLDOWN_MS;
   const header = Number(response?.headers?.get?.('retry-after') || 0);
-  if (Number.isFinite(header) && header > 0) ms = Math.max(ms, header * 1000);
-  cooldownUntilMs = Date.now() + ms;
+  if (Number.isFinite(header) && header > 0) untilMs = Math.max(untilMs, Date.now() + header * 1000);
+  if (/daily limit exceeded/i.test(message)) untilMs = nextPacificMidnightMs();
+  cooldownUntilMs = untilMs;
   state.cooldown_until = new Date(cooldownUntilMs).toISOString();
+  state.cooldown_reason = message;
+  state.cooldown_opened_at = new Date().toISOString();
   state.last_error = message;
 }
 
@@ -216,28 +250,57 @@ async function translateGoogleSegment(value, source, target) {
   }
   state.requests++;
   return serializedProviderRequest(async () => {
-    const response = await fetchWithTimeout(`https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(GOOGLE_API_KEY)}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json; charset=utf-8', accept: 'application/json' },
-      body: JSON.stringify({
-        q: value,
-        source: googleLanguage(source),
-        target: googleLanguage(target),
-        format: 'text',
-      }),
-    });
-    const raw = await response.text();
-    if (!response.ok) {
-      const message = `google_translation_http_${response.status}:${raw.slice(0, 220)}`;
-      if (response.status === 429 || response.status === 403 || response.status >= 500) openCooldown(message, response);
-      throw new Error(message);
+    const startedAt = Date.now();
+    let response = null;
+    try {
+      response = await fetchWithTimeout('https://translation.googleapis.com/language/translate/v2', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          accept: 'application/json',
+          'x-goog-api-key': GOOGLE_API_KEY,
+        },
+        body: JSON.stringify({
+          q: value,
+          source: googleLanguage(source),
+          target: googleLanguage(target),
+          format: 'text',
+        }),
+      });
+      state.provider_last_http_status = response.status;
+      state.provider_last_response_ms = Date.now() - startedAt;
+      const raw = await response.text();
+      if (!response.ok) {
+        const message = `google_translation_http_${response.status}:${raw.slice(0, 420)}`;
+        state.provider_last_http_error = message;
+        state.provider_last_error_at = new Date().toISOString();
+        state.provider_failures++;
+        state.provider_consecutive_failures++;
+        if (response.status === 429 || response.status === 403 || response.status >= 500) openCooldown(message, response);
+        throw new Error(message);
+      }
+      let payload = null;
+      try { payload = JSON.parse(raw); } catch (_) {}
+      const translated = decodeHtmlEntities(payload?.data?.translations?.[0]?.translatedText || '');
+      if (!translated) throw new Error('google_translation_empty');
+      await persistUsage(chargeChars);
+      state.provider_last_success_at = new Date().toISOString();
+      state.provider_consecutive_failures = 0;
+      state.cooldown_reason = null;
+      state.cooldown_until = null;
+      return translated;
+    } catch (error) {
+      state.provider_last_response_ms = Date.now() - startedAt;
+      if (error?.name === 'AbortError') {
+        const message = 'google_translation_timeout';
+        state.provider_last_http_error = message;
+        state.provider_last_error_at = new Date().toISOString();
+        state.provider_failures++;
+        state.provider_consecutive_failures++;
+        openCooldown(message, response);
+      }
+      throw error;
     }
-    let payload = null;
-    try { payload = JSON.parse(raw); } catch (_) {}
-    const translated = decodeHtmlEntities(payload?.data?.translations?.[0]?.translatedText || '');
-    if (!translated) throw new Error('google_translation_empty');
-    await persistUsage(chargeChars);
-    return translated;
   });
 }
 
@@ -260,7 +323,27 @@ function normalizeTranslations(raw) {
   return out;
 }
 
-export async function translateContentFields({ fields, existingTranslations = {}, existingSourceHash = '' }) {
+export function translationNeedsWork({ fields, existingTranslations = {}, existingSourceHash = '', requiredFields = null }) {
+  const normalizedFields = {};
+  for (const [key, value] of Object.entries(fields || {})) {
+    const clean = normalizeWhitespace(value);
+    if (clean) normalizedFields[key] = clean;
+  }
+  const sourceHash = contentTranslationHash(normalizedFields);
+  if (text(existingSourceHash) !== sourceHash) return Object.keys(normalizedFields).length > 0;
+  const existing = normalizeTranslations(existingTranslations);
+  const allow = Array.isArray(requiredFields) && requiredFields.length ? new Set(requiredFields) : null;
+  for (const [field, value] of Object.entries(normalizedFields)) {
+    if (allow && !allow.has(field)) continue;
+    const source = detectContentLanguage(value);
+    const target = targetForSource(source);
+    if (!target) continue;
+    if (!text(existing?.[target]?.[field])) return true;
+  }
+  return false;
+}
+
+export async function translateContentFields({ fields, existingTranslations = {}, existingSourceHash = '', onlyFields = null, maxSourceChars = Number.POSITIVE_INFINITY }) {
   const normalizedFields = {};
   for (const [key, value] of Object.entries(fields || {})) {
     const clean = normalizeWhitespace(value);
@@ -286,30 +369,38 @@ export async function translateContentFields({ fields, existingTranslations = {}
 
   // Source edits atomically invalidate stale translations.
   const next = existingSourceHash === sourceHash ? existing : {};
+  const allowed = Array.isArray(onlyFields) && onlyFields.length ? new Set(onlyFields) : null;
   let translatedFields = 0;
+  let translatedSourceChars = 0;
   let changed = existingSourceHash !== sourceHash;
   for (const job of needed) {
+    if (allowed && !allowed.has(job.field)) continue;
     const current = text(next?.[job.target]?.[job.field]);
     if (current && existingSourceHash === sourceHash) continue;
+    const jobChars = Array.from(job.value).length;
+    if (translatedSourceChars + jobChars > maxSourceChars) continue;
     try {
       const translated = await translateField(job.value, job.source, job.target);
       if (!translated) continue;
       next[job.target] ||= {};
       next[job.target][job.field] = translated;
       translatedFields++;
+      translatedSourceChars += jobChars;
       changed = true;
       state.successes++;
       state.translated_fields++;
-      state.translated_characters += job.value.length;
+      state.translated_characters += jobChars;
       state.last_success_at = new Date().toISOString();
       state.last_error = null;
     } catch (error) {
       state.failures++;
-      state.last_error = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
+      if (error?.code !== 'TRANSLATION_COOLDOWN') {
+        state.last_error = String(error?.name === 'AbortError' ? 'translation_timeout' : error?.message || error);
+      }
       throw error;
     }
   }
-  return { changed, source_hash: sourceHash, translations: next, translated_fields: translatedFields };
+  return { changed, source_hash: sourceHash, translations: next, translated_fields: translatedFields, translated_source_chars: translatedSourceChars };
 }
 
 export function getSharedTranslationHealth() {
@@ -317,6 +408,8 @@ export function getSharedTranslationHealth() {
     ...state,
     configured: Boolean(GOOGLE_API_KEY),
     provider_mode: GOOGLE_API_KEY ? 'google_cloud_translation_v2' : 'google_cloud_translation_key_required',
+    provider_auth_mode: 'x_goog_api_key_header',
     cooldown_until: cooldownUntilMs > Date.now() ? new Date(cooldownUntilMs).toISOString() : null,
+    provider_ready: Boolean(GOOGLE_API_KEY) && state.provider_consecutive_failures === 0 && cooldownUntilMs <= Date.now(),
   };
 }
