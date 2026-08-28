@@ -27,6 +27,8 @@ const AIRDROP_RECENT_BACKFILL_MAX_RESULTS = 10;
 const AIRDROP_RECENT_BACKFILL_MAX_ATTEMPTS = 3;
 const AIRDROP_RECENT_BACKFILL_WINDOW_MS = 7 * 24 * 60 * 60_000;
 const TRANSLATION_BACKFILL_PER_TICK = 3;
+const PUBLIC_AVATAR_REFRESH_MS = 24 * 60 * 60_000;
+const PUBLIC_AVATAR_RETRY_MS = 60 * 60_000;
 const MARKET_FOCUS_KEYWORDS = [
   'Bitcoin', 'BTC', 'crypto', 'Ethereum', 'ETH', 'DOGE', 'Dogecoin', 'stablecoin',
   'ETF', 'SEC', 'Fed', 'FOMC', 'tariff', 'sanction', 'regulation', 'market',
@@ -111,6 +113,14 @@ const state = {
   translationLastRunAt: null,
   translationLastSuccessAt: null,
   translationLastError: null,
+  avatarRefreshRequests: 0,
+  avatarRefreshSuccesses: 0,
+  avatarRefreshFailures: 0,
+  avatarRowsUpdated: 0,
+  avatarLastCheckedAt: null,
+  avatarLastSuccessAt: null,
+  avatarLastError: null,
+  avatarNextAllowedAt: null,
 };
 
 let settingsTimer = null;
@@ -244,6 +254,8 @@ function publicAccountView(account) {
     display_name: text(account?.display_name),
     category: text(account?.category),
     role_title: text(account?.role_title),
+    profile_image_url: text(account?.profile_image_url) || null,
+    profile_image_checked_at: text(account?.profile_image_checked_at) || null,
     sort_order: Math.trunc(finiteNumber(account?.sort_order, 100)),
     last_post_at: text(account?.last_post_at) || null,
   };
@@ -433,6 +445,21 @@ function publicHealth() {
     airdrop_recent_backfill_posts: state.airdropRecentBackfillPosts,
     airdrop_recent_backfill_inserted: state.airdropRecentBackfillInserted,
     airdrop_recent_backfill_error: state.airdropRecentBackfillError,
+    public_avatar_cache: {
+      shared_background_only: true,
+      refresh_interval_hours: Math.round(PUBLIC_AVATAR_REFRESH_MS / 3_600_000),
+      requests: state.avatarRefreshRequests,
+      successes: state.avatarRefreshSuccesses,
+      failures: state.avatarRefreshFailures,
+      rows_updated: state.avatarRowsUpdated,
+      last_checked_at: state.avatarLastCheckedAt,
+      last_success_at: state.avatarLastSuccessAt,
+      last_error: state.avatarLastError,
+      next_allowed_at: state.avatarNextAllowedAt,
+      user_read_x_requests: 0,
+      user_read_supabase_requests: 0,
+      x_requests_scale_with_users: false,
+    },
     user_read_supabase_requests: 0,
     native_detail_schema: NATIVE_DETAIL_SCHEMA,
     native_detail_shared_snapshot: true,
@@ -571,6 +598,75 @@ async function refreshXUsage({ force = false } = {}) {
   return true;
 }
 
+async function refreshPublicProfileImages(accounts) {
+  if (!state.xTokenConfigured || !Array.isArray(accounts) || !accounts.length) return false;
+  const nowMs = Date.now();
+  const nextAllowedMs = Date.parse(state.avatarNextAllowedAt || '');
+  if (Number.isFinite(nextAllowedMs) && nowMs < nextAllowedMs) return false;
+
+  const publicAccounts = accounts.filter((account) =>
+    account?.source === 'x' &&
+    account?.is_active === true &&
+    account?.public_visible === true &&
+    normalizeHandle(account?.handle)
+  );
+  if (!publicAccounts.length) return false;
+
+  const due = publicAccounts.filter((account) => {
+    const checkedMs = Date.parse(text(account?.profile_image_checked_at));
+    return !Number.isFinite(checkedMs) || nowMs - checkedMs >= PUBLIC_AVATAR_REFRESH_MS;
+  });
+  if (!due.length) return false;
+
+  const handles = [...new Set(due.map((account) => normalizeHandle(account.handle)).filter(Boolean))].slice(0, 100);
+  if (!handles.length) return false;
+  const params = new URLSearchParams({
+    usernames: handles.join(','),
+    'user.fields': 'id,username,name,profile_image_url',
+  });
+
+  state.avatarRefreshRequests++;
+  state.avatarLastCheckedAt = nowIso();
+  try {
+    const response = await xFetch(`/2/users/by?${params.toString()}`);
+    const raw = await response.text();
+    let payload = {};
+    try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { payload = {}; }
+    if (!response.ok) throw new Error(`social_watch_avatar_http_${response.status}:${text(raw).slice(0, 280)}`);
+
+    const users = Array.isArray(payload?.data) ? payload.data : [];
+    const byHandle = new Map(users.map((user) => [normalizeHandle(user?.username).toLowerCase(), user]));
+    const checkedAt = nowIso();
+    let updated = 0;
+    for (const account of due) {
+      const handle = normalizeHandle(account?.handle).toLowerCase();
+      const user = byHandle.get(handle);
+      const nextUrl = text(user?.profile_image_url);
+      const fields = { profile_image_checked_at: checkedAt };
+      if (nextUrl) fields.profile_image_url = nextUrl;
+      await supabaseFetch(`${ACCOUNTS_TABLE}?id=eq.${encodeURIComponent(text(account.id))}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify(fields),
+      });
+      account.profile_image_checked_at = checkedAt;
+      if (nextUrl) account.profile_image_url = nextUrl;
+      updated++;
+    }
+    state.avatarRowsUpdated += updated;
+    state.avatarRefreshSuccesses++;
+    state.avatarLastSuccessAt = checkedAt;
+    state.avatarLastError = null;
+    state.avatarNextAllowedAt = new Date(nowMs + PUBLIC_AVATAR_REFRESH_MS).toISOString();
+    return updated > 0;
+  } catch (error) {
+    state.avatarRefreshFailures++;
+    state.avatarLastError = String(error?.message || error);
+    state.avatarNextAllowedAt = new Date(nowMs + PUBLIC_AVATAR_RETRY_MS).toISOString();
+    return false;
+  }
+}
+
 async function readConfig() {
   const [settingsRows, accountRows] = await Promise.all([
     supabaseFetch(`${SETTINGS_TABLE}?id=eq.default&select=*`),
@@ -592,6 +688,9 @@ async function readConfig() {
   state.allTotalAccounts = accounts.length;
   state.totalAccounts = accounts.filter((account) => account?.public_visible === true).length;
   state.internalTotalAccounts = state.allTotalAccounts - state.totalAccounts;
+  // One shared X users/by batch at most once per 24h for public celebrity avatars.
+  // Public App reads never call this path; they only consume the in-memory snapshot.
+  try { await refreshPublicProfileImages(accounts); } catch (error) { state.avatarLastError = String(error?.message || error); }
   refreshPublicAccountsSnapshot(accounts);
 
   const activeCandidates = accounts

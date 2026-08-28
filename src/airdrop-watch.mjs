@@ -1300,6 +1300,8 @@ function publicHealth() {
       last_success_at: state.translationLastSuccessAt,
       last_error: state.translationLastError,
       hot_window_rows: TRANSLATION_WINDOW_ROWS,
+      default_landing_priority: 'binance_alpha_first',
+      provider_balanced_titles: true,
       rows_per_tick: TRANSLATION_ROWS_PER_TICK,
       detail_rows_per_tick: TRANSLATION_DETAIL_ROWS_PER_TICK,
       shared_service: getSharedTranslationHealth(),
