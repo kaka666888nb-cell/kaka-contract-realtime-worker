@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { contentTranslationHash, getSharedTranslationHealth, translateContentFields } from './content-translation.mjs';
 const STEP_SCHEMA = 'step1044_1_2_x_shared_snapshot_celebrity_hall_v3';
 const NATIVE_DETAIL_SCHEMA = 'step1045_4_celebrity_native_detail_v1';
@@ -29,6 +30,9 @@ const AIRDROP_RECENT_BACKFILL_WINDOW_MS = 7 * 24 * 60 * 60_000;
 const TRANSLATION_BACKFILL_PER_TICK = 3;
 const PUBLIC_AVATAR_REFRESH_MS = 24 * 60 * 60_000;
 const PUBLIC_AVATAR_RETRY_MS = 60 * 60_000;
+const PUBLIC_AVATAR_MIRROR_BUCKET = 'app-assets';
+const PUBLIC_AVATAR_MIRROR_MAX_BYTES = 2 * 1024 * 1024;
+const PUBLIC_AVATAR_MIRROR_FETCH_TIMEOUT_MS = 12_000;
 const MARKET_FOCUS_KEYWORDS = [
   'Bitcoin', 'BTC', 'crypto', 'Ethereum', 'ETH', 'DOGE', 'Dogecoin', 'stablecoin',
   'ETF', 'SEC', 'Fed', 'FOMC', 'tariff', 'sanction', 'regulation', 'market',
@@ -121,6 +125,12 @@ const state = {
   avatarLastSuccessAt: null,
   avatarLastError: null,
   avatarNextAllowedAt: null,
+  avatarMirrorDownloads: 0,
+  avatarMirrorUploads: 0,
+  avatarMirrorFailures: 0,
+  avatarMirrorBytes: 0,
+  avatarMirrorLastSuccessAt: null,
+  avatarMirrorLastError: null,
 };
 
 let settingsTimer = null;
@@ -249,7 +259,16 @@ function accountRuleValue(account) {
 function publicAccountView(account) {
   const overrideUrl = text(account?.avatar_override_url);
   const manualOverride = account?.avatar_override_enabled === true && Boolean(overrideUrl);
-  const xProfileUrl = text(account?.profile_image_url);
+  const mirroredXUrl = text(account?.profile_image_cached_url);
+  const directXUrl = text(account?.profile_image_url);
+  const effectiveUrl = manualOverride ? overrideUrl : (mirroredXUrl || directXUrl);
+  const source = manualOverride
+    ? 'admin_override'
+    : mirroredXUrl
+      ? 'x_shared_supabase_mirror'
+      : directXUrl
+        ? 'x_direct_fallback'
+        : 'fallback_initial';
   return {
     id: text(account?.id),
     source: text(account?.source) || 'x',
@@ -257,9 +276,10 @@ function publicAccountView(account) {
     display_name: text(account?.display_name),
     category: text(account?.category),
     role_title: text(account?.role_title),
-    profile_image_url: manualOverride ? overrideUrl : (xProfileUrl || null),
-    profile_image_source: manualOverride ? 'admin_override' : (xProfileUrl ? 'x_shared_profile' : 'fallback_initial'),
+    profile_image_url: effectiveUrl || null,
+    profile_image_source: source,
     profile_image_checked_at: text(account?.profile_image_checked_at) || null,
+    profile_image_cached_at: text(account?.profile_image_cached_at) || null,
     avatar_override_updated_at: manualOverride ? (text(account?.avatar_override_updated_at) || null) : null,
     sort_order: Math.trunc(finiteNumber(account?.sort_order, 100)),
     last_post_at: text(account?.last_post_at) || null,
@@ -439,8 +459,9 @@ function publicHealth() {
     public_snapshot_loaded_at: state.publicSnapshotLoadedAt,
     public_snapshot_accounts: state.publicSnapshotAccounts,
     avatar_manual_override_supported: true,
-    avatar_effective_priority: 'admin_override_then_x_shared_profile',
+    avatar_effective_priority: 'admin_override_then_supabase_mirrored_x_then_direct_x',
     avatar_manual_override_accounts: publicAccountsSnapshot.filter((row) => text(row?.profile_image_source) === 'admin_override').length,
+    avatar_supabase_mirror_accounts: publicAccountsSnapshot.filter((row) => text(row?.profile_image_source) === 'x_shared_supabase_mirror').length,
     public_snapshot_events: state.publicSnapshotEvents,
     public_snapshot_db_reads: state.publicSnapshotDbReads,
     airdrop_bridge_accounts: state.airdropBridgeAccounts,
@@ -467,6 +488,14 @@ function publicHealth() {
       user_read_x_requests: 0,
       user_read_supabase_requests: 0,
       x_requests_scale_with_users: false,
+      delivery_mode: 'supabase_storage_mirror_then_device_disk_cache',
+      mirror_bucket: PUBLIC_AVATAR_MIRROR_BUCKET,
+      mirror_downloads: state.avatarMirrorDownloads,
+      mirror_uploads: state.avatarMirrorUploads,
+      mirror_failures: state.avatarMirrorFailures,
+      mirror_bytes: state.avatarMirrorBytes,
+      mirror_last_success_at: state.avatarMirrorLastSuccessAt,
+      mirror_last_error: state.avatarMirrorLastError,
     },
     user_read_supabase_requests: 0,
     native_detail_schema: NATIVE_DETAIL_SCHEMA,
@@ -606,6 +635,70 @@ async function refreshXUsage({ force = false } = {}) {
   return true;
 }
 
+function avatarMirrorStoragePath(handle, sourceUrl) {
+  const safeHandle = normalizeHandle(handle).toLowerCase() || 'unknown';
+  const hash = createHash('sha256').update(text(sourceUrl)).digest('hex').slice(0, 24);
+  return `celebrity-avatars/x/${safeHandle}/${hash}.img`;
+}
+
+function encodedStoragePath(path) {
+  return text(path).split('/').filter(Boolean).map((part) => encodeURIComponent(part)).join('/');
+}
+
+async function mirrorPublicProfileImage(handle, sourceUrl) {
+  const cleanUrl = text(sourceUrl);
+  if (!/^https:\/\//i.test(cleanUrl)) throw new Error('social_watch_avatar_mirror_invalid_source_url');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PUBLIC_AVATAR_MIRROR_FETCH_TIMEOUT_MS);
+  let response;
+  try {
+    state.avatarMirrorDownloads++;
+    response = await fetch(cleanUrl, {
+      signal: controller.signal,
+      headers: {
+        accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'user-agent': 'KakaWeb3-SharedCelebrityAvatarMirror/1.0',
+      },
+      redirect: 'follow',
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response?.ok) throw new Error(`social_watch_avatar_mirror_source_http_${response?.status || 0}`);
+  const contentType = text(response.headers.get('content-type')).split(';')[0].trim().toLowerCase();
+  if (!contentType.startsWith('image/')) throw new Error(`social_watch_avatar_mirror_source_type:${contentType || 'unknown'}`);
+  const declaredBytes = finiteNumber(response.headers.get('content-length'), 0);
+  if (declaredBytes > PUBLIC_AVATAR_MIRROR_MAX_BYTES) throw new Error('social_watch_avatar_mirror_source_too_large');
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!bytes.length || bytes.length > PUBLIC_AVATAR_MIRROR_MAX_BYTES) throw new Error('social_watch_avatar_mirror_invalid_bytes');
+
+  const objectPath = avatarMirrorStoragePath(handle, cleanUrl);
+  const encodedPath = encodedStoragePath(objectPath);
+  const upload = await fetch(`${SUPABASE_URL}/storage/v1/object/${PUBLIC_AVATAR_MIRROR_BUCKET}/${encodedPath}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'content-type': contentType,
+      'cache-control': '31536000',
+      'x-upsert': 'true',
+    },
+    body: bytes,
+  });
+  const raw = await upload.text();
+  if (!upload.ok) throw new Error(`social_watch_avatar_mirror_storage_http_${upload.status}:${text(raw).slice(0, 180)}`);
+  state.avatarMirrorUploads++;
+  state.avatarMirrorBytes += bytes.length;
+  state.avatarMirrorLastSuccessAt = nowIso();
+  state.avatarMirrorLastError = null;
+  return {
+    url: `${SUPABASE_URL}/storage/v1/object/public/${PUBLIC_AVATAR_MIRROR_BUCKET}/${encodedPath}`,
+    sourceUrl: cleanUrl,
+    cachedAt: nowIso(),
+    bytes: bytes.length,
+  };
+}
+
 async function refreshPublicProfileImages(accounts) {
   if (!state.xTokenConfigured || !Array.isArray(accounts) || !accounts.length) return false;
   const nowMs = Date.now();
@@ -622,7 +715,8 @@ async function refreshPublicProfileImages(accounts) {
 
   const due = publicAccounts.filter((account) => {
     const checkedMs = Date.parse(text(account?.profile_image_checked_at));
-    return !Number.isFinite(checkedMs) || nowMs - checkedMs >= PUBLIC_AVATAR_REFRESH_MS;
+    const mirrorMissing = !text(account?.profile_image_cached_url);
+    return mirrorMissing || !Number.isFinite(checkedMs) || nowMs - checkedMs >= PUBLIC_AVATAR_REFRESH_MS;
   });
   if (!due.length) return false;
 
@@ -649,9 +743,27 @@ async function refreshPublicProfileImages(accounts) {
     for (const account of due) {
       const handle = normalizeHandle(account?.handle).toLowerCase();
       const user = byHandle.get(handle);
-      const nextUrl = text(user?.profile_image_url);
+      const nextUrl = text(user?.profile_image_url) || text(account?.profile_image_url);
       const fields = { profile_image_checked_at: checkedAt };
       if (nextUrl) fields.profile_image_url = nextUrl;
+
+      const cachedUrl = text(account?.profile_image_cached_url);
+      const cachedSourceUrl = text(account?.profile_image_cached_source_url);
+      if (nextUrl && (!cachedUrl || cachedSourceUrl !== nextUrl)) {
+        try {
+          const mirror = await mirrorPublicProfileImage(handle, nextUrl);
+          fields.profile_image_cached_url = mirror.url;
+          fields.profile_image_cached_source_url = mirror.sourceUrl;
+          fields.profile_image_cached_at = mirror.cachedAt;
+          account.profile_image_cached_url = mirror.url;
+          account.profile_image_cached_source_url = mirror.sourceUrl;
+          account.profile_image_cached_at = mirror.cachedAt;
+        } catch (mirrorError) {
+          state.avatarMirrorFailures++;
+          state.avatarMirrorLastError = String(mirrorError?.message || mirrorError);
+        }
+      }
+
       await supabaseFetch(`${ACCOUNTS_TABLE}?id=eq.${encodeURIComponent(text(account.id))}`, {
         method: 'PATCH',
         headers: { Prefer: 'return=minimal' },
