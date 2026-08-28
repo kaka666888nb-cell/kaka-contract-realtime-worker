@@ -304,6 +304,12 @@ function normalizeCandidateUrl(source, rawUrl) {
       m = u.pathname.match(/^(\/support)\/sections\/(\d{10,})$/i);
       if (m && m[2] !== '4413154768537') u.pathname = `${m[1]}/articles/${m[2]}`;
     }
+    if (source?.provider === 'bybit' && u.hostname.toLowerCase() === 'announcements.bybit.com') {
+      // The v5 announcement API can publish locale-qualified /en-US/article URLs,
+      // while the current public announcement frontend canonically serves /en/article.
+      // Normalize only the locale prefix; keep the official host and article slug intact.
+      u.pathname = u.pathname.replace(/^\/en(?:-|_)US\/article\//i, '/en/article/');
+    }
     return canonicalUrl(u.toString());
   } catch (_) { return value; }
 }
@@ -462,7 +468,7 @@ function extractBybitApiCandidates(raw, source) {
   const rows = [];
   for (const item of list) {
     const title = normalizeWhitespace(item?.title);
-    const sourceUrl = canonicalUrl(item?.url);
+    const sourceUrl = normalizeCandidateUrl(source, item?.url);
     if (!titleMatches(source, title) || !sourceUrl || !hostAllowed(sourceUrl, source)) continue;
     rows.push({
       title,
@@ -501,11 +507,16 @@ function extractCandidates(html, source, baseUrl) {
   return [...found.values()].slice(0, 80);
 }
 function publicEventView(row) {
+  const provider = text(row?.provider).toLowerCase();
+  const title = text(row?.title);
   return {
     id: row?.id ?? null,
-    provider: text(row?.provider),
+    provider,
     provider_name: text(row?.provider_name),
-    category: text(row?.category) || 'airdrop',
+    // Recompute provider taxonomy for every public row, including historical DB seed rows.
+    // Step1045.2 stored generic values such as `campaign`; those must never leak back into
+    // the Step1045.3 provider-specific contract after a restart or stale-snapshot merge.
+    category: categoryFor(provider, title),
     source_event_id: text(row?.source_event_id),
     title: text(row?.title),
     project_symbol: text(row?.project_symbol) || null,
@@ -898,9 +909,12 @@ async function enrichSourceContent(source, rows) {
         content_fetched_at: nowIso(),
       });
       contentRetryAfter.delete(retryKey);
+      sourceState.content_last_error = null;
+      sourceState.content_last_success_at = nowIso();
     } catch (error) {
       state.contentEnrichFailures++;
       sourceState.content_enrich_failures = finiteNumber(sourceState.content_enrich_failures, 0) + 1;
+      sourceState.content_last_error = String(error?.name === 'AbortError' ? 'official_timeout' : error?.message || error);
       // Preserve the list row and avoid hammering a 404/challenge URL every cycle.
       contentRetryAfter.set(retryKey, Date.now() + CONTENT_RETRY_MS);
       out.push(row);
@@ -1174,6 +1188,7 @@ export const __airdropWatchTest = Object.freeze({
   extractRewardText,
   htmlArticleText,
   contentUsable,
+  publicEventView,
   statusFor,
   sources: OFFICIAL_SOURCES,
 });
