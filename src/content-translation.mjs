@@ -2,36 +2,57 @@ import crypto from 'node:crypto';
 
 const ENABLED = String(process.env.KAKA_CONTENT_AUTO_TRANSLATION_ENABLED || '1') !== '0';
 const GOOGLE_API_KEY = String(process.env.KAKA_GOOGLE_TRANSLATION_API_KEY || process.env.GOOGLE_TRANSLATION_API_KEY || '').trim();
-const MYMEMORY_EMAIL = String(process.env.KAKA_TRANSLATION_CONTACT_EMAIL || '').trim();
-const REQUEST_TIMEOUT_MS = Math.max(3000, Math.min(15000, Number(process.env.KAKA_TRANSLATION_TIMEOUT_MS || 8000) || 8000));
-const MAX_FIELD_CHARS = Math.max(800, Math.min(12000, Number(process.env.KAKA_TRANSLATION_MAX_FIELD_CHARS || 6000) || 6000));
-const MYMEMORY_MAX_BYTES = 450;
-const MYMEMORY_MAX_SEGMENTS = 32;
-const PROVIDER_MIN_GAP_MS = Math.max(80, Math.min(1200, Number(process.env.KAKA_TRANSLATION_REQUEST_GAP_MS || 220) || 220));
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const USAGE_TABLE = 'app_content_translation_usage';
+const MONTHLY_CHAR_LIMIT = Math.max(50_000, Math.min(5_000_000, Number(process.env.KAKA_TRANSLATION_MONTHLY_CHAR_LIMIT || 450000) || 450000));
+const REQUEST_TIMEOUT_MS = Math.max(3000, Math.min(20000, Number(process.env.KAKA_TRANSLATION_TIMEOUT_MS || 10000) || 10000));
+const MAX_FIELD_CHARS = Math.max(1200, Math.min(60000, Number(process.env.KAKA_TRANSLATION_MAX_FIELD_CHARS || 30000) || 30000));
+const SEGMENT_CHARS = Math.max(1200, Math.min(5000, Number(process.env.KAKA_TRANSLATION_SEGMENT_CHARS || 3800) || 3800));
+const PROVIDER_MIN_GAP_MS = Math.max(80, Math.min(1500, Number(process.env.KAKA_TRANSLATION_REQUEST_GAP_MS || 180) || 180));
+const RETRY_COOLDOWN_MS = Math.max(60_000, Math.min(6 * 60 * 60_000, Number(process.env.KAKA_TRANSLATION_RETRY_COOLDOWN_MS || 15 * 60_000) || 15 * 60_000));
 
 const state = {
   enabled: ENABLED,
-  provider_mode: GOOGLE_API_KEY ? 'google_cloud_translation_v2' : 'mymemory_shared_fallback',
+  configured: Boolean(GOOGLE_API_KEY),
+  provider_mode: GOOGLE_API_KEY ? 'google_cloud_translation_v2' : 'google_cloud_translation_key_required',
   google_configured: Boolean(GOOGLE_API_KEY),
+  mymemory_disabled: true,
+  shared_background_only: true,
+  user_translation_requests: 0,
   requests: 0,
-  google_requests: 0,
-  mymemory_requests: 0,
   successes: 0,
   failures: 0,
   translated_fields: 0,
   translated_characters: 0,
-  skipped_same_language: 0,
   skipped_unclassified: 0,
   last_request_at: null,
   last_success_at: null,
-  last_error: null,
+  last_error: GOOGLE_API_KEY ? null : 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY',
+  cooldown_until: null,
+  monthly_char_limit: MONTHLY_CHAR_LIMIT,
+  monthly_characters_used: 0,
+  monthly_requests: 0,
+  usage_persistence_configured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
+  usage_persistence_healthy: true,
 };
 
 let lane = Promise.resolve();
 let lastProviderRequestAtMs = 0;
+let cooldownUntilMs = 0;
+let usageLoadedMonth = '';
+let usageLoadPromise = null;
 
 function text(value) { return String(value ?? '').trim(); }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function normalizeWhitespace(raw) {
+  return text(raw)
+    .replace(/\r/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
 function decodeHtmlEntities(raw) {
   return text(raw)
     .replace(/&quot;/gi, '"')
@@ -41,14 +62,6 @@ function decodeHtmlEntities(raw) {
     .replace(/&amp;/gi, '&')
     .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
     .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)));
-}
-function normalizeWhitespace(raw) {
-  return text(raw)
-    .replace(/\r/g, '')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/ *\n */g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
 }
 
 export function detectContentLanguage(raw) {
@@ -76,52 +89,96 @@ function targetForSource(sourceLanguage) {
   if (sourceLanguage === 'zh') return 'en';
   return '';
 }
-function googleTarget(target) { return target === 'zh' ? 'zh-CN' : 'en'; }
-function myMemoryPair(source, target) {
-  const from = source === 'zh' ? 'zh-CN' : 'en';
-  const to = target === 'zh' ? 'zh-CN' : 'en';
-  return `${from}|${to}`;
+function googleLanguage(locale) { return locale === 'zh' ? 'zh-CN' : 'en'; }
+
+function monthKey() { return new Date().toISOString().slice(0, 7); }
+function usageHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    'content-type': 'application/json',
+    ...extra,
+  };
+}
+async function ensureUsageLoaded() {
+  const month = monthKey();
+  if (usageLoadedMonth === month) return;
+  if (usageLoadPromise) return usageLoadPromise;
+  usageLoadPromise = (async () => {
+    state.monthly_characters_used = 0;
+    state.monthly_requests = 0;
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const response = await fetch(`${SUPABASE_URL}/rest/v1/${USAGE_TABLE}?month_key=eq.${encodeURIComponent(month)}&select=characters_used,requests&limit=1`, { headers: usageHeaders({ accept: 'application/json' }) });
+        const raw = await response.text();
+        if (!response.ok) throw new Error(`translation_usage_http_${response.status}:${raw.slice(0, 180)}`);
+        let rows = [];
+        try { rows = raw ? JSON.parse(raw) : []; } catch (_) {}
+        const row = Array.isArray(rows) ? rows[0] : null;
+        state.monthly_characters_used = Math.max(0, Number(row?.characters_used || 0) || 0);
+        state.monthly_requests = Math.max(0, Number(row?.requests || 0) || 0);
+        state.usage_persistence_healthy = true;
+      } catch (error) {
+        state.usage_persistence_healthy = false;
+        state.last_error = String(error?.message || error);
+        throw error;
+      }
+    }
+    usageLoadedMonth = month;
+  })().finally(() => { usageLoadPromise = null; });
+  return usageLoadPromise;
+}
+async function persistUsage(deltaChars) {
+  state.monthly_characters_used += deltaChars;
+  state.monthly_requests += 1;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+  const month = monthKey();
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${USAGE_TABLE}?on_conflict=month_key`, {
+    method: 'POST',
+    headers: usageHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    body: JSON.stringify({
+      month_key: month,
+      provider: 'google_cloud_translation_v2',
+      characters_used: state.monthly_characters_used,
+      requests: state.monthly_requests,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  if (!response.ok) {
+    const raw = await response.text();
+    state.usage_persistence_healthy = false;
+    throw new Error(`translation_usage_persist_http_${response.status}:${raw.slice(0, 180)}`);
+  }
+  state.usage_persistence_healthy = true;
 }
 
-function splitUtf8Segments(raw) {
+function splitText(raw) {
   const value = normalizeWhitespace(raw).slice(0, MAX_FIELD_CHARS);
   if (!value) return [];
-  const segments = [];
-  let current = '';
-  const flush = () => {
-    const clean = current.trim();
-    if (clean) segments.push(clean);
-    current = '';
-  };
-  const units = value.split(/(?<=[.!?。！？；;:\n])\s*/u).filter(Boolean);
-  for (const unitRaw of units) {
-    let unit = unitRaw;
-    while (unit) {
-      const candidate = current ? `${current} ${unit}` : unit;
-      if (Buffer.byteLength(candidate, 'utf8') <= MYMEMORY_MAX_BYTES) {
-        current = candidate;
-        unit = '';
-        continue;
-      }
-      if (current) {
-        flush();
-        continue;
-      }
-      let cut = Math.min(unit.length, 300);
-      while (cut > 1 && Buffer.byteLength(unit.slice(0, cut), 'utf8') > MYMEMORY_MAX_BYTES) cut--;
-      if (cut <= 1) break;
-      segments.push(unit.slice(0, cut).trim());
-      unit = unit.slice(cut).trim();
-      if (segments.length >= MYMEMORY_MAX_SEGMENTS) break;
-    }
-    if (segments.length >= MYMEMORY_MAX_SEGMENTS) break;
+  if (value.length <= SEGMENT_CHARS) return [value];
+  const out = [];
+  let remaining = value;
+  while (remaining.length > SEGMENT_CHARS) {
+    let cut = SEGMENT_CHARS;
+    const window = remaining.slice(0, SEGMENT_CHARS + 1);
+    const candidates = [window.lastIndexOf('\n\n'), window.lastIndexOf('\n'), window.lastIndexOf('。'), window.lastIndexOf('. '), window.lastIndexOf('！'), window.lastIndexOf('？')];
+    const best = Math.max(...candidates);
+    if (best >= Math.floor(SEGMENT_CHARS * 0.55)) cut = best + 1;
+    out.push(remaining.slice(0, cut).trim());
+    remaining = remaining.slice(cut).trim();
   }
-  if (segments.length < MYMEMORY_MAX_SEGMENTS) flush();
-  return segments.slice(0, MYMEMORY_MAX_SEGMENTS);
+  if (remaining) out.push(remaining);
+  return out.filter(Boolean);
 }
 
 async function serializedProviderRequest(fn) {
   const run = lane.then(async () => {
+    const now = Date.now();
+    if (cooldownUntilMs > now) {
+      const error = new Error(`translation_provider_cooldown_until:${new Date(cooldownUntilMs).toISOString()}`);
+      error.code = 'TRANSLATION_COOLDOWN';
+      throw error;
+    }
     const wait = Math.max(0, PROVIDER_MIN_GAP_MS - (Date.now() - lastProviderRequestAtMs));
     if (wait > 0) await sleep(wait);
     lastProviderRequestAtMs = Date.now();
@@ -135,74 +192,61 @@ async function serializedProviderRequest(fn) {
 async function fetchWithTimeout(url, init = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+  try { return await fetch(url, { ...init, signal: controller.signal }); }
+  finally { clearTimeout(timer); }
 }
 
-async function translateGoogle(value, source, target) {
+function openCooldown(message, response = null) {
+  let ms = RETRY_COOLDOWN_MS;
+  const header = Number(response?.headers?.get?.('retry-after') || 0);
+  if (Number.isFinite(header) && header > 0) ms = Math.max(ms, header * 1000);
+  cooldownUntilMs = Date.now() + ms;
+  state.cooldown_until = new Date(cooldownUntilMs).toISOString();
+  state.last_error = message;
+}
+
+async function translateGoogleSegment(value, source, target) {
+  if (!GOOGLE_API_KEY) throw new Error('translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY');
+  await ensureUsageLoaded();
+  const chargeChars = Array.from(value).length;
+  if (state.monthly_characters_used + chargeChars > MONTHLY_CHAR_LIMIT) {
+    const error = new Error(`translation_monthly_budget_exhausted:${state.monthly_characters_used}/${MONTHLY_CHAR_LIMIT}`);
+    state.last_error = error.message;
+    throw error;
+  }
   state.requests++;
-  state.google_requests++;
   return serializedProviderRequest(async () => {
     const response = await fetchWithTimeout(`https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(GOOGLE_API_KEY)}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json; charset=utf-8' },
+      headers: { 'content-type': 'application/json; charset=utf-8', accept: 'application/json' },
       body: JSON.stringify({
-        q: value.slice(0, MAX_FIELD_CHARS),
-        source: source === 'zh' ? 'zh-CN' : 'en',
-        target: googleTarget(target),
+        q: value,
+        source: googleLanguage(source),
+        target: googleLanguage(target),
         format: 'text',
       }),
     });
     const raw = await response.text();
-    if (!response.ok) throw new Error(`google_translation_http_${response.status}:${raw.slice(0, 180)}`);
+    if (!response.ok) {
+      const message = `google_translation_http_${response.status}:${raw.slice(0, 220)}`;
+      if (response.status === 429 || response.status === 403 || response.status >= 500) openCooldown(message, response);
+      throw new Error(message);
+    }
     let payload = null;
     try { payload = JSON.parse(raw); } catch (_) {}
     const translated = decodeHtmlEntities(payload?.data?.translations?.[0]?.translatedText || '');
     if (!translated) throw new Error('google_translation_empty');
+    await persistUsage(chargeChars);
     return translated;
   });
 }
 
-async function translateMyMemory(value, source, target) {
-  const segments = splitUtf8Segments(value);
-  if (!segments.length) return '';
-  const out = [];
-  for (const segment of segments) {
-    state.requests++;
-    state.mymemory_requests++;
-    const translated = await serializedProviderRequest(async () => {
-      const url = new URL('https://api.mymemory.translated.net/get');
-      url.searchParams.set('q', segment);
-      url.searchParams.set('langpair', myMemoryPair(source, target));
-      url.searchParams.set('mt', '1');
-      if (MYMEMORY_EMAIL) url.searchParams.set('de', MYMEMORY_EMAIL);
-      const response = await fetchWithTimeout(url, {
-        headers: {
-          accept: 'application/json',
-          'user-agent': 'KakaWeb3-SharedContentTranslation/1.0',
-        },
-      });
-      const raw = await response.text();
-      if (!response.ok) throw new Error(`mymemory_http_${response.status}:${raw.slice(0, 180)}`);
-      let payload = null;
-      try { payload = JSON.parse(raw); } catch (_) {}
-      const result = decodeHtmlEntities(payload?.responseData?.translatedText || '');
-      if (!result) throw new Error('mymemory_translation_empty');
-      return result;
-    });
-    out.push(translated);
-  }
-  return normalizeWhitespace(out.join('\n'));
-}
-
 async function translateField(raw, source, target) {
-  const value = normalizeWhitespace(raw);
-  if (!value) return '';
-  if (GOOGLE_API_KEY) return translateGoogle(value, source, target);
-  return translateMyMemory(value, source, target);
+  const segments = splitText(raw);
+  if (!segments.length) return '';
+  const translated = [];
+  for (const segment of segments) translated.push(await translateGoogleSegment(segment, source, target));
+  return normalizeWhitespace(translated.join('\n\n'));
 }
 
 function normalizeTranslations(raw) {
@@ -227,30 +271,23 @@ export async function translateContentFields({ fields, existingTranslations = {}
   if (!ENABLED || !Object.keys(normalizedFields).length) {
     return { changed: false, source_hash: sourceHash, translations: existing, translated_fields: 0 };
   }
+  if (!GOOGLE_API_KEY) throw new Error('translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY');
 
   const needed = [];
   for (const [field, value] of Object.entries(normalizedFields)) {
     const source = detectContentLanguage(value);
     const target = targetForSource(source);
-    if (!target) {
-      state.skipped_unclassified++;
-      continue;
-    }
-    if (source === target) {
-      state.skipped_same_language++;
-      continue;
-    }
+    if (!target) { state.skipped_unclassified++; continue; }
     needed.push({ field, value, source, target });
   }
   if (!needed.length) {
     return { changed: existingSourceHash !== sourceHash, source_hash: sourceHash, translations: {}, translated_fields: 0 };
   }
 
-  // A content edit invalidates the old translation atomically; never expose stale translated text.
+  // Source edits atomically invalidate stale translations.
   const next = existingSourceHash === sourceHash ? existing : {};
   let translatedFields = 0;
   let changed = existingSourceHash !== sourceHash;
-
   for (const job of needed) {
     const current = text(next?.[job.target]?.[job.field]);
     if (current && existingSourceHash === sourceHash) continue;
@@ -272,10 +309,14 @@ export async function translateContentFields({ fields, existingTranslations = {}
       throw error;
     }
   }
-
   return { changed, source_hash: sourceHash, translations: next, translated_fields: translatedFields };
 }
 
 export function getSharedTranslationHealth() {
-  return { ...state };
+  return {
+    ...state,
+    configured: Boolean(GOOGLE_API_KEY),
+    provider_mode: GOOGLE_API_KEY ? 'google_cloud_translation_v2' : 'google_cloud_translation_key_required',
+    cooldown_until: cooldownUntilMs > Date.now() ? new Date(cooldownUntilMs).toISOString() : null,
+  };
 }

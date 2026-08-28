@@ -470,6 +470,7 @@ async function supabaseFetch(path, init = {}) {
 
 async function translateSocialPublicSnapshot() {
   if (translationBackfillInFlight || !state.supabaseConfigured || !publicEventsSnapshot.length) return false;
+  if (!getSharedTranslationHealth().configured) { state.translationLastError = 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY'; return false; }
   translationBackfillInFlight = true;
   state.translationRuns++;
   state.translationLastRunAt = nowIso();

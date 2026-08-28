@@ -21,6 +21,7 @@ const DB_RELOAD_MS = 30 * 60_000;
 const HTML_MAX_BYTES = 3 * 1024 * 1024;
 const TRANSLATION_TICK_MS = 60_000;
 const TRANSLATION_ROWS_PER_TICK = 5;
+const TRANSLATION_WINDOW_ROWS = Math.max(25, Math.min(100, Number(process.env.KAKA_AIRDROP_TRANSLATION_WINDOW_ROWS || 60) || 60));
 
 const OFFICIAL_SOURCES = Object.freeze([
   {
@@ -1045,14 +1046,19 @@ function translationPriority(row) {
 }
 async function translateAirdropSnapshot() {
   if (translationBackfillInFlight || !state.supabaseConfigured || !publicSnapshot.length) return false;
+  if (!getSharedTranslationHealth().configured) { state.translationLastError = 'translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY'; return false; }
   translationBackfillInFlight = true;
   state.translationRuns++;
   state.translationLastRunAt = nowIso();
   try {
-    const pending = publicSnapshot
+    // Translate only the bounded hot/relevant window. Do not drain the entire
+    // historical airdrop archive just because a translation provider is available.
+    const translationWindow = [...publicSnapshot]
       .filter((row) => text(row?.source_event_id))
-      .filter((row) => text(row?.translation_source_hash) !== contentTranslationHash(translationFieldsForAirdrop(row)))
-      .sort((a, b) => translationPriority(b) - translationPriority(a));
+      .sort((a, b) => translationPriority(b) - translationPriority(a))
+      .slice(0, TRANSLATION_WINDOW_ROWS);
+    const pending = translationWindow
+      .filter((row) => text(row?.translation_source_hash) !== contentTranslationHash(translationFieldsForAirdrop(row)));
     // Provider-balanced backlog: each cycle prioritizes one missing row from every
     // official provider so no platform waits behind a large OKX/Gate history set.
     const candidates = [];
@@ -1243,6 +1249,8 @@ function publicHealth() {
       last_run_at: state.translationLastRunAt,
       last_success_at: state.translationLastSuccessAt,
       last_error: state.translationLastError,
+      hot_window_rows: TRANSLATION_WINDOW_ROWS,
+      rows_per_tick: TRANSLATION_ROWS_PER_TICK,
       shared_service: getSharedTranslationHealth(),
     },
     official_domain_whitelist_only: true,

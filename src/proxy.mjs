@@ -31,12 +31,13 @@ import { installProviderGovernorFetch, getProviderGovernorHealth, runProviderGov
 import { startCollectorIsolationSupervisor, proxyIsolatedCollectorRequest, requestIsolatedJson, getCollectorIsolationHealth, stopCollectorIsolationSupervisor } from './collector-isolation.mjs';
 import { startKlineAssetRankCollector, handleKlineAssetRank, getKlineAssetRankHealth } from './kline-asset-rank.mjs';
 import { getSocialWatchHealth, handleSocialWatch, startSocialWatch, stopSocialWatch } from './social-watch.mjs';
+import { getContentPublicationTranslationHealth, handleContentPublicationTranslation, startContentPublicationTranslation, stopContentPublicationTranslation } from './content-publication-translation.mjs';
 import { getAirdropWatchHealth, handleAirdropWatch, startAirdropWatch, stopAirdropWatch } from './airdrop-watch.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.197.3.3.20';
+const STEP_VERSION = '650.8.15.197.3.3.21';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -50,6 +51,7 @@ startProjectFundamentalsCollector();
 startStockCatalogV2Collector();
 startKlineAssetRankCollector({ requestIsolatedJson, getMarketLightInternalSnapshot });
 startSocialWatch();
+startContentPublicationTranslation();
 startAirdropWatch();
 let shuttingDown = false;
 
@@ -539,6 +541,7 @@ const server = http.createServer(async (req, res) => {
       version: STEP_VERSION,
       social_watch: getSocialWatchHealth(),
       airdrop_watch: getAirdropWatchHealth(),
+      content_publication_translation: getContentPublicationTranslationHealth(),
       step1028_7_http_transport: {
         keep_alive_timeout_ms: server.keepAliveTimeout,
         headers_timeout_ms: server.headersTimeout,
@@ -1293,6 +1296,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (await handleSocialWatch(req, res, url)) return;
+  if (await handleContentPublicationTranslation(req, res, url)) return;
   if (await handleAirdropWatch(req, res, url)) return;
   if (await handleRealityRankedPage(req, res, url)) return;
   if (await handleKlineAssetRank(req, res, url)) return;
@@ -1376,6 +1380,7 @@ function shutdown(signal) {
   shuttingDown = true;
   stopCollectorIsolationSupervisor();
   stopSocialWatch();
+  stopContentPublicationTranslation();
   stopAirdropWatch();
   beginBinanceRestShutdown(`shutdown:${signal}`);
   console.log(`[Step${STEP_VERSION}] shutdown ${signal}; new Binance REST blocked immediately`);
