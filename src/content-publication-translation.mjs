@@ -25,6 +25,16 @@ const ARTICLE_SHORT_BODY_CHARS = Math.max(300, Math.min(4000, Number(process.env
 const ARTICLE_BODY_PER_TICK = Math.max(0, Math.min(2, Number(process.env.KAKA_TRANSLATION_ARTICLE_BODY_PER_TICK || 1) || 1));
 const TICK_MS = Math.max(15_000, Math.min(10 * 60_000, Number(process.env.KAKA_TRANSLATION_PUBLICATION_TICK_MS || 60_000) || 60_000));
 const IDLE_TICK_MS = Math.max(TICK_MS, Math.min(15 * 60_000, Number(process.env.KAKA_TRANSLATION_PUBLICATION_IDLE_TICK_MS || 180_000) || 180_000));
+const OFFICIAL_ENGLISH_NEWS_SOURCE_KEYS = Object.freeze([
+  'sec_official_press',
+  'cftc_official_enforcement',
+  'cftc_official_general',
+  'ethereum_foundation_blog',
+]);
+const OFFICIAL_ENGLISH_NEWS_SCAN_LIMIT = Math.max(20, Math.min(100, Number(process.env.KAKA_TRANSLATION_OFFICIAL_EN_NEWS_SCAN_LIMIT || 80) || 80));
+const OFFICIAL_ENGLISH_NEWS_TITLE_PER_TICK = Math.max(1, Math.min(8, Number(process.env.KAKA_TRANSLATION_OFFICIAL_EN_NEWS_TITLE_PER_TICK || 6) || 6));
+const OFFICIAL_ENGLISH_NEWS_BODY_MAX_CHARS = Math.max(900, Math.min(2400, Number(process.env.KAKA_TRANSLATION_OFFICIAL_EN_NEWS_BODY_MAX_CHARS || 1600) || 1600));
+const OFFICIAL_ENGLISH_NEWS_BODY_PER_TICK = Math.max(0, Math.min(3, Number(process.env.KAKA_TRANSLATION_OFFICIAL_EN_NEWS_BODY_PER_TICK || 2) || 2));
 
 const state = {
   schema: SCHEMA,
@@ -54,6 +64,10 @@ const state = {
   last_error: null,
   pending_news_titles: 0,
   pending_news_short_bodies: 0,
+  official_english_source_keys: OFFICIAL_ENGLISH_NEWS_SOURCE_KEYS,
+  official_english_body_max_chars: OFFICIAL_ENGLISH_NEWS_BODY_MAX_CHARS,
+  pending_official_english_titles: 0,
+  pending_official_english_short_bodies: 0,
   pending_article_titles: 0,
   pending_article_short_bodies: 0,
 };
@@ -106,6 +120,12 @@ async function loadNews() {
   const rows = await supabaseFetch(`${NEWS_TABLE}?is_active=eq.true&select=id,title,content,translations,translation_source_hash,translation_updated_at,published_at,updated_at&order=sort_order.asc,published_at.desc&limit=${NEWS_SCAN_LIMIT}`);
   return Array.isArray(rows) ? rows : [];
 }
+async function loadOfficialEnglishNews() {
+  state.scan_reads++;
+  const sourceFilter = OFFICIAL_ENGLISH_NEWS_SOURCE_KEYS.join(',');
+  const rows = await supabaseFetch(`${NEWS_TABLE}?is_active=eq.true&primary_source_key=in.(${sourceFilter})&select=id,title,content,translations,translation_source_hash,translation_updated_at,published_at,updated_at,primary_source_key&order=published_at.desc&limit=${OFFICIAL_ENGLISH_NEWS_SCAN_LIMIT}`);
+  return Array.isArray(rows) ? rows : [];
+}
 async function loadArticles() {
   state.scan_reads++;
   const rows = await supabaseFetch(`${ARTICLES_TABLE}?status=eq.published&select=id,title,summary,content,status,visibility_type,translations,translation_source_hash,translation_updated_at,created_at,edited_by_user_at&order=is_top.desc,created_at.desc&limit=${ARTICLE_SCAN_LIMIT}`);
@@ -155,20 +175,36 @@ async function runOnce() {
   state.runs++;
   state.last_run_at = nowIso();
   try {
-    const [newsRows, articleRows] = await Promise.all([loadNews(), loadArticles()]);
-    const pendingNewsTitles = newsRows.filter((row) => needs(row, newsFields, ['title']));
+    const [newsRows, articleRows, officialEnglishRows] = await Promise.all([loadNews(), loadArticles(), loadOfficialEnglishNews()]);
+    const officialIds = new Set(officialEnglishRows.map((row) => text(row?.id)).filter(Boolean));
+    const pendingOfficialEnglishTitles = officialEnglishRows.filter((row) => needs(row, newsFields, ['title']));
+    const pendingNewsTitles = newsRows.filter((row) => !officialIds.has(text(row?.id)) && needs(row, newsFields, ['title']));
     const pendingArticleTitles = articleRows.filter((row) => needs(row, articleFields, ['title']));
-    const shortNewsRows = newsRows.filter((row) => chars(row?.content) > 0 && chars(row?.content) <= NEWS_SHORT_BODY_CHARS);
+    const shortOfficialEnglishRows = officialEnglishRows.filter((row) => chars(row?.content) > 0 && chars(row?.content) <= OFFICIAL_ENGLISH_NEWS_BODY_MAX_CHARS);
+    const shortNewsRows = newsRows.filter((row) => !officialIds.has(text(row?.id)) && chars(row?.content) > 0 && chars(row?.content) <= NEWS_SHORT_BODY_CHARS);
     const shortArticleRows = articleRows.filter((row) => {
       const bodyChars = chars(row?.summary) + chars(row?.content);
       return bodyChars > 0 && bodyChars <= ARTICLE_SHORT_BODY_CHARS;
     });
+    const pendingOfficialEnglishBodies = shortOfficialEnglishRows.filter((row) => needs(row, newsFields, ['content']));
     const pendingNewsBodies = shortNewsRows.filter((row) => needs(row, newsFields, ['content']));
     const pendingArticleBodies = shortArticleRows.filter((row) => needs(row, articleFields, ['summary', 'content']));
     state.pending_news_titles = pendingNewsTitles.length;
     state.pending_news_short_bodies = pendingNewsBodies.length;
+    state.pending_official_english_titles = pendingOfficialEnglishTitles.length;
+    state.pending_official_english_short_bodies = pendingOfficialEnglishBodies.length;
     state.pending_article_titles = pendingArticleTitles.length;
     state.pending_article_short_bodies = pendingArticleBodies.length;
+
+    // Tiny first-party English feeds get their own bounded priority lane so SEC/CFTC/EF
+    // never sit behind hundreds of already-Chinese high-frequency newsflashes.
+    for (const row of pendingOfficialEnglishTitles.slice(0, OFFICIAL_ENGLISH_NEWS_TITLE_PER_TICK)) {
+      try {
+        await translateRow({ table: NEWS_TABLE, row, fields: newsFields, onlyFields: ['title'], maxSourceChars: 700, counter: 'news_title_rows_translated' });
+      } catch (error) {
+        state.failures++; state.last_error = String(error?.message || error); if (isBudgetStop(error)) break;
+      }
+    }
 
     // Titles first. This makes list browsing useful in Chinese while keeping bodies cheap.
     for (const row of pendingNewsTitles.slice(0, NEWS_TITLE_PER_TICK)) {
@@ -186,7 +222,16 @@ async function runOnce() {
       }
     }
 
-    // Only short English bodies are auto-translated to Chinese. Long bodies wait for a tap.
+    // First-party captured RSS bodies are bounded (currently <=1200 chars), so this dedicated lane can auto-translate them too.
+    if (pendingOfficialEnglishTitles.length === 0 && OFFICIAL_ENGLISH_NEWS_BODY_PER_TICK > 0) {
+      for (const row of pendingOfficialEnglishBodies.slice(0, OFFICIAL_ENGLISH_NEWS_BODY_PER_TICK)) {
+        try {
+          await translateRow({ table: NEWS_TABLE, row, fields: newsFields, onlyFields: ['content'], maxSourceChars: OFFICIAL_ENGLISH_NEWS_BODY_MAX_CHARS, counter: 'news_short_body_rows_translated' });
+        } catch (error) {
+          state.failures++; state.last_error = String(error?.message || error); if (isBudgetStop(error)) break;
+        }
+      }
+    }
     if (pendingNewsTitles.length === 0 && NEWS_BODY_PER_TICK > 0) {
       for (const row of pendingNewsBodies.slice(0, NEWS_BODY_PER_TICK)) {
         try {
@@ -217,7 +262,7 @@ function schedule(delayMs = TICK_MS) {
     try { await runOnce(); }
     finally {
       if (!stopping) {
-        const backlog = state.pending_news_titles > 0 || state.pending_news_short_bodies > 0 || state.pending_article_titles > 0 || state.pending_article_short_bodies > 0;
+        const backlog = state.pending_official_english_titles > 0 || state.pending_official_english_short_bodies > 0 || state.pending_news_titles > 0 || state.pending_news_short_bodies > 0 || state.pending_article_titles > 0 || state.pending_article_short_bodies > 0;
         schedule(backlog ? TICK_MS : IDLE_TICK_MS);
       }
     }

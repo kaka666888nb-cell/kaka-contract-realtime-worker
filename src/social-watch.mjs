@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { contentTranslationHash, getSharedTranslationHealth, translateContentFields, translationNeedsWork } from './content-translation.mjs';
-const STEP_SCHEMA = 'step1046_2_4_1_x_shared_snapshot_celebrity_media_v4';
-const NATIVE_DETAIL_SCHEMA = 'step1046_2_4_1_celebrity_native_detail_media_v2';
+const STEP_SCHEMA = 'step1047_content_lifecycle_social_v1';
+const NATIVE_DETAIL_SCHEMA = 'step1047_celebrity_native_detail_lifecycle_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const X_API_BEARER_TOKEN = String(process.env.X_API_BEARER_TOKEN || '').trim();
@@ -22,7 +22,7 @@ const X_USAGE_MIN_REFRESH_MS = 5 * 60_000;
 const DEFAULT_X_USAGE_REFRESH_MS = 10 * 60_000;
 const PUBLIC_EVENT_CACHE_LIMIT = 1000;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
-const PUBLIC_EVENT_RELOAD_MS = 30 * 60_000;
+const PUBLIC_EVENT_RELOAD_MS = 5 * 60_000;
 const AIRDROP_OFFICIAL_X_HANDLES = new Set(['binance', 'binancewallet']);
 const AIRDROP_RECENT_BACKFILL_MAX_RESULTS = 10;
 const AIRDROP_RECENT_BACKFILL_MAX_ATTEMPTS = 3;
@@ -351,6 +351,8 @@ function refreshPublicAccountsSnapshot(accounts) {
 function publicEventView(row) {
   const translationHash = contentTranslationHash({ content: text(row?.content) });
   const translationFresh = text(row?.translation_source_hash) === translationHash;
+  const lifecycle = text(row?.lifecycle_status).toLowerCase() || 'active';
+  const active = row?.is_active !== false && lifecycle === 'active';
   return {
     id: row?.id ?? null,
     watch_account_id: text(row?.watch_account_id),
@@ -359,6 +361,10 @@ function publicEventView(row) {
     author_handle: normalizeHandle(row?.author_handle),
     author_name: text(row?.author_name),
     content: text(row?.content),
+    is_active: active,
+    lifecycle_status: lifecycle,
+    updated_at: text(row?.updated_at) || null,
+    last_seen_at: text(row?.last_seen_at) || null,
     translations: translationFresh && row?.translations && typeof row.translations === 'object' && !Array.isArray(row.translations) ? row.translations : {},
     translation_source_hash: text(row?.translation_source_hash) || null,
     translation_updated_at: text(row?.translation_updated_at) || null,
@@ -386,7 +392,7 @@ async function loadPublicEventsSnapshot({ force = false } = {}) {
     }
     const inFilter = encodeURIComponent(`(${ids.join(',')})`);
     const rows = await supabaseFetch(
-      `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,media_items,translations,translation_source_hash,translation_updated_at,post_url,published_at,language,notification_created&order=published_at.desc&limit=${PUBLIC_EVENT_CACHE_LIMIT}`,
+      `${EVENTS_TABLE}?watch_account_id=in.${inFilter}&is_active=eq.true&lifecycle_status=eq.active&select=id,watch_account_id,source,source_post_id,author_handle,author_name,content,media_items,translations,translation_source_hash,translation_updated_at,post_url,published_at,language,notification_created,is_active,lifecycle_status,updated_at,last_seen_at&order=published_at.desc&limit=${PUBLIC_EVENT_CACHE_LIMIT}`,
     );
     state.publicSnapshotDbReads++;
     publicEventsSnapshot = (Array.isArray(rows) ? rows : []).map(publicEventView).slice(0, PUBLIC_EVENT_CACHE_LIMIT);
@@ -1238,15 +1244,24 @@ function notificationText(content) {
 
 async function insertEvent(account, post, tag) {
   const postId = text(post?.id);
+  const editHistory = Array.isArray(post?.edit_history_tweet_ids) ? post.edit_history_tweet_ids.map(text).filter(Boolean) : [];
+  const sourcePostId = editHistory[0] || postId;
   const handle = normalizeHandle(account?.handle);
-  if (!postId || !handle) return false;
+  if (!postId || !sourcePostId || !handle) return false;
   const postUrl = `https://x.com/${handle}/status/${postId}`;
   const publishedAt = text(post?.created_at) || nowIso();
   const mediaItems = await prepareSocialPostMedia(postId, post);
   const body = {
     watch_account_id: account.id,
     source: 'x',
-    source_post_id: postId,
+    source_post_id: sourcePostId,
+    is_active: true,
+    lifecycle_status: 'active',
+    last_seen_at: nowIso(),
+    removed_at: null,
+    expired_at: null,
+    lifecycle_reason: '',
+    updated_at: nowIso(),
     author_handle: handle,
     author_name: text(account.display_name),
     content: postFullText(post),
@@ -1256,11 +1271,15 @@ async function insertEvent(account, post, tag) {
     media_items: mediaItems,
     matched_rule_tag: tag,
   };
+  const existingRows = await supabaseFetch(
+    `${EVENTS_TABLE}?source=eq.x&source_post_id=eq.${encodeURIComponent(sourcePostId)}&select=id&limit=1`,
+  );
+  const existed = Array.isArray(existingRows) && Boolean(existingRows[0]?.id);
   const inserted = await supabaseFetch(
     `${EVENTS_TABLE}?on_conflict=source,source_post_id&select=id`,
     {
       method: 'POST',
-      headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
       body: JSON.stringify(body),
     },
   );
@@ -1271,7 +1290,7 @@ async function insertEvent(account, post, tag) {
   if (account?.public_visible === true) {
     publicEventsSnapshot = [
       publicEventView({ id: row.id, ...body, notification_created: false }),
-      ...publicEventsSnapshot.filter((item) => text(item?.source_post_id) !== postId),
+      ...publicEventsSnapshot.filter((item) => text(item?.source_post_id) !== sourcePostId),
     ].slice(0, PUBLIC_EVENT_CACHE_LIMIT);
     state.publicSnapshotLoaded = true;
     state.publicSnapshotLoadedAt = nowIso();
@@ -1281,7 +1300,7 @@ async function insertEvent(account, post, tag) {
   }
 
   let notificationId = null;
-  const shouldNotify = state.autoAppNotification && account.notify_app !== false;
+  const shouldNotify = !existed && state.autoAppNotification && account.notify_app !== false;
   if (shouldNotify) {
     const displayName = text(account.display_name) || `@${handle}`;
     const title = `${displayName} · X 新动态`;

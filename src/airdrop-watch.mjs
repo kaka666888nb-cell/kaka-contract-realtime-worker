@@ -1,5 +1,5 @@
 import { contentTranslationHash, getSharedTranslationHealth, translateContentFields, translationNeedsWork } from './content-translation.mjs';
-const STEP_SCHEMA = 'step1046_2_4_1_airdrop_native_detail_media_v2';
+const STEP_SCHEMA = 'step1047_content_lifecycle_airdrop_v1';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const EVENTS_TABLE = 'app_airdrop_events';
@@ -17,7 +17,7 @@ const BYBIT_STRUCTURED_CONTENT_MIN_CHARS = 20;
 const CONTENT_RETRY_MS = 6 * 60 * 60_000;
 const PUBLIC_CACHE_LIMIT = 600;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
-const DB_RELOAD_MS = 30 * 60_000;
+const DB_RELOAD_MS = 5 * 60_000;
 const HTML_MAX_BYTES = 3 * 1024 * 1024;
 const TRANSLATION_TICK_MS = 60_000;
 const TRANSLATION_ROWS_PER_TICK = 5;
@@ -579,6 +579,10 @@ function publicEventView(row) {
   const translationFresh = text(row?.translation_source_hash) === translationHash;
   return {
     id: row?.id ?? null,
+    is_active: row?.is_active !== false && (text(row?.lifecycle_status).toLowerCase() || 'active') === 'active',
+    lifecycle_status: text(row?.lifecycle_status).toLowerCase() || 'active',
+    last_seen_at: text(row?.last_seen_at) || null,
+    removed_at: text(row?.removed_at) || null,
     provider,
     provider_name: text(row?.provider_name),
     // Recompute provider taxonomy for every public row, including historical DB seed rows.
@@ -624,11 +628,13 @@ function mergePublicSnapshot(rows) {
   const byKey = new Map();
   for (const oldRow of publicSnapshot) {
     const row = publicEventView(oldRow);
+    if (!row.is_active || row.lifecycle_status !== 'active') continue;
     const key = row.source_event_id || `${row.provider}|${row.source_url}`;
     if (key) byKey.set(key, row);
   }
   for (const incoming of rows) {
     const row = publicEventView(incoming);
+    if (!row.is_active || row.lifecycle_status !== 'active') continue;
     const key = row.source_event_id || `${row.provider}|${row.source_url}`;
     if (!key) continue;
     const previous = byKey.get(key) || {};
@@ -651,6 +657,14 @@ function mergePublicSnapshot(rows) {
   state.publicSnapshotRows = publicSnapshot.length;
   state.publicSnapshotLoaded = true;
 }
+function replacePublicSnapshot(rows) {
+  publicSnapshot = sortSnapshot((Array.isArray(rows) ? rows : [])
+    .map(publicEventView)
+    .filter((row) => row.is_active && row.lifecycle_status === 'active'))
+    .slice(0, PUBLIC_CACHE_LIMIT);
+  state.publicSnapshotRows = publicSnapshot.length;
+  state.publicSnapshotLoaded = true;
+}
 async function supabaseFetch(path, init = {}) {
   if (!state.supabaseConfigured) throw new Error('airdrop_watch_supabase_not_configured');
   const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
@@ -666,9 +680,9 @@ async function supabaseFetch(path, init = {}) {
 async function loadDbSnapshot({ force = false } = {}) {
   if (!state.supabaseConfigured) return false;
   if (!force && dbLoadedAtMs && Date.now() - dbLoadedAtMs < DB_RELOAD_MS) return false;
-  const rows = await supabaseFetch(`${EVENTS_TABLE}?select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at&order=published_at.desc.nullslast,fetched_at.desc&limit=${PUBLIC_CACHE_LIMIT}`);
+  const rows = await supabaseFetch(`${EVENTS_TABLE}?is_active=eq.true&lifecycle_status=eq.active&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at,is_active,lifecycle_status,last_seen_at,removed_at&order=published_at.desc.nullslast,fetched_at.desc&limit=${PUBLIC_CACHE_LIMIT}`);
   state.publicSnapshotDbReads++;
-  mergePublicSnapshot(Array.isArray(rows) ? rows : []);
+  replacePublicSnapshot(Array.isArray(rows) ? rows : []);
   dbLoadedAtMs = Date.now();
   state.lastDbLoadAt = nowIso();
   return true;
@@ -824,6 +838,7 @@ function rowsFromSocialXEvents(events, source) {
 }
 
 async function collectSocialXSource(source, sourceState) {
+  sourceState.last_collection_complete = false;
   const handles = (source.social_x_handles || []).map((handle) => text(handle)).filter(Boolean);
   if (!handles.length || !state.supabaseConfigured) return [];
   const handleFilter = handles.join(',');
@@ -833,7 +848,7 @@ async function collectSocialXSource(source, sourceState) {
     state.sharedBridgeReads++;
     sourceState.bridge_reads = finiteNumber(sourceState.bridge_reads, 0) + 1;
     const events = await supabaseFetch(
-      `${SOCIAL_EVENTS_TABLE}?source=eq.x&author_handle=in.(${handleFilter})&select=source_post_id,author_handle,author_name,content,post_url,published_at,media_items&order=published_at.desc&limit=100`,
+      `${SOCIAL_EVENTS_TABLE}?source=eq.x&is_active=eq.true&lifecycle_status=eq.active&author_handle=in.(${handleFilter})&select=source_post_id,author_handle,author_name,content,post_url,published_at,media_items&order=published_at.desc&limit=100`,
     );
     rows = rowsFromSocialXEvents(events, source);
     if (rows.length || attempt === firstCycleAttempts - 1) break;
@@ -847,6 +862,7 @@ async function collectSocialXSource(source, sourceState) {
   sourceState.refreshes = finiteNumber(sourceState.refreshes, 0) + 1;
   sourceState.last_success_at = nowIso();
   sourceState.last_error = null;
+  sourceState.last_collection_complete = true;
   return rows;
 }
 
@@ -865,11 +881,16 @@ async function collectSource(source) {
   const knownById = new Map(publicSnapshot.filter((row) => row.provider === source.provider).map((row) => [row.source_event_id, row]));
   const candidatesByKey = new Map();
   let structuredSourceHealthy = false;
+  let sourceAttempts = 0;
+  let sourceSuccesses = 0;
+  let sourceHadNotModified = false;
   for (const root of source.json_roots || []) {
+    sourceAttempts++;
     try {
       const result = await fetchHtml(root, source.id);
+      sourceSuccesses++;
       structuredSourceHealthy = true;
-      if (result.notModified) continue;
+      if (result.notModified) { sourceHadNotModified = true; continue; }
       const extracted = source.provider === 'bybit'
         ? extractBybitApiCandidates(result.html, source)
         : [];
@@ -886,9 +907,11 @@ async function collectSource(source) {
   // a redundant webpage request on every normal refresh.
   if (!structuredSourceHealthy) {
     for (const root of source.roots || []) {
+      sourceAttempts++;
       try {
         const result = await fetchHtml(root, source.id);
-        if (result.notModified) continue;
+        sourceSuccesses++;
+        if (result.notModified) { sourceHadNotModified = true; continue; }
         for (const candidate of extractCandidates(result.html, source, result.finalUrl || root)) {
           const id = sourceEventId(source.provider, candidate.source_url, candidate.title);
           if (!candidatesByKey.has(id)) candidatesByKey.set(id, candidate);
@@ -939,6 +962,7 @@ async function collectSource(source) {
   // Step1045.3: the old optional metadata-detail fan-out is fully disabled.
   // Native detail body synchronization is handled only by enrichSourceContent().
   sourceState.last_new_detail_fetches = 0;
+  sourceState.last_collection_complete = sourceAttempts > 0 && sourceSuccesses === sourceAttempts && !sourceHadNotModified;
   sourceState.refreshes = finiteNumber(sourceState.refreshes, 0) + 1;
   if (rows.length || sourceState.last_error == null) {
     sourceState.last_success_at = nowIso();
@@ -1070,10 +1094,16 @@ async function persistRows(rows) {
     content_fetched_at: contentUsableForProvider(row.provider, row.content_text) ? (row.content_fetched_at || nowIso()) : null,
     media_items: normalizeContentMediaItems(row.media_items),
     fetched_at: nowIso(),
+    is_active: true,
+    lifecycle_status: 'active',
+    last_seen_at: nowIso(),
+    removed_at: null,
+    expired_at: null,
+    lifecycle_reason: '',
     updated_at: nowIso(),
   });
   });
-  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at`, {
+  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at,is_active,lifecycle_status,last_seen_at,removed_at`, {
     method: 'POST',
     headers: { prefer: 'resolution=merge-duplicates,return=representation' },
     body: JSON.stringify(payload),
@@ -1244,6 +1274,28 @@ function scheduleTranslationTick(delayMs = TRANSLATION_TICK_MS) {
   translationTimer.unref?.();
 }
 
+async function reconcileAirdropProviderWindow(source, rows) {
+  if (!state.supabaseConfigured || source?.last_collection_complete !== true) return null;
+  const cutoff = Date.now() - 7 * 24 * 60 * 60_000;
+  const recent = (Array.isArray(rows) ? rows : [])
+    .map((row) => ({ row, ms: Date.parse(text(row?.published_at)) }))
+    .filter((item) => Number.isFinite(item.ms) && item.ms >= cutoff)
+    .sort((a, b) => a.ms - b.ms);
+  if (recent.length < 2) return null;
+  const windowStart = new Date(recent[0].ms).toISOString();
+  const windowEnd = new Date(recent[recent.length - 1].ms).toISOString();
+  const ids = [...new Set(recent.map((item) => text(item.row?.source_event_id)).filter(Boolean))];
+  if (ids.length < 2) return null;
+  return supabaseFetch('rpc/app_edge_reconcile_airdrop_provider_window', {
+    method: 'POST',
+    body: JSON.stringify({
+      p_provider: source.provider,
+      p_source_event_ids: ids,
+      p_window_start: windowStart,
+      p_window_end: windowEnd,
+    }),
+  });
+}
 async function refreshOnce({ force = false } = {}) {
   if (refreshPromise && !force) return refreshPromise;
   refreshPromise = (async () => {
@@ -1255,12 +1307,18 @@ async function refreshOnce({ force = false } = {}) {
         try { await loadDbSnapshot({ force: true }); } catch (error) { state.lastError = `db_load:${String(error?.message || error)}`; }
       }
       const rows = [];
+      const reconcileGroups = [];
       // Run sources sequentially to keep outbound pressure flat and bounded.
       for (const source of OFFICIAL_SOURCES) {
         if (stopping) break;
         try {
           const sourceRows = await collectSource(source);
-          rows.push(...await enrichSourceContent(source, sourceRows));
+          const enrichedRows = await enrichSourceContent(source, sourceRows);
+          rows.push(...enrichedRows);
+          const sourceState = state.sourceStates[source.id] || {};
+          if (sourceState.last_collection_complete === true) {
+            reconcileGroups.push({ source: { ...source, last_collection_complete: true }, rows: enrichedRows });
+          }
         } catch (error) {
           const sourceState = state.sourceStates[source.id] ||= {};
           sourceState.last_error = String(error?.message || error);
@@ -1274,6 +1332,17 @@ async function refreshOnce({ force = false } = {}) {
           try {
             const persisted = await persistRows(rows);
             if (persisted.length) mergePublicSnapshot(persisted);
+            let reconciled = false;
+            for (const group of reconcileGroups) {
+              try {
+                const result = await reconcileAirdropProviderWindow(group.source, group.rows);
+                if (result) reconciled = true;
+              } catch (error) {
+                const sourceState = state.sourceStates[group.source.id] ||= {};
+                sourceState.lifecycle_reconcile_error = String(error?.message || error);
+              }
+            }
+            if (reconciled) await loadDbSnapshot({ force: true });
           } catch (error) {
             state.persistFailures++;
             state.lastError = `persist:${String(error?.message || error)}`;
