@@ -1,0 +1,161 @@
+name: Step1049.2 live cross-chain search pool units
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/onchain-market.mjs'
+      - 'src/proxy.mjs'
+      - '.github/workflows/step1049_2-live-search-pool-units.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  live-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait Render Auto-Deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          EXPECTED='650.8.15.197.3.3.29.2'
+          for i in $(seq 1 90); do
+            body="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
+            version="$(printf '%s' "$body" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
+            echo "render_poll=$i version=$version"
+            if [ "$version" = "$EXPECTED" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "Render did not reach $EXPECTED" >&2
+          exit 1
+
+      - name: Backend self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/onchain/self-test" -o /tmp/self.json
+          python3 - <<'PY'
+          import json
+          body=json.load(open('/tmp/self.json'))
+          tests={x.get('name'):x for x in body.get('tests',[])}
+          required=[
+            'step1049_2_trusted_usdt_beats_higher_liquidity_native',
+            'step1049_2_fake_usdt_symbol_not_trusted',
+            'step1049_2_dust_stable_does_not_beat_healthy_native',
+            'step1049_2_search_refinements_cover_bsc_and_solana_quotes',
+            'step1049_2_kline_volume_semantics_usd',
+            'cross_chain_substitution_false',
+            'cross_token_substitution_false',
+            'direct_app_upstream_zero',
+          ]
+          for name in required:
+              assert tests.get(name,{}).get('pass') is True, (name,tests.get(name))
+              print('PASS self-test',name)
+          PY
+
+      - name: Real cross-chain searches
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          mkdir -p /tmp/step1049_2
+          python3 - <<'PY'
+          import urllib.parse, pathlib
+          for name,q in [('jingtian','景甜'),('pepe','pepe'),('cat','cat'),('doge','doge')]:
+              pathlib.Path(f'/tmp/step1049_2/{name}.url').write_text(
+                  'https://kaka-contract-realtime-worker.onrender.com/api/onchain/search?'+
+                  urllib.parse.urlencode({'q':q,'limit':50})
+              )
+          PY
+          for name in jingtian pepe cat doge; do
+            url="$(cat /tmp/step1049_2/$name.url)"
+            ok=0
+            for attempt in $(seq 1 4); do
+              code="$(curl -sS --connect-timeout 8 --max-time 35 -o "/tmp/step1049_2/$name.json" -w '%{http_code}' "$url" || true)"
+              echo "query=$name attempt=$attempt http=$code"
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 12
+            done
+            test "$ok" = "1"
+          done
+          python3 - <<'PY'
+          import json, math
+
+          expected_schema='step1049_2_onchain_search_coverage_quote_priority_units_v1'
+          expected_rank='default_pool_then_liquidity_desc_24h_volume_activity_v3'
+          expected_policy='trusted_stable_then_native_then_other_exact_token_v1'
+          expected_discovery='dexscreener_base_plus_quote_refinement_v1'
+          bsc_stables={
+            '0x55d398326f99059ff775485246999027b3197955',
+            '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d',
+          }
+
+          def n(v):
+              try:
+                  x=float(v)
+                  return x if math.isfinite(x) and x>0 else 0.0
+              except Exception:
+                  return 0.0
+          def activity(pool,p):
+              tx=((pool or {}).get('txns') or {}).get(p) or {}
+              return n(tx.get('buys'))+n(tx.get('sells'))
+          def rank(row):
+              p=row.get('best_pool') or {}
+              return (n(p.get('liquidity_usd')),n((p.get('volume_usd') or {}).get('h24')),activity(p,'h24'),activity(p,'h1'),activity(p,'m5'))
+
+          for name in ('jingtian','pepe','cat','doge'):
+              body=json.load(open(f'/tmp/step1049_2/{name}.json'))
+              assert body.get('ok') is True,(name,body.get('error'))
+              assert body.get('feature_schema_version')==expected_schema,(name,body.get('feature_schema_version'))
+              assert body.get('search_rank_rule_version')==expected_rank
+              assert body.get('default_pool_policy_version')==expected_policy
+              assert body.get('search_discovery_version')==expected_discovery
+              assert body.get('liquidity_unit')=='usd'
+              assert body.get('volume_24h_unit')=='usd'
+              rows=body.get('rows') or []
+              assert rows,name+' empty'
+              prev=None
+              ids=set()
+              for i,row in enumerate(rows):
+                  net=str(row.get('network') or '')
+                  tok=row.get('token') or {}
+                  addr=str(tok.get('address') or '')
+                  pool=row.get('best_pool') or {}
+                  pool_addr=str(pool.get('pool_address') or '')
+                  assert net and addr and pool_addr,(name,i)
+                  ident=(net,addr if net=='solana' else addr.lower())
+                  assert ident not in ids,(name,'duplicate exact token',ident)
+                  ids.add(ident)
+                  cur=rank(row)
+                  if prev is not None: assert prev>=cur,(name,'rank broken',i,prev,cur)
+                  prev=cur
+              print('PASS',name,'rows',len(rows),'networks',body.get('search_networks_present'))
+
+          jt=json.load(open('/tmp/step1049_2/jingtian.json'))
+          nets=set(jt.get('search_networks_present') or [])
+          assert 'solana' in nets,('jingtian missing solana',nets)
+          assert 'bsc' in nets,('jingtian missing bsc',nets)
+          bsc=[r for r in jt.get('rows',[]) if r.get('network')=='bsc']
+          assert bsc,'jingtian BSC rows missing'
+          stable=[r for r in bsc if str(((r.get('best_pool') or {}).get('quote_token') or {}).get('address') or '').lower() in bsc_stables]
+          assert stable, 'jingtian BSC trusted USDT/USDC result missing'
+          print('PASS 景甜 includes Solana+BSC and BSC trusted stable-quote result')
+          PY
+
+      - name: Repeated read stability
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for q in '%E6%99%AF%E7%94%9C' pepe; do
+            for i in $(seq 1 10); do
+              code="$(curl -sS --connect-timeout 8 --max-time 25 -o /tmp/repeat.json -w '%{http_code}' "$BASE/api/onchain/search?q=$q&limit=50" || true)"
+              echo "q=$q repeat=$i http=$code"
+              test "$code" = "200"
+            done
+          done
+          echo "PASS repeated shared search reads"

@@ -8,14 +8,43 @@
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { KAKA_FULL_INTERVALS, KAKA_DERIVED_PLAN, klineIntervalMs, klineDerivedPlan, deriveAndFillKlines } from './kline-derived.mjs';
 
-const VERSION = '650.8.15.197.3';
-const DATA_VERSION = 1042000;
+const VERSION = '650.8.15.197.3.2';
+const DATA_VERSION = 1049002;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
 const STEP1040_FEATURE_SCHEMA_VERSION = 'step1040_onchain_wallet_relationship_evidence_v1';
 const STEP1041_FEATURE_SCHEMA_VERSION = 'step1041_onchain_final_productization_v1';
 const STEP1042_FEATURE_SCHEMA_VERSION = 'step1042_onchain_multichain_smart_money_v1';
+const STEP1049_2_FEATURE_SCHEMA_VERSION = 'step1049_2_onchain_search_coverage_quote_priority_units_v1';
+const STEP1049_2_SEARCH_RANK_RULE_VERSION = 'default_pool_then_liquidity_desc_24h_volume_activity_v3';
+const STEP1049_2_DEFAULT_POOL_POLICY_VERSION = 'trusted_stable_then_native_then_other_exact_token_v1';
+const STEP1049_2_SEARCH_DISCOVERY_VERSION = 'dexscreener_base_plus_quote_refinement_v1';
+const STEP1049_2_KLINE_UNITS_VERSION = 'step1049_2_usd_ohlcv_v1';
+const STEP1049_2_DEFAULT_QUOTE_MIN_LIQUIDITY_USD = 1_000;
+const STEP1049_2_SEARCH_QUERY_SUFFIXES = Object.freeze(['', 'USDT', 'USDC', 'WBNB', 'WETH', 'SOL']);
+const STEP1049_2_TRUSTED_STABLE_QUOTES = Object.freeze({
+  ethereum: Object.freeze(['0xdac17f958d2ee523a2206206994597c13d831ec7', '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48']),
+  bsc: Object.freeze(['0x55d398326f99059ff775485246999027b3197955', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d']),
+  base: Object.freeze(['0x833589fcd6edb6e08f4c7c32d4f71b54bda02913']),
+  solana: Object.freeze(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB']),
+  arbitrum: Object.freeze(['0xaf88d065e77c8cc2239327c5edb3a432268e5831']),
+  polygon: Object.freeze(['0x3c499c542cef5e3811e1192ce70d8cc03d5c3359']),
+  optimism: Object.freeze(['0x0b2c639c533813f4aa9d7837caf62653d097ff85']),
+  avalanche: Object.freeze(['0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e', '0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7']),
+  linea: Object.freeze(['0x176211869ca2b568f2a7d4ee941e073a821ee1ff']),
+});
+const STEP1049_2_TRUSTED_NATIVE_QUOTES = Object.freeze({
+  ethereum: Object.freeze(['0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2']),
+  bsc: Object.freeze(['0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c']),
+  base: Object.freeze(['0x4200000000000000000000000000000000000006']),
+  solana: Object.freeze(['So11111111111111111111111111111111111111112']),
+  arbitrum: Object.freeze(['0x82af49447d8a07e3bd95bd0d56f35241523fbab1']),
+  polygon: Object.freeze(['0x0d500b1d8e8ed17ae45cbcdcc54d21f1270e690']),
+  optimism: Object.freeze(['0x4200000000000000000000000000000000000006']),
+  avalanche: Object.freeze(['0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7']),
+  linea: Object.freeze(['0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f']),
+});
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -3439,11 +3468,40 @@ function poolVolume24h(row) { return Math.max(0, Number(row?.volume_usd?.h24 || 
 function poolActivity(row, period) {
   return Math.max(0, Number(row?.txns?.[period]?.buys || 0) + Number(row?.txns?.[period]?.sells || 0));
 }
-// Step1049.1: keep this search-only. Do not alter pool identity, hot discovery,
-// token detail, K-line identity or cache-key behavior outside the search route.
-function searchTokenIdentityKey(network, address) {
+// Step1049.2 exact search identity + exact-token default pool policy.
+// Hot/trending ranking remains untouched. Quote priority is only for selecting
+// one default pool within the SAME exact network+token contract.
+function searchCanonicalAddress(network, address) {
   const raw = text(address);
-  return `${network}|${network === 'solana' ? raw : lower(raw)}`;
+  return network === 'solana' ? raw : lower(raw);
+}
+function searchTokenIdentityKey(network, address) {
+  return `${network}|${searchCanonicalAddress(network, address)}`;
+}
+function searchAddressEqual(network, left, right) {
+  return searchCanonicalAddress(network, left) === searchCanonicalAddress(network, right);
+}
+function step1049RegistryHas(registry, network, address) {
+  const candidate = searchCanonicalAddress(network, address);
+  return (registry[network] || []).some((value) => searchCanonicalAddress(network, value) === candidate);
+}
+function companionTokenForExactPool(pool, tokenAddress) {
+  if (searchAddressEqual(pool?.network, pool?.base_token?.address, tokenAddress)) return pool?.quote_token || null;
+  if (searchAddressEqual(pool?.network, pool?.quote_token?.address, tokenAddress)) return pool?.base_token || null;
+  return null;
+}
+function step1049DefaultQuoteMeta(pool, tokenAddress) {
+  const companion = companionTokenForExactPool(pool, tokenAddress);
+  const address = text(companion?.address);
+  const symbol = text(companion?.symbol);
+  const eligibleLiquidity = poolLiquidity(pool) >= STEP1049_2_DEFAULT_QUOTE_MIN_LIQUIDITY_USD;
+  if (address && eligibleLiquidity && step1049RegistryHas(STEP1049_2_TRUSTED_STABLE_QUOTES, pool?.network, address)) {
+    return { tier: 0, tier_name: 'trusted_stable', symbol, address, exact_contract_verified: true };
+  }
+  if (address && eligibleLiquidity && step1049RegistryHas(STEP1049_2_TRUSTED_NATIVE_QUOTES, pool?.network, address)) {
+    return { tier: 1, tier_name: 'trusted_native', symbol, address, exact_contract_verified: true };
+  }
+  return { tier: 2, tier_name: 'other', symbol, address, exact_contract_verified: false };
 }
 function compareSearchPoolPriority(a, b) {
   return poolLiquidity(b) - poolLiquidity(a)
@@ -3452,6 +3510,14 @@ function compareSearchPoolPriority(a, b) {
     || poolActivity(b, 'h1') - poolActivity(a, 'h1')
     || poolActivity(b, 'm5') - poolActivity(a, 'm5')
     || String(a?.pool_address || '').localeCompare(String(b?.pool_address || ''));
+}
+function compareExactTokenDefaultPool(a, b, tokenAddress) {
+  const aMeta = step1049DefaultQuoteMeta(a, tokenAddress);
+  const bMeta = step1049DefaultQuoteMeta(b, tokenAddress);
+  return aMeta.tier - bMeta.tier || compareSearchPoolPriority(a, b);
+}
+function sortExactTokenDefaultPools(rows, tokenAddress) {
+  return [...(rows || [])].sort((a, b) => compareExactTokenDefaultPool(a, b, tokenAddress));
 }
 function poolScore(row) {
   // Legacy quality helper. Pool *selection* is no longer based on this score.
@@ -3508,6 +3574,8 @@ function tokenCentricRow(pair, token, extra = {}) {
     chain_id: pair.chain_id,
     token: { ...token },
     best_pool: pair,
+    default_pool_quote: step1049DefaultQuoteMeta(pair, token?.address),
+    default_pool_policy_version: STEP1049_2_DEFAULT_POOL_POLICY_VERSION,
     token_orientation: orientation,
     token_market_fields_verified: baseVerified,
     price_usd: baseVerified ? pair.price_usd : null,
@@ -3528,7 +3596,11 @@ function chooseBetterTokenRow(current, candidate) {
   if (!current) return candidate;
   if (candidate.token_market_fields_verified && !current.token_market_fields_verified) return candidate;
   if (!candidate.token_market_fields_verified && current.token_market_fields_verified) return current;
-  return compareSearchPoolPriority(candidate.best_pool, current.best_pool) < 0 ? candidate : current;
+  return compareExactTokenDefaultPool(
+    candidate.best_pool,
+    current.best_pool,
+    candidate?.token?.address,
+  ) < 0 ? candidate : current;
 }
 function tokenCentricSearchRows(query, pairs) {
   const byToken = new Map();
@@ -3555,8 +3627,25 @@ function tokenCentricSearchRows(query, pairs) {
 }
 
 async function buildDexSearch(query) {
-  const payload = await dexFetchJson(`${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`, { priority: 10, label: 'search' });
-  const pairs = sortBestPools(dedupePools(normalizeDexPairs(payload))).slice(0, MAX_RESPONSE_ROWS);
+  // DEX Screener's one global search result can be saturated by a single chain.
+  // Keep the base query, then add bounded quote refinements through the existing
+  // global 1.2s DEX scheduler. Partial supplemental failures never blank base results.
+  const variants = STEP1049_2_SEARCH_QUERY_SUFFIXES.map((suffix) =>
+    suffix ? `${query}/${suffix}` : query);
+  const settled = await Promise.allSettled(variants.map((variant, index) =>
+    dexFetchJson(
+      `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(variant)}`,
+      { priority: 10, label: index === 0 ? 'search' : `search_refine_${STEP1049_2_SEARCH_QUERY_SUFFIXES[index].toLowerCase()}` },
+    )));
+  const merged = [];
+  let baseSucceeded = false;
+  settled.forEach((result, index) => {
+    if (result.status !== 'fulfilled') return;
+    if (index === 0) baseSucceeded = true;
+    merged.push(...normalizeDexPairs(result.value));
+  });
+  if (!baseSucceeded && !merged.length) throw new Error('onchain_search_sources_unavailable');
+  const pairs = dedupePools(merged);
   return tokenCentricSearchRows(query, pairs);
 }
 async function buildDexTokenPairs(network, address) {
@@ -3564,7 +3653,7 @@ async function buildDexTokenPairs(network, address) {
   if (!meta || !validAddressForNetwork(network, address)) return [];
   const payload = await dexFetchJson(`${DEX_BASE}/token-pairs/v1/${encodeURIComponent(meta.dex)}/${encodeURIComponent(address)}`, { priority: 12, label: 'token_pairs' });
   const exact = normalizeDexPairs(payload).filter((row) => row.network === network && tokenAddressInPair(row, address));
-  return sortBestPools(dedupePools(exact)).slice(0, MAX_RESPONSE_ROWS);
+  return sortExactTokenDefaultPools(dedupePools(exact), address).slice(0, MAX_RESPONSE_ROWS);
 }
 function normalizePublicLink(item) {
   if (!item || typeof item !== 'object') return null;
@@ -4756,6 +4845,39 @@ function runSelfTest() {
     quoteSynthetic?.market_cap_usd === null &&
     quoteSynthetic?.fdv_usd === null &&
     quoteSynthetic?.price_change_pct?.h24 === null);
+  const step1049Target = '0x0000000000000000000000000000000000000049';
+  const step1049Pool = (quoteAddress, quoteSymbol, liquidity, poolAddress) => ({
+    network: 'bsc',
+    chain_id: 'bsc',
+    pool_address: poolAddress,
+    base_token: { address: step1049Target, symbol: 'TEST', name: 'Test' },
+    quote_token: { address: quoteAddress, symbol: quoteSymbol, name: quoteSymbol },
+    liquidity_usd: liquidity,
+    volume_usd: { h24: 1000 },
+    txns: { h24: { buys: 10, sells: 10 }, h1: { buys: 1, sells: 1 }, m5: { buys: 0, sells: 0 } },
+  });
+  const step1049Usdt = step1049Pool(
+    '0x55d398326f99059ff775485246999027b3197955', 'USDT', 5000,
+    '0x0000000000000000000000000000000000000101');
+  const step1049Wbnb = step1049Pool(
+    '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', 'WBNB', 100000,
+    '0x0000000000000000000000000000000000000102');
+  const step1049FakeUsdt = step1049Pool(
+    '0x0000000000000000000000000000000000000999', 'USDT', 1000000,
+    '0x0000000000000000000000000000000000000103');
+  const step1049DustUsdt = { ...step1049Usdt, liquidity_usd: 500, pool_address: '0x0000000000000000000000000000000000000104' };
+  t('step1049_2_trusted_usdt_beats_higher_liquidity_native',
+    sortExactTokenDefaultPools([step1049Wbnb, step1049Usdt], step1049Target)[0] === step1049Usdt);
+  t('step1049_2_fake_usdt_symbol_not_trusted',
+    step1049DefaultQuoteMeta(step1049FakeUsdt, step1049Target).tier_name === 'other');
+  t('step1049_2_dust_stable_does_not_beat_healthy_native',
+    sortExactTokenDefaultPools([step1049Wbnb, step1049DustUsdt], step1049Target)[0] === step1049Wbnb);
+  t('step1049_2_search_refinements_cover_bsc_and_solana_quotes',
+    STEP1049_2_SEARCH_QUERY_SUFFIXES.includes('USDT') &&
+    STEP1049_2_SEARCH_QUERY_SUFFIXES.includes('WBNB') &&
+    STEP1049_2_SEARCH_QUERY_SUFFIXES.includes('SOL'));
+  t('step1049_2_kline_volume_semantics_usd',
+    STEP1049_2_KLINE_UNITS_VERSION === 'step1049_2_usd_ohlcv_v1');
   t('cross_chain_substitution_false', responseBase().cross_chain_substitution === false);
   t('cross_token_substitution_false', responseBase().cross_token_substitution === false);
   t('direct_app_upstream_zero', responseBase().app_direct_upstream_requests === 0);
@@ -5383,8 +5505,16 @@ export async function handleOnchainMarket(req, res, url) {
         network: network || 'all',
         rows,
         row_count: rows.length,
-        search_rank_rule_version: 'liquidity_desc_then_24h_volume_desc_then_24h_activity_desc_v2',
+        feature_schema_version: STEP1049_2_FEATURE_SCHEMA_VERSION,
+        search_rank_rule_version: STEP1049_2_SEARCH_RANK_RULE_VERSION,
         exact_identity_scope: 'network_plus_token_contract_best_pool_contract_v2',
+        default_pool_policy_version: STEP1049_2_DEFAULT_POOL_POLICY_VERSION,
+        search_discovery_version: STEP1049_2_SEARCH_DISCOVERY_VERSION,
+        search_query_variants: STEP1049_2_SEARCH_QUERY_SUFFIXES.map((suffix) => suffix ? `${q}/${suffix}` : q),
+        search_networks_present: [...new Set(rows.map((row) => row.network).filter(Boolean))].sort(),
+        market_amount_unit: 'usd',
+        liquidity_unit: 'usd',
+        volume_24h_unit: 'usd',
         ranking_happens_before_response_limit: true,
         cache_status: result.cache_status,
         bounded_backend_build: result.cache_status === 'miss',
@@ -5402,7 +5532,21 @@ export async function handleOnchainMarket(req, res, url) {
       const result = await cachedBuild(key, { freshMs: 20_000, staleMs: 5 * 60_000 }, () => buildDexTokenPairs(network, address));
       const rows = (result.value || []).slice(0, limit);
       if (path === POOLS_ROUTE) {
-        sendJson(res, 200, responseBase({ network, address, rows, row_count: rows.length, cache_status: result.cache_status }));
+        const best = rows[0] || null;
+        const quoteMeta = best ? step1049DefaultQuoteMeta(best, address) : null;
+        sendJson(res, 200, responseBase({
+          feature_schema_version: STEP1049_2_FEATURE_SCHEMA_VERSION,
+          network,
+          address,
+          rows,
+          row_count: rows.length,
+          default_pool_address: best?.pool_address || null,
+          default_pool_quote: quoteMeta,
+          default_pool_policy_version: STEP1049_2_DEFAULT_POOL_POLICY_VERSION,
+          liquidity_unit: 'usd',
+          volume_24h_unit: 'usd',
+          cache_status: result.cache_status,
+        }));
       } else {
         const best = rows[0] || null;
         const token = best ? tokenAddressInPair(best, address) : null;
@@ -5420,6 +5564,12 @@ export async function handleOnchainMarket(req, res, url) {
           token_market_fields_verified: tokenMarket?.token_market_fields_verified === true,
           pool_count: rows.length,
           pools_preview: rows.slice(0, 6),
+          feature_schema_version: STEP1049_2_FEATURE_SCHEMA_VERSION,
+          default_pool_address: best?.pool_address || null,
+          default_pool_quote: best ? step1049DefaultQuoteMeta(best, address) : null,
+          default_pool_policy_version: STEP1049_2_DEFAULT_POOL_POLICY_VERSION,
+          liquidity_unit: 'usd',
+          volume_24h_unit: 'usd',
           cache_status: result.cache_status,
         }));
       }
@@ -5544,6 +5694,11 @@ export async function handleOnchainMarket(req, res, url) {
           quote_token: pool.quote_token,
         },
         interval,
+        kline_units_version: STEP1049_2_KLINE_UNITS_VERSION,
+        price_unit: 'usd',
+        volume_unit: 'usd_notional',
+        quote_volume_unit: 'usd_notional',
+        volume_semantics: 'source_ohlcv_usd_notional_not_base_or_pool_quote_quantity',
         source_interval: built.source_timeframe || MORALIS_TIMEFRAME[interval],
         source: built.source || 'moralis_official_data_api_pair_ohlcv',
         source_pair_address: built.source_pair_address || poolAddress,
