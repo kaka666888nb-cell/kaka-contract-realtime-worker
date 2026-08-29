@@ -1,0 +1,106 @@
+name: Step1050D.2 live project Top3000 rank
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/market-light-snapshot.mjs'
+      - 'src/proxy.mjs'
+      - '.github/workflows/step1050d2-live-project-rank.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  live-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Wait Render and project rank warmup
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          EXPECTED='650.8.15.197.3.3.31'
+          for i in $(seq 1 90); do
+            root="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
+            ver="$(printf '%s' "$root" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
+            mh="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/api/market-light/health" || true)"
+            read -r ready rows <<<"$(printf '%s' "$mh" | python3 -c '
+import json,sys
+try:
+ d=json.loads(sys.stdin.read()); p=d.get("project_market_cap_rank") or {}
+ print(str(bool(p.get("ready"))).lower(), int(p.get("current_rows") or 0))
+except Exception: print("false 0")
+' 2>/dev/null || echo 'false 0')"
+            echo "poll=$i render=$ver project_ready=$ready rows=$rows"
+            if [ "$ver" = "$EXPECTED" ] && [ "$ready" = "true" ] && [ "$rows" -ge 2800 ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Verify first project page contains ranks 1 and 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 25             "$BASE/api/market-light/project-ranked-page?offset=0&limit=50"             -o /tmp/p0.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/p0.json'))
+          assert d['ok'] is True
+          assert d['schema_version']=='step1050_d_2_project_rank_page_v1'
+          assert d['feature_schema_version']=='step1050_d_2_project_top3000_rank_v1'
+          assert d['rank_identity']=='coingecko_coin_id'
+          assert d['ranking_happens_before_pagination'] is True
+          assert d['pagination_order_frozen_by_rank_version'] is True
+          assert d['user_read_upstream_requests']==0
+          assert int(d['source_data_version']) >= 1050000
+          assert d['source_schema_version']=='step1050_market_cap_catalog_v1'
+          rows=d['items']
+          assert len(rows)==50
+          ranks={int(x['market_cap_rank']):x for x in rows}
+          assert 1 in ranks, ranks.keys()
+          assert 3 in ranks, ranks.keys()
+          assert str(ranks[1]['symbol']).upper()=='BTC', ranks[1]
+          assert str(ranks[3]['symbol']).upper()=='USDT', ranks[3]
+          print('PASS first page rank1=',ranks[1]['coin_id'],ranks[1]['symbol'])
+          print('PASS first page rank3=',ranks[3]['coin_id'],ranks[3]['symbol'])
+          print('top10=',[(x['market_cap_rank'],x['symbol'],x['coin_id']) for x in rows[:10]])
+          PY
+
+      - name: Verify frozen +50 project pagination
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          RV="$(python3 -c "import json; print(json.load(open('/tmp/p0.json'))['rank_version'])")"
+          curl -fsS --connect-timeout 8 --max-time 25             "$BASE/api/market-light/project-ranked-page?offset=50&limit=50&rank_version=$RV"             -o /tmp/p50.json
+          python3 - <<'PY'
+          import json
+          a=json.load(open('/tmp/p0.json')); b=json.load(open('/tmp/p50.json'))
+          assert a['rank_version']==b['rank_version']
+          ids0=[x['coin_id'] for x in a['items']]
+          ids1=[x['coin_id'] for x in b['items']]
+          assert not(set(ids0)&set(ids1))
+          allr=[int(x['market_cap_rank']) for x in a['items']+b['items']]
+          assert allr==sorted(allr), allr
+          print('PASS project 50 -> +50 frozen pagination')
+          PY
+
+      - name: Repeated project reads start zero upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          BEFORE="$(curl -fsS "$BASE/api/market-light/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["shared_rank_index"]["market_cap"]["source_requests_started"])')"
+          for i in $(seq 1 20); do
+            code="$(curl -sS --connect-timeout 8 --max-time 20 -o /tmp/pr.json -w '%{http_code}'               "$BASE/api/market-light/project-ranked-page?offset=0&limit=50")"
+            echo "read=$i http=$code"
+            test "$code" = "200"
+          done
+          AFTER="$(curl -fsS "$BASE/api/market-light/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["shared_rank_index"]["market_cap"]["source_requests_started"])')"
+          test "$BEFORE" = "$AFTER"
+          echo "PASS project reads upstream delta=0 ($BEFORE -> $AFTER)"

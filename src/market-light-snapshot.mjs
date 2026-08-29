@@ -2,9 +2,10 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.4';
+const STEP_VERSION = '650.8.15.197.3.3.5';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
+const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
 const DATA_HUB_SPOT_SUMMARY_ROUTE = '/api/market-light/data-hub-spot-summary';
 const WATCHLIST_TICKERS_ROUTE = '/api/market-light/watchlist-tickers';
 const HEALTH_ROUTE = '/api/market-light/health';
@@ -256,6 +257,23 @@ let marketCapSourceCatalogPolicy = '';
 let marketCapSourceImplementationRevision = '';
 let marketCapFundamentalsRows = 0;
 let marketCapKnownAmbiguousByFundamentals = 0;
+
+// Step1050D.2: project page ranking is a project catalog, NOT a USDT spot-pair rank.
+// Keep the verified CoinGecko catalog keyed by coin_id and preserve BTC/USDT/etc
+// even when no self-quoted USDT pair can exist. User pages only slice this shared
+// in-memory snapshot and never start Supabase/CoinGecko work.
+const STEP1050_D_2_PROJECT_FEATURE_SCHEMA = 'step1050_d_2_project_top3000_rank_v1';
+const STEP1050_D_2_PROJECT_SCHEMA = 'step1050_d_2_project_rank_page_v1';
+const PROJECT_RANK_PAGE_LIMIT_MAX = 50;
+const PROJECT_RANK_SNAPSHOT_TTL_MS = 10 * 60_000;
+const PROJECT_RANK_SNAPSHOT_MAX = 6;
+const projectMarketCapRankSnapshots = new Map();
+let projectMarketCapCurrentRankVersion = '';
+let projectMarketCapRankSeq = 0;
+let projectRankPageReads = 0;
+let projectRankSnapshotBuilds = 0;
+let projectRankSnapshotExpired = 0;
+
 let rankPageReads = 0;
 let rankPageBuilds = 0;
 let rankPageCacheHits = 0;
@@ -3072,6 +3090,159 @@ function marketRankedPagePayload({ market, provider = '', quote = '', sort = 'ma
   return { ...payload, cache_hit: false, cache_age_ms: 0 };
 }
 
+function projectMarketCapSafeRow(raw) {
+  const rank = marketRankNumber(raw?.market_cap_rank);
+  const marketCap = marketRankNumber(raw?.market_cap_usd);
+  const price = marketRankNumber(raw?.current_price_usd);
+  const totalVolume = marketRankNumber(raw?.total_volume_usd);
+  const fdv = marketRankNumber(raw?.fully_diluted_valuation_usd);
+  const circulating = marketRankNumber(raw?.circulating_supply);
+  const totalSupply = marketRankNumber(raw?.total_supply);
+  const maxSupply = marketRankNumber(raw?.max_supply);
+  const coinId = String(raw?.coin_id || '').trim();
+  const symbol = marketRankNormalizeBase(raw?.symbol);
+  const name = String(raw?.name || '').trim();
+  const image = String(raw?.image_url || '').trim();
+
+  if (!coinId || !symbol || !name || rank == null || rank <= 0) return null;
+
+  return {
+    coin_id: coinId,
+    symbol,
+    name,
+    image_url: image.startsWith('https://') ? image : null,
+    market_cap_rank: Math.trunc(rank),
+    market_cap_usd: marketCap != null && marketCap >= 0 ? marketCap : null,
+    current_price_usd: price != null && price >= 0 ? price : null,
+    total_volume_usd: totalVolume != null && totalVolume >= 0 ? totalVolume : null,
+    fully_diluted_valuation_usd: fdv != null && fdv >= 0 ? fdv : null,
+    circulating_supply: circulating != null && circulating >= 0 ? circulating : null,
+    total_supply: totalSupply != null && totalSupply >= 0 ? totalSupply : null,
+    max_supply: maxSupply != null && maxSupply >= 0 ? maxSupply : null,
+    last_updated: String(raw?.last_updated || '').trim() || null,
+  };
+}
+
+function pruneProjectMarketCapRankSnapshots() {
+  const now = Date.now();
+  for (const [version, snapshot] of projectMarketCapRankSnapshots.entries()) {
+    if (
+      version !== projectMarketCapCurrentRankVersion &&
+      now - Number(snapshot?.created_at_ms || 0) > PROJECT_RANK_SNAPSHOT_TTL_MS
+    ) {
+      projectMarketCapRankSnapshots.delete(version);
+      projectRankSnapshotExpired += 1;
+    }
+  }
+  while (projectMarketCapRankSnapshots.size > PROJECT_RANK_SNAPSHOT_MAX) {
+    const oldest = [...projectMarketCapRankSnapshots.entries()]
+      .filter(([version]) => version !== projectMarketCapCurrentRankVersion)
+      .sort((a, b) => Number(a[1]?.created_at_ms || 0) - Number(b[1]?.created_at_ms || 0))[0];
+    if (!oldest) break;
+    projectMarketCapRankSnapshots.delete(oldest[0]);
+    projectRankSnapshotExpired += 1;
+  }
+}
+
+function publishProjectMarketCapRankSnapshot(catalogRows) {
+  const rows = catalogRows
+    .map(projectMarketCapSafeRow)
+    .filter(Boolean)
+    .sort((a, b) =>
+      Number(a.market_cap_rank || 1e9) - Number(b.market_cap_rank || 1e9) ||
+      String(a.coin_id).localeCompare(String(b.coin_id)));
+
+  if (rows.length < STEP1050_MARKET_CAP_CATALOG_MIN_ROWS) {
+    throw new Error(`project_market_cap_catalog_too_small:${rows.length}`);
+  }
+
+  const version = `pmcr-${marketCapRankVersion}-${++projectMarketCapRankSeq}-${Date.now()}`;
+  projectMarketCapRankSnapshots.set(version, {
+    created_at_ms: Date.now(),
+    rows,
+  });
+  projectMarketCapCurrentRankVersion = version;
+  projectRankSnapshotBuilds += 1;
+  pruneProjectMarketCapRankSnapshots();
+}
+
+function projectMarketCapRankedPagePayload({ offset = 0, limit = 50, rankVersion = '' } = {}) {
+  pruneProjectMarketCapRankSnapshots();
+  const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
+  const safeLimit = Math.max(
+    1,
+    Math.min(PROJECT_RANK_PAGE_LIMIT_MAX, Math.trunc(Number(limit) || 50)),
+  );
+
+  let snapshot = null;
+  if (rankVersion) {
+    snapshot = projectMarketCapRankSnapshots.get(String(rankVersion)) || null;
+    if (!snapshot) {
+      return {
+        status_code: 409,
+        ok: false,
+        version: STEP_VERSION,
+        schema_version: STEP1050_D_2_PROJECT_SCHEMA,
+        feature_schema_version: STEP1050_D_2_PROJECT_FEATURE_SCHEMA,
+        error: 'project_rank_version_expired',
+        rank_version: String(rankVersion),
+        restart_from_offset: 0,
+        user_read_upstream_requests: 0,
+        reads_scale_with_users: false,
+      };
+    }
+  } else {
+    snapshot = projectMarketCapRankSnapshots.get(projectMarketCapCurrentRankVersion) || null;
+  }
+
+  if (!snapshot) {
+    return {
+      status_code: 503,
+      ok: false,
+      version: STEP_VERSION,
+      schema_version: STEP1050_D_2_PROJECT_SCHEMA,
+      feature_schema_version: STEP1050_D_2_PROJECT_FEATURE_SCHEMA,
+      error: 'project_market_cap_rank_not_ready',
+      user_read_upstream_requests: 0,
+      reads_scale_with_users: false,
+    };
+  }
+
+  const rows = Array.isArray(snapshot.rows) ? snapshot.rows : [];
+  const page = rows.slice(safeOffset, safeOffset + safeLimit);
+  return {
+    ok: true,
+    version: STEP_VERSION,
+    schema_version: STEP1050_D_2_PROJECT_SCHEMA,
+    feature_schema_version: STEP1050_D_2_PROJECT_FEATURE_SCHEMA,
+    source: 'render_shared_step1050_project_tokenomics_catalog_rank',
+    rank_identity: 'coingecko_coin_id',
+    sort: 'market_cap_rank_asc',
+    rank_version: rankVersion || projectMarketCapCurrentRankVersion,
+    rank_snapshot_created_at: new Date(Number(snapshot.created_at_ms)).toISOString(),
+    rank_snapshot_ttl_ms: PROJECT_RANK_SNAPSHOT_TTL_MS,
+    total_items: rows.length,
+    offset: safeOffset,
+    limit: safeLimit,
+    returned_items: page.length,
+    has_more: safeOffset + page.length < rows.length,
+    next_offset: safeOffset + page.length < rows.length ? safeOffset + page.length : null,
+    source_data_version: marketCapSourceDataVersion,
+    source_schema_version: marketCapSourceSchemaVersion || null,
+    source_coverage_ready: marketCapSourceCoverageReady,
+    source_snapshot_rows: marketCapSourceSnapshotRows,
+    read_only_shared: true,
+    user_read_upstream_requests: 0,
+    user_read_upstream_connections: 0,
+    reads_scale_with_users: false,
+    ranking_happens_before_pagination: true,
+    pagination_order_frozen_by_rank_version: true,
+    app_page_size_remains_50: true,
+    items: page,
+    generated_at: new Date().toISOString(),
+  };
+}
+
 function marketCapSupabaseConfig() {
   const base = String(process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
   const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -3299,6 +3470,7 @@ async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
         payload?.implementation_revision ?? item?.implementation_revision ?? '',
       ).trim();
       marketCapRankVersion += 1;
+      publishProjectMarketCapRankSnapshot(catalogRows);
       marketCapLastSucceededAt = new Date().toISOString();
       marketCapLastError = '';
       marketCapRefreshSuccesses += 1;
@@ -4027,6 +4199,7 @@ export function getMarketLightSnapshotHealth() {
     mode: 'shared_primary_quote_full_directory_light_snapshot',
     snapshot_endpoint: SNAPSHOT_ROUTE,
     ranked_page_endpoint: RANKED_PAGE_ROUTE,
+    project_ranked_page_endpoint: PROJECT_RANKED_PAGE_ROUTE,
     watchlist_tickers_endpoint: WATCHLIST_TICKERS_ROUTE,
     health_endpoint: HEALTH_ROUTE,
     watchlist_realtime: {
@@ -4045,6 +4218,34 @@ export function getMarketLightSnapshotHealth() {
       coinbase_spot_source: 'existing_public_ticker_batch_websocket',
       other_provider_source: 'fixed_background_exact_focus_ticker_batches',
       stats: { ...watchlistTickerStats },
+    },
+    project_market_cap_rank: {
+      schema_version: STEP1050_D_2_PROJECT_SCHEMA,
+      feature_schema_version: STEP1050_D_2_PROJECT_FEATURE_SCHEMA,
+      endpoint: PROJECT_RANKED_PAGE_ROUTE,
+      identity: 'coingecko_coin_id',
+      source: 'shared_project_tokenomics_top3000_catalog',
+      ready: Boolean(
+        projectMarketCapCurrentRankVersion &&
+        projectMarketCapRankSnapshots.get(projectMarketCapCurrentRankVersion)?.rows?.length >=
+          STEP1050_MARKET_CAP_CATALOG_MIN_ROWS
+      ),
+      current_rank_version: projectMarketCapCurrentRankVersion || null,
+      current_rows:
+        projectMarketCapRankSnapshots.get(projectMarketCapCurrentRankVersion)?.rows?.length || 0,
+      snapshot_entries: projectMarketCapRankSnapshots.size,
+      snapshot_builds: projectRankSnapshotBuilds,
+      snapshot_expired: projectRankSnapshotExpired,
+      reads: projectRankPageReads,
+      page_limit_max: PROJECT_RANK_PAGE_LIMIT_MAX,
+      ranking_happens_before_pagination: true,
+      pagination_order_frozen_by_rank_version: true,
+      quote_pair_filter_applied: false,
+      self_pair_filter_applied: false,
+      symbol_ambiguity_exclusion_applied: false,
+      includes_stablecoin_projects: true,
+      user_read_upstream_requests: 0,
+      reads_scale_with_users: false,
     },
     shared_rank_index: {
       schema_version: 'step1041_6_shared_full_market_rank_page_v2',
@@ -4398,7 +4599,7 @@ function sendJson(res, status, payload) {
 export async function handleMarketLightSnapshot(req, res, url) {
   const sectorHistoryRoute = url.pathname === '/api/crypto-sector-professional/history' ||
     url.pathname === '/api/crypto-sector-professional/history-health';
-  if (![SNAPSHOT_ROUTE, RANKED_PAGE_ROUTE, DATA_HUB_SPOT_SUMMARY_ROUTE, WATCHLIST_TICKERS_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
+  if (![SNAPSHOT_ROUTE, RANKED_PAGE_ROUTE, PROJECT_RANKED_PAGE_ROUTE, DATA_HUB_SPOT_SUMMARY_ROUTE, WATCHLIST_TICKERS_ROUTE, HEALTH_ROUTE, SECTOR_SNAPSHOT_ROUTE, SECTOR_HEALTH_ROUTE].includes(url.pathname) && !sectorHistoryRoute) return false;
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -4450,6 +4651,43 @@ export async function handleMarketLightSnapshot(req, res, url) {
     return true;
   }
   const market = String(url.searchParams.get('market_type') || url.searchParams.get('market') || '').trim().toLowerCase();
+
+  if (url.pathname === PROJECT_RANKED_PAGE_ROUTE) {
+    const offset = Math.max(0, Math.trunc(Number(url.searchParams.get('offset') || 0) || 0));
+    const limit = Math.max(
+      1,
+      Math.min(
+        PROJECT_RANK_PAGE_LIMIT_MAX,
+        Math.trunc(Number(url.searchParams.get('limit') || 50) || 50),
+      ),
+    );
+    const rankVersion = String(url.searchParams.get('rank_version') || '').trim();
+    if (offset > 0 && !rankVersion) {
+      sendJson(res, 400, {
+        ok: false,
+        version: STEP_VERSION,
+        schema_version: STEP1050_D_2_PROJECT_SCHEMA,
+        feature_schema_version: STEP1050_D_2_PROJECT_FEATURE_SCHEMA,
+        error: 'rank_version_required_after_first_page',
+        restart_from_offset: 0,
+        user_read_upstream_requests: 0,
+      });
+      return true;
+    }
+    projectRankPageReads += 1;
+    const payload = projectMarketCapRankedPagePayload({
+      offset,
+      limit,
+      rankVersion,
+    });
+    const statusCode = Number(payload?.status_code || 200);
+    if (payload && Object.prototype.hasOwnProperty.call(payload, 'status_code')) {
+      delete payload.status_code;
+    }
+    sendJson(res, statusCode, payload);
+    return true;
+  }
+
   if (url.pathname === RANKED_PAGE_ROUTE) {
     if (!['spot', 'contract'].includes(market)) {
       sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'market_type_required_for_rank_page' });
