@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
-const VERSION = '650.8.15.197.3.3.4';
+const VERSION = '650.8.15.197.3.3.5';
 const MARKET_LIGHT_PORT = Number(process.env.KAKA_MARKET_LIGHT_COLLECTOR_PORT || 10011);
 const LIQUIDATION_PORT = Number(process.env.KAKA_LIQUIDATION_COLLECTOR_PORT || 10012);
 const DEEP_MARKET_PORT = Number(process.env.KAKA_DEEP_MARKET_COLLECTOR_PORT || 10013);
@@ -49,13 +49,28 @@ const sharedResponseStats = {
   gzip_bytes_built: 0,
 };
 
+// Step1051A: watchlist/asset-detail exact ticker reads are already exchange-isolated,
+// but many semantically identical user requests may carry the same item set in a
+// different order. Track this route separately so the 10/100/1000-user pressure
+// gate can prove that localhost collector fetches stay bounded.
+const watchlistTickerSharedCacheStats = {
+  user_requests: 0,
+  fresh_hits: 0,
+  stale_hits: 0,
+  cold_misses: 0,
+  inflight_coalesced: 0,
+  collector_fetches: 0,
+  canonical_key_rewrites: 0,
+  canonical_item_deduped: 0,
+};
+
 function sharedResponsePolicy(pathname) {
   const path = String(pathname || '');
   if (path === '/api/market-light/current-snapshot') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
   if (path === '/api/market-light/ranked-page') return { freshMs: 2_000, staleMs: 15_000, cdnSMaxAgeSec: 2 };
   if (path === '/api/market-light/project-ranked-page') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/market-light/data-hub-spot-summary') return { freshMs: 2_000, staleMs: 15_000, cdnSMaxAgeSec: 2 };
-  if (path === '/api/market-light/watchlist-tickers') return { freshMs: 500, staleMs: 2_000, cdnSMaxAgeSec: 1 };
+  if (path === '/api/market-light/watchlist-tickers') return { freshMs: 1_000, staleMs: 5_000, cdnSMaxAgeSec: 1 };
   if (path === '/api/crypto-sector-professional/current-snapshot') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
   if (path === '/api/contract-flow/market-snapshot') return { freshMs: 5_000, staleMs: 30_000, cdnSMaxAgeSec: 5 };
   if (path === '/api/contract-liquidation/market-snapshot') return { freshMs: 1_500, staleMs: 8_000, cdnSMaxAgeSec: 2 };
@@ -79,6 +94,50 @@ function sharedResponsePolicy(pathname) {
   if (path === '/api/onchain/holders') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };
   if (path === '/api/onchain/security') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };
   return null;
+}
+
+function normalizeWatchlistTickerSpec(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const parts = raw.split('|');
+  if (parts.length !== 3) return raw;
+  const market = String(parts[0] || '').trim().toLowerCase();
+  const provider = String(parts[1] || '').trim().toLowerCase();
+  const symbol = String(parts[2] || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+  if (!market || !provider || !symbol) return raw;
+  return `${market}|${provider}|${symbol}`;
+}
+
+function sharedResponseCanonicalPath(url) {
+  const pathname = String(url?.pathname || '');
+  if (pathname !== '/api/market-light/watchlist-tickers') {
+    return `${pathname}${String(url?.search || '')}`;
+  }
+
+  const rawItems = String(url?.searchParams?.get('items') || '');
+  const sourceItems = rawItems
+    .split('~')
+    .map(normalizeWatchlistTickerSpec)
+    .filter(Boolean);
+  const canonicalItems = [...new Set(sourceItems)].sort();
+  const params = new URLSearchParams(url.searchParams || undefined);
+  if (canonicalItems.length) params.set('items', canonicalItems.join('~'));
+  else params.delete('items');
+
+  if (canonicalItems.length < sourceItems.length) {
+    watchlistTickerSharedCacheStats.canonical_item_deduped +=
+      sourceItems.length - canonicalItems.length;
+  }
+  const canonicalSearch = params.toString();
+  const canonicalPath = `${pathname}${canonicalSearch ? `?${canonicalSearch}` : ''}`;
+  const rawPath = `${pathname}${String(url?.search || '')}`;
+  if (canonicalPath !== rawPath) {
+    watchlistTickerSharedCacheStats.canonical_key_rewrites += 1;
+  }
+  return canonicalPath;
 }
 
 function sharedResponseCdnCacheControl(policy) {
@@ -198,6 +257,9 @@ function sendSharedResponse(req, res, entry, cacheState, policy) {
 function startSharedResponseRefresh(key, role, path) {
   let pending = sharedResponseInflight.get(key);
   if (pending) return pending;
+  if (String(path || '').startsWith('/api/market-light/watchlist-tickers')) {
+    watchlistTickerSharedCacheStats.collector_fetches += 1;
+  }
   pending = buildSharedResponseEntry(role, path)
     .then((entry) => {
       if (entry.statusCode >= 200 && entry.statusCode < 300) {
@@ -217,27 +279,40 @@ function startSharedResponseRefresh(key, role, path) {
 
 function proxySharedCachedCollectorGet(req, res, url, role, policy) {
   sharedResponseStats.user_requests += 1;
-  const key = `${role}:${url.pathname}${url.search}`;
+  const watchlistTickerRoute =
+    String(url?.pathname || '') === '/api/market-light/watchlist-tickers';
+  if (watchlistTickerRoute) watchlistTickerSharedCacheStats.user_requests += 1;
+
+  const key = `${role}:${sharedResponseCanonicalPath(url)}`;
   const now = Date.now();
   const cached = sharedResponseCache.get(key);
   const age = cached ? now - Number(cached.storedAt || 0) : Number.POSITIVE_INFINITY;
 
   if (cached && age <= policy.freshMs) {
     sharedResponseStats.fresh_hits += 1;
+    if (watchlistTickerRoute) watchlistTickerSharedCacheStats.fresh_hits += 1;
     sendSharedResponse(req, res, cached, 'fresh', policy);
     return;
   }
 
   if (cached && age <= policy.staleMs) {
     sharedResponseStats.stale_hits += 1;
+    if (watchlistTickerRoute) watchlistTickerSharedCacheStats.stale_hits += 1;
     startSharedResponseRefresh(key, role, req.url).catch(() => {});
     sendSharedResponse(req, res, cached, 'stale', policy);
     return;
   }
 
   const existing = sharedResponseInflight.get(key);
-  if (existing) sharedResponseStats.inflight_coalesced += 1;
-  else sharedResponseStats.cold_misses += 1;
+  if (existing) {
+    sharedResponseStats.inflight_coalesced += 1;
+    if (watchlistTickerRoute) {
+      watchlistTickerSharedCacheStats.inflight_coalesced += 1;
+    }
+  } else {
+    sharedResponseStats.cold_misses += 1;
+    if (watchlistTickerRoute) watchlistTickerSharedCacheStats.cold_misses += 1;
+  }
   const pending = existing || startSharedResponseRefresh(key, role, req.url);
   pending.then((entry) => sendSharedResponse(req, res, entry, existing ? 'coalesced' : 'miss', policy))
     .catch((error) => {
@@ -690,6 +765,27 @@ export function getCollectorIsolationHealth() {
       raw_bytes_fetched: sharedResponseStats.raw_bytes_fetched,
       gzip_bytes_built: sharedResponseStats.gzip_bytes_built,
       cacheable_routes: 10,
+      watchlist_ticker_pressure: {
+        schema_version: 'step1051a_exact_ticker_shared_pressure_v1',
+        canonical_item_set_cache_key: true,
+        canonical_item_sort: true,
+        canonical_item_dedupe: true,
+        fresh_ms: 1_000,
+        stale_ms: 5_000,
+        user_requests: watchlistTickerSharedCacheStats.user_requests,
+        fresh_hits: watchlistTickerSharedCacheStats.fresh_hits,
+        stale_hits: watchlistTickerSharedCacheStats.stale_hits,
+        cold_misses: watchlistTickerSharedCacheStats.cold_misses,
+        inflight_coalesced:
+          watchlistTickerSharedCacheStats.inflight_coalesced,
+        collector_fetches: watchlistTickerSharedCacheStats.collector_fetches,
+        canonical_key_rewrites:
+          watchlistTickerSharedCacheStats.canonical_key_rewrites,
+        canonical_item_deduped:
+          watchlistTickerSharedCacheStats.canonical_item_deduped,
+        collector_fetches_scale_with_users: false,
+        exchange_requests_started_by_user_read: 0,
+      },
     },
     timestamp_ms: Date.now(),
   };

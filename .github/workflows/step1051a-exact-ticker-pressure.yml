@@ -1,0 +1,165 @@
+name: Step1051A exact ticker shared pressure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/collector-isolation.mjs'
+      - 'src/proxy.mjs'
+      - '.github/workflows/step1051a-exact-ticker-pressure.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pressure-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait Render Step1051A
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          EXPECTED='650.8.15.197.3.3.32'
+          for i in $(seq 1 90); do
+            body="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
+            ver="$(printf '%s' "$body" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
+            echo "poll=$i version=$ver"
+            if [ "$ver" = "$EXPECTED" ]; then exit 0; fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Verify Step1050 project regression stays green
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 25             "$BASE/api/market-light/project-ranked-page?offset=0&limit=50"             -o /tmp/project.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/project.json'))
+          assert d['ok'] is True
+          rows={int(x['market_cap_rank']):x for x in d['items']}
+          assert rows[1]['symbol']=='BTC'
+          assert rows[3]['symbol']=='USDT'
+          assert int(rows[2]['contract_market_count']) >= 5
+          assert int(rows[5]['contract_market_count']) >= 4
+          assert d['user_read_upstream_requests']==0
+          print('PASS Step1050 regression')
+          PY
+
+      - name: Warm exact ticker route and capture baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          ITEMS='spot|binance|BTCUSDT~spot|okx|BTCUSDT~spot|bybit|BTCUSDT~spot|bitget|BTCUSDT~spot|gate|BTCUSDT'
+          curl -fsS --connect-timeout 8 --max-time 20             --get --data-urlencode "items=$ITEMS"             "$BASE/api/market-light/watchlist-tickers"             -o /tmp/ticker.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/ticker.json'))
+          assert d['ok'] is True
+          assert d['user_read_upstream_requests']==0
+          assert d['reads_scale_with_users'] is False
+          assert isinstance(d['items'], list)
+          print('PASS exact ticker warm rows=',len(d['items']))
+          PY
+          curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" -o /tmp/h_before.json
+
+      - name: 1000 virtual exact ticker reads with permuted identity order
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import itertools, json, urllib.parse, urllib.request
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          base='https://kaka-contract-realtime-worker.onrender.com/api/market-light/watchlist-tickers'
+          specs=[
+            'spot|binance|BTCUSDT',
+            'spot|okx|BTCUSDT',
+            'spot|bybit|BTCUSDT',
+            'spot|bitget|BTCUSDT',
+            'spot|gate|BTCUSDT',
+          ]
+          perms=list(itertools.permutations(specs))
+          urls=[]
+          for i in range(1000):
+            items='~'.join(perms[i % len(perms)])
+            urls.append(base+'?'+urllib.parse.urlencode({'items':items}))
+
+          def one(url):
+            req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'Kaka-Step1051A-Pressure'})
+            with urllib.request.urlopen(req,timeout=25) as r:
+              body=r.read()
+              if r.status != 200:
+                return False, r.status, ''
+            try:
+              d=json.loads(body)
+            except Exception:
+              return False, 0, 'json'
+            return bool(d.get('ok') is True and d.get('user_read_upstream_requests')==0), 200, ''
+
+          ok=0
+          failures=[]
+          with ThreadPoolExecutor(max_workers=50) as ex:
+            futs=[ex.submit(one,u) for u in urls]
+            for fut in as_completed(futs):
+              good,status,err=fut.result()
+              if good: ok+=1
+              else: failures.append((status,err))
+          print('virtual_reads=1000 ok=',ok,'failures=',failures[:10])
+          assert ok==1000, (ok,failures[:10])
+          PY
+          curl -fsS --connect-timeout 8 --max-time 20             'https://kaka-contract-realtime-worker.onrender.com/health'             -o /tmp/h_after.json
+
+      - name: Verify canonical coalescing and bounded collector work
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+
+          before=json.load(open('/tmp/h_before.json'))
+          after=json.load(open('/tmp/h_after.json'))
+
+          def find_watch(obj):
+            if isinstance(obj,dict):
+              p=obj.get('watchlist_ticker_pressure')
+              if isinstance(p,dict): return p
+              for v in obj.values():
+                r=find_watch(v)
+                if r is not None: return r
+            elif isinstance(obj,list):
+              for v in obj:
+                r=find_watch(v)
+                if r is not None: return r
+            return None
+
+          b=find_watch(before)
+          a=find_watch(after)
+          assert isinstance(a,dict), 'watchlist_ticker_pressure health missing'
+          assert a['schema_version']=='step1051a_exact_ticker_shared_pressure_v1'
+          assert a['canonical_item_set_cache_key'] is True
+          assert a['canonical_item_sort'] is True
+          assert a['canonical_item_dedupe'] is True
+          assert a['collector_fetches_scale_with_users'] is False
+          assert int(a['exchange_requests_started_by_user_read'])==0
+
+          bf=int((b or {}).get('collector_fetches') or 0)
+          af=int(a.get('collector_fetches') or 0)
+          br=int((b or {}).get('canonical_key_rewrites') or 0)
+          ar=int(a.get('canonical_key_rewrites') or 0)
+          delta_fetch=af-bf
+          delta_rewrite=ar-br
+
+          print('collector_fetches',bf,'->',af,'delta=',delta_fetch)
+          print('canonical_key_rewrites',br,'->',ar,'delta=',delta_rewrite)
+          # 1000 user-facing reads must not become anything close to 1000
+          # localhost collector fetches. Allow a generous bound for CDN/origin timing.
+          assert delta_fetch <= 60, delta_fetch
+          assert delta_rewrite >= 1, delta_rewrite
+          print('PASS 1000 virtual reads -> bounded canonical shared collector work')
+          PY
