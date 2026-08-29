@@ -24,7 +24,7 @@ jobs:
           EXPECTED='650.8.15.197.3.3.29.1'
           for i in $(seq 1 72); do
             body="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
-            version="$(python3 -c 'import json,sys; try: print(json.loads(sys.stdin.read()).get("version","")) except Exception: print("")' <<<"$body")"
+            version="$(printf '%s' "$body" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
             echo "render_poll=$i version=$version"
             if [ "$version" = "$EXPECTED" ]; then
               exit 0
