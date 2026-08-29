@@ -8,16 +8,14 @@
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { KAKA_FULL_INTERVALS, KAKA_DERIVED_PLAN, klineIntervalMs, klineDerivedPlan, deriveAndFillKlines } from './kline-derived.mjs';
 
-const VERSION = '650.8.15.197.3.1';
-const DATA_VERSION = 1049000;
+const VERSION = '650.8.15.197.3';
+const DATA_VERSION = 1042000;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
 const STEP1039_FEATURE_SCHEMA_VERSION = 'step1039_onchain_wallet_intelligence_v1';
 const STEP1040_FEATURE_SCHEMA_VERSION = 'step1040_onchain_wallet_relationship_evidence_v1';
 const STEP1041_FEATURE_SCHEMA_VERSION = 'step1041_onchain_final_productization_v1';
 const STEP1042_FEATURE_SCHEMA_VERSION = 'step1042_onchain_multichain_smart_money_v1';
-const STEP1049_FEATURE_SCHEMA_VERSION = 'step1049_onchain_exact_identity_rank_v1';
-const STEP1049_SEARCH_RANK_RULE_VERSION = 'liquidity_desc_then_24h_volume_desc_then_24h_activity_desc_v1';
 
 const HEALTH_ROUTE = '/api/onchain/health';
 const SELF_TEST_ROUTE = '/api/onchain/self-test';
@@ -3420,20 +3418,7 @@ function normalizeDexPairs(payload) {
   const rows = Array.isArray(payload) ? payload : Array.isArray(payload?.pairs) ? payload.pairs : [];
   return rows.map(normalizeDexPair).filter(Boolean);
 }
-function canonicalIdentityAddress(network, value) {
-  const raw = text(value);
-  const meta = networkMeta(network);
-  return meta?.family === 'evm' ? lower(raw) : raw;
-}
-function tokenIdentityKey(network, tokenAddress) {
-  return `${network}|${canonicalIdentityAddress(network, tokenAddress)}`;
-}
-function exactTokenPoolIdentityKey(network, tokenAddress, poolAddress) {
-  return `${network}|${canonicalIdentityAddress(network, tokenAddress)}|${canonicalIdentityAddress(network, poolAddress)}`;
-}
-function pairIdentity(row) {
-  return `${row.network}|${canonicalIdentityAddress(row.network, row.pool_address)}`;
-}
+function pairIdentity(row) { return `${row.network}|${lower(row.pool_address)}`; }
 function dedupePools(rows) {
   const byKey = new Map();
   for (const row of rows || []) {
@@ -3444,9 +3429,9 @@ function dedupePools(rows) {
   return [...byKey.values()];
 }
 function tokenAddressInPair(row, tokenAddress) {
-  const network = row?.network;
-  if (exactAddressEqual(network, row?.base_token?.address, tokenAddress)) return row.base_token;
-  if (exactAddressEqual(network, row?.quote_token?.address, tokenAddress)) return row.quote_token;
+  const a = lower(tokenAddress);
+  if (lower(row?.base_token?.address) === a) return row.base_token;
+  if (lower(row?.quote_token?.address) === a) return row.quote_token;
   return null;
 }
 function poolLiquidity(row) { return Math.max(0, Number(row?.liquidity_usd || 0)); }
@@ -3474,17 +3459,13 @@ function hotScoreComponents(rows) {
     + Math.log10(1 + liquidity) * 1.5;
   return { score, volume_24h_usd: volume24h, liquidity_usd: liquidity, h1_transactions: h1tx, m5_transactions: m5tx };
 }
-function compareExactPoolPriority(a, b) {
-  return poolLiquidity(b) - poolLiquidity(a)
-    || poolVolume24h(b) - poolVolume24h(a)
-    || poolActivity(b, 'h24') - poolActivity(a, 'h24')
-    || poolActivity(b, 'h1') - poolActivity(a, 'h1')
-    || poolActivity(b, 'm5') - poolActivity(a, 'm5')
-    || String(canonicalIdentityAddress(a?.network, a?.pool_address))
-      .localeCompare(String(canonicalIdentityAddress(b?.network, b?.pool_address)));
-}
 function sortBestPools(rows) {
-  return [...rows].sort(compareExactPoolPriority);
+  return [...rows].sort((a, b) =>
+    poolLiquidity(b) - poolLiquidity(a)
+    || poolVolume24h(b) - poolVolume24h(a)
+    || poolActivity(b, 'h1') - poolActivity(a, 'h1')
+    || String(a?.pool_address || '').localeCompare(String(b?.pool_address || ''))
+  );
 }
 
 function tokenMatchesText(token, query) {
@@ -3495,8 +3476,8 @@ function tokenMatchesText(token, query) {
     .some((value) => value && (value === q || value.includes(q)));
 }
 function tokenOrientationInPair(pair, tokenAddress) {
-  if (exactAddressEqual(pair?.network, pair?.base_token?.address, tokenAddress)) return 'base';
-  if (exactAddressEqual(pair?.network, pair?.quote_token?.address, tokenAddress)) return 'quote';
+  if (lower(pair?.base_token?.address) === lower(tokenAddress)) return 'base';
+  if (lower(pair?.quote_token?.address) === lower(tokenAddress)) return 'quote';
   return '';
 }
 function nullPriceChange() {
@@ -3511,9 +3492,6 @@ function tokenCentricRow(pair, token, extra = {}) {
   return {
     network: pair.network,
     chain_id: pair.chain_id,
-    token_address: text(token?.address),
-    pool_address: text(pair?.pool_address),
-    exact_identity_key: exactTokenPoolIdentityKey(pair.network, token?.address, pair?.pool_address),
     token: { ...token },
     best_pool: pair,
     token_orientation: orientation,
@@ -3536,7 +3514,7 @@ function chooseBetterTokenRow(current, candidate) {
   if (!current) return candidate;
   if (candidate.token_market_fields_verified && !current.token_market_fields_verified) return candidate;
   if (!candidate.token_market_fields_verified && current.token_market_fields_verified) return current;
-  return compareExactPoolPriority(candidate.best_pool, current.best_pool) < 0 ? candidate : current;
+  return poolLiquidity(candidate.best_pool) > poolLiquidity(current.best_pool) ? candidate : current;
 }
 function tokenCentricSearchRows(query, pairs) {
   const byToken = new Map();
@@ -3545,22 +3523,18 @@ function tokenCentricSearchRows(query, pairs) {
       if (!token?.address || !tokenMatchesText(token, query)) continue;
       const row = tokenCentricRow(pair, token, { search_query: text(query) });
       if (!row) continue;
-      // Same name/symbol never merges identities. Only the exact same network+token
-      // contract may choose one best pool for its token-centric search row.
-      const key = tokenIdentityKey(pair.network, token.address);
+      const key = `${pair.network}|${lower(token.address)}`;
       byToken.set(key, chooseBetterTokenRow(byToken.get(key), row));
     }
   }
   return [...byToken.values()]
     .filter((row) => row.token_market_fields_verified === true)
-    .sort((a, b) =>
-      compareExactPoolPriority(a.best_pool, b.best_pool)
-      || String(a.network || '').localeCompare(String(b.network || ''))
-      || canonicalIdentityAddress(a.network, a.token_address)
-        .localeCompare(canonicalIdentityAddress(b.network, b.token_address))
-      || canonicalIdentityAddress(a.network, a.pool_address)
-        .localeCompare(canonicalIdentityAddress(b.network, b.pool_address))
-    )
+    .sort((a, b) => {
+      if (a.token_market_fields_verified !== b.token_market_fields_verified) {
+        return a.token_market_fields_verified ? -1 : 1;
+      }
+      return poolScore(b.best_pool) - poolScore(a.best_pool);
+    })
     .slice(0, MAX_RESPONSE_ROWS);
 }
 
@@ -3625,9 +3599,9 @@ function mergeTokenProfile(left, right) {
   };
 }
 function tokenProfileForIdentity(network, address) {
-  const key = tokenIdentityKey(network, address);
+  const key = `${network}|${lower(address)}`;
   for (const row of trendingSnapshot) {
-    if (tokenIdentityKey(row.network, row?.token?.address) === key && row.token_profile) {
+    if (`${row.network}|${lower(row?.token?.address)}` === key && row.token_profile) {
       return row.token_profile;
     }
   }
@@ -3882,7 +3856,7 @@ function recentHotTokenRows(pairs) {
     // Published hot rows require exact base-token market fields. Quote-side pools remain
     // available in the pool list, but cannot lend the base token's price/change fields.
     if (tokenOrientationInPair(pair, candidateAddress) !== 'base') continue;
-    const key = tokenIdentityKey(pair.network, token.address);
+    const key = `${pair.network}|${lower(token.address)}`;
     let group = groups.get(key);
     if (!group) {
       group = { token, network: pair.network, pairs: [], candidate_sources: [], token_profile: null, binance_wallet_rank: null, binance_wallet_alpha_info: null };
@@ -4766,75 +4740,6 @@ function runSelfTest() {
     quoteSynthetic?.market_cap_usd === null &&
     quoteSynthetic?.fdv_usd === null &&
     quoteSynthetic?.price_change_pct?.h24 === null);
-  const step1049BaseQuote = {
-    address: '0x00000000000000000000000000000000000000f0',
-    symbol: 'WETH',
-    name: 'Wrapped Ether',
-  };
-  const step1049PoolA = {
-    network: 'ethereum',
-    chain_id: 'ethereum',
-    pool_address: '0x00000000000000000000000000000000000000a1',
-    base_token: {
-      address: '0x0000000000000000000000000000000000000001',
-      symbol: 'SAME',
-      name: 'Same Token',
-    },
-    quote_token: step1049BaseQuote,
-    liquidity_usd: 1000,
-    volume_usd: { h24: 9000 },
-    txns: { h24: { buys: 80, sells: 70 }, h1: { buys: 8, sells: 7 }, m5: { buys: 1, sells: 1 } },
-    price_usd: 1,
-    price_change_pct: nullPriceChange(),
-  };
-  const step1049PoolB = {
-    network: 'ethereum',
-    chain_id: 'ethereum',
-    pool_address: '0x00000000000000000000000000000000000000b1',
-    base_token: {
-      address: '0x0000000000000000000000000000000000000002',
-      symbol: 'SAME',
-      name: 'Same Token',
-    },
-    quote_token: step1049BaseQuote,
-    liquidity_usd: 2000,
-    volume_usd: { h24: 100 },
-    txns: { h24: { buys: 2, sells: 2 }, h1: { buys: 1, sells: 1 }, m5: { buys: 0, sells: 0 } },
-    price_usd: 2,
-    price_change_pct: nullPriceChange(),
-  };
-  const step1049SameRows = tokenCentricSearchRows('SAME', [step1049PoolA, step1049PoolB]);
-  t('step1049_same_symbol_distinct_contracts',
-    step1049SameRows.length === 2 &&
-    new Set(step1049SameRows.map((row) => row.token_address)).size === 2);
-  t('step1049_liquidity_primary_rank',
-    step1049SameRows[0]?.token_address === step1049PoolB.base_token.address);
-  const step1049VolumeA = { ...step1049PoolA, liquidity_usd: 5000, volume_usd: { h24: 100 } };
-  const step1049VolumeB = { ...step1049PoolB, liquidity_usd: 5000, volume_usd: { h24: 200 } };
-  t('step1049_volume_secondary_rank',
-    [step1049VolumeA, step1049VolumeB].sort(compareExactPoolPriority)[0] === step1049VolumeB);
-  const step1049ActivityA = {
-    ...step1049PoolA,
-    liquidity_usd: 5000,
-    volume_usd: { h24: 200 },
-    txns: { h24: { buys: 2, sells: 2 }, h1: { buys: 1, sells: 1 }, m5: { buys: 0, sells: 0 } },
-  };
-  const step1049ActivityB = {
-    ...step1049PoolB,
-    liquidity_usd: 5000,
-    volume_usd: { h24: 200 },
-    txns: { h24: { buys: 20, sells: 20 }, h1: { buys: 1, sells: 1 }, m5: { buys: 0, sells: 0 } },
-  };
-  t('step1049_activity_tertiary_rank',
-    [step1049ActivityA, step1049ActivityB].sort(compareExactPoolPriority)[0] === step1049ActivityB);
-  t('step1049_exact_identity_includes_pool_contract',
-    step1049SameRows.every((row) =>
-      row.exact_identity_key === exactTokenPoolIdentityKey(row.network, row.token_address, row.pool_address)));
-  t('step1049_solana_identity_case_sensitive',
-    tokenIdentityKey('solana', 'AbCdEf123') !== tokenIdentityKey('solana', 'abcdef123'));
-  t('step1049_evm_identity_case_insensitive',
-    tokenIdentityKey('ethereum', '0xAbCd') === tokenIdentityKey('ethereum', '0xabcd'));
-
   t('cross_chain_substitution_false', responseBase().cross_chain_substitution === false);
   t('cross_token_substitution_false', responseBase().cross_token_substitution === false);
   t('direct_app_upstream_zero', responseBase().app_direct_upstream_requests === 0);
@@ -5453,21 +5358,11 @@ export async function handleOnchainMarket(req, res, url) {
   if (path === SEARCH_ROUTE) {
     const q = text(url.searchParams.get('q')).slice(0, 160);
     if (q.length < 2) { sendJson(res, 400, responseBase({ ok: false, error: 'query_too_short', rows: [] })); return true; }
-    const key = `search:${STEP1049_SEARCH_RANK_RULE_VERSION}:${lower(q)}:${network || 'all'}`;
+    const key = `search:${lower(q)}:${network || 'all'}`;
     try {
       const result = await cachedBuild(key, { freshMs: 60_000, staleMs: 10 * 60_000 }, () => buildDexSearch(q));
       const rows = (result.value || []).filter((row) => !network || network === 'all' || row.network === network).slice(0, limit);
-      sendJson(res, 200, responseBase({
-        feature_schema_version: STEP1049_FEATURE_SCHEMA_VERSION,
-        search_rank_rule_version: STEP1049_SEARCH_RANK_RULE_VERSION,
-        exact_identity_scope: 'network_token_contract_best_pool_contract',
-        query: q,
-        network: network || 'all',
-        rows,
-        row_count: rows.length,
-        cache_status: result.cache_status,
-        bounded_backend_build: result.cache_status === 'miss',
-      }));
+      sendJson(res, 200, responseBase({ query: q, network: network || 'all', rows, row_count: rows.length, cache_status: result.cache_status, bounded_backend_build: result.cache_status === 'miss' }));
     } catch (error) { sendJson(res, 503, responseBase({ ok: false, error: text(error?.message || error), query: q, rows: [] })); }
     return true;
   }
