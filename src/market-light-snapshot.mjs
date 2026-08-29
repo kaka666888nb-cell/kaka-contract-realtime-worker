@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.5';
+const STEP_VERSION = '650.8.15.197.3.3.6';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -264,6 +264,7 @@ let marketCapKnownAmbiguousByFundamentals = 0;
 // in-memory snapshot and never start Supabase/CoinGecko work.
 const STEP1050_D_2_PROJECT_FEATURE_SCHEMA = 'step1050_d_2_project_top3000_rank_v1';
 const STEP1050_D_2_PROJECT_SCHEMA = 'step1050_d_2_project_rank_page_v1';
+const STEP1050_D_3_2_PROJECT_MARKET_COUNT_SCHEMA = 'step1050_d_3_2_project_market_counts_v1';
 const PROJECT_RANK_PAGE_LIMIT_MAX = 50;
 const PROJECT_RANK_SNAPSHOT_TTL_MS = 10 * 60_000;
 const PROJECT_RANK_SNAPSHOT_MAX = 6;
@@ -3166,6 +3167,72 @@ function publishProjectMarketCapRankSnapshot(catalogRows) {
   pruneProjectMarketCapRankSnapshots();
 }
 
+
+function projectDirectoryRowTradable(row) {
+  if (!row || typeof row !== 'object' || row.active === false) return false;
+  const status = String(
+    row.trading_status ?? row.status ?? row.state ?? '',
+  ).trim().toUpperCase();
+  if ([
+    'DELISTED',
+    'SUSPENDED',
+    'HALTED',
+    'CLOSED',
+    'EXPIRED',
+    'OFFLINE',
+    'STOPPED',
+    'DISABLED',
+  ].includes(status)) return false;
+  return true;
+}
+
+function projectDirectoryBaseForCount(row, quote) {
+  let base = compact(row?.base_asset ?? row?.baseAsset);
+  if (!base) base = baseAssetFor(row, quote);
+  if (base === 'XBT') base = 'BTC';
+  return base;
+}
+
+function projectDirectoryMarketCountIndex(market) {
+  const providers = market === 'spot' ? SPOT_PROVIDERS : CONTRACT_PROVIDERS;
+  const counts = new Map();
+  const readyProviders = [];
+
+  for (const provider of providers) {
+    const quote = PRIMARY_QUOTE[market]?.[provider];
+    const rows = directoryRowsByKey.get(keyFor(market, provider)) || [];
+    if (rows.length) readyProviders.push(provider);
+    if (!quote || !rows.length) continue;
+
+    for (const row of rows) {
+      if (!projectDirectoryRowTradable(row)) continue;
+      const rowQuote = quoteAssetFor(row, quote);
+      if (rowQuote !== quote) continue;
+      const base = projectDirectoryBaseForCount(row, rowQuote);
+      const symbol = compact(row?.symbol ?? row?.native_symbol ?? row?.raw_symbol);
+      if (!base || !symbol || base === rowQuote) continue;
+
+      const key = `${provider}|${symbol}`;
+      let identities = counts.get(base);
+      if (!identities) {
+        identities = new Set();
+        counts.set(base, identities);
+      }
+      identities.add(key);
+    }
+  }
+
+  return {
+    counts: new Map(
+      [...counts.entries()].map(([base, identities]) => [base, identities.size]),
+    ),
+    ready: readyProviders.length === providers.length,
+    ready_provider_count: readyProviders.length,
+    expected_provider_count: providers.length,
+    ready_providers: readyProviders,
+  };
+}
+
 function projectMarketCapRankedPagePayload({ offset = 0, limit = 50, rankVersion = '' } = {}) {
   pruneProjectMarketCapRankSnapshots();
   const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
@@ -3209,7 +3276,24 @@ function projectMarketCapRankedPagePayload({ offset = 0, limit = 50, rankVersion
   }
 
   const rows = Array.isArray(snapshot.rows) ? snapshot.rows : [];
-  const page = rows.slice(safeOffset, safeOffset + safeLimit);
+  const spotMarketCounts = projectDirectoryMarketCountIndex('spot');
+  const contractMarketCounts = projectDirectoryMarketCountIndex('contract');
+  const page = rows.slice(safeOffset, safeOffset + safeLimit).map((item) => {
+    const base = compact(item?.symbol);
+    return {
+      ...item,
+      spot_market_count:
+        spotMarketCounts.ready && base
+          ? Number(spotMarketCounts.counts.get(base) || 0)
+          : null,
+      contract_market_count:
+        contractMarketCounts.ready && base
+          ? Number(contractMarketCounts.counts.get(base) || 0)
+          : null,
+      spot_market_count_ready: spotMarketCounts.ready,
+      contract_market_count_ready: contractMarketCounts.ready,
+    };
+  });
   return {
     ok: true,
     version: STEP_VERSION,
@@ -3231,6 +3315,17 @@ function projectMarketCapRankedPagePayload({ offset = 0, limit = 50, rankVersion
     source_schema_version: marketCapSourceSchemaVersion || null,
     source_coverage_ready: marketCapSourceCoverageReady,
     source_snapshot_rows: marketCapSourceSnapshotRows,
+    market_count_schema_version: STEP1050_D_3_2_PROJECT_MARKET_COUNT_SCHEMA,
+    market_count_source: 'render_shared_background_full_primary_quote_directories',
+    market_count_semantics: 'exact_tradable_provider_symbol_markets_primary_quote',
+    spot_market_count_ready: spotMarketCounts.ready,
+    contract_market_count_ready: contractMarketCounts.ready,
+    spot_market_count_ready_provider_count: spotMarketCounts.ready_provider_count,
+    spot_market_count_expected_provider_count: spotMarketCounts.expected_provider_count,
+    contract_market_count_ready_provider_count: contractMarketCounts.ready_provider_count,
+    contract_market_count_expected_provider_count: contractMarketCounts.expected_provider_count,
+    market_count_user_read_upstream_requests: 0,
+    market_count_reads_scale_with_users: false,
     read_only_shared: true,
     user_read_upstream_requests: 0,
     user_read_upstream_connections: 0,
@@ -4244,6 +4339,9 @@ export function getMarketLightSnapshotHealth() {
       self_pair_filter_applied: false,
       symbol_ambiguity_exclusion_applied: false,
       includes_stablecoin_projects: true,
+      market_count_schema_version: STEP1050_D_3_2_PROJECT_MARKET_COUNT_SCHEMA,
+      market_count_source: 'render_shared_background_full_primary_quote_directories',
+      market_count_user_reads_start_upstream: false,
       user_read_upstream_requests: 0,
       reads_scale_with_users: false,
     },

@@ -21,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          EXPECTED='650.8.15.197.3.3.31.1'
+          EXPECTED='650.8.15.197.3.3.31.2'
           for i in $(seq 1 90); do
             root="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
             ver="$(printf '%s' "$root" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
@@ -53,6 +53,11 @@ jobs:
           assert d['user_read_upstream_requests']==0
           assert int(d['source_data_version']) >= 1050000
           assert d['source_schema_version']=='step1050_market_cap_catalog_v1'
+          assert d['market_count_schema_version']=='step1050_d_3_2_project_market_counts_v1'
+          assert d['market_count_source']=='render_shared_background_full_primary_quote_directories'
+          assert d['spot_market_count_ready'] is True
+          assert d['contract_market_count_ready'] is True
+          assert d['market_count_user_read_upstream_requests']==0
           rows=d['items']
           assert len(rows)==50
           ranks={int(x['market_cap_rank']):x for x in rows}
@@ -60,9 +65,14 @@ jobs:
           assert 3 in ranks, ranks.keys()
           assert str(ranks[1]['symbol']).upper()=='BTC', ranks[1]
           assert str(ranks[3]['symbol']).upper()=='USDT', ranks[3]
+          assert int(ranks[2]['contract_market_count']) >= 5, ranks[2]
+          assert int(ranks[5]['contract_market_count']) >= 4, ranks[5]
+          assert int(ranks[1]['spot_market_count']) >= 5, ranks[1]
           print('PASS first page rank1=',ranks[1]['coin_id'],ranks[1]['symbol'])
           print('PASS first page rank3=',ranks[3]['coin_id'],ranks[3]['symbol'])
-          print('top10=',[(x['market_cap_rank'],x['symbol'],x['coin_id']) for x in rows[:10]])
+          print('PASS ETH contract markets=',ranks[2]['contract_market_count'])
+          print('PASS XRP contract markets=',ranks[5]['contract_market_count'])
+          print('top10=',[(x['market_cap_rank'],x['symbol'],x['spot_market_count'],x['contract_market_count']) for x in rows[:10]])
           PY
 
       - name: Verify frozen +50 project pagination
