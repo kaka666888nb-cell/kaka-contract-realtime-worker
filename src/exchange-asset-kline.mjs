@@ -8,16 +8,18 @@
 
 import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { resolveCoinbaseEquityCandleRoute, getCoinbaseCoreKlineReplicaHealth } from './stock-catalog-v2.mjs';
+import { KAKA_FULL_INTERVALS, KAKA_DERIVED_PLAN, klineDerivedPlan, deriveAndFillKlines } from './kline-derived.mjs';
 
-const VERSION = '650.8.15.196.11';
-const DATA_VERSION = 1041010;
-const SCHEMA_VERSION = 'step1026_all_asset_kline_v1';
+const VERSION = '650.8.15.196.12';
+const DATA_VERSION = 1041011;
+const SCHEMA_VERSION = 'step1046_2_5_asset_kline_continuity_v1';
 const ENDPOINT = '/api/asset-klines';
 const HEALTH_ENDPOINT = '/api/asset-klines/health';
 const SELF_TEST_ENDPOINT = '/api/asset-klines/self-test';
 
 const PROVIDERS = new Set(['okx', 'bybit', 'bitget', 'gate']);
-const INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d']);
+const NATIVE_INTERVALS = new Set(['1m', '5m', '15m', '1h', '4h', '1d']);
+const INTERVALS = new Set(KAKA_FULL_INTERVALS);
 const CACHE_MAX = 512;
 const NEGATIVE_CACHE_MAX = 256;
 const BUILD_MAX_ACTIVE = 4; // global emergency ceiling retained from .161
@@ -166,7 +168,7 @@ function parseBitgetRealityInstrument(row) {
     underlying_identity_kind: 'reality_protocol_reference',
     official_kline_capability: 'supported',
     official_kline_source: 'bitget_public_reality_candlestick',
-    kline_intervals: ['1m', '5m', '15m', '1h', '4h', '1d'],
+    kline_intervals: [...KAKA_FULL_INTERVALS],
     source: 'bitget_official_v3_market_instruments_isReality_yes',
   };
 }
@@ -293,7 +295,9 @@ function bitgetRealityCatalogHealth() {
     reads_scale_with_users: false,
     one_catalog_request_per_refresh: true,
     kline_build_mode: 'exact_rtoken_shared_cache_singleflight_on_demand',
-    supported_intervals: ['1m', '5m', '15m', '1h', '4h', '1d'],
+    supported_intervals: [...KAKA_FULL_INTERVALS],
+    native_intervals: [...NATIVE_INTERVALS],
+    derived_intervals: Object.keys(KAKA_DERIVED_PLAN),
     ...bitgetRealityCatalogStats,
   };
 }
@@ -427,11 +431,20 @@ function exactScopeSupported({ provider, marketType, assetClass }) {
 function freshTtlMs(interval) {
   switch (interval) {
     case '1m': return 20_000;
+    case '3m': return 25_000;
     case '5m': return 30_000;
     case '15m': return 45_000;
+    case '30m': return 45_000;
     case '1h': return 60_000;
+    case '2h': return 90_000;
     case '4h': return 120_000;
-    case '1d': return 300_000;
+    case '6h':
+    case '8h':
+    case '12h': return 180_000;
+    case '1d':
+    case '3d':
+    case '1w':
+    case '1M': return 300_000;
     default: return 30_000;
   }
 }
@@ -936,7 +949,7 @@ function cacheKey(identity) {
   ].join('|');
 }
 
-async function getSharedRows(identity, signal) {
+async function getSharedNativeRows(identity, signal) {
   stats.reads += 1;
   pruneMaps();
   const key = cacheKey(identity);
@@ -1036,6 +1049,132 @@ async function getSharedRows(identity, signal) {
   } finally {
     if (inflight.get(key) === task) inflight.delete(key);
   }
+}
+
+function klineContinuitySessionMode(identity) {
+  if (identity.sparse) return 'none';
+  const scope = `${assetClassKey(identity.assetClass)}|${marketTypeKey(identity.marketType)}`;
+  // Stocks/RWA/FX/commodities have sessions. Never fill overnight/weekend closures.
+  if (/(equity|stock|rwa|commodity|metal|fx|forex)/.test(scope)) return 'intraday_only';
+  return 'continuous_24x7';
+}
+
+function applyNativeContinuity(identity, payload) {
+  if (!payload || !Array.isArray(payload.rows) || payload.rows.length === 0) return payload;
+  const source = text(payload.rows[0]?.source);
+  const continuity = deriveAndFillKlines(payload.rows, identity.interval, {
+    sourceInterval: identity.interval,
+    source,
+    sessionMode: klineContinuitySessionMode(identity),
+    maxGapBars: 96,
+    limit: identity.limit,
+  });
+  const rows = continuity.rows.map((row) => ({ ...row, interval: identity.interval }));
+  return {
+    ...payload,
+    rows,
+    row_count: rows.length,
+    interval_mode: 'native_shared_with_bounded_gap_continuity',
+    derived_from_interval: null,
+    zero_trade_fill_count: continuity.zero_trade_fill_count,
+    zero_trade_fill_policy: continuity.zero_trade_fill_policy,
+    zero_trade_fill_tail_extrapolation: false,
+  };
+}
+
+async function getSharedDerivedRows(identity, signal) {
+  pruneMaps();
+  const plan = klineDerivedPlan(identity.interval);
+  if (!plan || !NATIVE_INTERVALS.has(plan.base)) {
+    throw new Error('asset_kline_derived_plan_invalid');
+  }
+  const key = cacheKey(identity);
+  const now = Date.now();
+  const existing = cache.get(key);
+  if (existing && existing.freshUntil > now) {
+    stats.fresh_hits += 1;
+    return cachedPayload(existing, 'fresh_hit');
+  }
+  const running = inflight.get(key);
+  if (running) {
+    stats.inflight_hits += 1;
+    return await running;
+  }
+  const task = (async () => {
+    try {
+      // Canonical 300-row base key means 2h/6h share one 1h upstream build, 8h/12h share 4h, etc.
+      const baseIdentity = { ...identity, interval: plan.base, limit: 300 };
+      const basePayload = await getSharedNativeRows(baseIdentity, signal);
+      if (!basePayload?.ok || !Array.isArray(basePayload.rows) || basePayload.rows.length === 0) {
+        if (existing && existing.staleUntil > Date.now()) {
+          stats.stale_hits += 1;
+          return cachedPayload(existing, 'stale_base_empty');
+        }
+        return {
+          ...responseBase(identity),
+          ok: false,
+          error: 'official_exact_asset_base_kline_empty',
+          rows: [],
+          row_count: 0,
+          cache_status: 'derived_base_empty',
+          derived_from_interval: plan.base,
+          generated_at: new Date().toISOString(),
+        };
+      }
+      const source = text(basePayload.rows[0]?.source);
+      const continuity = deriveAndFillKlines(basePayload.rows, identity.interval, {
+        sourceInterval: plan.base,
+        source,
+        sessionMode: klineContinuitySessionMode(identity),
+        maxGapBars: 96,
+        limit: identity.limit,
+      });
+      const rows = continuity.rows.map((row) => ({ ...row, interval: identity.interval }));
+      const payload = {
+        ...responseBase(identity),
+        rows,
+        row_count: rows.length,
+        cache_status: 'derived_miss',
+        interval_mode: 'shared_derived_same_exact_product',
+        derived_from_interval: plan.base,
+        base_cache_status: basePayload.cache_status || null,
+        zero_trade_fill_count: continuity.zero_trade_fill_count,
+        zero_trade_fill_policy: continuity.zero_trade_fill_policy,
+        zero_trade_fill_tail_extrapolation: false,
+        derived_user_upstream_requests: 0,
+        generated_at: new Date().toISOString(),
+      };
+      const entry = {
+        payload,
+        storedAt: Date.now(),
+        freshUntil: Date.now() + freshTtlMs(identity.interval),
+        staleUntil: Date.now() + STALE_MS,
+      };
+      cache.set(key, entry);
+      pruneMaps();
+      return cachedPayload(entry, 'derived_miss');
+    } catch (error) {
+      if (existing && existing.staleUntil > Date.now()) {
+        stats.stale_hits += 1;
+        return cachedPayload(existing, 'stale_derived_error');
+      }
+      throw error;
+    }
+  })();
+  inflight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (inflight.get(key) === task) inflight.delete(key);
+  }
+}
+
+async function getSharedRows(identity, signal) {
+  const plan = klineDerivedPlan(identity.interval);
+  if (plan && !NATIVE_INTERVALS.has(identity.interval)) {
+    return await getSharedDerivedRows(identity, signal);
+  }
+  return applyNativeContinuity(identity, await getSharedNativeRows(identity, signal));
 }
 
 function parseIdentity(url) {
@@ -1153,6 +1292,9 @@ export function runAssetKlineSelfTest() {
     okx_latest_asset_window_uses_current_candles: true,
     okx_xperp_symbol_preserved: nativeSymbolKey('AAOI-USD_UM_XPERP-310711') === 'AAOI-USD_UM_XPERP-310711',
     no_symbol_rewrite: nativeSymbolKey('EURUSD_USDT') === 'EURUSD_USDT' && nativeSymbolKey('ABC-USD-SWAP') === 'ABC-USD-SWAP',
+    derived_2h_from_1h_plan: klineDerivedPlan('2h')?.base === '1h',
+    derived_month_from_1d_plan: klineDerivedPlan('1M')?.base === '1d',
+    all_intervals_include_sparse_and_long_periods: ['3m','30m','2h','6h','8h','12h','3d','1w','1M'].every((x) => INTERVALS.has(x)),
   };
   return {
     ok: Object.values(checks).every(Boolean),
@@ -1175,7 +1317,13 @@ export function getAssetKlineHealth() {
     self_test_endpoint: SELF_TEST_ENDPOINT,
     providers: [...PROVIDERS],
     intervals: [...INTERVALS],
-    mode: 'exact_identity_shared_cache_singleflight_official_asset_klines',
+    native_intervals: [...NATIVE_INTERVALS],
+    derived_intervals: Object.keys(KAKA_DERIVED_PLAN),
+    derived_base_cache_limit: 300,
+    bounded_zero_trade_gap_fill: true,
+    zero_trade_tail_extrapolation: false,
+    stock_session_fill_policy: 'internal_same_utc_day_only_no_overnight_weekend_fill',
+    mode: 'exact_identity_shared_cache_singleflight_official_asset_klines_plus_shared_derived_intervals',
     read_only_shared: true,
     app_direct_exchange_requests: 0,
     same_exact_key_reads_share_cache_and_inflight: true,
