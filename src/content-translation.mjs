@@ -71,6 +71,9 @@ const state = {
   daily_requests: 0,
   daily_by_bucket: {},
   daily_budget_day_key: null,
+  daily_budget_rollovers: 0,
+  last_daily_budget_rollover_at: null,
+  last_daily_budget_rollover_from: null,
   daily_budget_persistence_healthy: true,
   daily_bucket_limits: { ...DAILY_BUCKET_LIMITS },
   usage_persistence_configured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
@@ -139,6 +142,23 @@ function pacificDayKey() {
     timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(new Date());
 }
+// Step1046.2.6: health/read paths must never keep yesterday's saturated counters alive
+// into a new Pacific day. This is a local view rollover only: it performs no Google request
+// and intentionally does NOT mark dailyUsageLoadedKey as loaded. The first real translation
+// attempt will still reload today's persisted per-bucket usage from Supabase before charging.
+function rollDailyBudgetViewIfNeeded() {
+  const day = pacificDayKey();
+  if (state.daily_budget_day_key === day) return false;
+  const previous = state.daily_budget_day_key || dailyUsageLoadedKey || null;
+  state.daily_characters_used = 0;
+  state.daily_requests = 0;
+  state.daily_by_bucket = {};
+  state.daily_budget_day_key = day;
+  state.daily_budget_rollovers += 1;
+  state.last_daily_budget_rollover_at = new Date().toISOString();
+  state.last_daily_budget_rollover_from = previous;
+  return true;
+}
 function normalizeBudgetBucket(value) {
   const key = text(value).toLowerCase();
   return Object.prototype.hasOwnProperty.call(DAILY_BUCKET_LIMITS, key) ? key : 'legacy_bootstrap';
@@ -181,8 +201,12 @@ async function ensureUsageLoaded() {
 }
 async function ensureDailyUsageLoaded() {
   const day = pacificDayKey();
+  rollDailyBudgetViewIfNeeded();
   if (dailyUsageLoadedKey === day) return;
-  if (dailyUsageLoadPromise) return dailyUsageLoadPromise;
+  if (dailyUsageLoadPromise) {
+    await dailyUsageLoadPromise;
+    if (dailyUsageLoadedKey === day) return;
+  }
   dailyUsageLoadPromise = (async () => {
     state.daily_characters_used = 0;
     state.daily_requests = 0;
@@ -544,6 +568,7 @@ export function noteUserSharedTranslationRequest() {
 }
 
 export function getSharedTranslationHealth() {
+  rollDailyBudgetViewIfNeeded();
   return {
     ...state,
     configured: Boolean(GOOGLE_API_KEY),
