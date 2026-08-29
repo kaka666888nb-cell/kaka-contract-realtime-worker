@@ -3439,6 +3439,20 @@ function poolVolume24h(row) { return Math.max(0, Number(row?.volume_usd?.h24 || 
 function poolActivity(row, period) {
   return Math.max(0, Number(row?.txns?.[period]?.buys || 0) + Number(row?.txns?.[period]?.sells || 0));
 }
+// Step1049.1: keep this search-only. Do not alter pool identity, hot discovery,
+// token detail, K-line identity or cache-key behavior outside the search route.
+function searchTokenIdentityKey(network, address) {
+  const raw = text(address);
+  return `${network}|${network === 'solana' ? raw : lower(raw)}`;
+}
+function compareSearchPoolPriority(a, b) {
+  return poolLiquidity(b) - poolLiquidity(a)
+    || poolVolume24h(b) - poolVolume24h(a)
+    || poolActivity(b, 'h24') - poolActivity(a, 'h24')
+    || poolActivity(b, 'h1') - poolActivity(a, 'h1')
+    || poolActivity(b, 'm5') - poolActivity(a, 'm5')
+    || String(a?.pool_address || '').localeCompare(String(b?.pool_address || ''));
+}
 function poolScore(row) {
   // Legacy quality helper. Pool *selection* is no longer based on this score.
   const liq = Math.log10(1 + poolLiquidity(row));
@@ -3514,7 +3528,7 @@ function chooseBetterTokenRow(current, candidate) {
   if (!current) return candidate;
   if (candidate.token_market_fields_verified && !current.token_market_fields_verified) return candidate;
   if (!candidate.token_market_fields_verified && current.token_market_fields_verified) return current;
-  return poolLiquidity(candidate.best_pool) > poolLiquidity(current.best_pool) ? candidate : current;
+  return compareSearchPoolPriority(candidate.best_pool, current.best_pool) < 0 ? candidate : current;
 }
 function tokenCentricSearchRows(query, pairs) {
   const byToken = new Map();
@@ -3523,18 +3537,20 @@ function tokenCentricSearchRows(query, pairs) {
       if (!token?.address || !tokenMatchesText(token, query)) continue;
       const row = tokenCentricRow(pair, token, { search_query: text(query) });
       if (!row) continue;
-      const key = `${pair.network}|${lower(token.address)}`;
+      // Never merge by name/symbol. The only dedupe key is exact chain + token contract.
+      // Solana/base58 stays case-sensitive; EVM remains case-insensitive.
+      const key = searchTokenIdentityKey(pair.network, token.address);
       byToken.set(key, chooseBetterTokenRow(byToken.get(key), row));
     }
   }
   return [...byToken.values()]
     .filter((row) => row.token_market_fields_verified === true)
-    .sort((a, b) => {
-      if (a.token_market_fields_verified !== b.token_market_fields_verified) {
-        return a.token_market_fields_verified ? -1 : 1;
-      }
-      return poolScore(b.best_pool) - poolScore(a.best_pool);
-    })
+    .sort((a, b) =>
+      compareSearchPoolPriority(a.best_pool, b.best_pool)
+      || String(a.network || '').localeCompare(String(b.network || ''))
+      || searchTokenIdentityKey(a.network, a?.token?.address)
+        .localeCompare(searchTokenIdentityKey(b.network, b?.token?.address))
+    )
     .slice(0, MAX_RESPONSE_ROWS);
 }
 
@@ -5362,7 +5378,17 @@ export async function handleOnchainMarket(req, res, url) {
     try {
       const result = await cachedBuild(key, { freshMs: 60_000, staleMs: 10 * 60_000 }, () => buildDexSearch(q));
       const rows = (result.value || []).filter((row) => !network || network === 'all' || row.network === network).slice(0, limit);
-      sendJson(res, 200, responseBase({ query: q, network: network || 'all', rows, row_count: rows.length, cache_status: result.cache_status, bounded_backend_build: result.cache_status === 'miss' }));
+      sendJson(res, 200, responseBase({
+        query: q,
+        network: network || 'all',
+        rows,
+        row_count: rows.length,
+        search_rank_rule_version: 'liquidity_desc_then_24h_volume_desc_then_24h_activity_desc_v2',
+        exact_identity_scope: 'network_plus_token_contract_best_pool_contract_v2',
+        ranking_happens_before_response_limit: true,
+        cache_status: result.cache_status,
+        bounded_backend_build: result.cache_status === 'miss',
+      }));
     } catch (error) { sendJson(res, 503, responseBase({ ok: false, error: text(error?.message || error), query: q, rows: [] })); }
     return true;
   }

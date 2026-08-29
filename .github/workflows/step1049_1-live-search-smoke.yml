@@ -1,0 +1,147 @@
+name: Step1049.1 live onchain search smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/onchain-market.mjs'
+      - 'src/proxy.mjs'
+      - '.github/workflows/step1049_1-live-search-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 16
+    steps:
+      - name: Wait for Render Auto-Deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          EXPECTED='650.8.15.197.3.3.29.1'
+          for i in $(seq 1 72); do
+            body="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
+            version="$(python3 -c 'import json,sys; try: print(json.loads(sys.stdin.read()).get("version","")) except Exception: print("")' <<<"$body")"
+            echo "render_poll=$i version=$version"
+            if [ "$version" = "$EXPECTED" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Render did not reach $EXPECTED" >&2
+          exit 1
+
+      - name: Real PEPE CAT DOGE search contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          mkdir -p /tmp/step1049_1
+          for q in pepe cat doge; do
+            ok=0
+            for attempt in $(seq 1 8); do
+              code="$(curl -sS --connect-timeout 8 --max-time 25                 -o "/tmp/step1049_1/$q.json"                 -w '%{http_code}'                 "$BASE/api/onchain/search?q=$q&limit=50" || true)"
+              echo "query=$q attempt=$attempt http=$code"
+              if [ "$code" = "200" ]; then
+                ok=1
+                break
+              fi
+              sleep 12
+            done
+            if [ "$ok" != "1" ]; then
+              echo "query=$q never returned HTTP200" >&2
+              cat "/tmp/step1049_1/$q.json" 2>/dev/null || true
+              exit 1
+            fi
+          done
+
+          python3 - <<'PY'
+          import json, pathlib, math
+
+          expected_rank = 'liquidity_desc_then_24h_volume_desc_then_24h_activity_desc_v2'
+          expected_identity = 'network_plus_token_contract_best_pool_contract_v2'
+
+          def n(v):
+              try:
+                  x = float(v)
+                  return x if math.isfinite(x) and x > 0 else 0.0
+              except Exception:
+                  return 0.0
+
+          def activity(pool, period):
+              tx = ((pool or {}).get("txns") or {}).get(period) or {}
+              return n(tx.get("buys")) + n(tx.get("sells"))
+
+          def rank_tuple(row):
+              pool = row.get("best_pool") or {}
+              return (
+                  n(pool.get("liquidity_usd")),
+                  n((pool.get("volume_usd") or {}).get("h24")),
+                  activity(pool, "h24"),
+                  activity(pool, "h1"),
+                  activity(pool, "m5"),
+              )
+
+          total_rows = 0
+          same_symbol_distinct = []
+          all_rows = []
+          for q in ("pepe","cat","doge"):
+              p = pathlib.Path(f"/tmp/step1049_1/{q}.json")
+              body = json.loads(p.read_text())
+              assert body.get("ok") is True, (q, body.get("error"))
+              assert body.get("search_rank_rule_version") == expected_rank, (q, body.get("search_rank_rule_version"))
+              assert body.get("exact_identity_scope") == expected_identity, (q, body.get("exact_identity_scope"))
+              rows = body.get("rows")
+              assert isinstance(rows, list) and rows, f"{q} empty"
+              total_rows += len(rows)
+
+              identities = set()
+              prev = None
+              by_symbol = {}
+              for i,row in enumerate(rows):
+                  network = str(row.get("network") or "")
+                  token = row.get("token") or {}
+                  token_address = str(token.get("address") or "")
+                  pool = row.get("best_pool") or {}
+                  pool_address = str(pool.get("pool_address") or "")
+                  assert network and token_address and pool_address, (q, i, network, token_address, pool_address)
+
+                  ident = (network, token_address if network=="solana" else token_address.lower(), pool_address)
+                  assert ident not in identities, (q, "duplicate exact identity", ident)
+                  identities.add(ident)
+
+                  current = rank_tuple(row)
+                  if prev is not None:
+                      assert prev >= current, (q, "rank order broken", i-1, prev, i, current)
+                  prev = current
+
+                  symbol = str(token.get("symbol") or "").strip().upper()
+                  if symbol:
+                      by_symbol.setdefault(symbol, set()).add((network, token_address if network=="solana" else token_address.lower()))
+                  all_rows.append((q, network, symbol, token_address, pool_address, current))
+
+              for symbol, ids in by_symbol.items():
+                  if len(ids) >= 2:
+                      same_symbol_distinct.append((q, symbol, len(ids)))
+
+              print(f"PASS query={q} rows={len(rows)} top_rank={rank_tuple(rows[0])} cache={body.get('cache_status')}")
+
+          assert total_rows >= 3
+          print("INFO same_symbol_distinct_examples=", same_symbol_distinct[:10])
+          print("PASS real live search: HTTP200, non-empty, exact identities, liquidity-first rank")
+          PY
+
+      - name: Repeat shared query reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 20); do
+            code="$(curl -sS --connect-timeout 8 --max-time 20 -o /tmp/repeat.json -w '%{http_code}'               "$BASE/api/onchain/search?q=pepe&limit=50" || true)"
+            echo "repeat=$i http=$code"
+            test "$code" = "200"
+          done
+          echo "PASS 20 repeated PEPE reads"
