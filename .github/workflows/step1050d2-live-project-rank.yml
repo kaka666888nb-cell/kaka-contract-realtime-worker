@@ -26,13 +26,7 @@ jobs:
             root="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
             ver="$(printf '%s' "$root" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
             mh="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/api/market-light/health" || true)"
-            read -r ready rows <<<"$(printf '%s' "$mh" | python3 -c '
-import json,sys
-try:
- d=json.loads(sys.stdin.read()); p=d.get("project_market_cap_rank") or {}
- print(str(bool(p.get("ready"))).lower(), int(p.get("current_rows") or 0))
-except Exception: print("false 0")
-' 2>/dev/null || echo 'false 0')"
+            read -r ready rows <<<"$(printf '%s' "$mh" | python3 -c 'import json,sys; d=json.load(sys.stdin); p=d.get("project_market_cap_rank") or {}; print(str(bool(p.get("ready"))).lower(), int(p.get("current_rows") or 0))' 2>/dev/null || echo 'false 0')"
             echo "poll=$i render=$ver project_ready=$ready rows=$rows"
             if [ "$ver" = "$EXPECTED" ] && [ "$ready" = "true" ] && [ "$rows" -ge 2800 ]; then
               exit 0
@@ -80,7 +74,8 @@ except Exception: print("false 0")
           curl -fsS --connect-timeout 8 --max-time 25             "$BASE/api/market-light/project-ranked-page?offset=50&limit=50&rank_version=$RV"             -o /tmp/p50.json
           python3 - <<'PY'
           import json
-          a=json.load(open('/tmp/p0.json')); b=json.load(open('/tmp/p50.json'))
+          a=json.load(open('/tmp/p0.json'))
+          b=json.load(open('/tmp/p50.json'))
           assert a['rank_version']==b['rank_version']
           ids0=[x['coin_id'] for x in a['items']]
           ids1=[x['coin_id'] for x in b['items']]
