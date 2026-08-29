@@ -6,6 +6,7 @@
 // upstream amplification. No trading, wallet signing or database writes.
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { KAKA_FULL_INTERVALS, KAKA_DERIVED_PLAN, klineIntervalMs, klineDerivedPlan, deriveAndFillKlines } from './kline-derived.mjs';
 
 const VERSION = '650.8.15.197.3';
 const DATA_VERSION = 1042000;
@@ -124,7 +125,8 @@ const MORALIS_DAILY_CU_BUDGET = Math.max(3_000, Math.min(38_000, Number(process.
 const MORALIS_KLINE_CU = 150;
 const MORALIS_TRADES_CU = 50;
 const MORALIS_LEDGER_PATH = process.env.KAKA_MORALIS_LEDGER_PATH || '/tmp/kaka_onchain_moralis_budget_v1.json';
-const KLINE_CACHE_MAX_ENTRIES = 96;
+const KLINE_CACHE_MAX_ENTRIES = 128;
+const KLINE_FEATURE_SCHEMA_VERSION = 'step1046_2_5_onchain_kline_continuity_v1';
 const TRADE_CACHE_MAX_ENTRIES = 96;
 const IDENTITY_PROOF_MAX_ENTRIES = 256;
 const KLINE_MAX_ROWS = 300;
@@ -2641,7 +2643,7 @@ async function exactPoolPreflight(network, tokenAddress, poolAddress) {
 
 function intervalPolicy(interval, endTimeMs = null) {
   const now = Date.now();
-  const step = INTERVAL_MS[interval] || 60_000;
+  const step = klineIntervalMs(interval) || INTERVAL_MS[interval] || 60_000;
   const historical = Number.isFinite(Number(endTimeMs)) && Number(endTimeMs) < now - step * 4;
   if (historical) return { freshMs: 6 * 60 * 60_000, staleMs: 7 * 24 * 60 * 60_000 };
   if (interval === '1m') return { freshMs: 15_000, staleMs: 5 * 60_000 };
@@ -2960,6 +2962,69 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
     error.statusCode = 503;
     throw error;
   }
+}
+
+async function buildSharedContinuityKlines(network, tokenAddress, pool, interval, limit, endTimeMs) {
+  const nativeInterval = Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, interval);
+  if (nativeInterval) {
+    const built = await buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, limit, endTimeMs);
+    const continuity = deriveAndFillKlines(built.rows || [], interval, {
+      sourceInterval: interval,
+      source: built.source || 'moralis_official_data_api_pair_ohlcv',
+      sessionMode: 'continuous_24x7',
+      maxGapBars: 96,
+      limit,
+    });
+    return {
+      ...built,
+      rows: continuity.rows,
+      kline_feature_schema_version: KLINE_FEATURE_SCHEMA_VERSION,
+      interval_mode: 'native_shared_with_bounded_gap_continuity',
+      derived_from_interval: null,
+      zero_trade_fill_count: continuity.zero_trade_fill_count,
+      zero_trade_fill_policy: continuity.zero_trade_fill_policy,
+      zero_trade_fill_tail_extrapolation: false,
+    };
+  }
+
+  const plan = klineDerivedPlan(interval);
+  if (!plan || !Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, plan.base)) {
+    const error = new Error('onchain_derived_interval_plan_invalid');
+    error.statusCode = 400;
+    throw error;
+  }
+  const baseLimit = KLINE_MAX_ROWS;
+  const endKey = endTimeMs ? String(Math.floor(endTimeMs)) : 'latest';
+  const baseKey = `kline:${network}:${lower(tokenAddress)}:${lower(pool.pool_address)}:${plan.base}:${baseLimit}:${endKey}`;
+  const baseResult = await cachedKlineBuild(
+    baseKey,
+    intervalPolicy(plan.base, endTimeMs),
+    () => buildKlinesWithExactPoolFallback(network, tokenAddress, pool, plan.base, baseLimit, endTimeMs),
+  );
+  const base = baseResult.value || { rows: [] };
+  if (!Array.isArray(base.rows) || base.rows.length === 0) {
+    const error = new Error('onchain_derived_base_kline_empty');
+    error.statusCode = 503;
+    throw error;
+  }
+  const continuity = deriveAndFillKlines(base.rows, interval, {
+    sourceInterval: plan.base,
+    source: base.source || 'moralis_official_data_api_pair_ohlcv',
+    sessionMode: 'continuous_24x7',
+    maxGapBars: 96,
+    limit,
+  });
+  return {
+    ...base,
+    rows: continuity.rows,
+    kline_feature_schema_version: KLINE_FEATURE_SCHEMA_VERSION,
+    interval_mode: 'shared_derived_same_exact_pool',
+    derived_from_interval: plan.base,
+    base_cache_status: baseResult.cache_status,
+    zero_trade_fill_count: continuity.zero_trade_fill_count,
+    zero_trade_fill_policy: continuity.zero_trade_fill_policy,
+    zero_trade_fill_tail_extrapolation: false,
+  };
 }
 
 function moralisPairTokenMeta(raw, amount, usdPrice) {
@@ -4496,8 +4561,15 @@ function healthPayload() {
       app_direct_moralis_requests: 0,
       exact_chain_token_pool_preflight: true,
       historical_pages_require_identity_proof: true,
-      supported_intervals: Object.keys(MORALIS_TIMEFRAME),
+      feature_schema_version: KLINE_FEATURE_SCHEMA_VERSION,
+      supported_intervals: [...KAKA_FULL_INTERVALS],
+      native_intervals: Object.keys(MORALIS_TIMEFRAME),
+      derived_intervals: Object.keys(KAKA_DERIVED_PLAN).filter((x) => !Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, x)),
+      derived_base_cache_limit: KLINE_MAX_ROWS,
       derived_15m_from_same_pool_5m: true,
+      bounded_zero_trade_gap_fill: true,
+      zero_trade_fill_evidence: 'internal_missing_bucket_bounded_by_real_bars_same_exact_pool',
+      zero_trade_tail_extrapolation: false,
       max_rows_per_response: KLINE_MAX_ROWS,
       cache_entries: klineCache.size,
       cache_max_entries: KLINE_CACHE_MAX_ENTRIES,
@@ -4639,6 +4711,8 @@ function runSelfTest() {
   t('moralis_single_auth_header_only', healthPayload().sources.moralis.auth_header_count_per_request === 1 && healthPayload().sources.moralis.duplicate_case_variant_headers === false);
   t('moralis_pair_swap_schema_not_token_swap_schema', healthPayload().recent_trades.token_swaps_bought_sold_schema_not_assumed === true);
   t('moralis_15m_same_pool_derivation_only', MORALIS_TIMEFRAME['15m'] === '5min');
+  t('step1046_2_5_full_kline_interval_namespace', ['3m','2h','6h','8h','12h','3d','1w','1M'].every((x) => KAKA_FULL_INTERVALS.includes(x)));
+  t('step1046_2_5_derived_plan_exact_base', klineDerivedPlan('2h')?.base === '1h' && klineDerivedPlan('1M')?.base === '1d');
   const profileSynthetic = normalizeCandidateProfile({ icon: 'https://cdn.example/icon.png', header: 'https://cdn.example/header.png', description: 'Hello', url: 'https://dexscreener.com/x', links: [{ type: 'twitter', url: 'https://x.com/example' }] });
   t('token_profile_metadata_parser', profileSynthetic?.icon_url.startsWith('https://') && profileSynthetic?.description === 'Hello' && profileSynthetic?.links?.length === 1);
   const fxSynthetic = parseEcbDailyFxXml(`<gesmes><Cube><Cube time='2026-08-19'><Cube currency='USD' rate='1.1605'/><Cube currency='JPY' rate='184.62'/><Cube currency='CNY' rate='7.8197'/></Cube></Cube></gesmes>`);
@@ -5358,8 +5432,8 @@ export async function handleOnchainMarket(req, res, url) {
       }
 
       const interval = text(url.searchParams.get('interval')) || '1h';
-      if (!Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, interval)) {
-        sendJson(res, 400, responseBase({ ok: false, error: 'unsupported_interval', supported_intervals: Object.keys(MORALIS_TIMEFRAME) }));
+      if (!KAKA_FULL_INTERVALS.includes(interval)) {
+        sendJson(res, 400, responseBase({ ok: false, error: 'unsupported_interval', supported_intervals: [...KAKA_FULL_INTERVALS] }));
         return true;
       }
       const klineLimit = intRange(url.searchParams.get('limit'), 1, KLINE_MAX_ROWS, 240);
@@ -5375,7 +5449,7 @@ export async function handleOnchainMarket(req, res, url) {
       const result = await cachedKlineBuild(
         key,
         intervalPolicy(interval, endTimeMs),
-        () => buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, klineLimit, endTimeMs),
+        () => buildSharedContinuityKlines(network, tokenAddress, pool, interval, klineLimit, endTimeMs),
       );
       const built = result.value || { rows: [] };
       const rows = (built.rows || []).map((row) => ({
@@ -5408,6 +5482,13 @@ export async function handleOnchainMarket(req, res, url) {
         identity_proof: built.identity_proof || null,
         exact_chain_token_pool_preflight: true,
         derived_15m_from_5m: built.derived_15m_from_5m === true,
+        kline_feature_schema_version: built.kline_feature_schema_version || KLINE_FEATURE_SCHEMA_VERSION,
+        interval_mode: built.interval_mode || 'native_shared',
+        derived_from_interval: built.derived_from_interval || null,
+        base_cache_status: built.base_cache_status || null,
+        zero_trade_fill_count: Number(built.zero_trade_fill_count || 0),
+        zero_trade_fill_policy: built.zero_trade_fill_policy || 'disabled',
+        zero_trade_fill_tail_extrapolation: false,
         rows,
         row_count: rows.length,
         cache_status: result.cache_status,
