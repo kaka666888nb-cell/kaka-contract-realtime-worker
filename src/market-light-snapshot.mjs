@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.3';
+const STEP_VERSION = '650.8.15.197.3.3.4';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const DATA_HUB_SPOT_SUMMARY_ROUTE = '/api/market-light/data-hub-spot-summary';
@@ -187,14 +187,15 @@ const watchlistTickerStats = {
   last_error: '',
 };
 
-// Step1041.6.3 / Render650.8.15.196.11: shared full-market ranking index.
-// Ranking is computed from the already-collected shared market-light rows BEFORE
-// pagination. User reads never start exchange requests and the App still receives
-// only 50 ranked assets per page. A rank_version freezes the ORDER (not full market
-// payloads) across subsequent +50 pages, preventing duplicates/missing rows while
-// realtime prices continue to move. Market-cap metadata no longer calls CoinGecko
-// directly from Render: it reuses Step1012's verified Supabase shared Top1000
-// tokenomics snapshot plus the existing verified project-fundamentals collision guard.
+// Step1050B: shared full-market ranking remains BEFORE pagination.
+// User reads never start exchange/CoinGecko requests and the App still receives
+// only 50 ranked assets per page. The market-cap identity layer now requires the
+// verified Step1050 Supabase Top3000 catalog; old Top1000 snapshots fail closed.
+// Symbol collisions remain guarded by verified project fundamentals.
+const STEP1050_MARKET_CAP_FEATURE_SCHEMA = 'step1050_market_cap_rank_top3000_v1';
+const STEP1050_MARKET_CAP_CATALOG_SCHEMA = 'step1050_market_cap_catalog_v1';
+const STEP1050_MARKET_CAP_CATALOG_DATA_VERSION = 1050000;
+const STEP1050_MARKET_CAP_CATALOG_MIN_ROWS = 2800;
 const RANK_PAGE_LIMIT_MAX = 50;
 const RANK_RESPONSE_CACHE_TTL_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_RANK_RESPONSE_CACHE_TTL_MS || 5_000));
 const RANK_ORDER_SNAPSHOT_TTL_MS = Math.max(60_000, Number(process.env.KAKA_MARKET_RANK_ORDER_TTL_MS || 3 * 60_000));
@@ -203,7 +204,10 @@ const MARKET_CAP_REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_MARK
 const MARKET_CAP_START_DELAY_MS = Math.max(8_000, Number(process.env.KAKA_MARKET_CAP_RANK_START_DELAY_MS || 20_000));
 const MARKET_CAP_SHARED_DATASET_KEY = 'project_tokenomics_catalog';
 const MARKET_CAP_SHARED_SCOPE_KEY = 'default';
-const MARKET_CAP_SHARED_MIN_ROWS = Math.max(500, Number(process.env.KAKA_MARKET_CAP_SHARED_MIN_ROWS || 850));
+const MARKET_CAP_SHARED_MIN_ROWS = Math.max(
+  STEP1050_MARKET_CAP_CATALOG_MIN_ROWS,
+  Number(process.env.KAKA_MARKET_CAP_SHARED_MIN_ROWS || STEP1050_MARKET_CAP_CATALOG_MIN_ROWS),
+);
 const MARKET_CAP_SHARED_READ_TIMEOUT_MS = Math.max(5_000, Number(process.env.KAKA_MARKET_CAP_SHARED_READ_TIMEOUT_MS || 15_000));
 const MARKET_CAP_COLD_FAILURE_RETRY_MS = Math.max(60_000, Number(process.env.KAKA_MARKET_CAP_COLD_FAILURE_RETRY_MS || 90_000));
 const MARKET_CAP_WARM_FAILURE_RETRY_MS = Math.max(5 * 60_000, Number(process.env.KAKA_MARKET_CAP_WARM_FAILURE_RETRY_MS || 30 * 60_000));
@@ -245,6 +249,11 @@ let marketCapSourceExpiresAt = null;
 let marketCapSourceStaleUntil = null;
 let marketCapSourceContentHash = '';
 let marketCapSourceSnapshotRows = 0;
+let marketCapSourceDataVersion = 0;
+let marketCapSourceSchemaVersion = '';
+let marketCapSourceCoverageReady = false;
+let marketCapSourceCatalogPolicy = '';
+let marketCapSourceImplementationRevision = '';
 let marketCapFundamentalsRows = 0;
 let marketCapKnownAmbiguousByFundamentals = 0;
 let rankPageReads = 0;
@@ -2723,7 +2732,12 @@ function marketRankEntryComparator(sortKey) {
         cmp = marketRankCompareNullable(a.market_cap_usd, b.market_cap_usd, { descending: true });
       }
     }
-    if (!cmp) cmp = marketRankCompareNullable(a.volume_desc, b.volume_desc, { descending: true });
+    // Step1050B: turnover is never a proxy for missing market cap.
+    // For market_cap_desc, all known market-cap identities come first and unknown
+    // identities use only deterministic identity ordering after the known set.
+    if (!cmp && sortKey !== 'market_cap_desc') {
+      cmp = marketRankCompareNullable(a.volume_desc, b.volume_desc, { descending: true });
+    }
     if (!cmp) cmp = String(a.rank_identity).localeCompare(String(b.rank_identity));
     return cmp;
   };
@@ -2778,6 +2792,8 @@ function buildMarketRankEntries({ market, provider = '', quote = '', sortKey }) 
         market_cap_rank: cap?.market_cap_rank ?? null,
         market_cap_usd: cap?.market_cap_usd ?? null,
         coingecko_id: cap?.coingecko_id ?? null,
+        market_cap_image_url: cap?.image_url ?? null,
+        coingecko_total_volume_usd: cap?.total_volume_usd ?? null,
         representative_row: representative,
         venue_rows: venueRows,
       });
@@ -2802,6 +2818,8 @@ function buildMarketRankEntries({ market, provider = '', quote = '', sortKey }) 
       market_cap_rank: cap?.market_cap_rank ?? null,
       market_cap_usd: cap?.market_cap_usd ?? null,
       coingecko_id: cap?.coingecko_id ?? null,
+      market_cap_image_url: cap?.image_url ?? null,
+      coingecko_total_volume_usd: cap?.total_volume_usd ?? null,
       row,
     };
   });
@@ -2854,6 +2872,8 @@ function createMarketRankOrderSnapshot({ market, provider = '', quote = '', sort
     market_cap_rank: marketRankNumber(entry?.market_cap_rank),
     market_cap_usd: marketRankNumber(entry?.market_cap_usd),
     coingecko_id: entry?.coingecko_id || null,
+    market_cap_image_url: entry?.market_cap_image_url || null,
+    coingecko_total_volume_usd: marketRankNumber(entry?.coingecko_total_volume_usd),
     rank_metric_value: marketRankMetricValue(entry, sortKey),
   })).filter((entry) => entry.rank_identity);
   const snapshot = {
@@ -3004,6 +3024,7 @@ function marketRankedPagePayload({ market, provider = '', quote = '', sort = 'ma
     ok: true,
     version: STEP_VERSION,
     schema_version: 'step1041_6_shared_full_market_rank_page_v2',
+    feature_schema_version: STEP1050_MARKET_CAP_FEATURE_SCHEMA,
     source: 'render_shared_market_light_rank_order_before_pagination',
     market_type: market,
     provider: provider || 'all',
@@ -3027,7 +3048,13 @@ function marketRankedPagePayload({ market, provider = '', quote = '', sort = 'ma
       ambiguous_symbols: marketCapDuplicateSymbols,
       shared_catalog_identity_rows: marketCapGlobalSymbolRows,
       shared_catalog_identity_ready: marketCapGlobalSymbolCounts.size > 0,
-      identity_guard: 'unique_in_shared_top1000_catalog_plus_verified_project_fundamentals_collision_guard',
+      source_data_version: marketCapSourceDataVersion,
+      source_schema_version: marketCapSourceSchemaVersion || null,
+      source_coverage_ready: marketCapSourceCoverageReady,
+      source_catalog_policy: marketCapSourceCatalogPolicy || null,
+      source_implementation_revision: marketCapSourceImplementationRevision || null,
+      identity_guard: 'unique_in_shared_top3000_catalog_plus_verified_project_fundamentals_collision_guard',
+      unknown_market_cap_sort_policy: 'after_known_deterministic_identity_no_turnover_proxy',
       last_succeeded_at: marketCapLastSucceededAt,
     },
     read_only_shared: true,
@@ -3106,11 +3133,45 @@ async function fetchSharedTokenomicsCatalog() {
   const staleUntilMs = marketCapIsoMs(snapshot.stale_until);
   if (staleUntilMs != null && Date.now() > staleUntilMs) throw new Error('shared_tokenomics_snapshot_hard_expired');
   const payload = marketCapSnapshotPayload(snapshot.payload);
-  const rows = payload?.item?.rows;
-  if (payload?.ok !== true || !Array.isArray(rows) || rows.length < MARKET_CAP_SHARED_MIN_ROWS) {
-    throw new Error(`shared_tokenomics_snapshot_too_small:${Array.isArray(rows) ? rows.length : 0}`);
+  const item = payload?.item && typeof payload.item === 'object' && !Array.isArray(payload.item)
+    ? payload.item
+    : null;
+  const rows = item?.rows;
+  const dataVersion = marketRankNumber(payload?.data_version ?? item?.data_version);
+  const schemaVersion = String(payload?.schema_version ?? item?.schema_version ?? '').trim();
+  const coverageReady = (payload?.coverage_ready ?? item?.coverage_ready) === true;
+  const sourceVerified = (payload?.source_verified ?? item?.source_verified) === true;
+  const userReadUpstream = marketRankNumber(
+    payload?.user_read_upstream_requests ?? item?.user_read_upstream_requests,
+  );
+  const readsScaleWithUsers = payload?.reads_scale_with_users ?? item?.reads_scale_with_users;
+
+  if (
+    payload?.ok !== true ||
+    !item ||
+    dataVersion == null ||
+    dataVersion < STEP1050_MARKET_CAP_CATALOG_DATA_VERSION ||
+    schemaVersion !== STEP1050_MARKET_CAP_CATALOG_SCHEMA ||
+    coverageReady !== true ||
+    sourceVerified !== true ||
+    userReadUpstream !== 0 ||
+    readsScaleWithUsers !== false ||
+    !Array.isArray(rows) ||
+    rows.length < MARKET_CAP_SHARED_MIN_ROWS ||
+    Number(snapshot?.row_count || 0) < MARKET_CAP_SHARED_MIN_ROWS
+  ) {
+    throw new Error(
+      `shared_tokenomics_step1050_contract_rejected:` +
+      `dv=${dataVersion ?? 'null'}:` +
+      `schema=${schemaVersion || 'null'}:` +
+      `coverage=${coverageReady}:verified=${sourceVerified}:` +
+      `user_upstream=${userReadUpstream ?? 'null'}:` +
+      `scale=${String(readsScaleWithUsers)}:` +
+      `rows=${Array.isArray(rows) ? rows.length : 0}`,
+    );
   }
-  return { snapshot, rows };
+
+  return { snapshot, payload, item, rows };
 }
 
 async function fetchVerifiedProjectFundamentalIdentities() {
@@ -3142,7 +3203,7 @@ async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
     marketCapNextRetryAt = null;
     const hadReadyIndex = marketCapBySymbol.size > 0 && marketCapGlobalSymbolCounts.size > 0;
     try {
-      const [{ snapshot, rows: catalogRows }, fundamentalRows] = await Promise.all([
+      const [{ snapshot, payload, item, rows: catalogRows }, fundamentalRows] = await Promise.all([
         fetchSharedTokenomicsCatalog(),
         fetchVerifiedProjectFundamentalIdentities(),
       ]);
@@ -3155,10 +3216,15 @@ async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
         const id = String(raw?.coin_id || '').trim();
         if (!symbol || rank == null || rank <= 0 || !id) continue;
         const list = candidatesBySymbol.get(symbol) || [];
+        const imageUrl = String(raw?.image_url || '').trim();
+        const totalVolumeUsd = marketRankNumber(raw?.total_volume_usd);
         list.push({
           coingecko_id: id,
           market_cap_rank: Math.trunc(rank),
           market_cap_usd: marketCap != null && marketCap >= 0 ? marketCap : null,
+          image_url: imageUrl.startsWith('https://') ? imageUrl : null,
+          total_volume_usd:
+            totalVolumeUsd != null && totalVolumeUsd >= 0 ? totalVolumeUsd : null,
         });
         candidatesBySymbol.set(symbol, list);
       }
@@ -3218,6 +3284,20 @@ async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
       marketCapSourceStaleUntil = snapshot?.stale_until || null;
       marketCapSourceContentHash = String(snapshot?.content_hash || '');
       marketCapSourceSnapshotRows = Number(snapshot?.row_count || catalogRows.length) || catalogRows.length;
+      marketCapSourceDataVersion = Math.trunc(
+        marketRankNumber(payload?.data_version ?? item?.data_version) || 0,
+      );
+      marketCapSourceSchemaVersion = String(
+        payload?.schema_version ?? item?.schema_version ?? '',
+      ).trim();
+      marketCapSourceCoverageReady =
+        (payload?.coverage_ready ?? item?.coverage_ready) === true;
+      marketCapSourceCatalogPolicy = String(
+        payload?.catalog_policy ?? item?.catalog_policy ?? '',
+      ).trim();
+      marketCapSourceImplementationRevision = String(
+        payload?.implementation_revision ?? item?.implementation_revision ?? '',
+      ).trim();
       marketCapRankVersion += 1;
       marketCapLastSucceededAt = new Date().toISOString();
       marketCapLastError = '';
@@ -3968,7 +4048,8 @@ export function getMarketLightSnapshotHealth() {
     },
     shared_rank_index: {
       schema_version: 'step1041_6_shared_full_market_rank_page_v2',
-      implementation_revision: 'step1042_3_1_rank_self_pair_filter_v1',
+      feature_schema_version: STEP1050_MARKET_CAP_FEATURE_SCHEMA,
+      implementation_revision: 'step1050_top3000_market_cap_rank_no_turnover_proxy_v1',
       ranking_happens_before_pagination: true,
       pagination_order_frozen_by_rank_version: true,
       self_pair_filter_before_rank_snapshot: true,
@@ -3992,7 +4073,11 @@ export function getMarketLightSnapshotHealth() {
       user_reads_start_upstream: false,
       reads_scale_with_users: false,
       market_cap: {
-        mode: 'supabase_shared_project_tokenomics_top1000_plus_verified_fundamentals_collision_guard',
+        mode: 'supabase_shared_project_tokenomics_top3000_plus_verified_fundamentals_collision_guard',
+        feature_schema_version: STEP1050_MARKET_CAP_FEATURE_SCHEMA,
+        required_catalog_data_version: STEP1050_MARKET_CAP_CATALOG_DATA_VERSION,
+        required_catalog_schema_version: STEP1050_MARKET_CAP_CATALOG_SCHEMA,
+        required_catalog_min_rows: STEP1050_MARKET_CAP_CATALOG_MIN_ROWS,
         refresh_interval_ms: MARKET_CAP_REFRESH_MS,
         pages_per_refresh: 0,
         page_size: 0,
@@ -4012,8 +4097,15 @@ export function getMarketLightSnapshotHealth() {
         source_stale_until: marketCapSourceStaleUntil,
         source_content_hash: marketCapSourceContentHash || null,
         source_snapshot_rows: marketCapSourceSnapshotRows,
-        identity_guard: 'unique_in_shared_top1000_catalog_plus_verified_project_fundamentals_collision_guard',
+        source_data_version: marketCapSourceDataVersion,
+        source_schema_version: marketCapSourceSchemaVersion || null,
+        source_coverage_ready: marketCapSourceCoverageReady,
+        source_catalog_policy: marketCapSourceCatalogPolicy || null,
+        source_implementation_revision: marketCapSourceImplementationRevision || null,
+        identity_guard: 'unique_in_shared_top3000_catalog_plus_verified_project_fundamentals_collision_guard',
         identity_scope_note: 'Known/observed symbol ambiguity is excluded; no cross-venue/product guessing.',
+        unknown_market_cap_sort_policy: 'after_known_deterministic_identity_no_turnover_proxy',
+        turnover_used_as_market_cap_proxy: false,
         fundamentals_identity_rows: marketCapFundamentalsRows,
         known_ambiguous_by_fundamentals: marketCapKnownAmbiguousByFundamentals,
         version: marketCapRankVersion,

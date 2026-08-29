@@ -1,0 +1,158 @@
+name: Step1050B live Top3000 market-cap rank
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/market-light-snapshot.mjs'
+      - 'src/proxy.mjs'
+      - '.github/workflows/step1050b-live-market-cap-rank.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  live-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    steps:
+      - name: Wait Render Auto-Deploy and Top3000 rank warmup
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          EXPECTED='650.8.15.197.3.3.30'
+          READY=0
+          for i in $(seq 1 120); do
+            root="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
+            ver="$(printf '%s' "$root" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
+            mh="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/api/market-light/health" || true)"
+            vals="$(printf '%s' "$mh" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); m=((d.get("shared_rank_index") or {}).get("market_cap") or {}); print(str(bool(m.get("ready"))).lower(), m.get("source_snapshot_rows",0), m.get("source_data_version",0), m.get("source_schema_version",""), m.get("direct_coingecko_requests_started",-1))' 2>/dev/null || echo 'false 0 0 none -1')"
+            read -r ready rows dv schema direct <<<"$vals"
+            echo "poll=$i render=$ver cap_ready=$ready rows=$rows dv=$dv schema=$schema direct_cg=$direct"
+            if [ "$ver" = "$EXPECTED" ] && [ "$ready" = "true" ] && [ "$rows" -ge 2800 ] && [ "$dv" -ge 1050000 ] && [ "$schema" = "step1050_market_cap_catalog_v1" ] && [ "$direct" = "0" ]; then
+              READY=1
+              break
+            fi
+            sleep 10
+          done
+          test "$READY" = "1"
+      - name: Validate health contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/market-light/health" -o /tmp/mlh.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/mlh.json'))
+          r=d['shared_rank_index']
+          m=r['market_cap']
+          assert d['version']=='650.8.15.197.3.3.4', d['version']
+          assert r['feature_schema_version']=='step1050_market_cap_rank_top3000_v1'
+          assert r['ranking_happens_before_pagination'] is True
+          assert m['mode']=='supabase_shared_project_tokenomics_top3000_plus_verified_fundamentals_collision_guard'
+          assert m['ready'] is True
+          assert int(m['source_snapshot_rows']) >= 2800
+          assert int(m['source_data_version']) >= 1050000
+          assert m['source_schema_version']=='step1050_market_cap_catalog_v1'
+          assert m['source_coverage_ready'] is True
+          assert m['turnover_used_as_market_cap_proxy'] is False
+          assert m['unknown_market_cap_sort_policy']=='after_known_deterministic_identity_no_turnover_proxy'
+          assert m['direct_coingecko_enabled'] is False
+          assert int(m['direct_coingecko_requests_started']) == 0
+          assert int(m['per_user_upstream_requests']) == 0
+          assert m['reads_scale_with_users'] is False
+          print('PASS market-light health Top3000 shared market-cap contract')
+          print('rows=',m['rows'],'unique=',m['unique_symbols'],'ambiguous=',m['ambiguous_symbols_excluded'])
+          PY
+      - name: Validate spot rank pages and frozen pagination
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 25   "$BASE/api/market-light/ranked-page?market_type=spot&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50"   -o /tmp/spot0.json
+          RV="$(python3 -c "import json; print(json.load(open('/tmp/spot0.json'))['rank_version'])")"
+          curl -fsS --connect-timeout 8 --max-time 25   "$BASE/api/market-light/ranked-page?market_type=spot&provider=all&quote=USDT&sort=market_cap_desc&offset=50&limit=50&rank_version=$RV"   -o /tmp/spot50.json
+          python3 - <<'PY'
+          import json
+          a=json.load(open('/tmp/spot0.json'))
+          b=json.load(open('/tmp/spot50.json'))
+          for x in (a,b):
+              assert x['ok'] is True
+              assert x['feature_schema_version']=='step1050_market_cap_rank_top3000_v1'
+              assert x['sort']=='market_cap_desc'
+              assert x['ranking_happens_before_pagination'] is True
+              assert x['pagination_order_frozen_by_rank_version'] is True
+              assert x['app_page_size_remains_50'] is True
+              assert x['user_read_upstream_requests']==0
+              m=x['market_cap_index']
+              assert m['ready'] is True
+              assert int(m['shared_catalog_identity_rows']) >= 2800
+              assert int(m['source_data_version']) >= 1050000
+              assert m['source_schema_version']=='step1050_market_cap_catalog_v1'
+              assert m['unknown_market_cap_sort_policy']=='after_known_deterministic_identity_no_turnover_proxy'
+          assert a['rank_version']==b['rank_version']
+          assert len(a['items'])<=50 and len(b['items'])<=50
+          ids0=[x['rank_identity'] for x in a['items']]
+          ids1=[x['rank_identity'] for x in b['items']]
+          assert not (set(ids0)&set(ids1)), 'duplicate identity across frozen pages'
+          all_items=a['items']+b['items']
+          seen_unknown=False
+          prev_rank=None
+          for item in all_items:
+              rank=item.get('market_cap_rank')
+              if rank is None:
+                  seen_unknown=True
+                  continue
+              assert not seen_unknown, 'known market cap appeared after unknown'
+              rank=int(rank)
+              if prev_rank is not None:
+                  assert rank>=prev_rank, (prev_rank,rank,item.get('rank_identity'))
+              prev_rank=rank
+          print('PASS spot Top3000 market-cap rank + frozen +50 pagination')
+          print('rank_version=',a['rank_version'],'total=',a['total_items'],'page0=',len(a['items']),'page1=',len(b['items']))
+          PY
+      - name: Validate contract market-cap page
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 25   "$BASE/api/market-light/ranked-page?market_type=contract&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50"   -o /tmp/contract.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/contract.json'))
+          assert d['ok'] is True
+          assert d['feature_schema_version']=='step1050_market_cap_rank_top3000_v1'
+          assert d['returned_items'] > 0 and d['returned_items'] <= 50
+          assert d['market_cap_index']['source_snapshot_rows'] >= 2800
+          assert d['user_read_upstream_requests']==0
+          prev=None
+          unknown=False
+          for item in d['items']:
+              r=item.get('market_cap_rank')
+              if r is None:
+                  unknown=True
+                  continue
+              assert not unknown
+              r=int(r)
+              if prev is not None:
+                  assert r>=prev
+              prev=r
+          print('PASS contract Top3000 market-cap rank page')
+          PY
+      - name: Repeated user-read isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          BEFORE="$(curl -fsS "$BASE/api/market-light/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["shared_rank_index"]["market_cap"]["source_requests_started"])')"
+          for i in $(seq 1 20); do
+            code="$(curl -sS --connect-timeout 8 --max-time 20 -o /tmp/rank.json -w '%{http_code}'     "$BASE/api/market-light/ranked-page?market_type=spot&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50")"
+            echo "read=$i http=$code"
+            test "$code" = "200"
+          done
+          AFTER="$(curl -fsS "$BASE/api/market-light/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["shared_rank_index"]["market_cap"]["source_requests_started"])')"
+          echo "shared_source_reads before=$BEFORE after=$AFTER"
+          test "$BEFORE" = "$AFTER"
+          echo "PASS 20 user rank reads start zero upstream work"
