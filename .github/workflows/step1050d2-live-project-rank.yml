@@ -21,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          EXPECTED='650.8.15.197.3.3.31'
+          EXPECTED='650.8.15.197.3.3.31.1'
           for i in $(seq 1 90); do
             root="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
             ver="$(printf '%s' "$root" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
