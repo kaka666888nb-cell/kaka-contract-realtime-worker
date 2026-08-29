@@ -2670,7 +2670,7 @@ async function cachedKlineBuild(key, policy, builder) {
     stats.kline_cache_stale_hits += 1;
     if (!klineInflight.has(key)) {
       const pending = Promise.resolve().then(builder).then((value) => {
-        if (value?.rows?.length) {
+        if (value?.rows?.length || value?.history_exhausted === true) {
           klineCache.set(key, { value, storedAt: Date.now() });
           pruneSimpleCache(klineCache, KLINE_CACHE_MAX_ENTRIES);
         }
@@ -2686,7 +2686,7 @@ async function cachedKlineBuild(key, policy, builder) {
   } else {
     stats.kline_cache_misses += 1;
     pending = Promise.resolve().then(builder).then((value) => {
-      if (value?.rows?.length) {
+      if (value?.rows?.length || value?.history_exhausted === true) {
         klineCache.set(key, { value, storedAt: Date.now() });
         pruneSimpleCache(klineCache, KLINE_CACHE_MAX_ENTRIES);
       }
@@ -2944,19 +2944,37 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
     fallback_from: 'moralis_pair_ohlcv_unavailable_or_empty',
   };
 }
+function historicalRangeReachesPoolCreation(pool, interval, limit, endTimeMs) {
+  const end = Number(endTimeMs);
+  const createdMs = Date.parse(text(pool?.pool_created_at));
+  if (!Number.isFinite(end) || end <= 0 || !Number.isFinite(createdMs) || createdMs <= 0) return false;
+  const range = klineRange(interval, limit, end);
+  return Number.isFinite(range?.fromMs) && range.fromMs <= createdMs;
+}
 async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, limit, endTimeMs) {
   let moralisError = '';
   try {
     const primary = await buildMoralisKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
     if (Array.isArray(primary?.rows) && primary.rows.length > 0) {
-      return { ...primary, source: 'moralis_official_data_api_pair_ohlcv', fallback_used: false };
+      return { ...primary, source: 'moralis_official_data_api_pair_ohlcv', fallback_used: false, history_exhausted: false };
+    }
+    const exactProof = text(primary?.identity_proof);
+    const exactPair = exactAddressEqual(network, primary?.source_pair_address, pool?.pool_address);
+    if (endTimeMs && exactProof && exactPair && historicalRangeReachesPoolCreation(pool, interval, limit, endTimeMs)) {
+      return {
+        ...primary,
+        source: 'moralis_official_data_api_pair_ohlcv',
+        fallback_used: false,
+        history_exhausted: true,
+        history_exhausted_reason: 'exact_pool_primary_empty_and_requested_range_reaches_pool_creation',
+      };
     }
     moralisError = 'moralis_exact_pool_ohlcv_empty';
   } catch (error) {
     moralisError = text(error?.message || error).slice(0, 240);
   }
   try {
-    return { ...(await buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs)), fallback_used: true, primary_error: moralisError };
+    return { ...(await buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs)), fallback_used: true, primary_error: moralisError, history_exhausted: false };
   } catch (fallbackError) {
     const error = new Error(`exact_pool_kline_unavailable:primary=${moralisError};fallback=${text(fallbackError?.message || fallbackError).slice(0, 220)}`);
     error.statusCode = 503;
@@ -2968,6 +2986,18 @@ async function buildSharedContinuityKlines(network, tokenAddress, pool, interval
   const nativeInterval = Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, interval);
   if (nativeInterval) {
     const built = await buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, limit, endTimeMs);
+    if (built.history_exhausted === true && (!Array.isArray(built.rows) || built.rows.length === 0)) {
+      return {
+        ...built,
+        rows: [],
+        kline_feature_schema_version: KLINE_FEATURE_SCHEMA_VERSION,
+        interval_mode: 'native_shared_history_exhausted',
+        derived_from_interval: null,
+        zero_trade_fill_count: 0,
+        zero_trade_fill_policy: 'disabled_history_exhausted',
+        zero_trade_fill_tail_extrapolation: false,
+      };
+    }
     const continuity = deriveAndFillKlines(built.rows || [], interval, {
       sourceInterval: interval,
       source: built.source || 'moralis_official_data_api_pair_ohlcv',
@@ -3002,6 +3032,19 @@ async function buildSharedContinuityKlines(network, tokenAddress, pool, interval
     () => buildKlinesWithExactPoolFallback(network, tokenAddress, pool, plan.base, baseLimit, endTimeMs),
   );
   const base = baseResult.value || { rows: [] };
+  if (base.history_exhausted === true && (!Array.isArray(base.rows) || base.rows.length === 0)) {
+    return {
+      ...base,
+      rows: [],
+      kline_feature_schema_version: KLINE_FEATURE_SCHEMA_VERSION,
+      interval_mode: 'shared_derived_history_exhausted',
+      derived_from_interval: plan.base,
+      base_cache_status: baseResult.cache_status,
+      zero_trade_fill_count: 0,
+      zero_trade_fill_policy: 'disabled_history_exhausted',
+      zero_trade_fill_tail_extrapolation: false,
+    };
+  }
   if (!Array.isArray(base.rows) || base.rows.length === 0) {
     const error = new Error('onchain_derived_base_kline_empty');
     error.statusCode = 503;
@@ -4561,6 +4604,8 @@ function healthPayload() {
       app_direct_moralis_requests: 0,
       exact_chain_token_pool_preflight: true,
       historical_pages_require_identity_proof: true,
+      historical_empty_page_pool_creation_boundary_returns_200: true,
+      historical_exhaustion_requires_exact_identity_and_pool_creation_boundary: true,
       feature_schema_version: KLINE_FEATURE_SCHEMA_VERSION,
       supported_intervals: [...KAKA_FULL_INTERVALS],
       native_intervals: Object.keys(MORALIS_TIMEFRAME),
@@ -4711,6 +4756,7 @@ function runSelfTest() {
   t('moralis_single_auth_header_only', healthPayload().sources.moralis.auth_header_count_per_request === 1 && healthPayload().sources.moralis.duplicate_case_variant_headers === false);
   t('moralis_pair_swap_schema_not_token_swap_schema', healthPayload().recent_trades.token_swaps_bought_sold_schema_not_assumed === true);
   t('moralis_15m_same_pool_derivation_only', MORALIS_TIMEFRAME['15m'] === '5min');
+  t('step1046_2_7_history_exhaustion_requires_creation_boundary', historicalRangeReachesPoolCreation({ pool_created_at: '2026-01-01T00:00:00Z' }, '15m', 300, Date.parse('2026-01-02T00:00:00Z')) === true && historicalRangeReachesPoolCreation({ pool_created_at: '2026-01-01T00:00:00Z' }, '15m', 300, Date.parse('2026-01-10T00:00:00Z')) === false);
   t('step1046_2_5_full_kline_interval_namespace', ['3m','2h','6h','8h','12h','3d','1w','1M'].every((x) => KAKA_FULL_INTERVALS.includes(x)));
   t('step1046_2_5_derived_plan_exact_base', klineDerivedPlan('2h')?.base === '1h' && klineDerivedPlan('1M')?.base === '1d');
   const profileSynthetic = normalizeCandidateProfile({ icon: 'https://cdn.example/icon.png', header: 'https://cdn.example/header.png', description: 'Hello', url: 'https://dexscreener.com/x', links: [{ type: 'twitter', url: 'https://x.com/example' }] });
@@ -5496,6 +5542,8 @@ export async function handleOnchainMarket(req, res, url) {
         user_read_direct_moralis_requests: 0,
         moralis_cu_if_upstream_build: MORALIS_KLINE_CU,
         historical_end_time_ms: endTimeMs,
+        history_exhausted: built.history_exhausted === true,
+        history_exhausted_reason: built.history_exhausted_reason || null,
       }));
     } catch (error) {
       const status = Number(error?.statusCode || 0);
