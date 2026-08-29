@@ -1,0 +1,75 @@
+name: Step1046 Kline Candidate Finalize
+
+on:
+  push:
+    branches:
+      - step1046-2-5-kline-continuity
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: step1046-2-5-kline-continuity
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Bump Render global version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/proxy.mjs')
+          s=p.read_text()
+          old="const STEP_VERSION = '650.8.15.197.3.3.24.1';"
+          new="const STEP_VERSION = '650.8.15.197.3.3.25';"
+          if s.count(old) != 1:
+              raise SystemExit(f'global version anchor mismatch {s.count(old)}')
+          p.write_text(s.replace(old,new,1))
+          PY
+      - name: Full candidate static checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check src/proxy.mjs
+          node --check src/kline-derived.mjs
+          node --check src/exchange-asset-kline.mjs
+          node --check src/onchain-market.mjs
+          git diff --check
+          grep -q "650.8.15.197.3.3.25" src/proxy.mjs
+          grep -q "step1046_2_5_asset_kline_continuity_v1" src/exchange-asset-kline.mjs
+          grep -q "step1046_2_5_onchain_kline_continuity_v1" src/onchain-market.mjs
+      - name: Asset K-line module self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { runAssetKlineSelfTest } from './src/exchange-asset-kline.mjs';
+          const result = runAssetKlineSelfTest();
+          if (!result?.ok) {
+            console.error(JSON.stringify(result, null, 2));
+            process.exit(1);
+          }
+          for (const name of ['derived_2h_from_1h_plan','derived_month_from_1d_plan','all_intervals_include_sparse_and_long_periods']) {
+            if (result.checks?.[name] !== true) throw new Error(`missing/pass=false ${name}`);
+          }
+          console.log('PASS asset K-line module self-test', result.version, result.schema_version);
+          NODE
+      - name: Commit final candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Kaka Step1046 Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git rm -f .github/workflows/step1046-kline-version-finalize.yml
+          git add src/proxy.mjs src/kline-derived.mjs src/exchange-asset-kline.mjs src/onchain-market.mjs
+          git diff --cached --check
+          git commit -m "Step1046.2.5 finalize shared K-line candidate version [skip ci]"
+          git push origin HEAD:step1046-2-5-kline-continuity
