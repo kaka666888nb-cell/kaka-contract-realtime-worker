@@ -1,4 +1,4 @@
-name: Step1053D.4 diagnose BTC contract rank
+name: Step1053D.4 verified project cap fallback
 
 on:
   push:
@@ -7,38 +7,91 @@ on:
       - '.github/workflows/step1053d3-market-rank-materialization-fix.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  apply-and-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Dump contract rank and BTC source rows
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply rank-cap fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/step1053d4_rank_cap_fallback.py
+          git diff --check
+          node --check src/market-light-snapshot.mjs
+          node --check src/proxy.mjs
+          grep -q "Step1053D.4: the project Top3000 rank is the canonical market-cap catalog" src/market-light-snapshot.mjs
+          grep -q "650.8.15.197.3.3.32.2" src/proxy.mjs
+
+      - name: Commit backend fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/market-light-snapshot.mjs src/proxy.mjs; then
+            echo 'backend fix already present'
+            exit 0
+          fi
+          git config user.name 'kaka666888nb-cell'
+          git config user.email '295432334+kaka666888nb-cell@users.noreply.github.com'
+          git add src/market-light-snapshot.mjs src/proxy.mjs
+          git commit -m 'Step1053D.4 recover verified BTC market-cap rank from project catalog'
+          git push origin HEAD:main
+
+      - name: Wait Render and warm rank
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/market-light/ranked-page?market_type=contract&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50" -o /tmp/contract.json
-          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/market-light/current-snapshot?market_type=contract&include_rows=1&offset=0&limit=5000" -o /tmp/snapshot.json
-          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/market-light/project-ranked-page?offset=0&limit=20" -o /tmp/project.json
+          EXPECTED='650.8.15.197.3.3.32.2'
+          for i in $(seq 1 120); do
+            body="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
+            ver="$(printf '%s' "$body" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
+            echo "version_poll=$i version=$ver"
+            if [ "$ver" = "$EXPECTED" ]; then break; fi
+            sleep 10
+            if [ "$i" = 120 ]; then exit 1; fi
+          done
+          fetch_ready() {
+            local url="$1" out="$2" label="$3"
+            for i in $(seq 1 90); do
+              code="$(curl -sS --connect-timeout 8 --max-time 25 -o "$out" -w '%{http_code}' "$url" || true)"
+              echo "$label poll=$i http=$code"
+              if [ "$code" = '200' ]; then return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+          fetch_ready "$BASE/api/market-light/ranked-page?market_type=contract&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50" /tmp/contract.json contract
+          fetch_ready "$BASE/api/market-light/project-ranked-page?offset=0&limit=50" /tmp/project.json project
+
+      - name: Verify BTC contract rank and project BTC ETH USDT
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json
           c=json.load(open('/tmp/contract.json'))
-          s=json.load(open('/tmp/snapshot.json'))
           p=json.load(open('/tmp/project.json'))
-          print('CONTRACT_OK',c.get('ok'),'TOTAL',c.get('total_items'),'CAP_INDEX',c.get('market_cap_index'))
-          print('CONTRACT_TOP50')
-          for x in c.get('items',[]):
-              row=x.get('row') if isinstance(x.get('row'),dict) else {}
-              print(x.get('rank_index'), x.get('market_cap_rank'), x.get('base_asset'), x.get('provider'), row.get('symbol'), row.get('base_asset'), row.get('quote_asset'))
-          rows=s.get('rows',[])
-          btc=[]
-          for r in rows:
-              vals=' '.join(str(r.get(k,'')) for k in ('symbol','base_asset','raw_symbol','native_symbol')).upper()
-              if 'BTC' in vals or 'XBT' in vals:
-                  btc.append({k:r.get(k) for k in ('provider','symbol','base_asset','quote_asset','raw_symbol','native_symbol','last_price','price_change_percent_24h','quote_volume_24h')})
-          print('SNAPSHOT_TOTAL',s.get('total_row_count'),'BTC_LIKE_COUNT',len(btc))
-          print('BTC_LIKE_ROWS',json.dumps(btc[:30],ensure_ascii=False))
-          print('PROJECT_TOP20',[(x.get('market_cap_rank'),x.get('symbol'),x.get('coin_id'),x.get('contract_market_count')) for x in p.get('items',[])])
+          assert c['ok'] is True
+          assert c['user_read_upstream_requests']==0
+          assert c['rank_order_fallback_identity_preserved'] is True
+          assert c['rank_index_scope_contiguous'] is True
+          items=c['items']
+          assert [x['rank_index'] for x in items] == list(range(1,len(items)+1))
+          btc=[x for x in items if str(x.get('base_asset','')).upper()=='BTC']
+          assert len(btc)==5, [(x.get('rank_index'),x.get('base_asset'),x.get('provider')) for x in items[:15]]
+          assert all(int(x.get('market_cap_rank') or 0)==1 for x in btc)
+          assert all(isinstance(x.get('row'),dict) for x in btc)
+          by_rank={int(x['market_cap_rank']):x for x in p['items']}
+          assert by_rank[1]['symbol']=='BTC'
+          assert by_rank[2]['symbol']=='ETH'
+          assert by_rank[3]['symbol']=='USDT'
+          assert p['user_read_upstream_requests']==0
+          print('PASS Step1053D.4: BTC contract five venues restored; project rank BTC/ETH/USDT intact')
           PY
