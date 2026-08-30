@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.1';
+const STEP_VERSION = '650.8.15.197.3.3.6.2';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -218,6 +218,7 @@ const rankCurrentBySignature = new Map();
 let rankOrderSnapshotSeq = 0;
 const marketCapBySymbol = new Map();
 const marketCapAmbiguousSymbols = new Set();
+const marketCapVerifiedFundIdsBySymbol = new Map();
 const marketCapGlobalSymbolCounts = new Map(); // compatibility: counts inside the verified shared catalog + collision guard
 let marketCapGlobalSymbolListAt = 0;
 let marketCapGlobalSymbolRows = 0;
@@ -2708,8 +2709,33 @@ function marketRankNumber(value) {
 
 function marketRankCapForBase(base) {
   const key = marketRankNormalizeBase(base);
-  const item = key ? marketCapBySymbol.get(key) : null;
-  return item ? { ...item } : null;
+  if (!key) return null;
+  const item = marketCapBySymbol.get(key);
+  if (item) return { ...item };
+
+  // Step1053D.4: the project Top3000 rank is the canonical market-cap catalog.
+  // If the fast symbol index ever misses a catalog-unique identity (BTC exposed
+  // this in production), recover only from the already-verified project snapshot.
+  // The same verified-fundamentals guard is re-applied here, so ambiguous symbols
+  // remain null and turnover is still never used as a market-cap proxy.
+  if (Number(marketCapGlobalSymbolCounts.get(key) || 0) !== 1) return null;
+  const verifiedIds = marketCapVerifiedFundIdsBySymbol.get(key);
+  if (verifiedIds && verifiedIds.size !== 1) return null;
+  const snapshot = projectMarketCapRankSnapshots.get(projectMarketCapCurrentRankVersion) || null;
+  const rows = Array.isArray(snapshot?.rows) ? snapshot.rows : [];
+  const matches = rows.filter((row) => marketRankNormalizeBase(row?.symbol) === key);
+  if (matches.length !== 1) return null;
+  const candidate = matches[0];
+  const coinId = String(candidate?.coin_id || '').trim();
+  if (!coinId) return null;
+  if (verifiedIds && !verifiedIds.has(coinId)) return null;
+  return {
+    coingecko_id: coinId,
+    market_cap_rank: marketRankNumber(candidate?.market_cap_rank),
+    market_cap_usd: marketRankNumber(candidate?.market_cap_usd),
+    image_url: String(candidate?.image_url || '').trim() || null,
+    total_volume_usd: marketRankNumber(candidate?.total_volume_usd),
+  };
 }
 
 function marketRankCompareNullable(a, b, { descending = false } = {}) {
@@ -3548,6 +3574,11 @@ async function refreshMarketCapRankIndex({ reason = 'scheduled' } = {}) {
         const set = verifiedFundIdsBySymbol.get(symbol) || new Set();
         set.add(id);
         verifiedFundIdsBySymbol.set(symbol, set);
+      }
+
+      marketCapVerifiedFundIdsBySymbol.clear();
+      for (const [symbol, ids] of verifiedFundIdsBySymbol.entries()) {
+        marketCapVerifiedFundIdsBySymbol.set(symbol, new Set(ids));
       }
 
       const next = new Map();
