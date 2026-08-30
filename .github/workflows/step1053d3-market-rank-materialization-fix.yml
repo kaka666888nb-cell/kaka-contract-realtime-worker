@@ -1,4 +1,4 @@
-name: Step1053D.3 market rank materialization fix
+name: Step1053D.4 market rank warm audit
 
 on:
   push:
@@ -7,76 +7,52 @@ on:
       - '.github/workflows/step1053d3-market-rank-materialization-fix.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply-and-audit:
+  audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Apply exact source patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/step1053d3_patch.py
-
-      - name: Static checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          git diff --check
-          grep -q "rank_order_fallback_identity_preserved: true" src/market-light-snapshot.mjs
-          grep -q "rank_index_scope_contiguous: true" src/market-light-snapshot.mjs
-          grep -q "650.8.15.197.3.3.32.1" src/proxy.mjs
-          node --check src/market-light-snapshot.mjs
-          node --check src/proxy.mjs
-
-      - name: Commit fix if needed
-        shell: bash
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- src/market-light-snapshot.mjs src/proxy.mjs; then
-            echo 'source patch already present on main'
-            exit 0
-          fi
-          git config user.name 'kaka666888nb-cell'
-          git config user.email '295432334+kaka666888nb-cell@users.noreply.github.com'
-          git add src/market-light-snapshot.mjs src/proxy.mjs
-          git commit -m 'Step1053D.3 preserve ranked market identities across refresh gaps'
-          git push origin HEAD:main
-
       - name: Wait Render Step1053D.3
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
           EXPECTED='650.8.15.197.3.3.32.1'
-          for i in $(seq 1 120); do
+          for i in $(seq 1 90); do
             body="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
             ver="$(printf '%s' "$body" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
-            echo "poll=$i version=$ver"
+            echo "health_poll=$i version=$ver"
             if [ "$ver" = "$EXPECTED" ]; then exit 0; fi
             sleep 10
           done
           exit 1
 
-      - name: Audit scoped spot and contract ranks
+      - name: Wait shared rank sources to warm and audit
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/market-light/ranked-page?market_type=spot&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50" -o /tmp/spot.json
-          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/market-light/ranked-page?market_type=contract&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50" -o /tmp/contract.json
-          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/market-light/project-ranked-page?offset=0&limit=50" -o /tmp/project.json
+          fetch_ready() {
+            local url="$1" out="$2" label="$3"
+            for i in $(seq 1 90); do
+              code="$(curl -sS --connect-timeout 8 --max-time 25 -o "$out" -w '%{http_code}' "$url" || true)"
+              echo "$label poll=$i http=$code"
+              if [ "$code" = '200' ]; then return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+          fetch_ready "$BASE/api/market-light/ranked-page?market_type=spot&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50" /tmp/spot.json spot
+          fetch_ready "$BASE/api/market-light/ranked-page?market_type=contract&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50" /tmp/contract.json contract
+          fetch_ready "$BASE/api/market-light/project-ranked-page?offset=0&limit=50" /tmp/project.json project
           python3 - <<'PY'
           import json
           spot=json.load(open('/tmp/spot.json'))
           contract=json.load(open('/tmp/contract.json'))
           project=json.load(open('/tmp/project.json'))
+
           for name,d in [('spot',spot),('contract',contract)]:
               assert d['ok'] is True, (name,d.get('error'))
               assert d['ranking_happens_before_pagination'] is True
@@ -85,14 +61,20 @@ jobs:
               assert d['rank_index_scope_contiguous'] is True
               assert d['user_read_upstream_requests']==0
               items=d['items']
+              assert len(items)>0, name
               assert [x['rank_index'] for x in items] == list(range(1,len(items)+1)), name
               if name=='spot':
                   assert all(isinstance(x.get('venue_rows'),list) and len(x['venue_rows'])>=1 for x in items), 'spot empty venue_rows'
               else:
                   assert all(isinstance(x.get('row'),dict) for x in items), 'contract null row'
+                  btc=[x for x in items if str(x.get('base_asset','')).upper()=='BTC']
+                  assert btc, 'contract BTC missing from first market-cap page'
+
           assert project['ok'] is True
           by_rank={int(x['market_cap_rank']):x for x in project['items']}
           assert by_rank[1]['symbol']=='BTC'
+          assert by_rank[2]['symbol']=='ETH'
           assert by_rank[3]['symbol']=='USDT'
-          print('PASS scoped market rank materialization + project regression')
+          assert project['user_read_upstream_requests']==0
+          print('PASS Step1053D.4 warm rank audit: project BTC/ETH/USDT + contract BTC + frozen rank materialization')
           PY
