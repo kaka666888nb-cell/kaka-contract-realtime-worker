@@ -1,4 +1,4 @@
-name: Step1053D.4 verified project cap fallback
+name: Step1053D.4 canonical BTC contract rank
 
 on:
   push:
@@ -18,16 +18,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply rank-cap fallback
+      - name: Apply exact BTC project identity fallback
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/step1053d4_rank_cap_fallback.py
+          python3 .github/scripts/step1053d4_btc_core_rank.py
           git diff --check
           node --check src/market-light-snapshot.mjs
           node --check src/proxy.mjs
-          grep -q "Step1053D.4: the project Top3000 rank is the canonical market-cap catalog" src/market-light-snapshot.mjs
-          grep -q "650.8.15.197.3.3.32.2" src/proxy.mjs
+          grep -q "Step1053D.4.1: BTC is an independently verified core identity" src/market-light-snapshot.mjs
+          grep -q "650.8.15.197.3.3.32.3" src/proxy.mjs
 
       - name: Commit backend fix
         shell: bash
@@ -40,23 +40,24 @@ jobs:
           git config user.name 'kaka666888nb-cell'
           git config user.email '295432334+kaka666888nb-cell@users.noreply.github.com'
           git add src/market-light-snapshot.mjs src/proxy.mjs
-          git commit -m 'Step1053D.4 recover verified BTC market-cap rank from project catalog'
+          git commit -m 'Step1053D.4 restore canonical BTC rank in contract market'
           git push origin HEAD:main
 
-      - name: Wait Render and warm rank
+      - name: Wait Render and rank warmup
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          EXPECTED='650.8.15.197.3.3.32.2'
+          EXPECTED='650.8.15.197.3.3.32.3'
+          ready_version=0
           for i in $(seq 1 120); do
             body="$(curl -fsS --connect-timeout 8 --max-time 20 "$BASE/health" || true)"
             ver="$(printf '%s' "$body" | python3 -c 'import json,sys; s=sys.stdin.read(); print(json.loads(s).get("version","") if s else "")' 2>/dev/null || true)"
             echo "version_poll=$i version=$ver"
-            if [ "$ver" = "$EXPECTED" ]; then break; fi
+            if [ "$ver" = "$EXPECTED" ]; then ready_version=1; break; fi
             sleep 10
-            if [ "$i" = 120 ]; then exit 1; fi
           done
+          test "$ready_version" = 1
           fetch_ready() {
             local url="$1" out="$2" label="$3"
             for i in $(seq 1 90); do
@@ -70,7 +71,7 @@ jobs:
           fetch_ready "$BASE/api/market-light/ranked-page?market_type=contract&provider=all&quote=USDT&sort=market_cap_desc&offset=0&limit=50" /tmp/contract.json contract
           fetch_ready "$BASE/api/market-light/project-ranked-page?offset=0&limit=50" /tmp/project.json project
 
-      - name: Verify BTC contract rank and project BTC ETH USDT
+      - name: Verify canonical market-cap ordering
         shell: bash
         run: |
           set -euo pipefail
@@ -85,13 +86,14 @@ jobs:
           items=c['items']
           assert [x['rank_index'] for x in items] == list(range(1,len(items)+1))
           btc=[x for x in items if str(x.get('base_asset','')).upper()=='BTC']
-          assert len(btc)==5, [(x.get('rank_index'),x.get('base_asset'),x.get('provider')) for x in items[:15]]
+          assert len(btc)==5, [(x.get('rank_index'),x.get('market_cap_rank'),x.get('base_asset'),x.get('provider')) for x in items[:20]]
+          assert [x['rank_index'] for x in btc]==[1,2,3,4,5]
           assert all(int(x.get('market_cap_rank') or 0)==1 for x in btc)
-          assert all(isinstance(x.get('row'),dict) for x in btc)
+          assert all(isinstance(x.get('row'),dict) and str(x['row'].get('symbol','')).upper()=='BTCUSDT' for x in btc)
           by_rank={int(x['market_cap_rank']):x for x in p['items']}
           assert by_rank[1]['symbol']=='BTC'
           assert by_rank[2]['symbol']=='ETH'
           assert by_rank[3]['symbol']=='USDT'
           assert p['user_read_upstream_requests']==0
-          print('PASS Step1053D.4: BTC contract five venues restored; project rank BTC/ETH/USDT intact')
+          print('PASS Step1053D.4.1 BTC contract positions 1-5; project BTC/ETH/USDT ranks 1/2/3')
           PY
