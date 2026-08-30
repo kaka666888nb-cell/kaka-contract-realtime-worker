@@ -2,11 +2,12 @@ from pathlib import Path
 
 p = Path("src/market-light-snapshot.mjs")
 s = p.read_text(encoding="utf-8")
-
 old_version = "const STEP_VERSION = '650.8.15.197.3.3.6';"
 new_version = "const STEP_VERSION = '650.8.15.197.3.3.6.1';"
-assert old_version in s, "market-light STEP_VERSION anchor missing"
-s = s.replace(old_version, new_version, 1)
+if old_version in s:
+    s = s.replace(old_version, new_version, 1)
+else:
+    assert new_version in s, "market-light STEP_VERSION anchor missing"
 
 anchor = "function createMarketRankOrderSnapshot({ market, provider = '', quote = '', sortKey }) {\n"
 helper = """function marketRankFallbackRow(raw, market) {
@@ -37,8 +38,9 @@ helper = """function marketRankFallbackRow(raw, market) {
 
 function createMarketRankOrderSnapshot({ market, provider = '', quote = '', sortKey }) {
 """
-assert anchor in s, "createMarketRankOrderSnapshot anchor missing"
-s = s.replace(anchor, helper, 1)
+if "function marketRankFallbackRow(raw, market)" not in s:
+    assert anchor in s, "createMarketRankOrderSnapshot anchor missing"
+    s = s.replace(anchor, helper, 1)
 
 old_order = """    coingecko_total_volume_usd: marketRankNumber(entry?.coingecko_total_volume_usd),
     rank_metric_value: marketRankMetricValue(entry, sortKey),
@@ -49,8 +51,9 @@ new_order = """    coingecko_total_volume_usd: marketRankNumber(entry?.coingecko
     fallback_row: marketRankFallbackRow(entry?.row ?? entry?.representative_row, market),
   })).filter((entry) => entry.rank_identity);
 """
-assert old_order in s, "rank order projection anchor missing"
-s = s.replace(old_order, new_order, 1)
+if "fallback_row: marketRankFallbackRow" not in s:
+    assert old_order in s, "rank order projection anchor missing"
+    s = s.replace(old_order, new_order, 1)
 
 old_materialize = """function materializeMarketRankItem(orderEntry, { market, provider = '', quote = '' }, current) {
   if (market === 'spot' && (!provider || provider === 'all')) {
@@ -104,8 +107,9 @@ new_materialize = """function materializeMarketRankItem(orderEntry, { market, pr
   };
 }
 """
-assert old_materialize in s, "materializeMarketRankItem anchor missing"
-s = s.replace(old_materialize, new_materialize, 1)
+if "const { fallback_row: fallbackRowRaw" not in s:
+    assert old_materialize in s, "materializeMarketRankItem anchor missing"
+    s = s.replace(old_materialize, new_materialize, 1)
 
 old_flags = """    ranking_happens_before_pagination: true,
     pagination_order_frozen_by_rank_version: true,
@@ -117,14 +121,17 @@ new_flags = """    ranking_happens_before_pagination: true,
     rank_index_scope_contiguous: true,
     app_page_size_remains_50: true,
 """
-assert old_flags in s, "rank payload flags anchor missing"
-s = s.replace(old_flags, new_flags, 1)
+if "rank_order_fallback_identity_preserved: true" not in s:
+    assert old_flags in s, "rank payload flags anchor missing"
+    s = s.replace(old_flags, new_flags, 1)
 p.write_text(s, encoding="utf-8")
 
 proxy = Path("src/proxy.mjs")
 q = proxy.read_text(encoding="utf-8")
 old_proxy = "const STEP_VERSION = '650.8.15.197.3.3.32';"
 new_proxy = "const STEP_VERSION = '650.8.15.197.3.3.32.1';"
-assert old_proxy in q, "proxy STEP_VERSION anchor missing"
-q = q.replace(old_proxy, new_proxy, 1)
+if old_proxy in q:
+    q = q.replace(old_proxy, new_proxy, 1)
+else:
+    assert new_proxy in q, "proxy STEP_VERSION anchor missing"
 proxy.write_text(q, encoding="utf-8")
