@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.2';
+const STEP_VERSION = '650.8.15.197.3.3.6.3';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -2712,6 +2712,30 @@ function marketRankCapForBase(base) {
   if (!key) return null;
   const item = marketCapBySymbol.get(key);
   if (item) return { ...item };
+
+  // Step1053D.4.1: BTC is an independently verified core identity in both
+  // project fundamentals (bitcoin) and the canonical project Top3000 snapshot.
+  // Production proved the generic fast symbol index can still omit rank #1 while
+  // all five real BTC/USDT contract rows are present. Recover BTC only from the
+  // exact project identity; never infer it from turnover or a similarly named token.
+  if (key === 'BTC') {
+    const snapshot = projectMarketCapRankSnapshots.get(projectMarketCapCurrentRankVersion) || null;
+    const rows = Array.isArray(snapshot?.rows) ? snapshot.rows : [];
+    const btc = rows.find((row) =>
+      String(row?.symbol || '').trim().toUpperCase() === 'BTC' &&
+      String(row?.coin_id || '').trim() === 'bitcoin' &&
+      Number(row?.market_cap_rank) === 1
+    );
+    if (btc) {
+      return {
+        coingecko_id: 'bitcoin',
+        market_cap_rank: 1,
+        market_cap_usd: marketRankNumber(btc?.market_cap_usd),
+        image_url: String(btc?.image_url || '').trim() || null,
+        total_volume_usd: marketRankNumber(btc?.total_volume_usd),
+      };
+    }
+  }
 
   // Step1053D.4: the project Top3000 rank is the canonical market-cap catalog.
   // If the fast symbol index ever misses a catalog-unique identity (BTC exposed
