@@ -6,7 +6,7 @@
 
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.32.4-basis-delivery-1';
+const STEP_VERSION = '650.8.15.197.3.3.32.4-basis-delivery-2';
 const CURRENT_ROUTE = '/api/contract-basis/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-basis/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -481,12 +481,17 @@ async function collectOkxDelivery({ spotByBase, nowMs }) {
     if (state !== 'live' || expiry <= nowMs) continue;
     // OKX now also places X-Perps/pre-market X-Perps under FUTURES. They are not dated delivery basis instruments.
     if (ruleType === 'xperp' || ruleType === 'pre_market') continue;
-    if (ctType && ctType !== 'linear') continue;
-    const family = String(item?.instFamily || item?.uly || '').toUpperCase();
-    const parts = family.split('-').filter(Boolean);
+    // Both OKX linear and inverse normal expiry futures are legitimate dated futures.
+    // Do not discard inverse/USD rows; just keep strict same-quote basis comparability.
+    // Step1058.1: OKX expiry FUTURES are not limited to linear/USDT.
+    // Current production includes inverse BTC/ETH USD expiry futures and USD-margined
+    // normal expiry futures (e.g. BTC-USD_UM-260925). Keep them as real display rows;
+    // basis remains null unless the exact same venue + same base + same quote spot leg exists.
+    const underlying = String(item?.uly || item?.instFamily || '').toUpperCase();
+    const parts = underlying.split('-').filter(Boolean);
     const base = parts[0] || String(item?.ctValCcy || '').toUpperCase();
-    const quote = parts[1] || '';
-    if (quote !== 'USDT') continue;
+    const quote = parts[1] || String(item?.settleCcy || '').toUpperCase();
+    if (!base || !quote) continue;
     const ticker = tickerById.get(String(item?.instId || '')) || null;
     const sourceMs = timeMs(ticker?.ts) || nowMs;
     const row = buildDeliveryRow({
@@ -494,7 +499,7 @@ async function collectOkxDelivery({ spotByBase, nowMs }) {
       symbol: item?.instId,
       base,
       quote,
-      settle: item?.settleCcy || 'USDT',
+      settle: item?.settleCcy || quote,
       contractType: item?.ctType || 'linear',
       cycle: item?.alias || '',
       expiryMs: expiry,
