@@ -1,15 +1,33 @@
+// KakaWeb3 Step1058: delivery-futures expiry + current delivery price + annualized delivery basis.
+// Extends the existing shared contract-basis scanner without changing its legacy perpetual contract.
+// Legacy /api/contract-basis/current-snapshot fields remain backward-compatible.
+// Delivery collection is backend-shared and runs on a bounded five-minute cadence; user reads never start exchange work.
+// Binance COIN-M delivery REST is intentionally NOT called here because KakaWeb3's existing Binance contract REST guard remains permanent.
+
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 
-const STEP_VERSION = '650.8.15.1';
+const STEP_VERSION = '650.8.15.197.3.3.32.4-basis-delivery-1';
 const CURRENT_ROUTE = '/api/contract-basis/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-basis/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
+const DELIVERY_SOURCE_PROVIDERS = Object.freeze(['okx', 'bybit', 'bitget', 'gate']);
 const REFRESH_INTERVAL_MS = Math.max(15_000, Number(process.env.KAKA_CONTRACT_BASIS_REFRESH_INTERVAL_MS || 30_000));
 const START_DELAY_MS = Math.max(5_000, Number(process.env.KAKA_CONTRACT_BASIS_START_DELAY_MS || 12_000));
 const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_CONTRACT_BASIS_RESPONSE_CACHE_TTL_MS || 20_000));
 const INPUT_STALE_MS = Math.max(60_000, Number(process.env.KAKA_CONTRACT_BASIS_INPUT_STALE_MS || 3 * 60_000));
 const BASIS_SIDE_FRESH_MS = Math.max(60_000, Number(process.env.KAKA_CONTRACT_BASIS_SIDE_FRESH_MS || 30 * 60_000));
 const BASIS_MAX_SKEW_MS = Math.max(60_000, Number(process.env.KAKA_CONTRACT_BASIS_MAX_SKEW_MS || 15 * 60_000));
+const DELIVERY_REFRESH_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.KAKA_CONTRACT_DELIVERY_BASIS_REFRESH_INTERVAL_MS || 5 * 60_000),
+);
+const DELIVERY_FETCH_TIMEOUT_MS = Math.max(
+  3_000,
+  Number(process.env.KAKA_CONTRACT_DELIVERY_BASIS_FETCH_TIMEOUT_MS || 8_000),
+);
+const DELIVERY_MAX_PROVIDER_PAGES = 4;
+const MIN_ANNUALIZE_REMAINING_MS = 60 * 60_000;
+const YEAR_MS = 365 * 24 * 60 * 60_000;
 
 let started = false;
 let running = false;
@@ -26,6 +44,15 @@ let responseCacheHits = 0;
 let responseCacheMisses = 0;
 let latestVerifiedSnapshot = null;
 const responseCache = new Map();
+
+let deliveryRunning = false;
+let deliveryLastStartedAt = null;
+let deliveryLastCompletedAt = null;
+let deliveryLastError = '';
+let deliveryTotalRefreshes = 0;
+let deliveryTotalRefreshFailures = 0;
+let deliveryTotalUpstreamRequests = 0;
+let latestDeliverySnapshot = null;
 
 function compact(value) {
   return String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -254,6 +281,7 @@ export function buildContractBasisSnapshotFromInputs(inputByProvider, { nowMs = 
     no_cross_provider_substitution: true,
     no_cross_quote_substitution: true,
     missing_values_remain_null: true,
+    // Legacy contract kept intentionally: the core perpetual layer itself still uses only existing market-light.
     derived_from_existing_shared_market_light_only: true,
     additional_exchange_requests_per_build: 0,
     additional_exchange_connections_per_build: 0,
@@ -278,6 +306,479 @@ function collectInputs() {
   return { inputByProvider, sharedRound };
 }
 
+async function fetchJson(url, provider) {
+  deliveryTotalUpstreamRequests += 1;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      accept: 'application/json',
+      'user-agent': `KakaWeb3-Step1058-DeliveryBasis/1.0 (${provider})`,
+    },
+    signal: AbortSignal.timeout(DELIVERY_FETCH_TIMEOUT_MS),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`${provider}_delivery_http_${response.status}`);
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch (_) {
+    throw new Error(`${provider}_delivery_invalid_json`);
+  }
+  return payload;
+}
+
+function buildDeliveryRow({
+  provider,
+  symbol,
+  base,
+  quote,
+  settle,
+  contractType,
+  cycle,
+  expiryMs,
+  lastPrice,
+  markPrice,
+  indexPrice,
+  sourceMs,
+  sourceUrl,
+  spotByBase,
+  nowMs,
+}) {
+  const cleanProvider = String(provider || '').toLowerCase();
+  const cleanSymbol = String(symbol || '').trim().toUpperCase();
+  const cleanBase = compact(base);
+  const cleanQuote = compact(quote);
+  const cleanSettle = compact(settle);
+  const expiry = timeMs(expiryMs);
+  if (!cleanProvider || !cleanSymbol || !cleanBase || !cleanQuote || expiry <= nowMs) return null;
+
+  const last = positive(lastPrice);
+  const mark = positive(markPrice);
+  const index = positive(indexPrice);
+  const deliveryPrice = mark ?? last;
+  const deliveryPriceKind = mark != null ? 'mark_price' : last != null ? 'last_price' : '';
+  if (deliveryPrice == null) return null;
+
+  const remainingMs = expiry - nowMs;
+  const spotMatch = cleanQuote === 'USDT' ? (spotByBase?.get(cleanBase) || null) : null;
+  const spotPrice = positive(spotMatch?.price);
+  const spotSourceMs = Number(spotMatch?.sourceMs || 0);
+  const sameQuoteSpot = cleanQuote === 'USDT' && spotPrice != null;
+  const spotFresh = spotSourceMs > 0 && nowMs - spotSourceMs <= BASIS_SIDE_FRESH_MS;
+  const deliverySourceMs = Number(sourceMs || 0) > 0 ? Number(sourceMs) : nowMs;
+  const deliveryFresh = nowMs - deliverySourceMs <= BASIS_SIDE_FRESH_MS;
+  const skewMs = spotSourceMs > 0 ? Math.abs(deliverySourceMs - spotSourceMs) : null;
+  const skewOk = skewMs != null && skewMs <= BASIS_MAX_SKEW_MS;
+  const basisComparable = sameQuoteSpot && spotFresh && deliveryFresh && skewOk && remainingMs >= MIN_ANNUALIZE_REMAINING_MS;
+
+  let basisPercent = null;
+  let annualizedBasisPercent = null;
+  if (basisComparable) {
+    basisPercent = percentage(deliveryPrice - spotPrice, spotPrice);
+    const years = remainingMs / YEAR_MS;
+    if (basisPercent != null && Number.isFinite(years) && years > 0) {
+      annualizedBasisPercent = basisPercent / years;
+      if (!Number.isFinite(annualizedBasisPercent)) annualizedBasisPercent = null;
+    }
+  }
+
+  let comparisonReason = '';
+  if (!basisComparable) {
+    if (cleanQuote !== 'USDT') comparisonReason = 'quote_not_usdt_same_quote_required';
+    else if (spotPrice == null) comparisonReason = 'same_venue_same_quote_spot_missing';
+    else if (!spotFresh) comparisonReason = 'spot_stale';
+    else if (!deliveryFresh) comparisonReason = 'delivery_price_stale';
+    else if (!skewOk) comparisonReason = 'source_time_skew_too_large';
+    else if (remainingMs < MIN_ANNUALIZE_REMAINING_MS) comparisonReason = 'too_close_to_expiry_for_annualization';
+    else comparisonReason = 'not_comparable';
+  }
+
+  return {
+    provider: cleanProvider,
+    market_type: 'delivery',
+    symbol: cleanSymbol,
+    base_asset: cleanBase,
+    quote_asset: cleanQuote,
+    quote_symbol: cleanQuote,
+    settle_asset: cleanSettle || null,
+    contract_type: String(contractType || '').trim(),
+    delivery_cycle: String(cycle || '').trim(),
+    expiry_at: isoOrNull(expiry),
+    expiry_timestamp_ms: expiry,
+    remaining_seconds: Math.max(0, Math.floor(remainingMs / 1000)),
+    last_price: last,
+    mark_price: mark,
+    index_price: index,
+    delivery_price: deliveryPrice,
+    delivery_price_kind: deliveryPriceKind,
+    spot_price: basisComparable ? spotPrice : null,
+    delivery_basis_percent: basisPercent,
+    annualized_delivery_basis_percent: annualizedBasisPercent,
+    basis_comparable: basisComparable,
+    comparison_reason: comparisonReason,
+    same_provider_spot_match: sameQuoteSpot,
+    same_quote_spot_match: sameQuoteSpot,
+    no_cross_provider_substitution: true,
+    no_cross_quote_substitution: true,
+    delivery_source_time: isoOrNull(deliverySourceMs),
+    spot_source_time: basisComparable ? isoOrNull(spotSourceMs) : null,
+    source_time_skew_seconds: basisComparable && skewMs != null ? Math.round(skewMs / 1000) : null,
+    source_time: isoOrNull(deliverySourceMs),
+    source_url: sourceUrl,
+  };
+}
+
+async function collectGateDelivery({ spotByBase, nowMs }) {
+  const sourceUrl = 'https://api.gateio.ws/api/v4/delivery/usdt/contracts';
+  const payload = await fetchJson(sourceUrl, 'gate');
+  if (!Array.isArray(payload)) throw new Error('gate_delivery_payload_not_array');
+  const rows = [];
+  for (const item of payload) {
+    const underlying = String(item?.underlying || '').toUpperCase();
+    const [base, quote] = underlying.split('_');
+    const row = buildDeliveryRow({
+      provider: 'gate',
+      symbol: item?.name,
+      base,
+      quote: quote || 'USDT',
+      settle: 'USDT',
+      contractType: item?.type,
+      cycle: item?.cycle,
+      expiryMs: item?.expire_time,
+      lastPrice: item?.last_price,
+      markPrice: item?.mark_price,
+      indexPrice: item?.index_price,
+      sourceMs: nowMs,
+      sourceUrl,
+      spotByBase,
+      nowMs,
+    });
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
+async function collectOkxDelivery({ spotByBase, nowMs }) {
+  const instrumentsUrl = 'https://www.okx.com/api/v5/public/instruments?instType=FUTURES';
+  const tickersUrl = 'https://www.okx.com/api/v5/market/tickers?instType=FUTURES';
+  const [instrumentsPayload, tickersPayload] = await Promise.all([
+    fetchJson(instrumentsUrl, 'okx'),
+    fetchJson(tickersUrl, 'okx'),
+  ]);
+  if (String(instrumentsPayload?.code ?? '') !== '0' || !Array.isArray(instrumentsPayload?.data)) {
+    throw new Error('okx_delivery_instruments_not_ready');
+  }
+  if (String(tickersPayload?.code ?? '') !== '0' || !Array.isArray(tickersPayload?.data)) {
+    throw new Error('okx_delivery_tickers_not_ready');
+  }
+  const tickerById = new Map(tickersPayload.data.map((item) => [String(item?.instId || ''), item]));
+  const rows = [];
+  for (const item of instrumentsPayload.data) {
+    const state = String(item?.state || '').toLowerCase();
+    const ruleType = String(item?.ruleType || 'normal').toLowerCase();
+    const ctType = String(item?.ctType || '').toLowerCase();
+    const expiry = timeMs(item?.expTime);
+    if (state !== 'live' || expiry <= nowMs) continue;
+    // OKX now also places X-Perps/pre-market X-Perps under FUTURES. They are not dated delivery basis instruments.
+    if (ruleType === 'xperp' || ruleType === 'pre_market') continue;
+    if (ctType && ctType !== 'linear') continue;
+    const family = String(item?.instFamily || item?.uly || '').toUpperCase();
+    const parts = family.split('-').filter(Boolean);
+    const base = parts[0] || String(item?.ctValCcy || '').toUpperCase();
+    const quote = parts[1] || '';
+    if (quote !== 'USDT') continue;
+    const ticker = tickerById.get(String(item?.instId || '')) || null;
+    const sourceMs = timeMs(ticker?.ts) || nowMs;
+    const row = buildDeliveryRow({
+      provider: 'okx',
+      symbol: item?.instId,
+      base,
+      quote,
+      settle: item?.settleCcy || 'USDT',
+      contractType: item?.ctType || 'linear',
+      cycle: item?.alias || '',
+      expiryMs: expiry,
+      lastPrice: ticker?.last,
+      markPrice: null,
+      indexPrice: null,
+      sourceMs,
+      sourceUrl: instrumentsUrl,
+      spotByBase,
+      nowMs,
+    });
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
+async function collectBybitInstrumentPages(category) {
+  const rows = [];
+  let cursor = '';
+  let rootTime = 0;
+  for (let page = 0; page < DELIVERY_MAX_PROVIDER_PAGES; page += 1) {
+    const url = new URL('https://api.bybit.com/v5/market/instruments-info');
+    url.searchParams.set('category', category);
+    url.searchParams.set('limit', '1000');
+    if (cursor) url.searchParams.set('cursor', cursor);
+    const payload = await fetchJson(url.toString(), 'bybit');
+    if (Number(payload?.retCode) !== 0 || !Array.isArray(payload?.result?.list)) {
+      throw new Error('bybit_delivery_instruments_not_ready');
+    }
+    rows.push(...payload.result.list);
+    rootTime = Math.max(rootTime, timeMs(payload?.time));
+    const next = String(payload?.result?.nextPageCursor || '').trim();
+    if (!next || next === cursor) break;
+    cursor = next;
+  }
+  return { rows, rootTime };
+}
+
+async function collectBybitDelivery({ spotByBase, nowMs }) {
+  const instruments = await collectBybitInstrumentPages('linear');
+  const tickersUrl = 'https://api.bybit.com/v5/market/tickers?category=linear';
+  const tickersPayload = await fetchJson(tickersUrl, 'bybit');
+  if (Number(tickersPayload?.retCode) !== 0 || !Array.isArray(tickersPayload?.result?.list)) {
+    throw new Error('bybit_delivery_tickers_not_ready');
+  }
+  const tickerBySymbol = new Map(
+    tickersPayload.result.list.map((item) => [String(item?.symbol || '').toUpperCase(), item]),
+  );
+  const rootTime = timeMs(tickersPayload?.time) || instruments.rootTime || nowMs;
+  const rows = [];
+  for (const item of instruments.rows) {
+    const contractType = String(item?.contractType || '');
+    const status = String(item?.status || '').toLowerCase();
+    const quote = compact(item?.quoteCoin);
+    const settle = compact(item?.settleCoin);
+    const expiry = timeMs(item?.deliveryTime);
+    if (!/futures/i.test(contractType) || /perpetual/i.test(contractType)) continue;
+    if (status !== 'trading' || expiry <= nowMs || quote !== 'USDT') continue;
+    if (settle && settle !== 'USDT') continue;
+    const ticker = tickerBySymbol.get(String(item?.symbol || '').toUpperCase()) || null;
+    const row = buildDeliveryRow({
+      provider: 'bybit',
+      symbol: item?.symbol,
+      base: item?.baseCoin,
+      quote,
+      settle: settle || 'USDT',
+      contractType,
+      cycle: '',
+      expiryMs: expiry,
+      lastPrice: ticker?.lastPrice,
+      markPrice: ticker?.markPrice,
+      indexPrice: ticker?.indexPrice,
+      sourceMs: rootTime,
+      sourceUrl: tickersUrl,
+      spotByBase,
+      nowMs,
+    });
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
+async function collectBitgetDelivery({ spotByBase, nowMs }) {
+  const contractsUrl = 'https://api.bitget.com/api/v2/mix/market/contracts?productType=COIN-FUTURES';
+  const tickersUrl = 'https://api.bitget.com/api/v2/mix/market/tickers?productType=COIN-FUTURES';
+  const [contractsPayload, tickersPayload] = await Promise.all([
+    fetchJson(contractsUrl, 'bitget'),
+    fetchJson(tickersUrl, 'bitget'),
+  ]);
+  if (String(contractsPayload?.code || '') !== '00000' || !Array.isArray(contractsPayload?.data)) {
+    throw new Error('bitget_delivery_contracts_not_ready');
+  }
+  if (String(tickersPayload?.code || '') !== '00000' || !Array.isArray(tickersPayload?.data)) {
+    throw new Error('bitget_delivery_tickers_not_ready');
+  }
+  const tickerBySymbol = new Map(
+    tickersPayload.data.map((item) => [String(item?.symbol || '').toUpperCase(), item]),
+  );
+  const rows = [];
+  for (const item of contractsPayload.data) {
+    const symbolType = String(item?.symbolType || '').toLowerCase();
+    const status = String(item?.symbolStatus || '').toLowerCase();
+    const expiry = timeMs(item?.deliveryTime);
+    if (symbolType !== 'delivery' || expiry <= nowMs) continue;
+    if (status && !['normal', 'listed'].includes(status)) continue;
+    const ticker = tickerBySymbol.get(String(item?.symbol || '').toUpperCase()) || null;
+    const sourceMs = timeMs(ticker?.ts) || timeMs(tickersPayload?.requestTime) || nowMs;
+    const row = buildDeliveryRow({
+      provider: 'bitget',
+      symbol: item?.symbol,
+      base: item?.baseCoin,
+      quote: item?.quoteCoin || 'USD',
+      settle: item?.symbol?.toString()?.toUpperCase()?.startsWith(String(item?.baseCoin || '').toUpperCase())
+        ? item?.baseCoin
+        : '',
+      contractType: 'coin_m_delivery',
+      cycle: item?.deliveryPeriod,
+      expiryMs: expiry,
+      lastPrice: ticker?.lastPr,
+      markPrice: ticker?.markPrice,
+      indexPrice: ticker?.indexPrice,
+      sourceMs,
+      sourceUrl: contractsUrl,
+      spotByBase,
+      nowMs,
+    });
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
+async function refreshDeliverySnapshot(inputByProvider, { reason = 'scheduled', nowMs = Date.now() } = {}) {
+  if (deliveryRunning) return latestDeliverySnapshot;
+  deliveryRunning = true;
+  deliveryTotalRefreshes += 1;
+  deliveryLastStartedAt = new Date(nowMs).toISOString();
+
+  const providerCoverage = {
+    binance: {
+      provider: 'binance',
+      source_supported: false,
+      delivery_contracts: 0,
+      comparable_pairs: 0,
+      status: 'guarded',
+      reason: 'binance_contract_rest_guard_no_new_rest',
+      upstream_requests: 0,
+    },
+  };
+  const rows = [];
+  const errors = [];
+  const requestsBefore = deliveryTotalUpstreamRequests;
+
+  const jobs = [
+    ['okx', collectOkxDelivery],
+    ['bybit', collectBybitDelivery],
+    ['bitget', collectBitgetDelivery],
+    ['gate', collectGateDelivery],
+  ].map(async ([provider, collector]) => {
+    const spotByBase = normalizeSpotMap(inputByProvider?.[provider]?.spot?.rows || []);
+    try {
+      const providerRows = await collector({ spotByBase, nowMs });
+      return { provider, ok: true, rows: providerRows };
+    } catch (error) {
+      return {
+        provider,
+        ok: false,
+        rows: [],
+        error: String(error?.message || error),
+      };
+    }
+  });
+
+  try {
+    const results = await Promise.all(jobs);
+    for (const result of results) {
+      rows.push(...result.rows);
+      const comparable = result.rows.filter((row) => row.basis_comparable === true).length;
+      providerCoverage[result.provider] = {
+        provider: result.provider,
+        source_supported: true,
+        delivery_contracts: result.rows.length,
+        comparable_pairs: comparable,
+        status: result.ok ? 'ready' : 'error',
+        reason: result.ok ? '' : result.error,
+      };
+      if (!result.ok) errors.push(`${result.provider}:${result.error}`);
+    }
+
+    rows.sort((a, b) => {
+      const ae = Number(a.expiry_timestamp_ms || 0);
+      const be = Number(b.expiry_timestamp_ms || 0);
+      if (ae !== be) return ae - be;
+      if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+      return a.symbol.localeCompare(b.symbol);
+    });
+
+    const comparableRows = rows.filter((row) => row.basis_comparable === true);
+    const providerReadyCount = DELIVERY_SOURCE_PROVIDERS.filter(
+      (provider) => providerCoverage[provider]?.status === 'ready',
+    ).length;
+    const providerComparableCount = new Set(comparableRows.map((row) => row.provider)).size;
+    const upstreamRequests = deliveryTotalUpstreamRequests - requestsBefore;
+
+    if (providerReadyCount === 0 && latestDeliverySnapshot?.ready === true) {
+      deliveryTotalRefreshFailures += 1;
+      deliveryLastError = errors.join('|') || 'all_delivery_sources_unavailable';
+      // Preserve the last verified delivery snapshot atomically. A temporary provider outage
+      // must not erase already-visible real delivery data. The old built_at remains unchanged,
+      // so consumers can still see that the preserved snapshot is older.
+      return {
+        ...latestDeliverySnapshot,
+        stale_preserved: true,
+        stale_preserve_reason: deliveryLastError,
+        latest_refresh_failed_at: new Date(nowMs).toISOString(),
+      };
+    }
+
+    const snapshot = {
+      ok: true,
+      schema: 'step1058_delivery_basis_v1',
+      version: STEP_VERSION,
+      ready: providerReadyCount > 0,
+      partial: providerReadyCount < DELIVERY_SOURCE_PROVIDERS.length,
+      providers: PROVIDERS,
+      source_providers: DELIVERY_SOURCE_PROVIDERS,
+      source_provider_count: DELIVERY_SOURCE_PROVIDERS.length,
+      provider_ready_count: providerReadyCount,
+      provider_comparable_count: providerComparableCount,
+      row_count: rows.length,
+      comparable_row_count: comparableRows.length,
+      provider_coverage: providerCoverage,
+      rows,
+      formula: {
+        delivery_basis_percent: '(delivery_price-spot_price)/spot_price*100',
+        annualized_delivery_basis_percent: 'delivery_basis_percent/(remaining_milliseconds/(365*24h))',
+      },
+      delivery_price_policy: 'mark_price_when_available_else_last_price',
+      same_provider_required: true,
+      same_base_required: true,
+      same_quote_required_for_basis: true,
+      comparable_quote: 'USDT',
+      no_cross_provider_substitution: true,
+      no_cross_quote_substitution: true,
+      missing_values_remain_null: true,
+      min_remaining_seconds_for_annualization: Math.round(MIN_ANNUALIZE_REMAINING_MS / 1000),
+      delivery_refresh_interval_seconds: Math.round(DELIVERY_REFRESH_INTERVAL_MS / 1000),
+      delivery_upstream_requests_this_refresh: upstreamRequests,
+      delivery_upstream_requests_scale_with_users: false,
+      user_reads_start_delivery_upstream_requests: false,
+      user_reads_scale_exchange_upstream: false,
+      binance_contract_rest_requests: 0,
+      binance_contract_rest_guard_preserved: true,
+      reason,
+      errors,
+      built_at: new Date(nowMs).toISOString(),
+      timestamp_ms: nowMs,
+    };
+
+    latestDeliverySnapshot = snapshot;
+    deliveryLastCompletedAt = new Date().toISOString();
+    deliveryLastError = errors.join('|');
+    if (providerReadyCount === 0) deliveryTotalRefreshFailures += 1;
+    return snapshot;
+  } catch (error) {
+    deliveryTotalRefreshFailures += 1;
+    deliveryLastError = String(error?.message || error);
+    return latestDeliverySnapshot;
+  } finally {
+    deliveryRunning = false;
+  }
+}
+
+async function maybeRefreshDeliverySnapshot(inputByProvider, { reason = 'scheduled' } = {}) {
+  const builtMs = timeMs(latestDeliverySnapshot?.built_at);
+  if (
+    latestDeliverySnapshot &&
+    builtMs > 0 &&
+    Date.now() - builtMs < DELIVERY_REFRESH_INTERVAL_MS
+  ) {
+    return latestDeliverySnapshot;
+  }
+  return await refreshDeliverySnapshot(inputByProvider, { reason, nowMs: Date.now() });
+}
+
 export async function runContractBasisCycle({ reason = 'scheduled' } = {}) {
   if (running) return false;
   running = true;
@@ -293,7 +794,24 @@ export async function runContractBasisCycle({ reason = 'scheduled' } = {}) {
       });
       throw new Error(`market_light_inputs_not_ready:${reasons.join('|')}`);
     }
-    latestVerifiedSnapshot = { ...snapshot, reason };
+
+    // Delivery is deliberately non-fatal to the already-stable perpetual basis layer.
+    // A provider outage can only make delivery partial; it cannot remove the existing basis snapshot.
+    await maybeRefreshDeliverySnapshot(inputByProvider, { reason: `contract_basis_${reason}` });
+
+    latestVerifiedSnapshot = {
+      ...snapshot,
+      delivery: latestDeliverySnapshot,
+      delivery_schema: latestDeliverySnapshot?.schema || 'step1058_delivery_basis_v1',
+      delivery_ready: latestDeliverySnapshot?.ready === true,
+      delivery_row_count: Number(latestDeliverySnapshot?.row_count || 0),
+      delivery_comparable_row_count: Number(latestDeliverySnapshot?.comparable_row_count || 0),
+      delivery_provider_ready_count: Number(latestDeliverySnapshot?.provider_ready_count || 0),
+      delivery_provider_comparable_count: Number(latestDeliverySnapshot?.provider_comparable_count || 0),
+      delivery_refresh_interval_seconds: Math.round(DELIVERY_REFRESH_INTERVAL_MS / 1000),
+      delivery_upstream_requests_scale_with_users: false,
+      binance_contract_rest_guard_preserved: true,
+    };
     round += 1;
     lastCompletedAt = new Date().toISOString();
     lastError = '';
@@ -335,11 +853,17 @@ function responsePayload() {
       providers: PROVIDERS,
       provider_coverage: {},
       rows: [],
+      delivery: latestDeliverySnapshot,
+      delivery_schema: 'step1058_delivery_basis_v1',
+      delivery_ready: latestDeliverySnapshot?.ready === true,
+      delivery_row_count: Number(latestDeliverySnapshot?.row_count || 0),
+      delivery_comparable_row_count: Number(latestDeliverySnapshot?.comparable_row_count || 0),
       last_error: lastError,
       exchange_requests_started: 0,
       exchange_connections_started: 0,
       reads_scale_with_users: false,
       derived_from_existing_shared_market_light_only: true,
+      binance_contract_rest_guard_preserved: true,
       timestamp_ms: Date.now(),
     };
   }
@@ -347,6 +871,8 @@ function responsePayload() {
     ...latestVerifiedSnapshot,
     shared_basis_round: round,
     last_error: lastError,
+    // Legacy zeroes mean a USER READ of this route starts no upstream work.
+    // Delivery background collector accounting is exposed separately under delivery.*.
     exchange_requests_started: 0,
     exchange_connections_started: 0,
     reads_scale_with_users: false,
@@ -403,6 +929,29 @@ export function getContractBasisHealth() {
     no_cross_provider_substitution: true,
     no_cross_quote_substitution: true,
     missing_values_remain_null: true,
+
+    delivery: {
+      schema: 'step1058_delivery_basis_v1',
+      running: deliveryRunning,
+      refresh_interval_seconds: Math.round(DELIVERY_REFRESH_INTERVAL_MS / 1000),
+      last_started_at: deliveryLastStartedAt,
+      last_completed_at: deliveryLastCompletedAt,
+      last_error: deliveryLastError,
+      total_refreshes: deliveryTotalRefreshes,
+      total_refresh_failures: deliveryTotalRefreshFailures,
+      total_upstream_requests: deliveryTotalUpstreamRequests,
+      latest_ready: latestDeliverySnapshot?.ready === true,
+      latest_partial: latestDeliverySnapshot?.partial === true,
+      latest_row_count: Number(latestDeliverySnapshot?.row_count || 0),
+      latest_comparable_row_count: Number(latestDeliverySnapshot?.comparable_row_count || 0),
+      latest_provider_ready_count: Number(latestDeliverySnapshot?.provider_ready_count || 0),
+      latest_provider_comparable_count: Number(latestDeliverySnapshot?.provider_comparable_count || 0),
+      latest_provider_coverage: latestDeliverySnapshot?.provider_coverage || {},
+      user_reads_start_exchange_requests: false,
+      reads_scale_with_users: false,
+      binance_contract_rest_requests: 0,
+      binance_contract_rest_guard_preserved: true,
+    },
     time: new Date().toISOString(),
   };
 }
