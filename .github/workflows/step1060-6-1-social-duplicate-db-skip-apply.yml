@@ -1,0 +1,41 @@
+name: Step1060.6.1 social duplicate DB skip apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-6-1-social-duplicate-db-skip-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply duplicate event DB skip patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/step1060_6_1_social_duplicate_db_skip_patch.py
+          node --check src/social-watch.mjs
+          grep -q "step1060_6_1_social_duplicate_event_cost_guard_v1" src/social-watch.mjs
+          grep -q "state.duplicateEventsSkipped++" src/social-watch.mjs
+          grep -q "removed_event_can_reactivate: true" src/social-watch.mjs
+          git diff --check
+          git diff -- src/social-watch.mjs
+
+      - name: Commit duplicate event cost guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka-step1060-cost-guard'
+          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git add src/social-watch.mjs
+          git commit -m 'Step1060.6.1 skip unchanged active social duplicate DB writes'
+          git push origin HEAD:main
