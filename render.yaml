@@ -3,5 +3,5 @@ services:
     name: kaka-contract-realtime-worker
     runtime: docker
     plan: free
-    healthCheckPath: /health
+    healthCheckPath: /health/ready
     autoDeploy: true
