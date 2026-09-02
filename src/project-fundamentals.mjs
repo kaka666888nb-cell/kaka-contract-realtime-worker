@@ -7,6 +7,17 @@ const HEALTH_ROUTE = '/api/project-fundamentals/health';
 const TABLE = 'kaka_project_fundamentals';
 const REFRESH_MS = Math.max(30 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_REFRESH_MS || 60 * 60_000));
 const RESTORE_MAX_AGE_MS = Math.max(24 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_AGE_MS || 7 * 24 * 60 * 60_000));
+// Step1060.10: PostgREST may cap one response at 1000 rows even when a larger limit is requested.
+// Restore the persisted project catalog with stable bounded pagination so a Render restart
+// compares against the full previous catalog instead of rewriting missing pages.
+const RESTORE_PAGE_SIZE = Math.max(
+  200,
+  Math.min(1000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_PAGE_SIZE || 1000) || 1000),
+);
+const RESTORE_MAX_PAGES = Math.max(
+  3,
+  Math.min(20, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_PAGES || 10) || 10),
+);
 // Step1060.9: source refresh remains hourly, while unchanged persisted rows only need a bounded
 // heartbeat for restart recovery. App reads keep using the freshly rebuilt in-memory catalog.
 const PERSIST_HEARTBEAT_MS = Math.max(
@@ -39,6 +50,9 @@ let lastRefreshError = '';
 let lastPersistedAt = '';
 let lastSourceFetchedAt = '';
 let restoreRows = 0;
+let restorePages = 0;
+let restoreRowsFetched = 0;
+let restoreTruncated = false;
 let sourceRequestsStarted = 0;
 let sourceRequestsSucceeded = 0;
 let sourceRequestsFailed = 0;
@@ -356,32 +370,42 @@ async function restorePersisted() {
   if (!SUPABASE_CONFIGURED) return false;
   try {
     const cutoff = new Date(Date.now() - RESTORE_MAX_AGE_MS).toISOString();
-    const query = `${TABLE}?select=*&source_fetched_at=gte.${encodeURIComponent(cutoff)}&order=source_fetched_at.desc&limit=5000`;
-    const response = await supabaseFetch(query, { method: 'GET' });
-    if (!response.ok) throw new Error(`restore_http_${response.status}`);
-    const rows = await response.json();
-    if (!Array.isArray(rows)) throw new Error('restore_payload_invalid');
     const restored = new Map();
-    for (const raw of rows) {
-      const coinId = lower(raw?.coin_id);
-      if (!coinId || raw?.match_verified !== true || compact(raw?.match_method) !== 'defillama_gecko_id_exact_unique') continue;
-      if (restored.has(coinId)) continue;
-      restored.set(coinId, {
-        ...raw,
-        coin_id: coinId,
-        chains: Array.isArray(raw?.chains) ? raw.chains : [],
-        match_verified: true,
-      });
+    restorePages = 0;
+    restoreRowsFetched = 0;
+    restoreTruncated = false;
+    for (let page = 0; page < RESTORE_MAX_PAGES; page += 1) {
+      const offset = page * RESTORE_PAGE_SIZE;
+      const query = `${TABLE}?select=*&source_fetched_at=gte.${encodeURIComponent(cutoff)}&order=source_fetched_at.desc,coin_id.asc&limit=${RESTORE_PAGE_SIZE}&offset=${offset}`;
+      const response = await supabaseFetch(query, { method: 'GET' });
+      if (!response.ok) throw new Error(`restore_http_${response.status}_page_${page + 1}`);
+      const rows = await response.json();
+      if (!Array.isArray(rows)) throw new Error(`restore_payload_invalid_page_${page + 1}`);
+      restorePages += 1;
+      restoreRowsFetched += rows.length;
+      for (const raw of rows) {
+        const coinId = lower(raw?.coin_id);
+        if (!coinId || raw?.match_verified !== true || compact(raw?.match_method) !== 'defillama_gecko_id_exact_unique') continue;
+        if (restored.has(coinId)) continue;
+        restored.set(coinId, {
+          ...raw,
+          coin_id: coinId,
+          chains: Array.isArray(raw?.chains) ? raw.chains : [],
+          match_verified: true,
+        });
+      }
+      if (rows.length < RESTORE_PAGE_SIZE) break;
+      if (page === RESTORE_MAX_PAGES - 1) restoreTruncated = true;
     }
+    restoreRows = restored.size;
     if (restored.size) {
       catalog.clear();
       for (const [key, row] of restored.entries()) catalog.set(key, row);
-      restoreRows = restored.size;
       lastSourceFetchedAt = compact([...restored.values()][0]?.source_fetched_at);
-      lastFullPersistAt = lastSourceFetchedAt;
+      lastFullPersistAt = restoreTruncated ? '' : lastSourceFetchedAt;
     }
     lastRestoreAt = new Date().toISOString();
-    lastRestoreError = '';
+    lastRestoreError = restoreTruncated ? `restore_page_cap_reached_${RESTORE_MAX_PAGES}` : '';
     return restored.size > 0;
   } catch (error) {
     lastRestoreError = String(error?.message || error).slice(0, 320);
@@ -515,6 +539,18 @@ export function getProjectFundamentalsHealth() {
     last_identity_refresh_at: lastIdentityRefreshAt || null,
     last_identity_refresh_error: lastIdentityRefreshError || null,
     restore_rows: restoreRows,
+    restart_restore_cost_guard: {
+      version: 'step1060_10_project_fundamentals_restore_pagination_v1',
+      postgrest_single_page_cap_avoided: true,
+      stable_order_source_time_then_coin_id: true,
+      restore_page_size: RESTORE_PAGE_SIZE,
+      restore_max_pages: RESTORE_MAX_PAGES,
+      restore_pages: restorePages,
+      restore_rows_fetched: restoreRowsFetched,
+      restore_unique_rows: restoreRows,
+      restore_truncated: restoreTruncated,
+      full_restore_ready: restoreRows > 0 && restoreTruncated === false,
+    },
     last_restore_at: lastRestoreAt || null,
     last_restore_error: lastRestoreError || null,
     last_refresh_started_at: lastRefreshStartedAt || null,
