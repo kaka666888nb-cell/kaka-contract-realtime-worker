@@ -1,0 +1,42 @@
+name: Step1060.5.1 onchain restart restore patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-5-1-onchain-restart-restore-patch.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact restart restore patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/step1060_5_1_onchain_restart_restore_patch.py
+          node --check src/onchain-hot-persistence.mjs
+          node --check src/onchain-market.mjs
+          grep -q "persisted_hot_snapshot_restored" src/onchain-market.mjs
+          grep -q "render_onchain_verified_discovery" src/onchain-market.mjs
+          grep -q "restorePersistedTrendingSnapshot" src/onchain-market.mjs
+          git diff --check
+          git diff -- src/onchain-market.mjs
+
+      - name: Commit onchain restore integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka-step1060-cost-guard'
+          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git add src/onchain-market.mjs
+          git commit -m 'Step1060.5.1 restore verified onchain hot snapshot across restarts'
+          git push origin HEAD:main
