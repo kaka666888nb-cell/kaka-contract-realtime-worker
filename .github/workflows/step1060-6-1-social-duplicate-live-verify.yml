@@ -1,0 +1,79 @@
+name: Step1060.6.1 social duplicate cost guard live verify
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-6-1-social-duplicate-live-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Wait for Render production with duplicate cost guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          sleep 75
+          ok=0
+          for i in $(seq 1 36); do
+            health="$(curl -sS --max-time 20 "$BASE/api/social-watch/health" 2>/dev/null || true)"
+            echo "poll=$i ${health:0:1200}"
+            if printf '%s' "$health" | python3 -c "import json,sys; b=json.load(sys.stdin); g=b.get('duplicate_event_cost_guard') or {}; assert g.get('version')=='step1060_6_1_social_duplicate_event_cost_guard_v1'; assert g.get('unchanged_active_event_db_write_skipped') is True; assert g.get('removed_event_can_reactivate') is True; assert g.get('edited_post_can_update') is True" 2>/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          test "$ok" = 1
+
+      - name: Verify public reads stay isolated and lifecycle remains active-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, urllib.request, concurrent.futures
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          url=BASE+'/api/social-watch/public?limit=100'
+          def one(_):
+              req=urllib.request.Request(url,headers={'Accept':'application/json','Accept-Encoding':'gzip','User-Agent':'Kaka-Step1060.6.1-Live/1.0'})
+              with urllib.request.urlopen(req,timeout=25) as r:
+                  raw=r.read()
+                  enc=(r.headers.get('Content-Encoding') or '').lower()
+              if enc=='gzip':
+                  import gzip; raw=gzip.decompress(raw)
+              b=json.loads(raw)
+              assert b.get('ok') is True,b
+              assert int(b.get('user_read_x_requests') or 0)==0,b
+              assert int(b.get('user_read_supabase_requests') or 0)==0,b
+              assert b.get('x_requests_scale_with_users') is False,b
+              bad=[x for x in (b.get('rows') or []) if x.get('is_active') is not True or str(x.get('lifecycle_status') or 'active').lower()!='active']
+              assert not bad,bad[:3]
+              return len(b.get('rows') or [])
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+              rows=list(ex.map(one,range(30)))
+          print('PASS social public 30/30 isolated reads rows_range=',min(rows),max(rows))
+          PY
+
+      - name: Verify global egress guard still healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 "$BASE/health/egress" -o /tmp/e.json
+          curl -fsS --max-time 20 "$BASE/health/egress/proxy" -o /tmp/p.json
+          python3 - <<'PY'
+          import json
+          e=json.load(open('/tmp/e.json')); p=json.load(open('/tmp/p.json'))
+          assert e.get('ok') is True,e
+          assert e.get('render_health_probe_compacted') is True,e
+          assert p.get('ok') is True,p
+          assert int(p.get('proxy_failures') or 0)==0,p
+          assert p.get('direct_uncompressed_fallback') is False,p
+          print('PASS egress/proxy after Step1060.6.1')
+          PY
