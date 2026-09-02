@@ -1,0 +1,45 @@
+name: Step1060.9 project fundamentals persistence cost guard apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-9-project-fundamentals-persist-cost-guard-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply project fundamentals persistence cost guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/step1060_9_project_fundamentals_persist_cost_guard_patch.py
+          node --check src/project-fundamentals.mjs
+          grep -q "step1060_9_project_fundamentals_persist_cost_guard_v1" src/project-fundamentals.mjs
+          grep -q "persistenceComparable" src/project-fundamentals.mjs
+          grep -q "exact_removed_coin_id_cleanup: true" src/project-fundamentals.mjs
+          if grep -q "source_fetched_at=lt" src/project-fundamentals.mjs; then
+            echo 'FAIL legacy timestamp-wide cleanup remains'
+            exit 1
+          fi
+          git diff --check
+          git diff -- src/project-fundamentals.mjs
+
+      - name: Commit project fundamentals cost guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka-step1060-cost-guard'
+          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git add src/project-fundamentals.mjs
+          git commit -m 'Step1060.9 reduce unchanged project fundamentals persistence writes'
+          git push origin HEAD:main
