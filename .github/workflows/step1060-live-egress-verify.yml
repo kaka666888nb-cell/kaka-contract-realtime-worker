@@ -1,0 +1,70 @@
+name: Step1060 live egress verify
+
+on:
+  push:
+    branches:
+      - step1060-live-verify
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Wait for Render Step1060
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          ok=0
+          for i in $(seq 1 40); do
+            body="$(curl -fsS --max-time 12 "$BASE/health/ready" 2>/dev/null || true)"
+            echo "poll=$i body=${body:0:300}"
+            if echo "$body" | grep -q '650.8.15.197.3.3.25' && echo "$body" | grep -q 'step1060_render_egress_cost_guard_v1'; then
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          test "$ok" = 1
+
+      - name: Verify gzip on full health JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 -H 'Accept-Encoding: gzip' -D /tmp/headers -o /tmp/body.gz "$BASE/health"
+          cat /tmp/headers
+          grep -qi '^content-encoding: gzip' /tmp/headers
+          python - <<'PY'
+          import gzip, json
+          raw=gzip.open('/tmp/body.gz','rb').read()
+          body=json.loads(raw)
+          assert isinstance(body, dict)
+          print('PASS full health gzip raw_json_bytes=', len(raw), 'gzip_bytes=', __import__('os').path.getsize('/tmp/body.gz'))
+          PY
+
+      - name: Verify egress metrics endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 15 "$BASE/health/egress" -o /tmp/egress.json
+          python - <<'PY'
+          import json
+          b=json.load(open('/tmp/egress.json','r',encoding='utf-8'))
+          assert b.get('ok') is True
+          assert b.get('version') == '650.8.15.197.3.3.25'
+          assert b.get('schema') == 'step1060_render_egress_cost_guard_v1'
+          assert isinstance(b.get('http'), dict)
+          assert isinstance(b.get('websocket'), dict)
+          assert isinstance(b.get('outbound_requests'), dict)
+          print(json.dumps({
+            'version': b.get('version'),
+            'http': b.get('http'),
+            'websocket': b.get('websocket'),
+            'outbound_requests': b.get('outbound_requests'),
+          }, ensure_ascii=False))
+          PY
