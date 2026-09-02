@@ -1,0 +1,94 @@
+name: Step1060.9 project fundamentals persistence cost live verify
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-9-project-fundamentals-live-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Wait for Render production cost guard and first source refresh
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          sleep 75
+          ok=0
+          for i in $(seq 1 32); do
+            health="$(curl -sS --max-time 20 "$BASE/api/project-fundamentals/health" 2>/dev/null || true)"
+            echo "poll=$i ${health:0:2400}"
+            if printf '%s' "$health" | python3 -c "import json,sys; b=json.load(sys.stdin); g=b.get('persistence_cost_guard') or {}; assert g.get('version')=='step1060_9_project_fundamentals_persist_cost_guard_v1'; assert g.get('unchanged_rows_write_skipped') is True; assert g.get('exact_removed_coin_id_cleanup') is True; assert int(b.get('refresh_successes') or 0)>=1; assert int(g.get('rows_considered') or 0)>=20" 2>/dev/null; then
+              printf '%s' "$health" > /tmp/project-health.json
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          test "$ok" = 1
+
+      - name: Report real persistence savings and verify read isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, urllib.request, concurrent.futures
+          h=json.load(open('/tmp/project-health.json'))
+          g=h.get('persistence_cost_guard') or {}
+          considered=int(g.get('rows_considered') or 0)
+          written=int(g.get('rows_written') or 0)
+          skipped=int(g.get('rows_noop_skipped') or 0)
+          assert considered>0
+          assert written+skipped>=considered,(considered,written,skipped,g)
+          assert int(h.get('source_requests_started') or 0)>=3,h
+          assert h.get('user_reads_trigger_source_requests') is False,h
+          assert h.get('reads_scale_with_users') is False,h
+          sample=(h.get('sample_coin_ids') or [])[:10]
+          assert sample,sample
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          def one(coin):
+              url=BASE+'/api/project-fundamentals/current?coin_id='+urllib.parse.quote(str(coin))
+              with urllib.request.urlopen(url,timeout=20) as r: b=json.loads(r.read())
+              assert b.get('ok') is True,b
+              assert int(b.get('user_read_source_requests') or 0)==0,b
+              assert int(b.get('user_read_exchange_requests') or 0)==0,b
+              assert b.get('reads_scale_with_users') is False,b
+              return b.get('available')
+          import urllib.parse
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+              result=list(ex.map(one,sample))
+          print(json.dumps({
+            'rows_considered':considered,
+            'rows_written':written,
+            'rows_noop_skipped':skipped,
+            'write_ratio':round(written/considered,4),
+            'noop_skip_ratio':round(skipped/considered,4),
+            'heartbeat_hours':g.get('full_persist_heartbeat_hours'),
+            'sample_reads':len(result),
+          },indent=2))
+          print('PASS Step1060.9 fresh source reads stay user-isolated; persistence guard measured from live cycle')
+          PY
+
+      - name: Verify global egress guard stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 "$BASE/health/egress" -o /tmp/e.json
+          curl -fsS --max-time 20 "$BASE/health/egress/proxy" -o /tmp/p.json
+          python3 - <<'PY'
+          import json
+          e=json.load(open('/tmp/e.json')); p=json.load(open('/tmp/p.json'))
+          assert e.get('ok') is True,e
+          assert e.get('render_health_probe_compacted') is True,e
+          assert p.get('ok') is True,p
+          assert int(p.get('proxy_failures') or 0)==0,p
+          assert p.get('direct_uncompressed_fallback') is False,p
+          print('PASS Step1060.9 egress stack')
+          PY
