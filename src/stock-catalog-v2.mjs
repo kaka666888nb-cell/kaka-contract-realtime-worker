@@ -17,6 +17,14 @@ const REFRESH_MS = Math.max(60 * 60_000, Number(process.env.KAKA_STOCK_CATALOG_R
 const COINBASE_MARKET_REFRESH_MS = Math.max(5 * 60_000, Number(process.env.KAKA_STOCK_MARKET_REFRESH_MS || 15 * 60_000));
 const GATE_SESSION_REFRESH_MS = Math.max(5 * 60_000, Number(process.env.KAKA_STOCK_GATE_SESSION_REFRESH_MS || 15 * 60_000));
 const START_DELAY_MS = Math.max(15_000, Number(process.env.KAKA_STOCK_CATALOG_START_DELAY_MS || 75_000));
+// Step1060.3: a transient provider failure must not make every Render deploy restage
+// the entire already-healthy stock catalog. Keep fast recovery only for genuinely
+// incomplete/integrity-broken committed catalogs; otherwise back off failed retries
+// across process restarts.
+const FAILURE_RETRY_BACKOFF_MS = Math.max(
+  15 * 60_000,
+  Math.min(6 * 60 * 60_000, Number(process.env.KAKA_STOCK_CATALOG_FAILURE_RETRY_BACKOFF_MS || 60 * 60_000) || 60 * 60_000),
+);
 const FETCH_TIMEOUT_MS = Math.max(8_000, Number(process.env.KAKA_STOCK_CATALOG_FETCH_TIMEOUT_MS || 20_000));
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -1635,10 +1643,23 @@ export function startStockCatalogV2Collector() {
     const committedRowsRatio = coinbaseCatalogHighWaterRows > 0 ? restoredCoinbaseRows / coinbaseCatalogHighWaterRows : 1;
     const committedSecsRatio = coinbaseCatalogHighWaterSecurities > 0 ? lastCoinbaseSecurities / coinbaseCatalogHighWaterSecurities : 1;
     const integrityRecoveryRequired = coinbaseCatalogHighWaterFresh() && (committedRowsRatio < COINBASE_CATALOG_HIGHWATER_MIN_RATIO || committedSecsRatio < COINBASE_CATALOG_HIGHWATER_MIN_RATIO);
-    const restoreIncomplete = restoredCoinbaseRows < COINBASE_COMPLETE_MIN_PRODUCTS || restoredGateRows < GATE_COMPLETE_MIN_ROWS || integrityRecoveryRequired || Boolean(lastRefreshError);
+    const restoreIncomplete = restoredCoinbaseRows < COINBASE_COMPLETE_MIN_PRODUCTS || restoredGateRows < GATE_COMPLETE_MIN_ROWS || integrityRecoveryRequired;
     const age = Date.now() - (Date.parse(lastRefreshSucceededAt || '') || 0);
-    const delay = restoreIncomplete ? 15_000 : (age >= REFRESH_MS ? START_DELAY_MS : Math.max(START_DELAY_MS, REFRESH_MS - age));
-    const startupReason = integrityRecoveryRequired ? 'startup_catalog_integrity_recovery' : (Boolean(lastRefreshError) ? 'startup_previous_refresh_failure' : (restoreIncomplete ? 'startup_restore_fallback' : 'startup_or_due'));
+    const lastAttemptAtMs = Date.parse(lastRefreshStartedAt || '') || 0;
+    const lastAttemptAge = lastAttemptAtMs > 0 ? Date.now() - lastAttemptAtMs : Number.POSITIVE_INFINITY;
+    const failedRecently = Boolean(lastRefreshError) && !restoreIncomplete && lastAttemptAge >= 0 && lastAttemptAge < FAILURE_RETRY_BACKOFF_MS;
+    const delay = restoreIncomplete
+      ? 15_000
+      : (failedRecently
+          ? Math.max(START_DELAY_MS, FAILURE_RETRY_BACKOFF_MS - lastAttemptAge)
+          : (age >= REFRESH_MS ? START_DELAY_MS : Math.max(START_DELAY_MS, REFRESH_MS - age)));
+    const startupReason = integrityRecoveryRequired
+      ? 'startup_catalog_integrity_recovery'
+      : (restoreIncomplete
+          ? 'startup_restore_fallback'
+          : (failedRecently
+              ? 'startup_previous_refresh_failure_backoff'
+              : (Boolean(lastRefreshError) ? 'startup_previous_refresh_failure_due' : 'startup_or_due')));
     startTimer = setTimeout(() => refreshNow(startupReason).catch(error => console.error('[Step1035 stock catalog] refresh failed', error?.message || error)), delay);
     startTimer.unref?.();
     refreshTimer = setInterval(() => refreshNow('interval').catch(error => console.error('[Step1035 stock catalog] refresh failed', error?.message || error)), REFRESH_MS);
