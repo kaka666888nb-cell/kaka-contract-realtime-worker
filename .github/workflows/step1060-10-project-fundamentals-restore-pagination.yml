@@ -27,102 +27,105 @@ jobs:
           from pathlib import Path
           p=Path('src/project-fundamentals.mjs')
           s=p.read_text(encoding='utf-8')
-
           old="const RESTORE_MAX_AGE_MS = Math.max(24 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_AGE_MS || 7 * 24 * 60 * 60_000));"
-          new="""const RESTORE_MAX_AGE_MS = Math.max(24 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_AGE_MS || 7 * 24 * 60 * 60_000));
-// Step1060.10: PostgREST may cap one response at 1000 rows even when a larger limit is
-// requested. Restore the persisted project catalog with stable bounded pagination so a
-// Render restart compares against the full previous catalog instead of rewriting missing pages.
-const RESTORE_PAGE_SIZE = Math.max(
-  200,
-  Math.min(1000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_PAGE_SIZE || 1000) || 1000),
-);
-const RESTORE_MAX_PAGES = Math.max(
-  3,
-  Math.min(20, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_PAGES || 10) || 10),
-);"""
+          new='\n'.join([
+              old,
+              '// Step1060.10: PostgREST may cap one response at 1000 rows even when a larger limit is requested.',
+              '// Restore the persisted project catalog with stable bounded pagination so a Render restart',
+              '// compares against the full previous catalog instead of rewriting missing pages.',
+              'const RESTORE_PAGE_SIZE = Math.max(',
+              '  200,',
+              '  Math.min(1000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_PAGE_SIZE || 1000) || 1000),',
+              ');',
+              'const RESTORE_MAX_PAGES = Math.max(',
+              '  3,',
+              '  Math.min(20, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_PAGES || 10) || 10),',
+              ');',
+          ])
           if old not in s:
               raise SystemExit('restore constant anchor missing')
           s=s.replace(old,new,1)
-
-          old="let restoreRows = 0;"
-          new="""let restoreRows = 0;
-let restorePages = 0;
-let restoreRowsFetched = 0;
-let restoreTruncated = false;"""
-          if old not in s:
+          old_counter='let restoreRows = 0;'
+          new_counter='\n'.join([
+              'let restoreRows = 0;',
+              'let restorePages = 0;',
+              'let restoreRowsFetched = 0;',
+              'let restoreTruncated = false;',
+          ])
+          if old_counter not in s:
               raise SystemExit('restore counter anchor missing')
-          s=s.replace(old,new,1)
-
+          s=s.replace(old_counter,new_counter,1)
           start=s.index('async function restorePersisted() {')
           end=s.index('\nasync function fetchBoundedIdentityMap', start)
-          replacement="""async function restorePersisted() {
-  if (!SUPABASE_CONFIGURED) return false;
-  try {
-    const cutoff = new Date(Date.now() - RESTORE_MAX_AGE_MS).toISOString();
-    const restored = new Map();
-    restorePages = 0;
-    restoreRowsFetched = 0;
-    restoreTruncated = false;
-    for (let page = 0; page < RESTORE_MAX_PAGES; page += 1) {
-      const offset = page * RESTORE_PAGE_SIZE;
-      const query = `${TABLE}?select=*&source_fetched_at=gte.${encodeURIComponent(cutoff)}&order=source_fetched_at.desc,coin_id.asc&limit=${RESTORE_PAGE_SIZE}&offset=${offset}`;
-      const response = await supabaseFetch(query, { method: 'GET' });
-      if (!response.ok) throw new Error(`restore_http_${response.status}_page_${page + 1}`);
-      const rows = await response.json();
-      if (!Array.isArray(rows)) throw new Error(`restore_payload_invalid_page_${page + 1}`);
-      restorePages += 1;
-      restoreRowsFetched += rows.length;
-      for (const raw of rows) {
-        const coinId = lower(raw?.coin_id);
-        if (!coinId || raw?.match_verified !== true || compact(raw?.match_method) !== 'defillama_gecko_id_exact_unique') continue;
-        if (restored.has(coinId)) continue;
-        restored.set(coinId, {
-          ...raw,
-          coin_id: coinId,
-          chains: Array.isArray(raw?.chains) ? raw.chains : [],
-          match_verified: true,
-        });
-      }
-      if (rows.length < RESTORE_PAGE_SIZE) break;
-      if (page === RESTORE_MAX_PAGES - 1) restoreTruncated = true;
-    }
-    restoreRows = restored.size;
-    if (restored.size) {
-      catalog.clear();
-      for (const [key, row] of restored.entries()) catalog.set(key, row);
-      lastSourceFetchedAt = compact([...restored.values()][0]?.source_fetched_at);
-      lastFullPersistAt = restoreTruncated ? '' : lastSourceFetchedAt;
-    }
-    lastRestoreAt = new Date().toISOString();
-    lastRestoreError = restoreTruncated ? `restore_page_cap_reached_${RESTORE_MAX_PAGES}` : '';
-    return restored.size > 0;
-  } catch (error) {
-    lastRestoreError = String(error?.message || error).slice(0, 320);
-    return false;
-  }
-}"""
+          replacement='\n'.join([
+              'async function restorePersisted() {',
+              '  if (!SUPABASE_CONFIGURED) return false;',
+              '  try {',
+              '    const cutoff = new Date(Date.now() - RESTORE_MAX_AGE_MS).toISOString();',
+              '    const restored = new Map();',
+              '    restorePages = 0;',
+              '    restoreRowsFetched = 0;',
+              '    restoreTruncated = false;',
+              '    for (let page = 0; page < RESTORE_MAX_PAGES; page += 1) {',
+              '      const offset = page * RESTORE_PAGE_SIZE;',
+              "      const query = `${TABLE}?select=*&source_fetched_at=gte.${encodeURIComponent(cutoff)}&order=source_fetched_at.desc,coin_id.asc&limit=${RESTORE_PAGE_SIZE}&offset=${offset}`;",
+              "      const response = await supabaseFetch(query, { method: 'GET' });",
+              '      if (!response.ok) throw new Error(`restore_http_${response.status}_page_${page + 1}`);',
+              '      const rows = await response.json();',
+              '      if (!Array.isArray(rows)) throw new Error(`restore_payload_invalid_page_${page + 1}`);',
+              '      restorePages += 1;',
+              '      restoreRowsFetched += rows.length;',
+              '      for (const raw of rows) {',
+              '        const coinId = lower(raw?.coin_id);',
+              "        if (!coinId || raw?.match_verified !== true || compact(raw?.match_method) !== 'defillama_gecko_id_exact_unique') continue;",
+              '        if (restored.has(coinId)) continue;',
+              '        restored.set(coinId, {',
+              '          ...raw,',
+              '          coin_id: coinId,',
+              '          chains: Array.isArray(raw?.chains) ? raw.chains : [],',
+              '          match_verified: true,',
+              '        });',
+              '      }',
+              '      if (rows.length < RESTORE_PAGE_SIZE) break;',
+              '      if (page === RESTORE_MAX_PAGES - 1) restoreTruncated = true;',
+              '    }',
+              '    restoreRows = restored.size;',
+              '    if (restored.size) {',
+              '      catalog.clear();',
+              '      for (const [key, row] of restored.entries()) catalog.set(key, row);',
+              '      lastSourceFetchedAt = compact([...restored.values()][0]?.source_fetched_at);',
+              "      lastFullPersistAt = restoreTruncated ? '' : lastSourceFetchedAt;",
+              '    }',
+              '    lastRestoreAt = new Date().toISOString();',
+              "    lastRestoreError = restoreTruncated ? `restore_page_cap_reached_${RESTORE_MAX_PAGES}` : '';",
+              '    return restored.size > 0;',
+              '  } catch (error) {',
+              '    lastRestoreError = String(error?.message || error).slice(0, 320);',
+              '    return false;',
+              '  }',
+              '}',
+          ])
           s=s[:start]+replacement+s[end:]
-
-          anchor="    restore_rows: restoreRows,\n"
-          insert="""    restore_rows: restoreRows,
-    restart_restore_cost_guard: {
-      version: 'step1060_10_project_fundamentals_restore_pagination_v1',
-      postgrest_single_page_cap_avoided: true,
-      stable_order_source_time_then_coin_id: true,
-      restore_page_size: RESTORE_PAGE_SIZE,
-      restore_max_pages: RESTORE_MAX_PAGES,
-      restore_pages: restorePages,
-      restore_rows_fetched: restoreRowsFetched,
-      restore_unique_rows: restoreRows,
-      restore_truncated: restoreTruncated,
-      full_restore_ready: restoreRows > 0 && restoreTruncated === false,
-    },
-"""
+          anchor='    restore_rows: restoreRows,\n'
+          insert='\n'.join([
+              '    restore_rows: restoreRows,',
+              '    restart_restore_cost_guard: {',
+              "      version: 'step1060_10_project_fundamentals_restore_pagination_v1',",
+              '      postgrest_single_page_cap_avoided: true,',
+              '      stable_order_source_time_then_coin_id: true,',
+              '      restore_page_size: RESTORE_PAGE_SIZE,',
+              '      restore_max_pages: RESTORE_MAX_PAGES,',
+              '      restore_pages: restorePages,',
+              '      restore_rows_fetched: restoreRowsFetched,',
+              '      restore_unique_rows: restoreRows,',
+              '      restore_truncated: restoreTruncated,',
+              '      full_restore_ready: restoreRows > 0 && restoreTruncated === false,',
+              '    },',
+              '',
+          ])
           if anchor not in s:
               raise SystemExit('health restore anchor missing')
           s=s.replace(anchor,insert,1)
-
           p.write_text(s,encoding='utf-8')
           PY
           node --check src/project-fundamentals.mjs
@@ -162,16 +165,7 @@ let restoreTruncated = false;"""
           import json
           b=json.load(open('/tmp/project-health.json'))
           g=b['restart_restore_cost_guard']; p=b['persistence_cost_guard']
-          print(json.dumps({
-            'restore_pages':g.get('restore_pages'),
-            'restore_rows_fetched':g.get('restore_rows_fetched'),
-            'restore_unique_rows':g.get('restore_unique_rows'),
-            'restore_truncated':g.get('restore_truncated'),
-            'rows_considered':p.get('rows_considered'),
-            'rows_written':p.get('rows_written'),
-            'rows_noop_skipped':p.get('rows_noop_skipped'),
-            'source_age_ms':b.get('source_age_ms'),
-          },indent=2))
+          print(json.dumps({'restore_pages':g.get('restore_pages'),'restore_rows_fetched':g.get('restore_rows_fetched'),'restore_unique_rows':g.get('restore_unique_rows'),'restore_truncated':g.get('restore_truncated'),'rows_considered':p.get('rows_considered'),'rows_written':p.get('rows_written'),'rows_noop_skipped':p.get('rows_noop_skipped'),'source_age_ms':b.get('source_age_ms')},indent=2))
           print('PASS Step1060.10 full restart restore + persistence comparison guard')
           PY
 
