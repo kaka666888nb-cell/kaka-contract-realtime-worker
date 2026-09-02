@@ -9,6 +9,7 @@ const ALLOWED_TABLES = new Set([
   'kaka_exchange_stock_catalog_v2_state',
   'kaka_project_fundamentals',
   'app_airdrop_events',
+  'app_onchain_shared_snapshots',
 ]);
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
