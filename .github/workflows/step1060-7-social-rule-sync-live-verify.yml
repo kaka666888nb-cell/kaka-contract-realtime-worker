@@ -1,0 +1,74 @@
+name: Step1060.7 social rule sync fixed-cost live verify
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-7-social-rule-sync-live-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Wait for Render production and verify startup no-op rule sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          sleep 90
+          ok=0
+          for i in $(seq 1 36); do
+            health="$(curl -sS --max-time 20 "$BASE/api/social-watch/health" 2>/dev/null || true)"
+            echo "poll=$i ${health:0:1800}"
+            if printf '%s' "$health" | python3 -c "import json,sys; w=json.load(sys.stdin); b=w.get('social_watch') or w; g=b.get('rule_cost_guard') or {}; assert g.get('version')=='step1060_7_social_rule_sync_cost_guard_v1'; assert g.get('second_x_rules_read_only_after_remote_mutation') is True; assert g.get('account_status_write_on_change_or_heartbeat_only') is True; assert int(g.get('second_x_rule_reads_avoided') or 0)>=1; assert int(g.get('account_status_noop_skips') or 0)>=9; assert int(g.get('account_status_writes') or 0)==0; assert int(b.get('rule_writes') or 0)==0; assert int(b.get('rule_reads') or 0)==1" 2>/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          test "$ok" = 1
+
+      - name: Verify social public surface remains isolated
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, urllib.request, concurrent.futures, gzip
+          URL='https://kaka-contract-realtime-worker.onrender.com/api/social-watch/public?limit=100'
+          def one(_):
+              req=urllib.request.Request(URL,headers={'Accept':'application/json','Accept-Encoding':'gzip','User-Agent':'Kaka-Step1060.7-Live/1.0'})
+              with urllib.request.urlopen(req,timeout=25) as r:
+                  raw=r.read(); enc=(r.headers.get('Content-Encoding') or '').lower()
+              if enc=='gzip': raw=gzip.decompress(raw)
+              b=json.loads(raw)
+              assert b.get('ok') is True,b
+              assert int(b.get('user_read_x_requests') or 0)==0,b
+              assert int(b.get('user_read_supabase_requests') or 0)==0,b
+              assert b.get('x_requests_scale_with_users') is False,b
+              return len(b.get('rows') or [])
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+              rows=list(ex.map(one,range(30)))
+          print('PASS Step1060.7 social public 30/30 isolated rows_range=',min(rows),max(rows))
+          PY
+
+      - name: Verify cost guard stack still healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 "$BASE/health/egress" -o /tmp/e.json
+          curl -fsS --max-time 20 "$BASE/health/egress/proxy" -o /tmp/p.json
+          python3 - <<'PY'
+          import json
+          e=json.load(open('/tmp/e.json')); p=json.load(open('/tmp/p.json'))
+          assert e.get('ok') is True,e
+          assert e.get('render_health_probe_compacted') is True,e
+          assert p.get('ok') is True,p
+          assert int(p.get('proxy_failures') or 0)==0,p
+          assert p.get('direct_uncompressed_fallback') is False,p
+          print('PASS Step1060.7 egress stack')
+          PY
