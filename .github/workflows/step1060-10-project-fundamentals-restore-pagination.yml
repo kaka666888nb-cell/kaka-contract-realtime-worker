@@ -1,0 +1,194 @@
+name: Step1060.10 project fundamentals restart restore pagination
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-10-project-fundamentals-restore-pagination.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch full paginated restart restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/project-fundamentals.mjs')
+          s=p.read_text(encoding='utf-8')
+
+          old="const RESTORE_MAX_AGE_MS = Math.max(24 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_AGE_MS || 7 * 24 * 60 * 60_000));"
+          new="""const RESTORE_MAX_AGE_MS = Math.max(24 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_AGE_MS || 7 * 24 * 60 * 60_000));
+// Step1060.10: PostgREST may cap one response at 1000 rows even when a larger limit is
+// requested. Restore the persisted project catalog with stable bounded pagination so a
+// Render restart compares against the full previous catalog instead of rewriting missing pages.
+const RESTORE_PAGE_SIZE = Math.max(
+  200,
+  Math.min(1000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_PAGE_SIZE || 1000) || 1000),
+);
+const RESTORE_MAX_PAGES = Math.max(
+  3,
+  Math.min(20, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_PAGES || 10) || 10),
+);"""
+          if old not in s:
+              raise SystemExit('restore constant anchor missing')
+          s=s.replace(old,new,1)
+
+          old="let restoreRows = 0;"
+          new="""let restoreRows = 0;
+let restorePages = 0;
+let restoreRowsFetched = 0;
+let restoreTruncated = false;"""
+          if old not in s:
+              raise SystemExit('restore counter anchor missing')
+          s=s.replace(old,new,1)
+
+          start=s.index('async function restorePersisted() {')
+          end=s.index('\nasync function fetchBoundedIdentityMap', start)
+          replacement="""async function restorePersisted() {
+  if (!SUPABASE_CONFIGURED) return false;
+  try {
+    const cutoff = new Date(Date.now() - RESTORE_MAX_AGE_MS).toISOString();
+    const restored = new Map();
+    restorePages = 0;
+    restoreRowsFetched = 0;
+    restoreTruncated = false;
+    for (let page = 0; page < RESTORE_MAX_PAGES; page += 1) {
+      const offset = page * RESTORE_PAGE_SIZE;
+      const query = `${TABLE}?select=*&source_fetched_at=gte.${encodeURIComponent(cutoff)}&order=source_fetched_at.desc,coin_id.asc&limit=${RESTORE_PAGE_SIZE}&offset=${offset}`;
+      const response = await supabaseFetch(query, { method: 'GET' });
+      if (!response.ok) throw new Error(`restore_http_${response.status}_page_${page + 1}`);
+      const rows = await response.json();
+      if (!Array.isArray(rows)) throw new Error(`restore_payload_invalid_page_${page + 1}`);
+      restorePages += 1;
+      restoreRowsFetched += rows.length;
+      for (const raw of rows) {
+        const coinId = lower(raw?.coin_id);
+        if (!coinId || raw?.match_verified !== true || compact(raw?.match_method) !== 'defillama_gecko_id_exact_unique') continue;
+        if (restored.has(coinId)) continue;
+        restored.set(coinId, {
+          ...raw,
+          coin_id: coinId,
+          chains: Array.isArray(raw?.chains) ? raw.chains : [],
+          match_verified: true,
+        });
+      }
+      if (rows.length < RESTORE_PAGE_SIZE) break;
+      if (page === RESTORE_MAX_PAGES - 1) restoreTruncated = true;
+    }
+    restoreRows = restored.size;
+    if (restored.size) {
+      catalog.clear();
+      for (const [key, row] of restored.entries()) catalog.set(key, row);
+      lastSourceFetchedAt = compact([...restored.values()][0]?.source_fetched_at);
+      lastFullPersistAt = restoreTruncated ? '' : lastSourceFetchedAt;
+    }
+    lastRestoreAt = new Date().toISOString();
+    lastRestoreError = restoreTruncated ? `restore_page_cap_reached_${RESTORE_MAX_PAGES}` : '';
+    return restored.size > 0;
+  } catch (error) {
+    lastRestoreError = String(error?.message || error).slice(0, 320);
+    return false;
+  }
+}"""
+          s=s[:start]+replacement+s[end:]
+
+          anchor="    restore_rows: restoreRows,\n"
+          insert="""    restore_rows: restoreRows,
+    restart_restore_cost_guard: {
+      version: 'step1060_10_project_fundamentals_restore_pagination_v1',
+      postgrest_single_page_cap_avoided: true,
+      stable_order_source_time_then_coin_id: true,
+      restore_page_size: RESTORE_PAGE_SIZE,
+      restore_max_pages: RESTORE_MAX_PAGES,
+      restore_pages: restorePages,
+      restore_rows_fetched: restoreRowsFetched,
+      restore_unique_rows: restoreRows,
+      restore_truncated: restoreTruncated,
+      full_restore_ready: restoreRows > 0 && restoreTruncated === false,
+    },
+"""
+          if anchor not in s:
+              raise SystemExit('health restore anchor missing')
+          s=s.replace(anchor,insert,1)
+
+          p.write_text(s,encoding='utf-8')
+          PY
+          node --check src/project-fundamentals.mjs
+          grep -q "step1060_10_project_fundamentals_restore_pagination_v1" src/project-fundamentals.mjs
+          grep -q "order=source_fetched_at.desc,coin_id.asc" src/project-fundamentals.mjs
+
+      - name: Commit production patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka-step1060-cost-guard'
+          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git add src/project-fundamentals.mjs
+          git diff --cached --check
+          git commit -m 'Step1060.10 paginate project fundamentals restart restore'
+          git push origin HEAD:main
+
+      - name: Verify Render full restore and restart write guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          sleep 80
+          ok=0
+          for i in $(seq 1 40); do
+            health="$(curl -sS --max-time 20 "$BASE/api/project-fundamentals/health" 2>/dev/null || true)"
+            echo "poll=$i ${health:0:2800}"
+            if printf '%s' "$health" | python3 -c "import json,sys; b=json.load(sys.stdin); g=b.get('restart_restore_cost_guard') or {}; p=b.get('persistence_cost_guard') or {}; assert g.get('version')=='step1060_10_project_fundamentals_restore_pagination_v1'; assert g.get('postgrest_single_page_cap_avoided') is True; assert g.get('stable_order_source_time_then_coin_id') is True; assert g.get('restore_truncated') is False; assert g.get('full_restore_ready') is True; assert int(g.get('restore_pages') or 0)>=3; assert int(g.get('restore_unique_rows') or 0)>=2000; assert int(b.get('restore_rows') or 0)>=2000; assert int(b.get('refresh_successes') or 0)>=1; assert p.get('unchanged_rows_write_skipped') is True; assert b.get('user_reads_trigger_source_requests') is False; assert b.get('reads_scale_with_users') is False" 2>/dev/null; then
+              printf '%s' "$health" > /tmp/project-health.json
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          test "$ok" = 1
+          python3 - <<'PY'
+          import json
+          b=json.load(open('/tmp/project-health.json'))
+          g=b['restart_restore_cost_guard']; p=b['persistence_cost_guard']
+          print(json.dumps({
+            'restore_pages':g.get('restore_pages'),
+            'restore_rows_fetched':g.get('restore_rows_fetched'),
+            'restore_unique_rows':g.get('restore_unique_rows'),
+            'restore_truncated':g.get('restore_truncated'),
+            'rows_considered':p.get('rows_considered'),
+            'rows_written':p.get('rows_written'),
+            'rows_noop_skipped':p.get('rows_noop_skipped'),
+            'source_age_ms':b.get('source_age_ms'),
+          },indent=2))
+          print('PASS Step1060.10 full restart restore + persistence comparison guard')
+          PY
+
+      - name: Verify global egress guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 "$BASE/health/egress" -o /tmp/e.json
+          curl -fsS --max-time 20 "$BASE/health/egress/proxy" -o /tmp/p.json
+          python3 - <<'PY'
+          import json
+          e=json.load(open('/tmp/e.json')); p=json.load(open('/tmp/p.json'))
+          assert e.get('ok') is True,e
+          assert e.get('render_health_probe_compacted') is True,e
+          assert p.get('ok') is True,p
+          assert int(p.get('proxy_failures') or 0)==0,p
+          assert p.get('direct_uncompressed_fallback') is False,p
+          print('PASS Step1060.10 egress stack')
+          PY
