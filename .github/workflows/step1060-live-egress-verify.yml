@@ -45,7 +45,8 @@ jobs:
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          curl -fsS --max-time 20 "$BASE/health/egress/proxy?probe=1" -o /tmp/proxy.json
+          curl -sS --max-time 20 "$BASE/health/egress/proxy?probe=1" -o /tmp/proxy.json
+          cat /tmp/proxy.json
           python - <<'PY'
           import json
           b=json.load(open('/tmp/proxy.json','r',encoding='utf-8'))
