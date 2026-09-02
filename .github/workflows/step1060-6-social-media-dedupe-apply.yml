@@ -1,0 +1,40 @@
+name: Step1060.6 social duplicate media dedupe apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-6-social-media-dedupe-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact duplicate media mirror patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/step1060_6_social_media_dedupe_patch.py
+          node --check src/social-watch.mjs
+          grep -q "const unchangedRepeat = existed" src/social-watch.mjs
+          grep -q "select=id,post_url,content,media_items" src/social-watch.mjs
+          git diff --check
+          git diff -- src/social-watch.mjs
+
+      - name: Commit social media dedupe integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka-step1060-cost-guard'
+          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git add src/social-watch.mjs
+          git commit -m 'Step1060.6 skip duplicate social media re-download and re-upload'
+          git push origin HEAD:main
