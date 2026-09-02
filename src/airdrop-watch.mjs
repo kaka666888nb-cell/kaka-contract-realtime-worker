@@ -178,7 +178,20 @@ const conditionalHeaders = new Map();
 const contentRetryAfter = new Map();
 
 function nowIso() { return new Date().toISOString(); }
-function text(v) { return String(v ?? '').trim(); }
+const POSTGRES_NUL = String.fromCharCode(0);
+function postgresSafeString(v) { return String(v ?? '').split(POSTGRES_NUL).join(''); }
+function text(v) { return postgresSafeString(v).trim(); }
+function sanitizePostgresJsonValue(value) {
+  if (typeof value === 'string') return postgresSafeString(value);
+  if (Array.isArray(value)) return value.map(sanitizePostgresJsonValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      postgresSafeString(key),
+      sanitizePostgresJsonValue(item),
+    ]));
+  }
+  return value;
+}
 function finiteNumber(v, fallback = 0) { const n = Number(v); return Number.isFinite(n) ? n : fallback; }
 function clampInt(v, min, max, fallback) {
   const n = Math.trunc(finiteNumber(v, fallback));
@@ -1070,6 +1083,7 @@ function detailRow(url) {
 }
 
 function stableComparableValue(value) {
+  if (typeof value === 'string') return postgresSafeString(value);
   if (Array.isArray(value)) return value.map(stableComparableValue);
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableComparableValue(value[key])]));
@@ -1168,7 +1182,7 @@ async function persistRows(rows, previousSnapshot = []) {
   const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at,is_active,lifecycle_status,last_seen_at,removed_at`, {
     method: 'POST',
     headers: { prefer: 'resolution=merge-duplicates,return=representation' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload.map(sanitizePostgresJsonValue)),
   });
   state.persistedRows += payload.length;
   state.persistRowsWritten += payload.length;
@@ -1485,7 +1499,8 @@ function publicHealth() {
     persist_successes: state.persistSuccesses,
     persist_failures: state.persistFailures,
     persistence_cost_guard: {
-      version: 'step1060_11_airdrop_persist_noop_guard_v1',
+      version: 'step1060_11_1_airdrop_persist_noop_guard_v2',
+      postgres_nul_sanitized_before_persist: true,
       unchanged_active_rows_write_skipped: true,
       removed_rows_can_reactivate: true,
       status_or_content_changes_write_immediately: true,
