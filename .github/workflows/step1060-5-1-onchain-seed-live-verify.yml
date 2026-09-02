@@ -1,0 +1,61 @@
+name: Step1060.5.1 onchain persisted snapshot live seed
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-5-1-onchain-seed-live-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - name: Wait for current Render instance and onchain persistence integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          sleep 75
+          ok=0
+          for i in $(seq 1 36); do
+            ready="$(curl -fsS --max-time 15 "$BASE/health/ready" 2>/dev/null || true)"
+            trending="$(curl -sS --max-time 20 "$BASE/api/onchain/trending?limit=5" 2>/dev/null || true)"
+            health="$(curl -sS --max-time 20 "$BASE/api/onchain/health" 2>/dev/null || true)"
+            printf 'poll=%s ready=%s\n' "$i" "${ready:0:240}"
+            printf 'trending=%s\n' "${trending:0:800}"
+            printf 'onchain_health=%s\n' "${health:0:1600}"
+            if echo "$trending" | grep -q '"ok":true' && echo "$trending" | grep -q '"onchain_hot_persistence"'; then
+              if echo "$trending" | python3 -c "import json,sys; b=json.load(sys.stdin); p=b.get('onchain_hot_persistence') or {}; assert int(p.get('persist_successes') or 0)>=1" 2>/dev/null; then
+                ok=1
+                break
+              fi
+            fi
+            sleep 15
+          done
+          test "$ok" = 1
+
+      - name: Verify persisted snapshot contract and no user amplification
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 "$BASE/api/onchain/trending?limit=50" -o /tmp/onchain.json
+          python3 - <<'PY'
+          import json
+          b=json.load(open('/tmp/onchain.json'))
+          assert b.get('ok') is True,b
+          assert int(b.get('user_read_upstream_requests') or 0)==0,b
+          assert b.get('fixed_backend_upstream_rate_independent_of_user_count') is True,b
+          assert b.get('cross_chain_substitution') is False,b
+          assert b.get('cross_token_substitution') is False,b
+          p=b.get('onchain_hot_persistence') or {}
+          assert p.get('configured') is True,p
+          assert int(p.get('persist_successes') or 0)>=1,p
+          rows=b.get('rows') or []
+          assert rows, 'onchain rows empty'
+          print('PASS live onchain rows=',len(rows),'persist=',p)
+          PY
