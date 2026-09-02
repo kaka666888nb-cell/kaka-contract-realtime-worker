@@ -11,6 +11,7 @@ const GZIP_MIN_BYTES = 512;
 
 const httpRoutes = new Map();
 const outboundHosts = new Map();
+const outboundPaths = new Map();
 let httpRequests = 0;
 let httpRawBytes = 0;
 let httpSentBytes = 0;
@@ -29,6 +30,15 @@ function safePath(raw) {
 function safeHost(raw) {
   try { return new URL(String(raw || '')).hostname.toLowerCase() || 'unknown'; }
   catch (_) { return 'unknown'; }
+}
+
+function safeOutboundPath(raw) {
+  try {
+    const u = new URL(String(raw || ''));
+    return `${u.hostname.toLowerCase()}${u.pathname || '/'}`.slice(0, 240);
+  } catch (_) {
+    return 'unknown/';
+  }
 }
 
 function bytesOf(value) {
@@ -115,6 +125,7 @@ export function egressHealth() {
       known_request_body_bytes: outboundKnownBodyBytes,
       note: 'known fetch request bodies sent from Render; upstream response bodies are inbound and excluded',
       top_hosts_by_known_request_body_bytes: topBy(outboundHosts, 'known_request_body_bytes', 24),
+      top_paths_by_known_request_body_bytes: topBy(outboundPaths, 'known_request_body_bytes', 32),
     },
   };
 }
@@ -155,6 +166,19 @@ function installFetchMeter() {
     row.requests += 1;
     row.known_request_body_bytes += bodyBytes;
     row.methods[method] = Number(row.methods[method] || 0) + 1;
+
+    const pathKey = safeOutboundPath(url);
+    const pathRow = boundedRow(outboundPaths, pathKey, () => ({
+      path: pathKey,
+      requests: 0,
+      known_request_body_bytes: 0,
+      max_request_body_bytes: 0,
+      methods: {},
+    }), MAX_ROUTES);
+    pathRow.requests += 1;
+    pathRow.known_request_body_bytes += bodyBytes;
+    pathRow.max_request_body_bytes = Math.max(pathRow.max_request_body_bytes, bodyBytes);
+    pathRow.methods[method] = Number(pathRow.methods[method] || 0) + 1;
     return await original(input, init);
   };
   wrapped.__kakaEgressWrapped = true;
