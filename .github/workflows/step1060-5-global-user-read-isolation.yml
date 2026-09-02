@@ -21,21 +21,34 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 18
     steps:
-      - name: Wait for production readiness
+      - name: Wait for post-deploy stable production instance
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          for i in $(seq 1 60); do
+          # A workflow-only commit can still trigger Render auto-deploy. Do not pressure
+          # the old instance while the replacement is being switched in.
+          sleep 90
+          stable_started=''
+          stable=0
+          for i in $(seq 1 30); do
             ready="$(curl -fsS --max-time 15 "$BASE/health/ready" 2>/dev/null || true)"
             proxy="$(curl -fsS --max-time 15 "$BASE/health/egress/proxy" 2>/dev/null || true)"
-            if echo "$ready" | grep -q 'step1060_render_egress_cost_guard_v1' && echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v2'; then
-              echo 'PASS production ready + egress guard'
-              exit 0
+            egress="$(curl -fsS --max-time 15 "$BASE/health/egress" 2>/dev/null || true)"
+            started="$(printf '%s' "$egress" | python3 -c "import json,sys; print((json.load(sys.stdin).get('started_at') or ''))" 2>/dev/null || true)"
+            if echo "$ready" | grep -q 'step1060_render_egress_cost_guard_v1' && echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v2' && [ -n "$started" ]; then
+              if [ "$started" = "$stable_started" ]; then stable=$((stable+1)); else stable_started="$started"; stable=1; fi
+              echo "stable_poll=$i started_at=$started consecutive=$stable"
+              if [ "$stable" -ge 3 ]; then
+                echo 'PASS same production instance remained ready for three checks'
+                exit 0
+              fi
+            else
+              stable_started=''; stable=0
             fi
-            sleep 10
+            sleep 15
           done
           exit 1
 
@@ -44,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import gzip, json, urllib.parse, urllib.request, concurrent.futures
+          import gzip, json, urllib.parse, urllib.request, urllib.error, concurrent.futures
           BASE='https://kaka-contract-realtime-worker.onrender.com'
           items='~'.join([
             'spot|binance|BTCUSDT','spot|okx|BTCUSDT','spot|bybit|BTCUSDT',
@@ -64,14 +77,24 @@ jobs:
               'Accept':'application/json','Accept-Encoding':'gzip',
               'User-Agent':'Kaka-Step1060.5-Isolation/1.0'
             })
-            with urllib.request.urlopen(req,timeout=25) as r:
-              wire=r.read(); enc=(r.headers.get('Content-Encoding') or '').lower(); status=r.status
-            raw=gzip.decompress(wire) if enc=='gzip' else wire
-            body=json.loads(raw)
-            return name,status,len(wire),body
+            try:
+              with urllib.request.urlopen(req,timeout=25) as r:
+                wire=r.read(); enc=(r.headers.get('Content-Encoding') or '').lower(); status=r.status
+              raw=gzip.decompress(wire) if enc=='gzip' else wire
+              try: body=json.loads(raw)
+              except Exception: body={'raw_preview':raw[:200].decode('utf-8','replace')}
+              return name,status,len(wire),body
+            except urllib.error.HTTPError as e:
+              wire=e.read(); enc=(e.headers.get('Content-Encoding') or '').lower()
+              raw=gzip.decompress(wire) if enc=='gzip' and wire else wire
+              try: body=json.loads(raw) if raw else {}
+              except Exception: body={'raw_preview':raw[:200].decode('utf-8','replace')}
+              return name,e.code,len(wire),body
+            except Exception as e:
+              return name,0,0,{'client_error':repr(e)}
 
           jobs=[]
-          # 140 user reads in parallel, but each route remains ordinary read-only traffic.
+          # 140 user reads in parallel, ordinary read-only traffic only.
           for name,url in routes.items():
             for _ in range(20): jobs.append((name,url))
           rows=[]
@@ -79,9 +102,17 @@ jobs:
             futs=[ex.submit(get,*j) for j in jobs]
             for f in concurrent.futures.as_completed(futs): rows.append(f.result())
 
+          failures=[r for r in rows if r[1]!=200]
+          if failures:
+            by_fail={}
+            for name,status,wire,b in failures:
+              by_fail.setdefault((name,status),0); by_fail[(name,status)]+=1
+            print('FAIL pressure errors by route/status=',by_fail)
+            print('FAIL samples=',failures[:8])
+          assert not failures,failures[:8]
+
           by={}
           for name,status,wire,b in rows:
-            assert status==200,(name,status,b)
             assert b.get('ok') is True,(name,b)
             by.setdefault(name,[]).append((wire,b))
 
@@ -111,8 +142,6 @@ jobs:
                 bad=[r for r in (b.get('rows') or []) if r.get('is_active') is not True or str(r.get('lifecycle_status') or 'active').lower()!='active']
                 assert not bad,bad[:3]
               elif name=='onchain':
-                # The public trending route must remain a shared-memory read. Current contract
-                # exposes one of these equivalent isolation markers depending on schema revision.
                 markers=[]
                 for k in ('user_read_upstream_requests','user_requests_started','user_upstream_requests'):
                   if k in b: markers.append((k,int(b.get(k) or 0)))
@@ -146,10 +175,6 @@ jobs:
             saved=int(p.get('estimated_saved_bytes') or 0)
             ratio=float(p.get('compression_ratio') or 1)
             assert raw>0 and compressed>0 and compressed<raw,p
-            # Some state rows already contain gzip/base64 snapshots and are not highly
-            # recompressible. The production cost guard is valid when it still reduces
-            # Render egress materially. Require >=30% byte savings globally instead of
-            # the old <=15% compressed-ratio assumption that only fits plain JSON batches.
             assert saved>=int(raw*0.30),(raw,compressed,saved,ratio,p)
             assert ratio<=0.70,(ratio,p)
           probes=[x for x in e.get('http',{}).get('health_probe_clients',[]) if str(x.get('client','')).startswith('Render/1.0|')]
