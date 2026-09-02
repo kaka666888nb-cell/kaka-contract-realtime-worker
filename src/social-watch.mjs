@@ -1250,7 +1250,21 @@ async function insertEvent(account, post, tag) {
   if (!postId || !sourcePostId || !handle) return false;
   const postUrl = `https://x.com/${handle}/status/${postId}`;
   const publishedAt = text(post?.created_at) || nowIso();
-  const mediaItems = await prepareSocialPostMedia(postId, post);
+  const contentText = postFullText(post);
+  // Step1060.6: resolve exact event identity before downloading/uploading media. Filtered
+  // stream reconnect/backfill can deliver the same post more than once; unchanged repeats
+  // must reuse the already mirrored media instead of paying another X download + Storage upload.
+  const existingRows = await supabaseFetch(
+    `${EVENTS_TABLE}?source=eq.x&source_post_id=eq.${encodeURIComponent(sourcePostId)}&select=id,post_url,content,media_items&limit=1`,
+  );
+  const existingEvent = Array.isArray(existingRows) ? existingRows[0] : null;
+  const existed = Boolean(existingEvent?.id);
+  const unchangedRepeat = existed &&
+    text(existingEvent?.post_url) === postUrl &&
+    text(existingEvent?.content) === contentText;
+  const mediaItems = unchangedRepeat && Array.isArray(existingEvent?.media_items)
+    ? existingEvent.media_items
+    : await prepareSocialPostMedia(postId, post);
   const body = {
     watch_account_id: account.id,
     source: 'x',
@@ -1264,17 +1278,13 @@ async function insertEvent(account, post, tag) {
     updated_at: nowIso(),
     author_handle: handle,
     author_name: text(account.display_name),
-    content: postFullText(post),
+    content: contentText,
     post_url: postUrl,
     published_at: publishedAt,
     language: text(post?.lang) || null,
     media_items: mediaItems,
     matched_rule_tag: tag,
   };
-  const existingRows = await supabaseFetch(
-    `${EVENTS_TABLE}?source=eq.x&source_post_id=eq.${encodeURIComponent(sourcePostId)}&select=id&limit=1`,
-  );
-  const existed = Array.isArray(existingRows) && Boolean(existingRows[0]?.id);
   const inserted = await supabaseFetch(
     `${EVENTS_TABLE}?on_conflict=source,source_post_id&select=id`,
     {
@@ -1304,7 +1314,7 @@ async function insertEvent(account, post, tag) {
   if (shouldNotify) {
     const displayName = text(account.display_name) || `@${handle}`;
     const title = `${displayName} · X 新动态`;
-    const content = notificationText(postFullText(post));
+    const content = notificationText(contentText);
     try {
       const notificationRows = await supabaseFetch(`${NOTIFICATIONS_TABLE}?select=id`, {
         method: 'POST',
