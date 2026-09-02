@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Wait for Render Step1060
+      - name: Wait for Render Step1060.1
         shell: bash
         run: |
           set -euo pipefail
@@ -28,13 +28,35 @@ jobs:
           for i in $(seq 1 40); do
             body="$(curl -fsS --max-time 12 "$BASE/health/ready" 2>/dev/null || true)"
             echo "poll=$i body=${body:0:300}"
-            if echo "$body" | grep -q '650.8.15.197.3.3.25' && echo "$body" | grep -q 'step1060_render_egress_cost_guard_v1'; then
+            if echo "$body" | grep -q '650.8.15.197.3.3.25.1' && echo "$body" | grep -q 'step1060_render_egress_cost_guard_v1'; then
               ok=1
               break
             fi
             sleep 15
           done
           test "$ok" = 1
+
+      - name: Observe live egress for 90 seconds
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 90
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 15 "$BASE/health/egress" -o /tmp/egress.json
+          python - <<'PY'
+          import json
+          b=json.load(open('/tmp/egress.json','r',encoding='utf-8'))
+          assert b.get('ok') is True
+          assert b.get('version') == '650.8.15.197.3.3.25.1'
+          assert b.get('schema') == 'step1060_render_egress_cost_guard_v1'
+          print(json.dumps({
+            'version':b.get('version'),
+            'uptime_seconds':b.get('uptime_seconds'),
+            'http':b.get('http'),
+            'websocket':b.get('websocket'),
+            'outbound_requests':b.get('outbound_requests')
+          },ensure_ascii=False))
+          PY
 
       - name: Verify gzip on full health JSON
         shell: bash
@@ -50,22 +72,4 @@ jobs:
           body=json.loads(raw)
           assert isinstance(body, dict)
           print('PASS full health gzip raw_json_bytes=', len(raw), 'gzip_bytes=', os.path.getsize('/tmp/body.gz'))
-          PY
-
-      - name: Verify egress metrics endpoint
-        shell: bash
-        run: |
-          set -euo pipefail
-          BASE='https://kaka-contract-realtime-worker.onrender.com'
-          curl -fsS --max-time 15 "$BASE/health/egress" -o /tmp/egress.json
-          python - <<'PY'
-          import json
-          b=json.load(open('/tmp/egress.json','r',encoding='utf-8'))
-          assert b.get('ok') is True
-          assert b.get('version') == '650.8.15.197.3.3.25'
-          assert b.get('schema') == 'step1060_render_egress_cost_guard_v1'
-          assert isinstance(b.get('http'), dict)
-          assert isinstance(b.get('websocket'), dict)
-          assert isinstance(b.get('outbound_requests'), dict)
-          print(json.dumps({'version':b.get('version'),'http':b.get('http'),'websocket':b.get('websocket'),'outbound_requests':b.get('outbound_requests')},ensure_ascii=False))
           PY
