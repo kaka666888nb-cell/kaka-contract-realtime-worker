@@ -117,13 +117,13 @@ function needs(row, fields, requiredFields) {
 }
 async function loadNews() {
   state.scan_reads++;
-  const rows = await supabaseFetch(`${NEWS_TABLE}?is_active=eq.true&select=id,title,content,translations,translation_source_hash,translation_updated_at,published_at,updated_at&order=sort_order.asc,published_at.desc&limit=${NEWS_SCAN_LIMIT}`);
+  const rows = await supabaseFetch(`${NEWS_TABLE}?is_active=eq.true&lifecycle_status=eq.active&select=id,title,content,translations,translation_source_hash,translation_updated_at,published_at,updated_at&order=sort_order.asc,published_at.desc&limit=${NEWS_SCAN_LIMIT}`);
   return Array.isArray(rows) ? rows : [];
 }
 async function loadOfficialEnglishNews() {
   state.scan_reads++;
   const sourceFilter = OFFICIAL_ENGLISH_NEWS_SOURCE_KEYS.join(',');
-  const rows = await supabaseFetch(`${NEWS_TABLE}?is_active=eq.true&primary_source_key=in.(${sourceFilter})&select=id,title,content,translations,translation_source_hash,translation_updated_at,published_at,updated_at,primary_source_key&order=published_at.desc&limit=${OFFICIAL_ENGLISH_NEWS_SCAN_LIMIT}`);
+  const rows = await supabaseFetch(`${NEWS_TABLE}?is_active=eq.true&lifecycle_status=eq.active&primary_source_key=in.(${sourceFilter})&select=id,title,content,translations,translation_source_hash,translation_updated_at,published_at,updated_at,primary_source_key&order=published_at.desc&limit=${OFFICIAL_ENGLISH_NEWS_SCAN_LIMIT}`);
   return Array.isArray(rows) ? rows : [];
 }
 async function loadArticles() {
