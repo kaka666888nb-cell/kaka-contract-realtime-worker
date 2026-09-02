@@ -25,7 +25,7 @@ jobs:
           for i in $(seq 1 60); do
             ready="$(curl -fsS --max-time 15 "$BASE/health/ready" 2>/dev/null || true)"
             proxy="$(curl -fsS --max-time 15 "$BASE/health/egress/proxy" 2>/dev/null || true)"
-            if echo "$ready" | grep -q '650.8.15.197.3.3.25.2' && echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v2'; then
+            if echo "$ready" | grep -q '650.8.15.197.3.3.25.3' && echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v2'; then
               echo 'PASS live Step1060.3 ready'
               exit 0
             fi

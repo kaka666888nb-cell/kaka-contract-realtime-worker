@@ -2,7 +2,7 @@ import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.197.3.3.25.2';
+const VERSION = '650.8.15.197.3.3.25.3';
 const SCHEMA = 'step1060_render_egress_cost_guard_v1';
 const STARTED_AT = Date.now();
 const MAX_ROUTES = 192;
@@ -266,17 +266,14 @@ function installResponseMeter(req, res) {
     const headers = (statusMessageOrHeaders && typeof statusMessageOrHeaders === 'object' && !Array.isArray(statusMessageOrHeaders))
       ? { ...statusMessageOrHeaders }
       : (maybeHeaders && typeof maybeHeaders === 'object' ? { ...maybeHeaders } : {});
-    const contentType = String(headers['content-type'] ?? headers['Content-Type'] ?? res.getHeader('content-type') ?? '').toLowerCase();
-    const noBody = statusCode === 204 || statusCode === 304;
-    const existingEncoding = String(headers['content-encoding'] ?? headers['Content-Encoding'] ?? res.getHeader('content-encoding') ?? '').trim();
-    const endDecision = String(res.__kakaEndGzipDecision || '');
-    gzipEnabled = endDecision !== 'identity' && streamedBytes === 0 && gzipAccepted && !noBody && contentType.includes('application/json') && !existingEncoding;
-    if (gzipEnabled) {
-      delete headers['content-length']; delete headers['Content-Length'];
-      headers['content-encoding'] = 'gzip';
-      headers['vary'] = mergeVary(headers['vary'] ?? headers['Vary'] ?? res.getHeader('vary'), 'Accept-Encoding');
-      try { res.removeHeader('content-length'); } catch (_) {}
-    }
+
+    // Step1060.33.3：writeHead发生时还无法知道调用方接下来会end一次性返回，
+    // 还是会write()/pipe()流式透传。旧逻辑在这里先声明Content-Encoding:gzip，
+    // 但res.write仍原样发送未压缩字节，会生成“gzip响应头 + 原始JSON流”的坏包，
+    // Dart/HttpClient解压时表现为FormatException: Filter error, bad data。
+    // 因此这里只记录status并原样发header；真正可安全压缩的完整单块JSON仍由res.end
+    // 在headers尚未发送且streamedBytes==0时决定。已有预压缩content-encoding保持不动。
+    gzipEnabled = false;
     if (statusMessageOrHeaders && typeof statusMessageOrHeaders === 'string') {
       return originalWriteHead(status, statusMessageOrHeaders, headers);
     }
