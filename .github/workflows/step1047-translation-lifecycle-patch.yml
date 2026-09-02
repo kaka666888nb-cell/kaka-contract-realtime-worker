@@ -1,0 +1,41 @@
+name: Step1047 translation lifecycle patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/step1047_translation_lifecycle_patch.py'
+      - '.github/workflows/step1047-translation-lifecycle-patch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply exact lifecycle patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/step1047_translation_lifecycle_patch.py
+          node --check src/content-publication-translation.mjs
+          grep -q 'is_active=eq.true&lifecycle_status=eq.active&select=id,title,content' src/content-publication-translation.mjs
+          grep -q 'is_active=eq.true&lifecycle_status=eq.active&primary_source_key=in.' src/content-publication-translation.mjs
+          git diff --check
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Kaka Step1047 Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add src/content-publication-translation.mjs
+          git commit -m 'Step1047 enforce lifecycle on publication translation scans'
+          git push origin main
