@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 
-const VERSION = 'step1060_3_render_supabase_egress_proxy_v1';
+const VERSION = 'step1060_3_render_supabase_egress_proxy_v2';
 const MIN_PROXY_BYTES = Math.max(8 * 1024, Number(process.env.KAKA_RENDER_SUPABASE_PROXY_MIN_BYTES || 32 * 1024));
 const MAX_COMPRESSED_BYTES = 4 * 1024 * 1024;
 const ALLOWED_TABLES = new Set([
@@ -105,6 +105,7 @@ function proxyHealth() {
     version: VERSION,
     configured: CONFIGURED,
     min_proxy_bytes: MIN_PROXY_BYTES,
+    service_role_verification: 'postgres_rpc_service_role_only',
     fail_closed_for_large_background_writes: true,
     direct_uncompressed_fallback: false,
     allowed_tables: [...ALLOWED_TABLES],
@@ -123,6 +124,16 @@ function proxyHealth() {
   };
 }
 
+function edgeHeaders(extra = {}) {
+  return {
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    'x-kaka-caller-key': SUPABASE_SERVICE_ROLE_KEY,
+    'content-type': 'application/octet-stream',
+    ...extra,
+  };
+}
+
 async function runEdgeProbe() {
   if (!CONFIGURED || typeof proxyTransportFetch !== 'function') {
     return { ok: false, error: 'proxy_transport_not_ready' };
@@ -135,24 +146,22 @@ async function runEdgeProbe() {
   try {
     const response = await proxyTransportFetch(`${SUPABASE_URL}/functions/v1/kaka-render-egress-ingest`, {
       method: 'POST',
-      headers: {
-        authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-        apikey: SUPABASE_SERVICE_ROLE_KEY,
-        'content-type': 'application/octet-stream',
+      headers: edgeHeaders({
         'x-kaka-compression': 'gzip',
         'x-kaka-probe': '1',
         'x-kaka-raw-bytes': String(raw.length),
-      },
+      }),
       body: compressed,
     });
     let body = null;
     try { body = await response.json(); } catch (_) {}
     return {
-      ok: response.ok && response.headers.get('x-kaka-render-egress-proxy') === 'ok' && body?.probe === true,
+      ok: response.ok && response.headers.get('x-kaka-render-egress-proxy') === 'ok' && body?.probe === true && body?.service_role_verified === true,
       status: response.status,
       raw_bytes: raw.length,
       compressed_bytes: compressed.length,
       edge_version: body?.version || null,
+      service_role_verified: body?.service_role_verified === true,
       error: body?.error || null,
     };
   } catch (error) {
@@ -223,16 +232,13 @@ export function installRenderSupabaseEgressProxy() {
     }
 
     const edgeUrl = `${SUPABASE_URL}/functions/v1/kaka-render-egress-ingest`;
-    const proxyHeaders = new Headers({
-      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      'content-type': 'application/octet-stream',
+    const proxyHeaders = new Headers(edgeHeaders({
       'x-kaka-compression': 'gzip',
       'x-kaka-target': encodeURIComponent(`${target.url.pathname}${target.url.search}`),
       'x-kaka-original-method': meta.method,
       'x-kaka-original-content-type': meta.headers.get('content-type') || 'application/json',
       'x-kaka-raw-bytes': String(meta.raw.length),
-    });
+    }));
     for (const [source, dest] of [
       ['prefer', 'x-kaka-original-prefer'],
       ['content-profile', 'x-kaka-original-content-profile'],
@@ -259,7 +265,7 @@ export function installRenderSupabaseEgressProxy() {
     const marker = response.headers.get('x-kaka-render-egress-proxy');
     if (marker !== 'ok') {
       stats.proxy_failures += 1;
-      stats.last_error = `proxy_marker_missing:http_${response.status}`;
+      stats.last_error = `proxy_unverified:http_${response.status}`;
       return syntheticFailure(503, 'render_egress_proxy_unverified_response');
     }
 

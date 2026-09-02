@@ -31,7 +31,7 @@ jobs:
             echo "poll=$i body=${body:0:300}"
             if echo "$body" | grep -q '650.8.15.197.3.3.25.2' && echo "$body" | grep -q 'step1060_render_egress_cost_guard_v1'; then
               proxy="$(curl -fsS --max-time 12 "$BASE/health/egress/proxy" 2>/dev/null || true)"
-              if echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v1'; then
+              if echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v2'; then
                 ok=1
                 break
               fi
@@ -52,13 +52,15 @@ jobs:
           b=json.load(open('/tmp/proxy.json','r',encoding='utf-8'))
           assert b.get('ok') is True
           assert b.get('configured') is True
-          assert b.get('version') == 'step1060_3_render_supabase_egress_proxy_v1'
+          assert b.get('version') == 'step1060_3_render_supabase_egress_proxy_v2'
+          assert b.get('service_role_verification') == 'postgres_rpc_service_role_only'
           assert b.get('direct_uncompressed_fallback') is False
           assert b.get('fail_closed_for_large_background_writes') is True
           p=b.get('probe') or {}
           assert p.get('ok') is True, p
           assert p.get('status') == 200, p
-          assert str(p.get('edge_version','')).startswith('step1060_3_render_egress_ingest_v4'), p
+          assert p.get('service_role_verified') is True, p
+          assert str(p.get('edge_version','')).startswith('step1060_3_render_egress_ingest_v5'), p
           raw=int(p.get('raw_bytes') or 0)
           zipped=int(p.get('compressed_bytes') or 0)
           assert raw > 60000 and 0 < zipped < raw * 0.10, p
@@ -91,26 +93,26 @@ jobs:
           sleep 90
           BASE='https://kaka-contract-realtime-worker.onrender.com'
           curl -fsS --max-time 15 "$BASE/health/egress" -o /tmp/egress.json
+          curl -fsS --max-time 15 "$BASE/health/egress/proxy" -o /tmp/proxy-health.json
           python - <<'PY'
           import json
           b=json.load(open('/tmp/egress.json','r',encoding='utf-8'))
+          p=json.load(open('/tmp/proxy-health.json','r',encoding='utf-8'))
           assert b.get('ok') is True
           assert b.get('version') == '650.8.15.197.3.3.25.2'
           assert b.get('schema') == 'step1060_render_egress_cost_guard_v1'
           assert b.get('render_health_probe_compacted') is True
           probes=[x for x in b.get('http',{}).get('health_probe_clients',[]) if str(x.get('client','')).startswith('Render/1.0|')]
           assert probes, 'Render health probe not observed'
-          for p in probes:
-            req=max(1,int(p.get('requests') or 0))
-            avg=float(p.get('sent_bytes') or 0)/req
-            assert avg < 2048, (p, avg)
-          print(json.dumps({
-            'version':b.get('version'),
-            'uptime_seconds':b.get('uptime_seconds'),
-            'http':b.get('http'),
-            'websocket':b.get('websocket'),
-            'outbound_requests':b.get('outbound_requests')
-          },ensure_ascii=False))
+          for row in probes:
+            req=max(1,int(row.get('requests') or 0))
+            avg=float(row.get('sent_bytes') or 0)/req
+            assert avg < 2048, (row, avg)
+          assert p.get('version') == 'step1060_3_render_supabase_egress_proxy_v2'
+          assert p.get('proxy_failures',0) == 0, p
+          if int(p.get('proxied') or 0) > 0:
+            assert int(p.get('compressed_bytes_sent') or 0) < int(p.get('raw_bytes_avoided') or 0), p
+          print(json.dumps({'egress':b,'proxy':p},ensure_ascii=False))
           PY
 
       - name: Verify gzip on full health JSON for normal clients
