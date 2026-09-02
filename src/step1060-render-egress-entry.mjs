@@ -1,5 +1,6 @@
 import { installRenderEgressCostGuard } from './render-egress-cost-guard.mjs';
 import { installRenderSupabaseEgressProxy } from './render-supabase-egress-proxy.mjs';
+import { installLiquidation1hNoopEgressGuard } from './liquidation-noop-egress-guard.mjs';
 
 // Step1060.3: install metering/compression first, then route only the known
 // large background Supabase JSON writes through the authenticated gzip ingest.
@@ -7,4 +8,7 @@ import { installRenderSupabaseEgressProxy } from './render-supabase-egress-proxy
 // last verified DB data instead of silently falling back to expensive raw egress.
 installRenderEgressCostGuard();
 installRenderSupabaseEgressProxy();
+// Step1060.26: filter identical liquidation 1H persistence rows before they
+// reach the existing Supabase egress proxy. Real semantic changes still pass.
+installLiquidation1hNoopEgressGuard();
 await import('./step1042-bitget-long-kline-continuity-proxy.mjs');
