@@ -14,21 +14,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Wait for Render production with duplicate cost guard
+      - name: Verify current Render production duplicate cost guard
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          sleep 75
           ok=0
-          for i in $(seq 1 36); do
+          for i in $(seq 1 12); do
             health="$(curl -sS --max-time 20 "$BASE/api/social-watch/health" 2>/dev/null || true)"
-            echo "poll=$i ${health:0:1200}"
-            if printf '%s' "$health" | python3 -c "import json,sys; b=json.load(sys.stdin); g=b.get('duplicate_event_cost_guard') or {}; assert g.get('version')=='step1060_6_1_social_duplicate_event_cost_guard_v1'; assert g.get('unchanged_active_event_db_write_skipped') is True; assert g.get('removed_event_can_reactivate') is True; assert g.get('edited_post_can_update') is True" 2>/dev/null; then
+            echo "poll=$i ${health:0:1600}"
+            if printf '%s' "$health" | python3 -c "import json,sys; root=json.load(sys.stdin); b=root.get('social_watch') or root; g=b.get('duplicate_event_cost_guard') or {}; assert g.get('version')=='step1060_6_1_social_duplicate_event_cost_guard_v1'; assert g.get('unchanged_active_event_db_write_skipped') is True; assert g.get('removed_event_can_reactivate') is True; assert g.get('edited_post_can_update') is True" 2>/dev/null; then
               ok=1
               break
             fi
-            sleep 15
+            sleep 10
           done
           test "$ok" = 1
 
