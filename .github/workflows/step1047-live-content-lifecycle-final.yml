@@ -1,0 +1,88 @@
+name: Step1047 live content lifecycle final
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/social-watch.mjs'
+      - 'src/airdrop-watch.mjs'
+      - 'src/content-publication-translation.mjs'
+      - '.github/workflows/step1047-live-content-lifecycle-final.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Wait for Render production
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 60); do
+            social="$(curl -fsS --max-time 15 "$BASE/api/social-watch/health" 2>/dev/null || true)"
+            airdrop="$(curl -fsS --max-time 15 "$BASE/api/airdrop-watch/health" 2>/dev/null || true)"
+            if echo "$social" | grep -q 'step1047_content_lifecycle_social_v1' && echo "$airdrop" | grep -q 'step1047'; then
+              echo 'PASS Step1047 lifecycle schemas live'
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Verify social public lifecycle and user-read isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 'https://kaka-contract-realtime-worker.onrender.com/api/social-watch/public?limit=200' -o /tmp/social.json
+          python3 - <<'PY'
+          import json
+          b=json.load(open('/tmp/social.json'))
+          assert b.get('ok') is True, b
+          assert b.get('schema')=='step1047_content_lifecycle_social_v1', b.get('schema')
+          assert b.get('user_read_x_requests')==0, b
+          assert b.get('user_read_supabase_requests')==0, b
+          assert b.get('x_requests_scale_with_users') is False, b
+          rows=b.get('rows') or []
+          bad=[r for r in rows if r.get('is_active') is not True or str(r.get('lifecycle_status') or 'active').lower()!='active']
+          assert not bad, bad[:3]
+          print('PASS social rows=',len(rows),'all active; user upstream/db=0')
+          PY
+
+      - name: Verify airdrop public lifecycle and user-read isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 'https://kaka-contract-realtime-worker.onrender.com/api/airdrop-watch/public?limit=200' -o /tmp/airdrop.json
+          python3 - <<'PY'
+          import json
+          b=json.load(open('/tmp/airdrop.json'))
+          assert b.get('ok') is True, b
+          assert str(b.get('schema','')).startswith('step1047'), b.get('schema')
+          assert b.get('user_read_upstream_requests')==0, b
+          assert b.get('user_read_supabase_requests')==0, b
+          assert b.get('upstream_requests_scale_with_users') is False, b
+          rows=b.get('rows') or []
+          bad=[r for r in rows if r.get('is_active') is not True or str(r.get('lifecycle_status') or 'active').lower()!='active']
+          assert not bad, bad[:3]
+          print('PASS airdrop rows=',len(rows),'all active; user upstream/db=0')
+          PY
+
+      - name: Verify translation policy stayed Chinese-first
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 30 -H 'Accept-Encoding: gzip' --compressed 'https://kaka-contract-realtime-worker.onrender.com/health' -o /tmp/health.json
+          python3 - <<'PY'
+          import json
+          b=json.load(open('/tmp/health.json'))
+          t=b.get('content_publication_translation') or {}
+          assert t.get('policy')=='english_to_chinese_title_plus_short_body_auto_long_body_on_demand', t
+          assert t.get('chinese_to_english_auto') is False, t
+          assert t.get('auto_target_locale')=='zh', t
+          print('PASS Chinese-first publication translation policy; db_writes=',t.get('db_writes'))
+          PY
