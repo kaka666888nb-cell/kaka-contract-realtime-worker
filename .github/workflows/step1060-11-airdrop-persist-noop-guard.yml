@@ -1,0 +1,284 @@
+name: Step1060.11 airdrop persistence noop cost guard
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-11-airdrop-persist-noop-guard.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch airdrop unchanged-row persistence guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/airdrop-watch.mjs')
+          s=p.read_text(encoding='utf-8')
+
+          anchor="const DB_RELOAD_MS = 5 * 60_000;"
+          repl='\n'.join([
+            anchor,
+            "const PERSIST_HEARTBEAT_MS = Math.max(60 * 60_000, Number(process.env.KAKA_AIRDROP_PERSIST_HEARTBEAT_MS || 6 * 60 * 60_000) || 6 * 60 * 60_000);",
+          ])
+          if anchor not in s: raise SystemExit('constant anchor missing')
+          s=s.replace(anchor,repl,1)
+
+          anchor="  persistFailures: 0,"
+          repl='\n'.join([
+            anchor,
+            '  persistRowsConsidered: 0,',
+            '  persistRowsWritten: 0,',
+            '  persistRowsNoopSkipped: 0,',
+            '  persistHeartbeatRows: 0,',
+            '  persistNoopBatches: 0,',
+          ])
+          if anchor not in s: raise SystemExit('state anchor missing')
+          s=s.replace(anchor,repl,1)
+
+          anchor="      ...row,\n      content_text: incomingHasContent ? row.content_text : (previous.content_text || null),"
+          repl="      ...row,\n      last_seen_at: row.last_seen_at || previous.last_seen_at || null,\n      content_text: incomingHasContent ? row.content_text : (previous.content_text || null),"
+          if anchor not in s: raise SystemExit('merge last_seen anchor missing')
+          s=s.replace(anchor,repl,1)
+
+          start=s.index('async function persistRows(rows) {')
+          end=s.index('\nfunction translationFieldsForAirdrop', start)
+          replacement='\n'.join([
+            'function stableComparableValue(value) {',
+            '  if (Array.isArray(value)) return value.map(stableComparableValue);',
+            "  if (value && typeof value === 'object') {",
+            '    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableComparableValue(value[key])]));',
+            '  }',
+            '  return value;',
+            '}',
+            'function comparableTime(value) {',
+            '  const ms = Date.parse(text(value));',
+            '  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;',
+            '}',
+            'function airdropPersistSignature(row) {',
+            "  const provider = text(row?.provider).toLowerCase();",
+            '  const title = normalizeWhitespace(row?.title);',
+            '  return JSON.stringify(stableComparableValue({',
+            '    provider,',
+            '    provider_name: text(row?.provider_name),',
+            '    category: categoryFor(provider, title),',
+            '    source_event_id: text(row?.source_event_id),',
+            '    title,',
+            '    project_symbol: text(row?.project_symbol) || null,',
+            '    reward_text: text(row?.reward_text) || null,',
+            '    eligibility_text: text(row?.eligibility_text) || null,',
+            '    start_at: comparableTime(row?.start_at),',
+            '    end_at: comparableTime(row?.end_at),',
+            '    published_at: comparableTime(row?.published_at),',
+            '    source_url: canonicalUrl(row?.source_url),',
+            '    status: statusFor(row?.start_at, row?.end_at),',
+            '    raw_summary: normalizeWhitespace(row?.raw_summary) || null,',
+            '    content_text: normalizeContentText(row?.content_text) || null,',
+            '    media_items: normalizeContentMediaItems(row?.media_items),',
+            '  }));',
+            '}',
+            '',
+            'async function persistRows(rows, previousSnapshot = []) {',
+            '  if (!rows.length || !state.supabaseConfigured) return [];',
+            "  const priorByKey = new Map((Array.isArray(previousSnapshot) ? previousSnapshot : []).map((item) => [`${text(item?.provider).toLowerCase()}|${text(item?.source_event_id)}`, item]));",
+            '  const nowMs = Date.now();',
+            '  const payload = [];',
+            '  let noopSkipped = 0;',
+            '  let heartbeatRows = 0;',
+            '  state.persistRowsConsidered += rows.length;',
+            '  for (const rawRow of rows) {',
+            "    const key = `${text(rawRow?.provider).toLowerCase()}|${text(rawRow?.source_event_id)}`;",
+            '    const previous = priorByKey.get(key) || {};',
+            '    const row = contentUsableForProvider(rawRow?.provider, rawRow?.content_text)',
+            '      ? rawRow',
+            '      : {',
+            '          ...rawRow,',
+            '          content_text: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_text : null,',
+            '          content_fetched_at: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_fetched_at : null,',
+            '        };',
+            '    const previousActive = previous?.is_active !== false && (text(previous?.lifecycle_status).toLowerCase() || \'active\') === \'active\';',
+            '    const unchanged = previousActive && airdropPersistSignature(previous) === airdropPersistSignature(row);',
+            '    const lastSeenMs = Date.parse(text(previous?.last_seen_at));',
+            '    const heartbeatDue = !Number.isFinite(lastSeenMs) || nowMs - lastSeenMs >= PERSIST_HEARTBEAT_MS;',
+            '    if (unchanged && !heartbeatDue) {',
+            '      noopSkipped += 1;',
+            '      continue;',
+            '    }',
+            '    if (unchanged && heartbeatDue) heartbeatRows += 1;',
+            '    payload.push({',
+            '      provider: row.provider,',
+            '      provider_name: row.provider_name,',
+            '      category: row.category,',
+            '      source_event_id: row.source_event_id,',
+            '      title: row.title,',
+            '      project_symbol: row.project_symbol,',
+            '      reward_text: row.reward_text,',
+            '      eligibility_text: row.eligibility_text,',
+            '      start_at: row.start_at,',
+            '      end_at: row.end_at,',
+            '      published_at: row.published_at,',
+            '      source_url: row.source_url,',
+            '      source_domain: row.source_domain,',
+            '      status: statusFor(row.start_at, row.end_at),',
+            '      raw_summary: row.raw_summary,',
+            '      content_text: contentUsableForProvider(row.provider, row.content_text) ? normalizeContentText(row.content_text).slice(0, CONTENT_TEXT_MAX_CHARS) : null,',
+            '      content_fetched_at: contentUsableForProvider(row.provider, row.content_text) ? (row.content_fetched_at || nowIso()) : null,',
+            '      media_items: normalizeContentMediaItems(row.media_items),',
+            '      fetched_at: nowIso(),',
+            '      is_active: true,',
+            "      lifecycle_status: 'active',",
+            '      last_seen_at: nowIso(),',
+            '      removed_at: null,',
+            '      expired_at: null,',
+            "      lifecycle_reason: '',",
+            '      updated_at: nowIso(),',
+            '    });',
+            '  }',
+            '  state.persistRowsNoopSkipped += noopSkipped;',
+            '  state.persistHeartbeatRows += heartbeatRows;',
+            '  if (!payload.length) {',
+            '    state.persistNoopBatches += 1;',
+            '    return [];',
+            '  }',
+            '  const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at,is_active,lifecycle_status,last_seen_at,removed_at`, {',
+            "    method: 'POST',",
+            "    headers: { prefer: 'resolution=merge-duplicates,return=representation' },",
+            '    body: JSON.stringify(payload),',
+            '  });',
+            '  state.persistedRows += payload.length;',
+            '  state.persistRowsWritten += payload.length;',
+            '  state.persistSuccesses++;',
+            '  state.lastPersistAt = nowIso();',
+            '  return Array.isArray(result) ? result : payload;',
+            '}',
+          ])
+          s=s[:start]+replacement+s[end:]
+
+          old='''      if (rows.length) {
+        mergePublicSnapshot(rows);
+        if (state.supabaseConfigured) {
+          try {
+            const persisted = await persistRows(rows);'''
+          new='''      if (rows.length) {
+        const previousSnapshot = publicSnapshot.slice();
+        mergePublicSnapshot(rows);
+        if (state.supabaseConfigured) {
+          try {
+            const persisted = await persistRows(rows, previousSnapshot);'''
+          if old not in s: raise SystemExit('refresh previous snapshot anchor missing')
+          s=s.replace(old,new,1)
+
+          anchor='''    persist_failures: state.persistFailures,
+    public_reads: state.publicReads,'''
+          repl='''    persist_failures: state.persistFailures,
+    persistence_cost_guard: {
+      version: 'step1060_11_airdrop_persist_noop_guard_v1',
+      unchanged_active_rows_write_skipped: true,
+      removed_rows_can_reactivate: true,
+      status_or_content_changes_write_immediately: true,
+      heartbeat_hours: PERSIST_HEARTBEAT_MS / 3_600_000,
+      rows_considered: state.persistRowsConsidered,
+      rows_written: state.persistRowsWritten,
+      rows_noop_skipped: state.persistRowsNoopSkipped,
+      heartbeat_rows_written: state.persistHeartbeatRows,
+      noop_batches: state.persistNoopBatches,
+    },
+    public_reads: state.publicReads,'''
+          if anchor not in s: raise SystemExit('health anchor missing')
+          s=s.replace(anchor,repl,1)
+
+          p.write_text(s,encoding='utf-8')
+          PY
+          node --check src/airdrop-watch.mjs
+          grep -q "step1060_11_airdrop_persist_noop_guard_v1" src/airdrop-watch.mjs
+          grep -q "previousSnapshot = publicSnapshot.slice" src/airdrop-watch.mjs
+          grep -q "last_seen_at: row.last_seen_at || previous.last_seen_at" src/airdrop-watch.mjs
+
+      - name: Commit production patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka-step1060-cost-guard'
+          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git add src/airdrop-watch.mjs
+          git diff --cached --check
+          git commit -m 'Step1060.11 skip unchanged airdrop persistence writes'
+          git push origin HEAD:main
+
+      - name: Verify live airdrop write cost guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          sleep 80
+          ok=0
+          for i in $(seq 1 40); do
+            h="$(curl -sS --max-time 20 "$BASE/api/airdrop-watch/health" 2>/dev/null || true)"
+            echo "poll=$i ${h:0:3200}"
+            if printf '%s' "$h" | python3 -c "import json,sys; root=json.load(sys.stdin); b=root.get('airdrop_watch') or root; g=b.get('persistence_cost_guard') or {}; assert g.get('version')=='step1060_11_airdrop_persist_noop_guard_v1'; assert g.get('unchanged_active_rows_write_skipped') is True; assert g.get('removed_rows_can_reactivate') is True; assert g.get('status_or_content_changes_write_immediately') is True; assert int(g.get('rows_considered') or 0)>0; assert int(g.get('rows_noop_skipped') or 0)>0; assert int(g.get('rows_written') or 0)<int(g.get('rows_considered') or 0); assert int(b.get('persist_failures') or 0)==0; assert int(b.get('user_read_upstream_requests') or 0)==0; assert int(b.get('user_read_supabase_requests') or 0)==0; assert b.get('upstream_requests_scale_with_users') is False" 2>/dev/null; then
+              printf '%s' "$h" > /tmp/airdrop-health.json
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          test "$ok" = 1
+          python3 - <<'PY'
+          import json
+          root=json.load(open('/tmp/airdrop-health.json')); b=root.get('airdrop_watch') or root; g=b['persistence_cost_guard']
+          print(json.dumps({'refreshes':b.get('refreshes'),'snapshot_rows':b.get('public_snapshot_rows'),'rows_considered':g.get('rows_considered'),'rows_written':g.get('rows_written'),'rows_noop_skipped':g.get('rows_noop_skipped'),'heartbeat_rows_written':g.get('heartbeat_rows_written'),'persist_failures':b.get('persist_failures')},indent=2))
+          print('PASS Step1060.11 airdrop persistence noop guard')
+          PY
+
+      - name: Verify public reads remain memory-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,urllib.request,concurrent.futures,gzip
+          URL='https://kaka-contract-realtime-worker.onrender.com/api/airdrop-watch/public?limit=100'
+          def one(_):
+              req=urllib.request.Request(URL,headers={'Accept':'application/json','Accept-Encoding':'gzip','User-Agent':'Kaka-Step1060.11-Live/1.0'})
+              with urllib.request.urlopen(req,timeout=25) as r:
+                  raw=r.read(); enc=(r.headers.get('Content-Encoding') or '').lower()
+              if enc=='gzip': raw=gzip.decompress(raw)
+              b=json.loads(raw)
+              assert b.get('ok') is True,b
+              assert int(b.get('user_read_upstream_requests') or 0)==0,b
+              assert int(b.get('user_read_supabase_requests') or 0)==0,b
+              assert b.get('upstream_requests_scale_with_users') is False,b
+              return len(b.get('rows') or [])
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+              rows=list(ex.map(one,range(30)))
+          print('PASS Step1060.11 public 30/30 isolated rows_range=',min(rows),max(rows))
+          PY
+
+      - name: Verify egress stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 "$BASE/health/egress" -o /tmp/e.json
+          curl -fsS --max-time 20 "$BASE/health/egress/proxy" -o /tmp/p.json
+          python3 - <<'PY'
+          import json
+          e=json.load(open('/tmp/e.json')); p=json.load(open('/tmp/p.json'))
+          assert e.get('ok') is True,e
+          assert e.get('render_health_probe_compacted') is True,e
+          assert p.get('ok') is True,p
+          assert int(p.get('proxy_failures') or 0)==0,p
+          assert p.get('direct_uncompressed_fallback') is False,p
+          print('PASS Step1060.11 egress stack')
+          PY
