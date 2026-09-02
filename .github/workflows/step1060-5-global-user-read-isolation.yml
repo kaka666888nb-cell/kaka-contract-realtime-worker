@@ -1,0 +1,151 @@
+name: Step1060.5 global user-read isolation gate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/market-light-snapshot.mjs'
+      - 'src/stock-catalog-v2.mjs'
+      - 'src/kline-asset-rank.mjs'
+      - 'src/onchain-market.mjs'
+      - 'src/social-watch.mjs'
+      - 'src/airdrop-watch.mjs'
+      - 'src/render-egress-cost-guard.mjs'
+      - 'src/render-supabase-egress-proxy.mjs'
+      - '.github/workflows/step1060-5-global-user-read-isolation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Wait for production readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 60); do
+            ready="$(curl -fsS --max-time 15 "$BASE/health/ready" 2>/dev/null || true)"
+            proxy="$(curl -fsS --max-time 15 "$BASE/health/egress/proxy" 2>/dev/null || true)"
+            if echo "$ready" | grep -q 'step1060_render_egress_cost_guard_v1' && echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v2'; then
+              echo 'PASS production ready + egress guard'
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Pressure shared user-read surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import gzip, json, urllib.parse, urllib.request, concurrent.futures
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          items='~'.join([
+            'spot|binance|BTCUSDT','spot|okx|BTCUSDT','spot|bybit|BTCUSDT',
+            'spot|bitget|BTCUSDT','spot|gate|BTCUSDT'
+          ])
+          routes={
+            'ticker': BASE+'/api/market-light/watchlist-tickers?'+urllib.parse.urlencode({'items':items}),
+            'project50': BASE+'/api/market-light/project-ranked-page?offset=0&limit=50',
+            'stock50': BASE+'/api/stock-catalog-v2/ranked-page?provider=all&sort=change_desc&offset=0&limit=50',
+            'asset50': BASE+'/api/asset-market/ranked-page?sort=change_desc&offset=0&limit=50',
+            'onchain': BASE+'/api/onchain/trending?limit=50',
+            'social': BASE+'/api/social-watch/public?limit=100',
+            'airdrop': BASE+'/api/airdrop-watch/public?limit=100',
+          }
+          def get(name,url):
+            req=urllib.request.Request(url,headers={
+              'Accept':'application/json','Accept-Encoding':'gzip',
+              'User-Agent':'Kaka-Step1060.5-Isolation/1.0'
+            })
+            with urllib.request.urlopen(req,timeout=25) as r:
+              wire=r.read(); enc=(r.headers.get('Content-Encoding') or '').lower(); status=r.status
+            raw=gzip.decompress(wire) if enc=='gzip' else wire
+            body=json.loads(raw)
+            return name,status,len(wire),body
+
+          jobs=[]
+          # 140 user reads in parallel, but each route remains ordinary read-only traffic.
+          for name,url in routes.items():
+            for _ in range(20): jobs.append((name,url))
+          rows=[]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+            futs=[ex.submit(get,*j) for j in jobs]
+            for f in concurrent.futures.as_completed(futs): rows.append(f.result())
+
+          by={}
+          for name,status,wire,b in rows:
+            assert status==200,(name,status,b)
+            assert b.get('ok') is True,(name,b)
+            by.setdefault(name,[]).append((wire,b))
+
+          def zero(b,*keys):
+            found=False
+            for k in keys:
+              if k in b:
+                found=True
+                assert int(b.get(k) or 0)==0,(k,b.get(k),b)
+            return found
+
+          for name,vals in by.items():
+            for wire,b in vals:
+              if name in ('ticker','project50','stock50','asset50'):
+                assert zero(b,'user_read_upstream_requests','user_read_exchange_requests'),(name,b)
+                if 'reads_scale_with_users' in b: assert b.get('reads_scale_with_users') is False,(name,b)
+              elif name=='social':
+                assert int(b.get('user_read_x_requests') or 0)==0,b
+                assert int(b.get('user_read_supabase_requests') or 0)==0,b
+                assert b.get('x_requests_scale_with_users') is False,b
+                bad=[r for r in (b.get('rows') or []) if r.get('is_active') is not True or str(r.get('lifecycle_status') or 'active').lower()!='active']
+                assert not bad,bad[:3]
+              elif name=='airdrop':
+                assert int(b.get('user_read_upstream_requests') or 0)==0,b
+                assert int(b.get('user_read_supabase_requests') or 0)==0,b
+                assert b.get('upstream_requests_scale_with_users') is False,b
+                bad=[r for r in (b.get('rows') or []) if r.get('is_active') is not True or str(r.get('lifecycle_status') or 'active').lower()!='active']
+                assert not bad,bad[:3]
+              elif name=='onchain':
+                # The public trending route must remain a shared-memory read. Current contract
+                # exposes one of these equivalent isolation markers depending on schema revision.
+                markers=[]
+                for k in ('user_read_upstream_requests','user_requests_started','user_upstream_requests'):
+                  if k in b: markers.append((k,int(b.get(k) or 0)))
+                if 'reads_scale_with_users' in b: assert b.get('reads_scale_with_users') is False,b
+                if 'user_reads_start_upstream' in b: assert b.get('user_reads_start_upstream') is False,b
+                for k,v in markers: assert v==0,(k,v,b)
+            print('PASS',name,'reads=',len(vals),'wire_max=',max(x[0] for x in vals))
+          assert sum(len(v) for v in by.values())==140
+          print('PASS 140 mixed production user reads; no declared user-scale upstream amplification')
+          PY
+
+      - name: Verify cost guards after pressure
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 'https://kaka-contract-realtime-worker.onrender.com/health/egress' -o /tmp/egress.json
+          curl -fsS --max-time 20 'https://kaka-contract-realtime-worker.onrender.com/health/egress/proxy' -o /tmp/proxy.json
+          python3 - <<'PY'
+          import json
+          e=json.load(open('/tmp/egress.json')); p=json.load(open('/tmp/proxy.json'))
+          assert e.get('ok') is True
+          assert e.get('render_health_probe_compacted') is True
+          assert p.get('ok') is True
+          assert p.get('version')=='step1060_3_render_supabase_egress_proxy_v2'
+          assert p.get('service_role_verification')=='postgres_rpc_service_role_only'
+          assert p.get('direct_uncompressed_fallback') is False
+          assert int(p.get('proxy_failures') or 0)==0,p
+          if int(p.get('proxied') or 0)>0:
+            assert float(p.get('compression_ratio') or 1)<=0.15,p
+          probes=[x for x in e.get('http',{}).get('health_probe_clients',[]) if str(x.get('client','')).startswith('Render/1.0|')]
+          assert probes,'Render health probe missing'
+          for x in probes:
+            avg=float(x.get('sent_bytes') or 0)/max(1,int(x.get('requests') or 0))
+            assert avg<2048,(x,avg)
+          print('PASS egress guard + gzip proxy + compact platform health after pressure')
+          PY
