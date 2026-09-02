@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'src/render-egress-cost-guard.mjs'
+      - 'src/render-supabase-egress-proxy.mjs'
       - 'src/step1060-render-egress-entry.mjs'
       - 'package.json'
       - 'package-lock.json'
@@ -19,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Wait for Render Step1060.2
+      - name: Wait for Render Step1060.3
         shell: bash
         run: |
           set -euo pipefail
@@ -29,12 +30,39 @@ jobs:
             body="$(curl -fsS --max-time 12 "$BASE/health/ready" 2>/dev/null || true)"
             echo "poll=$i body=${body:0:300}"
             if echo "$body" | grep -q '650.8.15.197.3.3.25.2' && echo "$body" | grep -q 'step1060_render_egress_cost_guard_v1'; then
-              ok=1
-              break
+              proxy="$(curl -fsS --max-time 12 "$BASE/health/egress/proxy" 2>/dev/null || true)"
+              if echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v1'; then
+                ok=1
+                break
+              fi
             fi
             sleep 15
           done
           test "$ok" = 1
+
+      - name: Verify authenticated gzip ingest path without database write
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 20 "$BASE/health/egress/proxy?probe=1" -o /tmp/proxy.json
+          python - <<'PY'
+          import json
+          b=json.load(open('/tmp/proxy.json','r',encoding='utf-8'))
+          assert b.get('ok') is True
+          assert b.get('configured') is True
+          assert b.get('version') == 'step1060_3_render_supabase_egress_proxy_v1'
+          assert b.get('direct_uncompressed_fallback') is False
+          assert b.get('fail_closed_for_large_background_writes') is True
+          p=b.get('probe') or {}
+          assert p.get('ok') is True, p
+          assert p.get('status') == 200, p
+          assert str(p.get('edge_version','')).startswith('step1060_3_render_egress_ingest_v3'), p
+          raw=int(p.get('raw_bytes') or 0)
+          zipped=int(p.get('compressed_bytes') or 0)
+          assert raw > 60000 and 0 < zipped < raw * 0.10, p
+          print('PASS proxy probe raw_bytes=',raw,'compressed_bytes=',zipped)
+          PY
 
       - name: Verify Render platform health probe is compact
         shell: bash
