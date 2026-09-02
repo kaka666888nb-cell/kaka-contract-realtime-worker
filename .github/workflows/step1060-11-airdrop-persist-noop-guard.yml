@@ -108,7 +108,7 @@ jobs:
             '          content_text: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_text : null,',
             '          content_fetched_at: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_fetched_at : null,',
             '        };',
-            '    const previousActive = previous?.is_active !== false && (text(previous?.lifecycle_status).toLowerCase() || \'active\') === \'active\';',
+            "    const previousActive = previous?.is_active !== false && (text(previous?.lifecycle_status).toLowerCase() || 'active') === 'active';",
             '    const unchanged = previousActive && airdropPersistSignature(previous) === airdropPersistSignature(row);',
             '    const lastSeenMs = Date.parse(text(previous?.last_seen_at));',
             '    const heartbeatDue = !Number.isFinite(lastSeenMs) || nowMs - lastSeenMs >= PERSIST_HEARTBEAT_MS;',
@@ -166,36 +166,13 @@ jobs:
           ])
           s=s[:start]+replacement+s[end:]
 
-          old='''      if (rows.length) {
-        mergePublicSnapshot(rows);
-        if (state.supabaseConfigured) {
-          try {
-            const persisted = await persistRows(rows);'''
-          new='''      if (rows.length) {
-        const previousSnapshot = publicSnapshot.slice();
-        mergePublicSnapshot(rows);
-        if (state.supabaseConfigured) {
-          try {
-            const persisted = await persistRows(rows, previousSnapshot);'''
+          old="      if (rows.length) {\n        mergePublicSnapshot(rows);\n        if (state.supabaseConfigured) {\n          try {\n            const persisted = await persistRows(rows);"
+          new="      if (rows.length) {\n        const previousSnapshot = publicSnapshot.slice();\n        mergePublicSnapshot(rows);\n        if (state.supabaseConfigured) {\n          try {\n            const persisted = await persistRows(rows, previousSnapshot);"
           if old not in s: raise SystemExit('refresh previous snapshot anchor missing')
           s=s.replace(old,new,1)
 
-          anchor='''    persist_failures: state.persistFailures,
-    public_reads: state.publicReads,'''
-          repl='''    persist_failures: state.persistFailures,
-    persistence_cost_guard: {
-      version: 'step1060_11_airdrop_persist_noop_guard_v1',
-      unchanged_active_rows_write_skipped: true,
-      removed_rows_can_reactivate: true,
-      status_or_content_changes_write_immediately: true,
-      heartbeat_hours: PERSIST_HEARTBEAT_MS / 3_600_000,
-      rows_considered: state.persistRowsConsidered,
-      rows_written: state.persistRowsWritten,
-      rows_noop_skipped: state.persistRowsNoopSkipped,
-      heartbeat_rows_written: state.persistHeartbeatRows,
-      noop_batches: state.persistNoopBatches,
-    },
-    public_reads: state.publicReads,'''
+          anchor="    persist_failures: state.persistFailures,\n    public_reads: state.publicReads,"
+          repl="    persist_failures: state.persistFailures,\n    persistence_cost_guard: {\n      version: 'step1060_11_airdrop_persist_noop_guard_v1',\n      unchanged_active_rows_write_skipped: true,\n      removed_rows_can_reactivate: true,\n      status_or_content_changes_write_immediately: true,\n      heartbeat_hours: PERSIST_HEARTBEAT_MS / 3_600_000,\n      rows_considered: state.persistRowsConsidered,\n      rows_written: state.persistRowsWritten,\n      rows_noop_skipped: state.persistRowsNoopSkipped,\n      heartbeat_rows_written: state.persistHeartbeatRows,\n      noop_batches: state.persistNoopBatches,\n    },\n    public_reads: state.publicReads,"
           if anchor not in s: raise SystemExit('health anchor missing')
           s=s.replace(anchor,repl,1)
 
