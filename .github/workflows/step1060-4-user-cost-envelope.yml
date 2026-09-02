@@ -1,0 +1,175 @@
+name: Step1060.4 real user egress cost envelope
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/render-egress-cost-guard.mjs'
+      - 'src/render-supabase-egress-proxy.mjs'
+      - '.github/workflows/step1060-4-user-cost-envelope.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cost-envelope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Wait for live Step1060.3 guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 60); do
+            ready="$(curl -fsS --max-time 15 "$BASE/health/ready" 2>/dev/null || true)"
+            proxy="$(curl -fsS --max-time 15 "$BASE/health/egress/proxy" 2>/dev/null || true)"
+            if echo "$ready" | grep -q '650.8.15.197.3.3.25.2' && echo "$proxy" | grep -q 'step1060_3_render_supabase_egress_proxy_v2'; then
+              echo 'PASS live Step1060.3 ready'
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Measure real compressed user-read wire bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import gzip, json, statistics, urllib.parse, urllib.request
+
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          items='~'.join([
+              'spot|binance|BTCUSDT',
+              'spot|okx|BTCUSDT',
+              'spot|bybit|BTCUSDT',
+              'spot|bitget|BTCUSDT',
+              'spot|gate|BTCUSDT',
+          ])
+          ticker_url=BASE+'/api/market-light/watchlist-tickers?'+urllib.parse.urlencode({'items':items})
+          project_url=BASE+'/api/market-light/project-ranked-page?offset=0&limit=50'
+
+          def one(url):
+              req=urllib.request.Request(url,headers={
+                  'Accept':'application/json',
+                  'Accept-Encoding':'gzip',
+                  'User-Agent':'Kaka-Step1060.4-CostEnvelope/1.0',
+              })
+              with urllib.request.urlopen(req,timeout=25) as r:
+                  wire=r.read()
+                  enc=(r.headers.get('Content-Encoding') or '').lower()
+                  status=r.status
+              body=gzip.decompress(wire) if enc=='gzip' else wire
+              data=json.loads(body)
+              return status, len(wire), len(body), enc, data
+
+          ticker=[]
+          for _ in range(20):
+              status,wire,raw,enc,d=one(ticker_url)
+              assert status==200 and d.get('ok') is True
+              assert d.get('user_read_upstream_requests')==0, d.get('user_read_upstream_requests')
+              assert d.get('reads_scale_with_users') is False
+              ticker.append(wire)
+
+          project=[]
+          for _ in range(10):
+              status,wire,raw,enc,d=one(project_url)
+              assert status==200 and d.get('ok') is True
+              assert d.get('user_read_upstream_requests')==0, d.get('user_read_upstream_requests')
+              project.append(wire)
+
+          def p95(xs):
+              xs=sorted(xs)
+              return xs[max(0,min(len(xs)-1,int((len(xs)-1)*0.95+0.999999)))]
+
+          out={
+              'ticker_wire_median':int(statistics.median(ticker)),
+              'ticker_wire_p95':p95(ticker),
+              'ticker_wire_max':max(ticker),
+              'project50_wire_median':int(statistics.median(project)),
+              'project50_wire_p95':p95(project),
+              'project50_wire_max':max(project),
+              'ticker_samples':len(ticker),
+              'project_samples':len(project),
+          }
+          assert out['ticker_wire_p95'] <= 16*1024, out
+          assert out['project50_wire_p95'] <= 512*1024, out
+          open('/tmp/user-wire.json','w').write(json.dumps(out))
+          print(json.dumps(out,indent=2))
+          PY
+
+      - name: Verify background write compression remains bounded
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 'https://kaka-contract-realtime-worker.onrender.com/health/egress/proxy' -o /tmp/proxy.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/proxy.json'))
+          assert p.get('ok') is True
+          assert p.get('version')=='step1060_3_render_supabase_egress_proxy_v2'
+          assert p.get('service_role_verification')=='postgres_rpc_service_role_only'
+          assert p.get('direct_uncompressed_fallback') is False
+          assert int(p.get('proxy_failures') or 0)==0, p
+          if int(p.get('proxied') or 0)>0:
+              ratio=float(p.get('compression_ratio') or 1)
+              assert ratio <= 0.15, ratio
+          print(json.dumps(p,indent=2))
+          PY
+
+      - name: Project 100 1000 10000 user monthly bandwidth and overage
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 'https://kaka-contract-realtime-worker.onrender.com/health/egress' -o /tmp/egress.json
+          python3 - <<'PY'
+          import json
+          w=json.load(open('/tmp/user-wire.json'))
+          e=json.load(open('/tmp/egress.json'))
+          ticker=int(w['ticker_wire_p95'])
+          page=int(w['project50_wire_p95'])
+          days=30
+          GB=1024**3
+          price_per_gb=0.15  # Render current additional outbound bandwidth rate, 2026-09-02.
+          included={'Hobby':5,'Pro':25}
+          scenarios={
+              'light': {'active_hours_per_day':0.5,'ticker_interval_seconds':30,'project_pages_per_day':5},
+              'normal':{'active_hours_per_day':2.0,'ticker_interval_seconds':15,'project_pages_per_day':10},
+              'heavy': {'active_hours_per_day':4.0,'ticker_interval_seconds':5,'project_pages_per_day':30},
+          }
+          report={
+              'wire_basis_bytes':{'ticker_p95':ticker,'project50_p95':page},
+              'pricing_reference':{'additional_usd_per_gb':price_per_gb,'included_gb':included},
+              'scenarios':{},
+          }
+          for name,s in scenarios.items():
+              polls=(s['active_hours_per_day']*3600)/s['ticker_interval_seconds']
+              per_user_month=ticker*polls*days + page*s['project_pages_per_day']*days
+              rows={}
+              for users in (100,1000,10000):
+                  gb=per_user_month*users/GB
+                  rows[str(users)]={
+                      'monthly_gb':round(gb,3),
+                      'hobby_overage_usd':round(max(0,gb-included['Hobby'])*price_per_gb,2),
+                      'pro_overage_usd':round(max(0,gb-included['Pro'])*price_per_gb,2),
+                  }
+              report['scenarios'][name]={**s,'users':rows}
+
+          uptime=max(1,int(e.get('uptime_seconds') or 1))
+          billed_observed=(int(e.get('http',{}).get('sent_response_bytes') or 0)
+                           +int(e.get('websocket',{}).get('downstream_payload_bytes') or 0)
+                           +int(e.get('outbound_requests',{}).get('known_request_body_bytes') or 0))
+          report['observed_process_rate_upper_bound']={
+              'uptime_seconds':uptime,
+              'known_billed_payload_bytes':billed_observed,
+              'monthly_gb_if_short_window_rate_persisted':round((billed_observed/uptime)*(30*86400)/GB,3),
+              'note':'startup-heavy process-lifetime upper bound; excludes TLS/HTTP2/WS framing and unknown request bodies',
+          }
+          normal1000=report['scenarios']['normal']['users']['1000']['monthly_gb']
+          assert normal1000 <= 100.0, report
+          open('/tmp/step1060_4_cost_report.json','w').write(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          print('PASS Step1060.4 100/1000/10000 real-wire cost envelope; normal 1000 users <=100GB/month')
+          PY
