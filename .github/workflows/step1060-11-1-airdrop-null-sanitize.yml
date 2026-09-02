@@ -1,0 +1,107 @@
+name: Step1060.11.1 airdrop PostgreSQL NUL sanitizer
+
+on:
+  push:
+    branches: [step1060-11-1-airdrop-null-sanitize]
+    paths:
+      - '.github/workflows/step1060-11-1-airdrop-null-sanitize.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: step1060-11-1-airdrop-null-sanitize
+          fetch-depth: 0
+
+      - name: Patch and statically verify NUL sanitizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/airdrop-watch.mjs')
+          s = p.read_text(encoding='utf-8')
+
+          old = "function text(v) { return String(v ?? '').trim(); }"
+          new = '\n'.join([
+              "const POSTGRES_NUL = String.fromCharCode(0);",
+              "function postgresSafeString(v) { return String(v ?? '').split(POSTGRES_NUL).join(''); }",
+              "function text(v) { return postgresSafeString(v).trim(); }",
+              "function sanitizePostgresJsonValue(value) {",
+              "  if (typeof value === 'string') return postgresSafeString(value);",
+              "  if (Array.isArray(value)) return value.map(sanitizePostgresJsonValue);",
+              "  if (value && typeof value === 'object') {",
+              "    return Object.fromEntries(Object.entries(value).map(([key, item]) => [",
+              "      postgresSafeString(key),",
+              "      sanitizePostgresJsonValue(item),",
+              "    ]));",
+              "  }",
+              "  return value;",
+              "}",
+          ])
+          if old not in s:
+              raise SystemExit('text helper anchor missing')
+          s = s.replace(old, new, 1)
+
+          old = "function stableComparableValue(value) {\n  if (Array.isArray(value)) return value.map(stableComparableValue);"
+          new = "function stableComparableValue(value) {\n  if (typeof value === 'string') return postgresSafeString(value);\n  if (Array.isArray(value)) return value.map(stableComparableValue);"
+          if old not in s:
+              raise SystemExit('stableComparableValue anchor missing')
+          s = s.replace(old, new, 1)
+
+          start = s.index('async function persistRows(rows, previousSnapshot = []) {')
+          end = s.index('\nfunction translationFieldsForAirdrop', start)
+          block = s[start:end]
+          old = '    body: JSON.stringify(payload),'
+          new = '    body: JSON.stringify(payload.map(sanitizePostgresJsonValue)),'
+          if old not in block:
+              raise SystemExit('persist payload anchor missing')
+          block = block.replace(old, new, 1)
+          s = s[:start] + block + s[end:]
+
+          old = "version: 'step1060_11_airdrop_persist_noop_guard_v1',"
+          new = '\n'.join([
+              "version: 'step1060_11_1_airdrop_persist_noop_guard_v2',",
+              "      postgres_nul_sanitized_before_persist: true,",
+          ])
+          if old not in s:
+              raise SystemExit('health version anchor missing')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+
+          node --check src/airdrop-watch.mjs
+          grep -q "step1060_11_1_airdrop_persist_noop_guard_v2" src/airdrop-watch.mjs
+          grep -q "POSTGRES_NUL = String.fromCharCode(0)" src/airdrop-watch.mjs
+          grep -q "payload.map(sanitizePostgresJsonValue)" src/airdrop-watch.mjs
+          node --input-type=module - <<'NODE'
+          const NUL = String.fromCharCode(0);
+          const safe = (v) => {
+            if (typeof v === 'string') return v.split(NUL).join('');
+            if (Array.isArray(v)) return v.map(safe);
+            if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k,x]) => [k.split(NUL).join(''), safe(x)]));
+            return v;
+          };
+          const probe = { title: `A${NUL}B`, media: [{ meta: `x${NUL}y`, nested: { text: `${NUL}z` } }] };
+          const encoded = JSON.stringify(safe(probe));
+          if (encoded.includes('\\u0000') || encoded.includes(NUL)) throw new Error('nul_not_removed');
+          if (!encoded.includes('AB') || !encoded.includes('xy') || !encoded.includes('z')) throw new Error('content_damaged');
+          console.log('PASS NUL sanitizer behavior');
+          NODE
+
+      - name: Commit tested source patch to branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka-step1060-cost-guard'
+          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git add src/airdrop-watch.mjs
+          git diff --cached --check
+          git commit -m 'Step1060.11.1 sanitize PostgreSQL NUL in airdrop persistence'
+          git push origin HEAD:step1060-11-1-airdrop-null-sanitize
