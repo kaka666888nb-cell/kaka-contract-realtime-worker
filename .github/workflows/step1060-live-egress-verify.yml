@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Wait for Render Step1060.1
+      - name: Wait for Render Step1060.2
         shell: bash
         run: |
           set -euo pipefail
@@ -28,13 +28,32 @@ jobs:
           for i in $(seq 1 40); do
             body="$(curl -fsS --max-time 12 "$BASE/health/ready" 2>/dev/null || true)"
             echo "poll=$i body=${body:0:300}"
-            if echo "$body" | grep -q '650.8.15.197.3.3.25.1' && echo "$body" | grep -q 'step1060_render_egress_cost_guard_v1'; then
+            if echo "$body" | grep -q '650.8.15.197.3.3.25.2' && echo "$body" | grep -q 'step1060_render_egress_cost_guard_v1'; then
               ok=1
               break
             fi
             sleep 15
           done
           test "$ok" = 1
+
+      - name: Verify Render platform health probe is compact
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --max-time 15 -A 'Render/1.0' -D /tmp/render-health-headers -o /tmp/render-health.json "$BASE/health"
+          python - <<'PY'
+          import json, os
+          p='/tmp/render-health.json'
+          b=json.load(open(p,'r',encoding='utf-8'))
+          assert b.get('ok') is True
+          assert b.get('ready') is True
+          assert b.get('version') == '650.8.15.197.3.3.25.2'
+          assert b.get('render_health_probe_compacted') is True
+          size=os.path.getsize(p)
+          assert size < 2048, size
+          print('PASS Render/1.0 /health compact bytes=', size)
+          PY
 
       - name: Observe live egress for 90 seconds
         shell: bash
@@ -47,8 +66,15 @@ jobs:
           import json
           b=json.load(open('/tmp/egress.json','r',encoding='utf-8'))
           assert b.get('ok') is True
-          assert b.get('version') == '650.8.15.197.3.3.25.1'
+          assert b.get('version') == '650.8.15.197.3.3.25.2'
           assert b.get('schema') == 'step1060_render_egress_cost_guard_v1'
+          assert b.get('render_health_probe_compacted') is True
+          probes=[x for x in b.get('http',{}).get('health_probe_clients',[]) if str(x.get('client','')).startswith('Render/1.0|')]
+          assert probes, 'Render health probe not observed'
+          for p in probes:
+            req=max(1,int(p.get('requests') or 0))
+            avg=float(p.get('sent_bytes') or 0)/req
+            assert avg < 2048, (p, avg)
           print(json.dumps({
             'version':b.get('version'),
             'uptime_seconds':b.get('uptime_seconds'),
@@ -58,12 +84,12 @@ jobs:
           },ensure_ascii=False))
           PY
 
-      - name: Verify gzip on full health JSON
+      - name: Verify gzip on full health JSON for normal clients
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          curl -fsS --max-time 20 -H 'Accept-Encoding: gzip' -D /tmp/headers -o /tmp/body.gz "$BASE/health"
+          curl -fsS --max-time 20 -A 'Kaka-Egress-Audit/1.0' -H 'Accept-Encoding: gzip' -D /tmp/headers -o /tmp/body.gz "$BASE/health"
           cat /tmp/headers
           grep -qi '^content-encoding: gzip' /tmp/headers
           python - <<'PY'
@@ -71,5 +97,6 @@ jobs:
           raw=gzip.open('/tmp/body.gz','rb').read()
           body=json.loads(raw)
           assert isinstance(body, dict)
+          assert len(raw) > 10000
           print('PASS full health gzip raw_json_bytes=', len(raw), 'gzip_bytes=', os.path.getsize('/tmp/body.gz'))
           PY
