@@ -58,7 +58,7 @@ jobs:
           p=b.get('probe') or {}
           assert p.get('ok') is True, p
           assert p.get('status') == 200, p
-          assert str(p.get('edge_version','')).startswith('step1060_3_render_egress_ingest_v3'), p
+          assert str(p.get('edge_version','')).startswith('step1060_3_render_egress_ingest_v4'), p
           raw=int(p.get('raw_bytes') or 0)
           zipped=int(p.get('compressed_bytes') or 0)
           assert raw > 60000 and 0 < zipped < raw * 0.10, p
