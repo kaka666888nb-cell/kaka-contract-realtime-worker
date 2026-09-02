@@ -4,74 +4,40 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/step1060_3_stock_retry_patch.py'
       - '.github/workflows/step1060-3-stock-retry-backoff-patch.yml'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  patch:
+  patch-stock-retry:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout main
+        uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
-      - name: Apply exact stock catalog restart backoff
+      - name: Apply exact patch
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('src/stock-catalog-v2.mjs')
-          s=p.read_text(encoding='utf-8')
-
-          old_const="const START_DELAY_MS = Math.max(15_000, Number(process.env.KAKA_STOCK_CATALOG_START_DELAY_MS || 75_000));\nconst FETCH_TIMEOUT_MS = Math.max(8_000, Number(process.env.KAKA_STOCK_CATALOG_FETCH_TIMEOUT_MS || 20_000));"
-          new_const="const START_DELAY_MS = Math.max(15_000, Number(process.env.KAKA_STOCK_CATALOG_START_DELAY_MS || 75_000));\n// Step1060.3: a transient provider failure must not make every Render deploy restage\n// the entire already-healthy stock catalog. Keep fast recovery only for genuinely\n// incomplete/integrity-broken committed catalogs; otherwise back off failed retries\n// across process restarts.\nconst FAILURE_RETRY_BACKOFF_MS = Math.max(\n  15 * 60_000,\n  Math.min(6 * 60 * 60_000, Number(process.env.KAKA_STOCK_CATALOG_FAILURE_RETRY_BACKOFF_MS || 60 * 60_000) || 60 * 60_000),\n);\nconst FETCH_TIMEOUT_MS = Math.max(8_000, Number(process.env.KAKA_STOCK_CATALOG_FETCH_TIMEOUT_MS || 20_000));"
-          assert s.count(old_const)==1, 'constant anchor mismatch'
-          s=s.replace(old_const,new_const,1)
-
-          old_start="""    const restoreIncomplete = restoredCoinbaseRows < COINBASE_COMPLETE_MIN_PRODUCTS || restoredGateRows < GATE_COMPLETE_MIN_ROWS || integrityRecoveryRequired || Boolean(lastRefreshError);
-    const age = Date.now() - (Date.parse(lastRefreshSucceededAt || '') || 0);
-    const delay = restoreIncomplete ? 15_000 : (age >= REFRESH_MS ? START_DELAY_MS : Math.max(START_DELAY_MS, REFRESH_MS - age));
-    const startupReason = integrityRecoveryRequired ? 'startup_catalog_integrity_recovery' : (Boolean(lastRefreshError) ? 'startup_previous_refresh_failure' : (restoreIncomplete ? 'startup_restore_fallback' : 'startup_or_due'));
-"""
-          new_start="""    const restoreIncomplete = restoredCoinbaseRows < COINBASE_COMPLETE_MIN_PRODUCTS || restoredGateRows < GATE_COMPLETE_MIN_ROWS || integrityRecoveryRequired;
-    const age = Date.now() - (Date.parse(lastRefreshSucceededAt || '') || 0);
-    const lastAttemptAtMs = Date.parse(lastRefreshStartedAt || '') || 0;
-    const lastAttemptAge = lastAttemptAtMs > 0 ? Date.now() - lastAttemptAtMs : Number.POSITIVE_INFINITY;
-    const failedRecently = Boolean(lastRefreshError) && !restoreIncomplete && lastAttemptAge >= 0 && lastAttemptAge < FAILURE_RETRY_BACKOFF_MS;
-    const delay = restoreIncomplete
-      ? 15_000
-      : (failedRecently
-          ? Math.max(START_DELAY_MS, FAILURE_RETRY_BACKOFF_MS - lastAttemptAge)
-          : (age >= REFRESH_MS ? START_DELAY_MS : Math.max(START_DELAY_MS, REFRESH_MS - age)));
-    const startupReason = integrityRecoveryRequired
-      ? 'startup_catalog_integrity_recovery'
-      : (restoreIncomplete
-          ? 'startup_restore_fallback'
-          : (failedRecently
-              ? 'startup_previous_refresh_failure_backoff'
-              : (Boolean(lastRefreshError) ? 'startup_previous_refresh_failure_due' : 'startup_or_due')));
-"""
-          assert s.count(old_start)==1, 'startup anchor mismatch'
-          s=s.replace(old_start,new_start,1)
-          p.write_text(s,encoding='utf-8')
-          PY
-
+          python3 .github/step1060_3_stock_retry_patch.py
           node --check src/stock-catalog-v2.mjs
-          grep -q "KAKA_STOCK_CATALOG_FAILURE_RETRY_BACKOFF_MS" src/stock-catalog-v2.mjs
-          grep -q "startup_previous_refresh_failure_backoff" src/stock-catalog-v2.mjs
+          grep -q 'KAKA_STOCK_CATALOG_FAILURE_RETRY_BACKOFF_MS' src/stock-catalog-v2.mjs
+          grep -q 'startup_previous_refresh_failure_backoff' src/stock-catalog-v2.mjs
           git diff --check
-          git diff -- src/stock-catalog-v2.mjs
 
-      - name: Commit exact patch
+      - name: Commit stock retry guard
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name 'kaka-step1060-cost-guard'
-          git config user.email 'kaka-step1060-cost-guard@users.noreply.github.com'
+          git config user.name 'Kaka Step1060 Bot'
+          git config user.email 'actions@users.noreply.github.com'
           git add src/stock-catalog-v2.mjs
           git commit -m 'Step1060.3 back off failed stock refresh across Render restarts'
-          git push origin HEAD:main
+          git push origin main
