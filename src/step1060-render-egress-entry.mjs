@@ -11,4 +11,9 @@ installRenderSupabaseEgressProxy();
 // Step1060.26: filter identical liquidation 1H persistence rows before they
 // reach the existing Supabase egress proxy. Real semantic changes still pass.
 installLiquidation1hNoopEgressGuard();
+// Step1060.31.7: public-device ticker fan-out reads only the already isolated
+// market-light shared snapshot. Active exact identities, not client count, bound
+// the localhost collector reads. The existing HTTP exact route remains the App
+// fallback and no client stream opens an exchange request or exchange connection.
+await import('./step1060-market-light-ticker-stream.mjs');
 await import('./step1042-bitget-long-kline-continuity-proxy.mjs');
