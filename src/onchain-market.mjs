@@ -7,6 +7,7 @@
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { KAKA_FULL_INTERVALS, KAKA_DERIVED_PLAN, klineIntervalMs, klineDerivedPlan, deriveAndFillKlines } from './kline-derived.mjs';
+import { restoreOnchainHotSnapshot, persistOnchainHotSnapshot, getOnchainHotPersistenceHealth } from './onchain-hot-persistence.mjs';
 
 const VERSION = '650.8.15.197.3.2';
 const DATA_VERSION = 1049002;
@@ -400,6 +401,11 @@ let discoveryStarted = false;
 let discoveryInflight = null;
 let trendingSnapshot = [];
 let discoveryUpdatedAt = 0;
+// Step1060.5.1: restart-safe shared hot snapshot. Restored rows retain the original
+// verified source timestamp; user reads never start an upstream or database request.
+let persistedHotSnapshotRestored = false;
+let persistedHotSnapshotRestoreAgeMs = null;
+let persistedHotSnapshotRestoreSource = '';
 let marketRefreshInflight = null;
 let marketUpdatedAt = 0;
 const marketNetworkUpdatedAt = new Map();
@@ -465,6 +471,10 @@ function responseBase(extra = {}) {
     app_direct_upstream_requests: 0,
     user_reads_direct_upstream_requests: 0,
     fixed_backend_upstream_rate_independent_of_user_count: true,
+    persisted_hot_snapshot_restored: persistedHotSnapshotRestored,
+    persisted_hot_snapshot_restore_age_ms: persistedHotSnapshotRestoreAgeMs,
+    persisted_hot_snapshot_restore_source: persistedHotSnapshotRestoreSource || null,
+    onchain_hot_persistence: getOnchainHotPersistenceHealth(),
     same_key_cache_singleflight: true,
     bounded_queue_fail_closed: true,
     cross_chain_substitution: false,
@@ -4314,6 +4324,13 @@ async function refreshDiscovery() {
       for (const network of new Set(rows.map((row) => row.network).filter(Boolean))) {
         marketNetworkUpdatedAt.set(network, discoveryUpdatedAt);
       }
+      // Persist only the slow 5-minute verified discovery snapshot. Do not persist the
+      // 30-second market-field refresh; this keeps database/Render cost fixed and bounded.
+      persistOnchainHotSnapshot({
+        rows: trendingSnapshot,
+        sourceTimeMs: discoveryUpdatedAt,
+        source: 'render_onchain_verified_discovery',
+      }).catch(() => {});
       stats.market_refresh_retained_networks_last = [];
       stats.market_refresh_retained_rows_last = 0;
       stats.background_cycles_succeeded += 1;
@@ -4328,9 +4345,36 @@ async function refreshDiscovery() {
   })();
   return discoveryInflight;
 }
+async function restorePersistedTrendingSnapshot() {
+  const baselineUpdatedAt = discoveryUpdatedAt;
+  const restored = await restoreOnchainHotSnapshot({
+    maxAgeMs: DISCOVERY_RETAIN_MS,
+    maxRows: STEP1042_INTERNAL_HOT_MAX_ROWS_PER_CHAIN * Object.keys(GECKO_NETWORK).length,
+  });
+  if (!restored?.rows?.length) return false;
+  // Never let an older persisted snapshot overwrite a fresh discovery that won the race.
+  if (discoveryUpdatedAt !== baselineUpdatedAt || trendingSnapshot.length) return false;
+  const sourceTimeMs = Number(restored.source_time_ms) || 0;
+  if (!sourceTimeMs) return false;
+  trendingSnapshot = restored.rows;
+  discoveryUpdatedAt = sourceTimeMs;
+  marketUpdatedAt = sourceTimeMs;
+  marketNetworkUpdatedAt.clear();
+  for (const network of new Set(trendingSnapshot.map((row) => row?.network).filter(Boolean))) {
+    marketNetworkUpdatedAt.set(network, sourceTimeMs);
+  }
+  persistedHotSnapshotRestored = true;
+  persistedHotSnapshotRestoreAgeMs = Math.max(0, Date.now() - sourceTimeMs);
+  persistedHotSnapshotRestoreSource = restored.source || 'supabase_backend_snapshot';
+  return true;
+}
+
 export function startOnchainMarketCollector() {
   if (discoveryStarted) return;
   discoveryStarted = true;
+  // Restore previous exact verified rows immediately. This is one fixed backend read on
+  // process startup, never a user-triggered DB/upstream request. Fresh discovery still runs.
+  restorePersistedTrendingSnapshot().catch(() => {});
   const first = setTimeout(() => refreshDiscovery().catch(() => {}), 2_500);
   first.unref?.();
   const timer = setInterval(() => refreshDiscovery().catch(() => {}), DISCOVERY_REFRESH_MS);
