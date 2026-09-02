@@ -1,0 +1,83 @@
+name: Step1060.5.1 onchain restart restore live verify
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1060-5-1-onchain-restart-restore-live-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for new Render instance to restore persisted hot rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          # Workflow-only commit triggers the real Render auto-deploy/restart. Poll until
+          # the new process exposes the explicit restore marker; fresh discovery is not
+          # accepted as a substitute for this proof.
+          sleep 45
+          ok=0
+          for i in $(seq 1 28); do
+            body="$(curl -sS --max-time 20 "$BASE/api/onchain/trending?limit=50" 2>/dev/null || true)"
+            ready="$(curl -sS --max-time 15 "$BASE/health/ready" 2>/dev/null || true)"
+            echo "poll=$i ready=${ready:0:260}"
+            echo "trending=${body:0:1000}"
+            if echo "$body" | python3 -c "import json,sys; b=json.load(sys.stdin); p=b.get('onchain_hot_persistence') or {}; assert b.get('ok') is True; assert b.get('persisted_hot_snapshot_restored') is True; assert int(p.get('restore_successes') or 0)>=1; assert int(b.get('user_read_upstream_requests') or 0)==0; assert len(b.get('rows') or [])>0" 2>/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 10
+          done
+          test "$ok" = 1
+
+      - name: Pressure restored onchain surface before relying on user-triggered work
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures, json, urllib.request, urllib.error
+          url='https://kaka-contract-realtime-worker.onrender.com/api/onchain/trending?limit=50'
+          def one(i):
+            req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'Kaka-Step1060.5.1-Restore/1.0'})
+            try:
+              with urllib.request.urlopen(req,timeout=20) as r:
+                b=json.loads(r.read())
+                return r.status,b
+            except urllib.error.HTTPError as e:
+              try: b=json.loads(e.read())
+              except Exception: b={'error':'non_json'}
+              return e.code,b
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            rows=list(ex.map(one,range(50)))
+          bad=[x for x in rows if x[0]!=200 or x[1].get('ok') is not True]
+          assert not bad,bad[:5]
+          for status,b in rows:
+            assert int(b.get('user_read_upstream_requests') or 0)==0,b
+            assert b.get('fixed_backend_upstream_rate_independent_of_user_count') is True,b
+            assert b.get('cross_chain_substitution') is False,b
+            assert b.get('cross_token_substitution') is False,b
+            assert b.get('persisted_hot_snapshot_restored') is True,b
+          print('PASS 50/50 onchain reads after real restart; restored snapshot served with zero user upstream amplification')
+          PY
+
+      - name: Verify onchain snapshot write remains inside gzip proxy protection
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 'https://kaka-contract-realtime-worker.onrender.com/health/egress/proxy' -o /tmp/proxy.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/proxy.json'))
+          assert p.get('ok') is True,p
+          assert 'app_onchain_shared_snapshots' in (p.get('allowed_tables') or []),p
+          assert p.get('direct_uncompressed_fallback') is False,p
+          assert int(p.get('proxy_failures') or 0)==0,p
+          print('PASS onchain snapshot table covered by fail-closed gzip egress proxy')
+          PY
