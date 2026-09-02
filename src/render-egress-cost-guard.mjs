@@ -2,7 +2,7 @@ import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.197.3.3.25.1';
+const VERSION = '650.8.15.197.3.3.25.2';
 const SCHEMA = 'step1060_render_egress_cost_guard_v1';
 const STARTED_AT = Date.now();
 const MAX_ROUTES = 192;
@@ -122,6 +122,7 @@ export function egressHealth() {
     started_at: new Date(STARTED_AT).toISOString(),
     uptime_seconds: Math.floor((Date.now() - STARTED_AT) / 1000),
     accounting_scope: 'process_lifetime_payload_estimate_excludes_tls_http2_and_ws_frame_overhead',
+    render_health_probe_compacted: true,
     http: {
       requests: httpRequests,
       raw_response_bytes: httpRawBytes,
@@ -152,6 +153,24 @@ function sendCompactJson(res, status, body) {
   res.setHeader('content-type', 'application/json; charset=utf-8');
   res.setHeader('cache-control', 'no-store');
   res.end(text);
+}
+
+function compactReadyPayload() {
+  return {
+    ok: true,
+    ready: true,
+    service: 'kaka-contract-realtime-worker',
+    version: VERSION,
+    schema: SCHEMA,
+    uptime_seconds: Math.floor(process.uptime()),
+    render_health_probe_compacted: true,
+  };
+}
+
+function isRenderPlatformHealthProbe(req, route) {
+  if (route !== '/health') return false;
+  const ua = String(req?.headers?.['user-agent'] || '').trim();
+  return /^Render\/1\.0(?:\s|$)/i.test(ua);
 }
 
 function installFetchMeter() {
@@ -309,15 +328,18 @@ function installHttpMeterAndCompression() {
     const wrappedListener = async (req, res) => {
       installResponseMeter(req, res);
       const route = safePath(req.url);
+
+      // Render's platform health probe does not advertise gzip. The historical
+      // /health payload is hundreds of KB and the platform probes every few
+      // seconds, which alone can create hundreds of GB/month of billed egress.
+      // Keep full /health for humans/audits, but answer the identifiable Render
+      // platform probe with the same compact readiness contract.
+      if (isRenderPlatformHealthProbe(req, route)) {
+        sendCompactJson(res, 200, compactReadyPayload());
+        return;
+      }
       if (route === '/health/ready') {
-        sendCompactJson(res, 200, {
-          ok: true,
-          ready: true,
-          service: 'kaka-contract-realtime-worker',
-          version: VERSION,
-          schema: SCHEMA,
-          uptime_seconds: Math.floor(process.uptime()),
-        });
+        sendCompactJson(res, 200, compactReadyPayload());
         return;
       }
       if (route === '/health/egress') {
@@ -325,14 +347,7 @@ function installHttpMeterAndCompression() {
         return;
       }
       if (route === '/health' && new URL(req.url || '/', 'http://127.0.0.1').searchParams.get('compact') === '1') {
-        sendCompactJson(res, 200, {
-          ok: true,
-          ready: true,
-          service: 'kaka-contract-realtime-worker',
-          version: VERSION,
-          schema: SCHEMA,
-          uptime_seconds: Math.floor(process.uptime()),
-        });
+        sendCompactJson(res, 200, compactReadyPayload());
         return;
       }
       return await listener(req, res);
