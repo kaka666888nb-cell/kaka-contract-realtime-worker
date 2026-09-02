@@ -2,7 +2,7 @@ import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.197.3.3.25';
+const VERSION = '650.8.15.197.3.3.25.1';
 const SCHEMA = 'step1060_render_egress_cost_guard_v1';
 const STARTED_AT = Date.now();
 const MAX_ROUTES = 192;
@@ -12,6 +12,7 @@ const GZIP_MIN_BYTES = 512;
 const httpRoutes = new Map();
 const outboundHosts = new Map();
 const outboundPaths = new Map();
+const healthClients = new Map();
 let httpRequests = 0;
 let httpRawBytes = 0;
 let httpSentBytes = 0;
@@ -65,7 +66,7 @@ function boundedRow(map, key, factory, max) {
   return row;
 }
 
-function recordHttp(path, status, rawBytes, sentBytes, gzip) {
+function recordHttp(path, status, rawBytes, sentBytes, gzip, clientKey = '') {
   const route = safePath(path);
   const raw = Math.max(0, Number(rawBytes) || 0);
   const sent = Math.max(0, Number(sentBytes) || 0);
@@ -90,6 +91,20 @@ function recordHttp(path, status, rawBytes, sentBytes, gzip) {
   if (status >= 500) row.status_5xx += 1;
   else if (status >= 400) row.status_4xx += 1;
   else if (status >= 200) row.status_2xx += 1;
+
+  if (route === '/health' && clientKey) {
+    const client = boundedRow(healthClients, clientKey, () => ({
+      client: clientKey,
+      requests: 0,
+      raw_bytes: 0,
+      sent_bytes: 0,
+      gzip_responses: 0,
+    }), 32);
+    client.requests += 1;
+    client.raw_bytes += raw;
+    client.sent_bytes += sent;
+    if (gzip) client.gzip_responses += 1;
+  }
 }
 
 function topBy(map, field, limit) {
@@ -115,6 +130,7 @@ export function egressHealth() {
       gzip_saved_bytes: Math.max(0, httpRawBytes - httpSentBytes),
       compression_ratio: httpRawBytes > 0 ? Number((httpSentBytes / httpRawBytes).toFixed(4)) : null,
       top_routes_by_sent_bytes: topBy(httpRoutes, 'sent_bytes', 32),
+      health_probe_clients: topBy(healthClients, 'sent_bytes', 32),
     },
     websocket: {
       downstream_messages: wsMessages,
@@ -212,6 +228,8 @@ function acceptsGzip(req) {
 function installResponseMeter(req, res) {
   const routePath = safePath(req.url);
   const gzipAccepted = acceptsGzip(req) && String(req.method || 'GET').toUpperCase() !== 'HEAD';
+  const userAgent = String(req.headers?.['user-agent'] || 'unknown').replace(/\s+/g, ' ').slice(0, 120);
+  const clientKey = `${userAgent}|ae=${gzipAccepted ? 'gzip' : 'none'}`;
   const originalWriteHead = res.writeHead.bind(res);
   const originalEnd = res.end.bind(res);
   const originalWrite = res.write.bind(res);
@@ -276,7 +294,7 @@ function installResponseMeter(req, res) {
       }
     }
     if (!res.headersSent && streamedBytes === 0 && sent.length > 0) res.setHeader('content-length', String(sent.length));
-    recordHttp(routePath, statusCode, streamedBytes + raw.length, streamedBytes + sent.length, usedGzip);
+    recordHttp(routePath, statusCode, streamedBytes + raw.length, streamedBytes + sent.length, usedGzip, clientKey);
     res.__kakaEndGzipDecision = usedGzip ? 'gzip' : 'identity';
     const finalCallback = typeof encoding === 'function' ? encoding : callback;
     return originalEnd(sent, undefined, finalCallback);
