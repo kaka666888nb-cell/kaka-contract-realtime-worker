@@ -18,6 +18,7 @@ const CONTENT_RETRY_MS = 6 * 60 * 60_000;
 const PUBLIC_CACHE_LIMIT = 600;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
 const DB_RELOAD_MS = 5 * 60_000;
+const PERSIST_HEARTBEAT_MS = Math.max(60 * 60_000, Number(process.env.KAKA_AIRDROP_PERSIST_HEARTBEAT_MS || 6 * 60 * 60_000) || 6 * 60 * 60_000);
 const HTML_MAX_BYTES = 3 * 1024 * 1024;
 const TRANSLATION_TICK_MS = 60_000;
 const TRANSLATION_ROWS_PER_TICK = 5;
@@ -149,6 +150,11 @@ const state = {
   persistedRows: 0,
   persistSuccesses: 0,
   persistFailures: 0,
+  persistRowsConsidered: 0,
+  persistRowsWritten: 0,
+  persistRowsNoopSkipped: 0,
+  persistHeartbeatRows: 0,
+  persistNoopBatches: 0,
   translationRuns: 0,
   translationRowsTranslated: 0,
   translationTitleRowsTranslated: 0,
@@ -642,6 +648,7 @@ function mergePublicSnapshot(rows) {
     byKey.set(key, {
       ...previous,
       ...row,
+      last_seen_at: row.last_seen_at || previous.last_seen_at || null,
       content_text: incomingHasContent ? row.content_text : (previous.content_text || null),
       content_fetched_at: incomingHasContent ? row.content_fetched_at : (previous.content_fetched_at || null),
       content_available: incomingHasContent || contentUsableForProvider(row.provider, previous.content_text),
@@ -1062,11 +1069,51 @@ function detailRow(url) {
   return row ? publicEventView(row) : null;
 }
 
-async function persistRows(rows) {
+function stableComparableValue(value) {
+  if (Array.isArray(value)) return value.map(stableComparableValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableComparableValue(value[key])]));
+  }
+  return value;
+}
+function comparableTime(value) {
+  const ms = Date.parse(text(value));
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+function airdropPersistSignature(row) {
+  const provider = text(row?.provider).toLowerCase();
+  const title = normalizeWhitespace(row?.title);
+  return JSON.stringify(stableComparableValue({
+    provider,
+    provider_name: text(row?.provider_name),
+    category: categoryFor(provider, title),
+    source_event_id: text(row?.source_event_id),
+    title,
+    project_symbol: text(row?.project_symbol) || null,
+    reward_text: text(row?.reward_text) || null,
+    eligibility_text: text(row?.eligibility_text) || null,
+    start_at: comparableTime(row?.start_at),
+    end_at: comparableTime(row?.end_at),
+    published_at: comparableTime(row?.published_at),
+    source_url: canonicalUrl(row?.source_url),
+    status: statusFor(row?.start_at, row?.end_at),
+    raw_summary: normalizeWhitespace(row?.raw_summary) || null,
+    content_text: normalizeContentText(row?.content_text) || null,
+    media_items: normalizeContentMediaItems(row?.media_items),
+  }));
+}
+
+async function persistRows(rows, previousSnapshot = []) {
   if (!rows.length || !state.supabaseConfigured) return [];
-  const priorByKey = new Map(publicSnapshot.map((item) => [item.source_event_id, item]));
-  const payload = rows.map((rawRow) => {
-    const previous = priorByKey.get(rawRow?.source_event_id) || {};
+  const priorByKey = new Map((Array.isArray(previousSnapshot) ? previousSnapshot : []).map((item) => [`${text(item?.provider).toLowerCase()}|${text(item?.source_event_id)}`, item]));
+  const nowMs = Date.now();
+  const payload = [];
+  let noopSkipped = 0;
+  let heartbeatRows = 0;
+  state.persistRowsConsidered += rows.length;
+  for (const rawRow of rows) {
+    const key = `${text(rawRow?.provider).toLowerCase()}|${text(rawRow?.source_event_id)}`;
+    const previous = priorByKey.get(key) || {};
     const row = contentUsableForProvider(rawRow?.provider, rawRow?.content_text)
       ? rawRow
       : {
@@ -1074,41 +1121,57 @@ async function persistRows(rows) {
           content_text: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_text : null,
           content_fetched_at: contentUsableForProvider(rawRow?.provider, previous?.content_text) ? previous.content_fetched_at : null,
         };
-    return ({
-    provider: row.provider,
-    provider_name: row.provider_name,
-    category: row.category,
-    source_event_id: row.source_event_id,
-    title: row.title,
-    project_symbol: row.project_symbol,
-    reward_text: row.reward_text,
-    eligibility_text: row.eligibility_text,
-    start_at: row.start_at,
-    end_at: row.end_at,
-    published_at: row.published_at,
-    source_url: row.source_url,
-    source_domain: row.source_domain,
-    status: statusFor(row.start_at, row.end_at),
-    raw_summary: row.raw_summary,
-    content_text: contentUsableForProvider(row.provider, row.content_text) ? normalizeContentText(row.content_text).slice(0, CONTENT_TEXT_MAX_CHARS) : null,
-    content_fetched_at: contentUsableForProvider(row.provider, row.content_text) ? (row.content_fetched_at || nowIso()) : null,
-    media_items: normalizeContentMediaItems(row.media_items),
-    fetched_at: nowIso(),
-    is_active: true,
-    lifecycle_status: 'active',
-    last_seen_at: nowIso(),
-    removed_at: null,
-    expired_at: null,
-    lifecycle_reason: '',
-    updated_at: nowIso(),
-  });
-  });
+    const previousActive = previous?.is_active !== false && (text(previous?.lifecycle_status).toLowerCase() || 'active') === 'active';
+    const unchanged = previousActive && airdropPersistSignature(previous) === airdropPersistSignature(row);
+    const lastSeenMs = Date.parse(text(previous?.last_seen_at));
+    const heartbeatDue = !Number.isFinite(lastSeenMs) || nowMs - lastSeenMs >= PERSIST_HEARTBEAT_MS;
+    if (unchanged && !heartbeatDue) {
+      noopSkipped += 1;
+      continue;
+    }
+    if (unchanged && heartbeatDue) heartbeatRows += 1;
+    payload.push({
+      provider: row.provider,
+      provider_name: row.provider_name,
+      category: row.category,
+      source_event_id: row.source_event_id,
+      title: row.title,
+      project_symbol: row.project_symbol,
+      reward_text: row.reward_text,
+      eligibility_text: row.eligibility_text,
+      start_at: row.start_at,
+      end_at: row.end_at,
+      published_at: row.published_at,
+      source_url: row.source_url,
+      source_domain: row.source_domain,
+      status: statusFor(row.start_at, row.end_at),
+      raw_summary: row.raw_summary,
+      content_text: contentUsableForProvider(row.provider, row.content_text) ? normalizeContentText(row.content_text).slice(0, CONTENT_TEXT_MAX_CHARS) : null,
+      content_fetched_at: contentUsableForProvider(row.provider, row.content_text) ? (row.content_fetched_at || nowIso()) : null,
+      media_items: normalizeContentMediaItems(row.media_items),
+      fetched_at: nowIso(),
+      is_active: true,
+      lifecycle_status: 'active',
+      last_seen_at: nowIso(),
+      removed_at: null,
+      expired_at: null,
+      lifecycle_reason: '',
+      updated_at: nowIso(),
+    });
+  }
+  state.persistRowsNoopSkipped += noopSkipped;
+  state.persistHeartbeatRows += heartbeatRows;
+  if (!payload.length) {
+    state.persistNoopBatches += 1;
+    return [];
+  }
   const result = await supabaseFetch(`${EVENTS_TABLE}?on_conflict=provider,source_event_id&select=id,provider,provider_name,category,source_event_id,title,project_symbol,reward_text,eligibility_text,start_at,end_at,published_at,source_url,status,raw_summary,content_text,content_fetched_at,media_items,translations,translation_source_hash,translation_updated_at,fetched_at,is_active,lifecycle_status,last_seen_at,removed_at`, {
     method: 'POST',
     headers: { prefer: 'resolution=merge-duplicates,return=representation' },
     body: JSON.stringify(payload),
   });
   state.persistedRows += payload.length;
+  state.persistRowsWritten += payload.length;
   state.persistSuccesses++;
   state.lastPersistAt = nowIso();
   return Array.isArray(result) ? result : payload;
@@ -1327,10 +1390,11 @@ async function refreshOnce({ force = false } = {}) {
         await sleep(250);
       }
       if (rows.length) {
+        const previousSnapshot = publicSnapshot.slice();
         mergePublicSnapshot(rows);
         if (state.supabaseConfigured) {
           try {
-            const persisted = await persistRows(rows);
+            const persisted = await persistRows(rows, previousSnapshot);
             if (persisted.length) mergePublicSnapshot(persisted);
             let reconciled = false;
             for (const group of reconcileGroups) {
@@ -1420,6 +1484,18 @@ function publicHealth() {
     persisted_rows: state.persistedRows,
     persist_successes: state.persistSuccesses,
     persist_failures: state.persistFailures,
+    persistence_cost_guard: {
+      version: 'step1060_11_airdrop_persist_noop_guard_v1',
+      unchanged_active_rows_write_skipped: true,
+      removed_rows_can_reactivate: true,
+      status_or_content_changes_write_immediately: true,
+      heartbeat_hours: PERSIST_HEARTBEAT_MS / 3_600_000,
+      rows_considered: state.persistRowsConsidered,
+      rows_written: state.persistRowsWritten,
+      rows_noop_skipped: state.persistRowsNoopSkipped,
+      heartbeat_rows_written: state.persistHeartbeatRows,
+      noop_batches: state.persistNoopBatches,
+    },
     public_reads: state.publicReads,
     public_snapshot_loaded: state.publicSnapshotLoaded,
     public_snapshot_rows: state.publicSnapshotRows,
