@@ -7,6 +7,12 @@ const HEALTH_ROUTE = '/api/project-fundamentals/health';
 const TABLE = 'kaka_project_fundamentals';
 const REFRESH_MS = Math.max(30 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_REFRESH_MS || 60 * 60_000));
 const RESTORE_MAX_AGE_MS = Math.max(24 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_RESTORE_MAX_AGE_MS || 7 * 24 * 60 * 60_000));
+// Step1060.9: source refresh remains hourly, while unchanged persisted rows only need a bounded
+// heartbeat for restart recovery. App reads keep using the freshly rebuilt in-memory catalog.
+const PERSIST_HEARTBEAT_MS = Math.max(
+  60 * 60_000,
+  Math.min(24 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_PERSIST_HEARTBEAT_MS || 6 * 60 * 60_000)),
+);
 const REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_REQUEST_TIMEOUT_MS || 25_000));
 const IDENTITY_REFRESH_MS = Math.max(6 * 60 * 60_000, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_IDENTITY_REFRESH_MS || 24 * 60 * 60_000));
 const IDENTITY_SUMMARY_LIMIT = Math.max(20, Math.min(120, Number(process.env.KAKA_PROJECT_FUNDAMENTALS_IDENTITY_SUMMARY_LIMIT || 80)));
@@ -42,6 +48,12 @@ let refreshFailures = 0;
 let persistAttempts = 0;
 let persistSuccesses = 0;
 let persistFailures = 0;
+let persistRowsConsidered = 0;
+let persistRowsWritten = 0;
+let persistRowsNoopSkipped = 0;
+let persistHeartbeatRows = 0;
+let persistRemovedRows = 0;
+let lastFullPersistAt = '';
 let totalReads = 0;
 let availableReads = 0;
 let unavailableReads = 0;
@@ -251,27 +263,86 @@ function buildCatalog(protocolsPayload, feesPayload, revenuePayload, fetchedAt, 
   }
   return { next, ambiguous, feesMatched, revenueMatched };
 }
-async function persistCatalog(rows, fetchedAt) {
-  if (!SUPABASE_CONFIGURED || !rows.length) return false;
-  persistAttempts += 1;
-  try {
-    const response = await supabaseFetch(`${TABLE}?on_conflict=coin_id`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        prefer: 'resolution=merge-duplicates,return=minimal',
-      },
-      body: JSON.stringify(rows),
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`persist_http_${response.status}:${text.slice(0, 160)}`);
-    }
-    const cleanup = await supabaseFetch(`${TABLE}?source_fetched_at=lt.${encodeURIComponent(fetchedAt)}`, {
+function persistenceComparable(row) {
+  return JSON.stringify({
+    coin_id: lower(row?.coin_id),
+    symbol: compact(row?.symbol).toUpperCase(),
+    protocol_id: compact(row?.protocol_id),
+    protocol_slug: compact(row?.protocol_slug),
+    protocol_name: compact(row?.protocol_name),
+    category: compact(row?.category),
+    chains: Array.isArray(row?.chains) ? row.chains.map(compact).filter(Boolean) : [],
+    tvl_usd: finiteOrNull(row?.tvl_usd),
+    fees_24h_usd: finiteOrNull(row?.fees_24h_usd),
+    fees_7d_usd: finiteOrNull(row?.fees_7d_usd),
+    fees_30d_usd: finiteOrNull(row?.fees_30d_usd),
+    revenue_24h_usd: finiteOrNull(row?.revenue_24h_usd),
+    revenue_7d_usd: finiteOrNull(row?.revenue_7d_usd),
+    revenue_30d_usd: finiteOrNull(row?.revenue_30d_usd),
+    revenue_to_fees_24h_pct: finiteOrNull(row?.revenue_to_fees_24h_pct),
+    match_method: compact(row?.match_method),
+    match_verified: row?.match_verified === true,
+    source_name: compact(row?.source_name),
+    source_protocols_endpoint: compact(row?.source_protocols_endpoint),
+    source_fees_endpoint: compact(row?.source_fees_endpoint),
+    source_revenue_endpoint: compact(row?.source_revenue_endpoint),
+  });
+}
+
+async function deleteRemovedPersisted(removedIds) {
+  if (!removedIds.length) return 0;
+  let removed = 0;
+  for (let index = 0; index < removedIds.length; index += 100) {
+    const batch = removedIds.slice(index, index + 100).map((id) => encodeURIComponent(id));
+    const response = await supabaseFetch(`${TABLE}?coin_id=in.(${batch.join(',')})`, {
       method: 'DELETE',
       headers: { prefer: 'return=minimal' },
     });
-    if (!cleanup.ok) throw new Error(`cleanup_http_${cleanup.status}`);
+    if (!response.ok) throw new Error(`cleanup_removed_http_${response.status}`);
+    removed += batch.length;
+  }
+  return removed;
+}
+
+async function persistCatalog(nextCatalog, fetchedAt) {
+  if (!SUPABASE_CONFIGURED || !(nextCatalog instanceof Map) || !nextCatalog.size) return false;
+  const previous = catalog;
+  const nextRows = [...nextCatalog.values()];
+  persistRowsConsidered += nextRows.length;
+  const lastFullMs = Date.parse(lastFullPersistAt || '');
+  const heartbeatDue = !Number.isFinite(lastFullMs) || Date.now() - lastFullMs >= PERSIST_HEARTBEAT_MS;
+  const changedRows = heartbeatDue ? nextRows : nextRows.filter((row) => {
+    const key = lower(row?.coin_id);
+    const old = previous.get(key);
+    return !old || persistenceComparable(old) !== persistenceComparable(row);
+  });
+  const removedIds = [...previous.keys()].filter((key) => !nextCatalog.has(key));
+  persistRowsNoopSkipped += Math.max(0, nextRows.length - changedRows.length);
+
+  if (!changedRows.length && !removedIds.length) return true;
+  persistAttempts += 1;
+  try {
+    if (changedRows.length) {
+      const response = await supabaseFetch(`${TABLE}?on_conflict=coin_id`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          prefer: 'resolution=merge-duplicates,return=minimal',
+        },
+        body: JSON.stringify(changedRows),
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`persist_http_${response.status}:${text.slice(0, 160)}`);
+      }
+      persistRowsWritten += changedRows.length;
+      if (heartbeatDue) {
+        persistHeartbeatRows += changedRows.length;
+        lastFullPersistAt = fetchedAt;
+      }
+    }
+    const removed = await deleteRemovedPersisted(removedIds);
+    persistRemovedRows += removed;
     persistSuccesses += 1;
     lastPersistedAt = new Date().toISOString();
     return true;
@@ -280,6 +351,7 @@ async function persistCatalog(rows, fetchedAt) {
     throw error;
   }
 }
+
 async function restorePersisted() {
   if (!SUPABASE_CONFIGURED) return false;
   try {
@@ -306,6 +378,7 @@ async function restorePersisted() {
       for (const [key, row] of restored.entries()) catalog.set(key, row);
       restoreRows = restored.size;
       lastSourceFetchedAt = compact([...restored.values()][0]?.source_fetched_at);
+      lastFullPersistAt = lastSourceFetchedAt;
     }
     lastRestoreAt = new Date().toISOString();
     lastRestoreError = '';
@@ -374,7 +447,7 @@ async function refreshCatalog() {
         }
       }
       if (built.next.size < 20) throw new Error(`exact_match_catalog_too_small_${built.next.size}`);
-      await persistCatalog([...built.next.values()], fetchedAt);
+      await persistCatalog(built.next, fetchedAt);
       catalog.clear();
       for (const [key, row] of built.next.entries()) catalog.set(key, row);
       exactUniqueMatches = built.next.size;
@@ -459,6 +532,19 @@ export function getProjectFundamentalsHealth() {
     persist_attempts: persistAttempts,
     persist_successes: persistSuccesses,
     persist_failures: persistFailures,
+    persistence_cost_guard: {
+      version: 'step1060_9_project_fundamentals_persist_cost_guard_v1',
+      source_refresh_interval_minutes: REFRESH_MS / 60_000,
+      unchanged_rows_write_skipped: true,
+      exact_removed_coin_id_cleanup: true,
+      full_persist_heartbeat_hours: PERSIST_HEARTBEAT_MS / 3_600_000,
+      rows_considered: persistRowsConsidered,
+      rows_written: persistRowsWritten,
+      rows_noop_skipped: persistRowsNoopSkipped,
+      heartbeat_rows_written: persistHeartbeatRows,
+      removed_rows: persistRemovedRows,
+      last_full_persist_at: lastFullPersistAt || null,
+    },
     user_reads: totalReads,
     user_reads_available: availableReads,
     user_reads_unavailable: unavailableReads,
