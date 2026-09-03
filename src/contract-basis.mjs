@@ -7,7 +7,7 @@
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 import { getBinanceDeliveryContractsSnapshot } from './binance-contract-market.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.32.5-basis-delivery-binance-ws';
+const STEP_VERSION = '650.8.15.197.3.3.32.6-basis-partial-provider-isolation';
 const CURRENT_ROUTE = '/api/contract-basis/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-basis/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -29,6 +29,10 @@ const DELIVERY_FETCH_TIMEOUT_MS = Math.max(
 const DELIVERY_MAX_PROVIDER_PAGES = 4;
 const MIN_ANNUALIZE_REMAINING_MS = 60 * 60_000;
 const YEAR_MS = 365 * 24 * 60 * 60_000;
+const MIN_READY_PROVIDERS = Math.max(1, Math.min(
+  PROVIDERS.length,
+  Number(process.env.KAKA_CONTRACT_BASIS_MIN_READY_PROVIDERS || 4),
+));
 
 let started = false;
 let running = false;
@@ -806,6 +810,88 @@ async function maybeRefreshDeliverySnapshot(inputByProvider, { reason = 'schedul
   return await refreshDeliverySnapshot(inputByProvider, { reason, nowMs: Date.now() });
 }
 
+function mergePartialProviderSnapshot(snapshot, previous, nowMs = Date.now()) {
+  const healthyProviders = PROVIDERS.filter((provider) => snapshot?.provider_coverage?.[provider]?.input_ready === true);
+  const unavailableProviders = PROVIDERS.filter((provider) => !healthyProviders.includes(provider));
+  const providerReadyCount = healthyProviders.length;
+  const partialReady = providerReadyCount >= MIN_READY_PROVIDERS;
+  if (!partialReady) {
+    return {
+      ...snapshot,
+      ready: false,
+      partial_input_ready: false,
+      minimum_ready_providers: MIN_READY_PROVIDERS,
+      provider_ready_count: providerReadyCount,
+      healthy_providers: healthyProviders,
+      unavailable_providers: unavailableProviders,
+      preserve_unavailable_cache: true,
+      preserved_unavailable_provider_rows: 0,
+    };
+  }
+
+  const rows = Array.isArray(snapshot?.rows) ? snapshot.rows.map((row) => ({ ...row })) : [];
+  const seen = new Set(rows.map((row) => `${String(row?.provider || '').toLowerCase()}|${String(row?.symbol || '').toUpperCase()}`));
+  let preservedRows = 0;
+  if (previous && unavailableProviders.length) {
+    for (const row of Array.isArray(previous?.rows) ? previous.rows : []) {
+      const provider = String(row?.provider || '').toLowerCase();
+      if (!unavailableProviders.includes(provider)) continue;
+      const sourceMs = Math.max(timeMs(row?.contract_source_time), timeMs(row?.spot_source_time), timeMs(row?.source_time));
+      if (!(sourceMs > 0) || nowMs - sourceMs > BASIS_SIDE_FRESH_MS) continue;
+      const key = `${provider}|${String(row?.symbol || '').toUpperCase()}`;
+      if (seen.has(key)) continue;
+      rows.push({ ...row, stale_preserved_provider: true });
+      seen.add(key);
+      preservedRows += 1;
+    }
+  }
+
+  rows.sort((a, b) => {
+    if (a.provider !== b.provider) return String(a.provider).localeCompare(String(b.provider));
+    return String(a.symbol).localeCompare(String(b.symbol));
+  });
+  const markIndexRowCount = rows.filter((row) => finite(row?.mark_index_basis_percent) != null).length;
+  const perpetualSpotRowCount = rows.filter((row) => finite(row?.perpetual_spot_basis_percent) != null).length;
+  const basesByProvider = new Map();
+  for (const row of rows) {
+    if (finite(row?.perpetual_spot_basis_percent) == null) continue;
+    const base = compact(row?.base_asset);
+    const provider = String(row?.provider || '').toLowerCase();
+    if (!base || !provider) continue;
+    if (!basesByProvider.has(base)) basesByProvider.set(base, new Set());
+    basesByProvider.get(base).add(provider);
+  }
+
+  const providerCoverage = { ...(snapshot?.provider_coverage || {}) };
+  for (const provider of unavailableProviders) {
+    const preserved = rows.filter((row) => String(row?.provider || '').toLowerCase() === provider && row?.stale_preserved_provider === true).length;
+    providerCoverage[provider] = {
+      ...(providerCoverage[provider] || { provider }),
+      stale_preserved_rows: preserved,
+      stale_preserved: preserved > 0,
+    };
+  }
+
+  return {
+    ...snapshot,
+    ready: true,
+    full_input_ready: providerReadyCount === PROVIDERS.length,
+    partial_input_ready: providerReadyCount < PROVIDERS.length,
+    minimum_ready_providers: MIN_READY_PROVIDERS,
+    provider_ready_count: providerReadyCount,
+    healthy_providers: healthyProviders,
+    unavailable_providers: unavailableProviders,
+    preserve_unavailable_cache: true,
+    preserved_unavailable_provider_rows: preservedRows,
+    row_count: rows.length,
+    mark_index_row_count: markIndexRowCount,
+    perpetual_spot_row_count: perpetualSpotRowCount,
+    cross_venue_asset_count: [...basesByProvider.values()].filter((providers) => providers.size >= 2).length,
+    provider_coverage: providerCoverage,
+    rows,
+  };
+}
+
 export async function runContractBasisCycle({ reason = 'scheduled' } = {}) {
   if (running) return false;
   running = true;
@@ -820,13 +906,14 @@ export async function runContractBasisCycle({ reason = 'scheduled' } = {}) {
     // This remains background-shared and non-fatal; user reads still start zero upstream work.
     await maybeRefreshDeliverySnapshot(inputByProvider, { reason: `contract_basis_${reason}` });
 
-    const snapshot = buildContractBasisSnapshotFromInputs(inputByProvider, { nowMs: Date.now(), sharedRound });
-    if (!snapshot.full_input_ready) {
+    const rawSnapshot = buildContractBasisSnapshotFromInputs(inputByProvider, { nowMs: Date.now(), sharedRound });
+    const snapshot = mergePartialProviderSnapshot(rawSnapshot, latestVerifiedSnapshot, Date.now());
+    if (!snapshot.ready) {
       const reasons = PROVIDERS.flatMap((provider) => {
         const coverage = snapshot.provider_coverage?.[provider];
         return coverage?.input_ready ? [] : [`${provider}:spot=${coverage?.spot_input_ready},contract=${coverage?.contract_input_ready}`];
       });
-      throw new Error(`market_light_inputs_not_ready:${reasons.join('|')}`);
+      throw new Error(`market_light_inputs_below_minimum_ready:${snapshot.provider_ready_count}/${MIN_READY_PROVIDERS}:${reasons.join('|')}`);
     }
 
     latestVerifiedSnapshot = {
@@ -944,7 +1031,14 @@ export function getContractBasisHealth() {
     response_cache_entries: responseCache.size,
     response_cache_hits: responseCacheHits,
     response_cache_misses: responseCacheMisses,
-    latest_ready: Boolean(latestVerifiedSnapshot?.full_input_ready),
+    latest_ready: Boolean(latestVerifiedSnapshot?.ready),
+    latest_full_input_ready: Boolean(latestVerifiedSnapshot?.full_input_ready),
+    latest_partial_input_ready: Boolean(latestVerifiedSnapshot?.partial_input_ready),
+    latest_provider_ready_count: Number(latestVerifiedSnapshot?.provider_ready_count || 0),
+    latest_healthy_providers: latestVerifiedSnapshot?.healthy_providers || [],
+    latest_unavailable_providers: latestVerifiedSnapshot?.unavailable_providers || [],
+    latest_preserved_unavailable_provider_rows: Number(latestVerifiedSnapshot?.preserved_unavailable_provider_rows || 0),
+    minimum_ready_providers: MIN_READY_PROVIDERS,
     latest_row_count: Number(latestVerifiedSnapshot?.row_count || 0),
     latest_mark_index_row_count: Number(latestVerifiedSnapshot?.mark_index_row_count || 0),
     latest_perpetual_spot_row_count: Number(latestVerifiedSnapshot?.perpetual_spot_row_count || 0),
