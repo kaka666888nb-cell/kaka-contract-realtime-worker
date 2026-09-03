@@ -7,7 +7,7 @@
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
 import { getBinanceDeliveryContractsSnapshot } from './binance-contract-market.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.32.6-basis-partial-provider-isolation';
+const STEP_VERSION = '650.8.15.197.3.3.32.6.1-basis-partial-binance-warm';
 const CURRENT_ROUTE = '/api/contract-basis/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-basis/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
@@ -32,6 +32,9 @@ const YEAR_MS = 365 * 24 * 60 * 60_000;
 const MIN_READY_PROVIDERS = Math.max(1, Math.min(
   PROVIDERS.length,
   Number(process.env.KAKA_CONTRACT_BASIS_MIN_READY_PROVIDERS || 4),
+));
+const BINANCE_DELIVERY_WARM_RETRY_MS = Math.max(15_000, Number(
+  process.env.KAKA_BINANCE_DELIVERY_WARM_RETRY_MS || 30_000,
 ));
 
 let started = false;
@@ -58,6 +61,10 @@ let deliveryTotalRefreshes = 0;
 let deliveryTotalRefreshFailures = 0;
 let deliveryTotalUpstreamRequests = 0;
 let latestDeliverySnapshot = null;
+let binanceDeliveryWarmLastAttemptAt = 0;
+let binanceDeliveryWarmAttempts = 0;
+let binanceDeliveryWarmSuccesses = 0;
+let binanceDeliveryWarmLastError = '';
 
 function compact(value) {
   return String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -798,6 +805,74 @@ async function refreshDeliverySnapshot(inputByProvider, { reason = 'scheduled', 
   }
 }
 
+async function maybeWarmBinanceDeliveryFromSharedWs(inputByProvider, nowMs = Date.now()) {
+  const currentBinance = latestDeliverySnapshot?.provider_coverage?.binance || null;
+  if (currentBinance?.status === 'ready' && Number(currentBinance?.delivery_contracts || 0) > 0) return latestDeliverySnapshot;
+  if (nowMs - binanceDeliveryWarmLastAttemptAt < BINANCE_DELIVERY_WARM_RETRY_MS) return latestDeliverySnapshot;
+  binanceDeliveryWarmLastAttemptAt = nowMs;
+  binanceDeliveryWarmAttempts += 1;
+  const spotByBase = normalizeSpotMap(inputByProvider?.binance?.spot?.rows || []);
+  try {
+    const binanceRows = await collectBinanceDelivery({ spotByBase, nowMs });
+    if (!Array.isArray(binanceRows) || !binanceRows.length) {
+      binanceDeliveryWarmLastError = 'binance_delivery_shared_ws_not_ready';
+      return latestDeliverySnapshot;
+    }
+    const previous = latestDeliverySnapshot || {
+      ok: true, schema: 'step1058_delivery_basis_v1', version: STEP_VERSION, provider_coverage: {}, rows: [],
+    };
+    const rows = [
+      ...(Array.isArray(previous.rows) ? previous.rows.filter((row) => String(row?.provider || '').toLowerCase() !== 'binance') : []),
+      ...binanceRows,
+    ];
+    rows.sort((a, b) => {
+      const ae = Number(a.expiry_timestamp_ms || 0);
+      const be = Number(b.expiry_timestamp_ms || 0);
+      if (ae !== be) return ae - be;
+      if (a.provider !== b.provider) return String(a.provider).localeCompare(String(b.provider));
+      return String(a.symbol).localeCompare(String(b.symbol));
+    });
+    const providerCoverage = { ...(previous.provider_coverage || {}) };
+    providerCoverage.binance = {
+      provider: 'binance', source_supported: true, delivery_contracts: binanceRows.length,
+      comparable_pairs: binanceRows.filter((row) => row?.basis_comparable === true).length,
+      status: 'ready', reason: '', upstream_requests: 0, shared_ws_reuse: true,
+    };
+    const comparableRows = rows.filter((row) => row?.basis_comparable === true);
+    const providerReadyCount = DELIVERY_SOURCE_PROVIDERS.filter((provider) => providerCoverage[provider]?.status === 'ready').length;
+    const providerComparableCount = new Set(comparableRows.map((row) => row.provider)).size;
+    latestDeliverySnapshot = {
+      ...previous, version: STEP_VERSION, ready: providerReadyCount > 0,
+      partial: providerReadyCount < DELIVERY_SOURCE_PROVIDERS.length,
+      provider_ready_count: providerReadyCount, provider_comparable_count: providerComparableCount,
+      row_count: rows.length, comparable_row_count: comparableRows.length, provider_coverage: providerCoverage, rows,
+      binance_contract_rest_requests: 0, binance_contract_rest_guard_preserved: true,
+      binance_delivery_source: 'existing_merged_public_futures_websocket_st_2',
+      binance_delivery_additional_websocket_connections: 0,
+      binance_shared_ws_warm_merged_at: new Date(nowMs).toISOString(),
+    };
+    binanceDeliveryWarmSuccesses += 1;
+    binanceDeliveryWarmLastError = '';
+    deliveryLastCompletedAt = new Date(nowMs).toISOString();
+    if (latestVerifiedSnapshot) {
+      latestVerifiedSnapshot = {
+        ...latestVerifiedSnapshot,
+        delivery: latestDeliverySnapshot,
+        delivery_ready: latestDeliverySnapshot.ready === true,
+        delivery_row_count: Number(latestDeliverySnapshot.row_count || 0),
+        delivery_comparable_row_count: Number(latestDeliverySnapshot.comparable_row_count || 0),
+        delivery_provider_ready_count: Number(latestDeliverySnapshot.provider_ready_count || 0),
+        delivery_provider_comparable_count: Number(latestDeliverySnapshot.provider_comparable_count || 0),
+      };
+    }
+    responseCache.clear();
+    return latestDeliverySnapshot;
+  } catch (error) {
+    binanceDeliveryWarmLastError = String(error?.message || error);
+    return latestDeliverySnapshot;
+  }
+}
+
 async function maybeRefreshDeliverySnapshot(inputByProvider, { reason = 'scheduled' } = {}) {
   const builtMs = timeMs(latestDeliverySnapshot?.built_at);
   if (
@@ -905,6 +980,10 @@ export async function runContractBasisCycle({ reason = 'scheduled' } = {}) {
     // Binance COIN-M WS-only delivery (or another healthy delivery venue) from refreshing.
     // This remains background-shared and non-fatal; user reads still start zero upstream work.
     await maybeRefreshDeliverySnapshot(inputByProvider, { reason: `contract_basis_${reason}` });
+    // Step1060.33.6.1: while Binance COIN-M delivery is warming after a Render restart,
+    // retry ONLY the already-existing shared Binance WS snapshot. Do not refetch the
+    // four REST-backed delivery venues and do not open any Binance REST/socket path.
+    await maybeWarmBinanceDeliveryFromSharedWs(inputByProvider, Date.now());
 
     const rawSnapshot = buildContractBasisSnapshotFromInputs(inputByProvider, { nowMs: Date.now(), sharedRound });
     const snapshot = mergePartialProviderSnapshot(rawSnapshot, latestVerifiedSnapshot, Date.now());
@@ -1077,6 +1156,11 @@ export function getContractBasisHealth() {
       binance_contract_rest_guard_preserved: true,
       binance_delivery_source: 'existing_merged_public_futures_websocket_st_2',
       binance_delivery_additional_websocket_connections: 0,
+      binance_shared_ws_warm_retry_seconds: Math.round(BINANCE_DELIVERY_WARM_RETRY_MS / 1000),
+      binance_shared_ws_warm_attempts: binanceDeliveryWarmAttempts,
+      binance_shared_ws_warm_successes: binanceDeliveryWarmSuccesses,
+      binance_shared_ws_warm_last_attempt_at: binanceDeliveryWarmLastAttemptAt ? new Date(binanceDeliveryWarmLastAttemptAt).toISOString() : null,
+      binance_shared_ws_warm_last_error: binanceDeliveryWarmLastError || null,
     },
     time: new Date().toISOString(),
   };
