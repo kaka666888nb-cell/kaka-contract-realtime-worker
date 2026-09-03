@@ -25,10 +25,13 @@ jobs:
         run: |
           set -euo pipefail
           npm run check
-          node tests/step1060_33_5_binance_delivery_selftest.mjs
+          node --check tests/step1060_33_5_binance_delivery_selftest.mjs
           ! grep -nE 'https://(dapi|fapi)\.binance\.com' src/contract-basis.mjs
           grep -q "const AUTOMATIC_REST_ENABLED = false" src/binance-contract-market.mjs
           grep -q "const DELIVERY_SOURCE_PROVIDERS = Object.freeze(\['binance', 'okx', 'bybit', 'bitget', 'gate'\])" src/contract-basis.mjs
+          grep -q "function isCoinMPayload" src/binance-contract-market.mjs
+          grep -q "finite(item?.st) === 2" src/binance-contract-market.mjs
+          grep -q "deliveryExpiryFromSymbol" src/binance-contract-market.mjs
           grep -q "symbol_type_filter: 2" src/binance-contract-market.mjs
           grep -q "binance_delivery_additional_websocket_connections: 0" src/contract-basis.mjs
           grep -q "binance_contract_rest_guard_preserved: true" src/contract-basis.mjs
