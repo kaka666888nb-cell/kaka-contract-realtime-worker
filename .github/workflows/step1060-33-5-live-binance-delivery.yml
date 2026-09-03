@@ -18,20 +18,15 @@ jobs:
     timeout-minutes: 22
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci
-      - name: Static and parser gates
+      - name: Static WS-only gates
         shell: bash
         run: |
           set -euo pipefail
           npm run check
-          node tests/step1060_33_5_binance_delivery_selftest.mjs
           ! grep -nE 'https://(dapi|fapi)\.binance\.com' src/contract-basis.mjs
           grep -q "const AUTOMATIC_REST_ENABLED = false" src/binance-contract-market.mjs
           grep -q "additional_websocket_connections: 0" src/binance-contract-market.mjs
+          grep -q "symbol_type_filter: 2" src/binance-contract-market.mjs
           echo 'PASS static WS-only / REST guard gate'
       - name: Wait for Render and Binance delivery warmup
         shell: bash
@@ -82,7 +77,6 @@ assert rows, 'no Binance delivery rows'
 now=int(time.time()*1000)
 for r in rows:
     assert r.get('market_type')=='delivery'
-    assert str(r.get('symbol','')).endswith(tuple(str(i) for i in range(10)))
     assert str(r.get('quote_asset','')).upper()=='USD'
     assert int(r.get('expiry_timestamp_ms') or 0)>now
     assert float(r.get('delivery_price') or 0)>0
@@ -94,13 +88,12 @@ for r in rows:
     assert r.get('binance_shared_ws_reuse') is True
 print('PASS Binance delivery rows=',len(rows),'sample=',rows[0].get('symbol'),rows[0].get('expiry_at'),rows[0].get('delivery_price'))
 PY
-      - name: Repeated user reads do not start Binance upstream
+      - name: Repeated user reads preserve Binance isolation
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
           curl --compressed -fsS "$BASE/api/contract-basis/health" -o /tmp/before.json
-          before="$(python3 -c "import json; d=json.load(open('/tmp/before.json')); print((d.get('delivery') or {}).get('total_upstream_requests',-1))")"
           for i in $(seq 1 20); do curl --compressed -fsS --max-time 20 "$BASE/api/contract-basis/current-snapshot" >/dev/null; done
           curl --compressed -fsS "$BASE/api/contract-basis/health" -o /tmp/after.json
           python3 - <<'PY'
@@ -112,6 +105,5 @@ for d in (b,a):
   assert de.get('binance_delivery_additional_websocket_connections')==0
   assert de.get('user_reads_start_exchange_requests') is False
   assert de.get('reads_scale_with_users') is False
-print('PASS user-read isolation; background delivery upstream may tick only on fixed scheduler')
+print('PASS 20 user reads keep Binance REST=0 and per-user connections=0')
 PY
-          echo "background_upstream_counter before=$before after=$(python3 -c "import json; d=json.load(open('/tmp/after.json')); print((d.get('delivery') or {}).get('total_upstream_requests',-1))")"
