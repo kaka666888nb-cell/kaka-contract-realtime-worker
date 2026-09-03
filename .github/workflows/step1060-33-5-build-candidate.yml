@@ -1,0 +1,53 @@
+name: Step1060.33.5 build candidate
+
+on:
+  push:
+    branches: [step1060-33-5-binance-delivery]
+    paths:
+      - '.github/step1060_33_5_patch.py'
+      - '.github/workflows/step1060-33-5-build-candidate.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: step1060-33-5-binance-delivery
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Apply exact candidate patch
+        run: python .github/step1060_33_5_patch.py
+      - name: Static gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run check
+          node tests/step1060_33_5_binance_delivery_selftest.mjs
+          git diff --check
+          ! grep -nE 'https://(dapi|fapi)\.binance\.com' src/contract-basis.mjs
+          grep -q "const AUTOMATIC_REST_ENABLED = false" src/binance-contract-market.mjs
+          grep -q "DELIVERY_SOURCE_PROVIDERS = Object.freeze(\['binance', 'okx', 'bybit', 'bitget', 'gate'\])" src/contract-basis.mjs
+          grep -q "binance_delivery_additional_websocket_connections: 0" src/contract-basis.mjs
+          echo 'PASS Step1060.33.5 static candidate gates'
+      - name: Commit candidate source atomically on branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka666888nb-cell'
+          git config user.email 'kaka666888nb@gmail.com'
+          git add src/binance-contract-market.mjs src/contract-basis.mjs tests/step1060_33_5_binance_delivery_selftest.mjs
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit'
+            exit 0
+          fi
+          git commit -m 'Step1060.33.5 Binance delivery WS-only and Gate readiness support'
+          git push origin HEAD:step1060-33-5-binance-delivery
