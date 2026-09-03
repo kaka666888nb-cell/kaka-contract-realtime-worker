@@ -1,0 +1,45 @@
+name: Step1060.33.5 delivery independent apply
+
+on:
+  push:
+    branches: [step1060-33-5-binance-delivery]
+    paths:
+      - '.github/step1060_33_5_delivery_independent_patch.py'
+      - '.github/workflows/step1060-33-5-delivery-independent-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Fetch patch script from candidate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show origin/step1060-33-5-binance-delivery:.github/step1060_33_5_delivery_independent_patch.py > /tmp/patch.py
+      - name: Apply and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python /tmp/patch.py
+          npm run check
+          git diff --check
+          ! grep -nE 'https://(dapi|fapi)\.binance\.com' src/contract-basis.mjs
+          grep -q "const AUTOMATIC_REST_ENABLED = false" src/binance-contract-market.mjs
+          python3 -c "s=open('src/contract-basis.mjs').read(); assert s.index('await maybeRefreshDeliverySnapshot') < s.index('if (!snapshot.full_input_ready)'); print('PASS delivery refresh precedes full-input gate')"
+      - name: Commit production fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka666888nb-cell'
+          git config user.email 'kaka666888nb@gmail.com'
+          git add src/contract-basis.mjs
+          git commit -m 'Step1060.33.5 keep delivery refresh independent of Gate readiness'
+          git push origin HEAD:main
