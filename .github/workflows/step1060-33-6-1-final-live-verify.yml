@@ -1,0 +1,52 @@
+name: Step1060.33.6.1 final live verify
+
+on:
+  push:
+    branches: [step1060-33-6-basis-partial-provider]
+    paths:
+      - '.github/workflows/step1060-33-6-1-final-live-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait Render deploy and partial basis readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          OK=0
+          for i in $(seq 1 60); do
+            curl --compressed -sS --connect-timeout 8 --max-time 25 "$BASE/api/contract-basis/current-snapshot" -o /tmp/b.json || true
+            python3 -c "import json; d=json.load(open('/tmp/b.json')); print('basis poll',${i},'v',d.get('version'),'ready',d.get('ready'),'full',d.get('full_input_ready'),'partial',d.get('partial_input_ready'),'providers',d.get('provider_ready_count'),'rows',d.get('row_count'),'delivery',d.get('delivery_row_count'),'err',d.get('last_error'))" 2>/dev/null || true
+            if python3 -c "import json,sys; d=json.load(open('/tmp/b.json')); sys.exit(0 if d.get('version')=='650.8.15.197.3.3.32.6.1-basis-partial-binance-warm' and d.get('ready') is True and int(d.get('provider_ready_count') or 0)>=4 and int(d.get('row_count') or 0)>0 and d.get('last_error','')=='' else 1)" 2>/dev/null; then OK=1; break; fi
+            sleep 6
+          done
+          test "$OK" = '1'
+      - name: Wait Binance shared-WS delivery warm merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          OK=0
+          for i in $(seq 1 45); do
+            curl --compressed -sS --connect-timeout 8 --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/h.json || true
+            python3 -c "import json; h=json.load(open('/tmp/h.json')); de=h.get('delivery') or {}; b=(de.get('latest_provider_coverage') or {}).get('binance') or {}; print('binance poll',${i},'rows',b.get('delivery_contracts'),'status',b.get('status'),'warm_attempts',de.get('binance_shared_ws_warm_attempts'),'warm_success',de.get('binance_shared_ws_warm_successes'),'warm_err',de.get('binance_shared_ws_warm_last_error'),'rest',de.get('binance_contract_rest_requests'),'extra_ws',de.get('binance_delivery_additional_websocket_connections'))" 2>/dev/null || true
+            if python3 -c "import json,sys; h=json.load(open('/tmp/h.json')); de=h.get('delivery') or {}; b=(de.get('latest_provider_coverage') or {}).get('binance') or {}; ok=(h.get('version')=='650.8.15.197.3.3.32.6.1-basis-partial-binance-warm' and b.get('status')=='ready' and int(b.get('delivery_contracts') or 0)>0 and int(de.get('binance_contract_rest_requests') or 0)==0 and int(de.get('binance_delivery_additional_websocket_connections') or 0)==0 and int(de.get('binance_shared_ws_warm_successes') or 0)>0); sys.exit(0 if ok else 1)" 2>/dev/null; then OK=1; break; fi
+            sleep 8
+          done
+          test "$OK" = '1'
+      - name: Validate current snapshot and repeated user reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl --compressed -fsS --max-time 25 "$BASE/api/contract-basis/current-snapshot" -o /tmp/b.json
+          python3 -c "import json; d=json.load(open('/tmp/b.json')); de=d.get('delivery') or {}; b=(de.get('provider_coverage') or {}).get('binance') or {}; assert d.get('ready') is True; assert int(d.get('provider_ready_count') or 0)>=4; assert int(d.get('row_count') or 0)>0; assert d.get('preserve_unavailable_cache') is True; assert d.get('reads_scale_with_users') is False; assert d.get('no_cross_provider_substitution') is True; assert d.get('missing_values_remain_null') is True; assert b.get('status')=='ready' and int(b.get('delivery_contracts') or 0)>0; assert de.get('binance_contract_rest_requests')==0; assert de.get('binance_delivery_additional_websocket_connections')==0; print('PASS final snapshot basis_rows=',d.get('row_count'),'healthy=',d.get('healthy_providers'),'unavailable=',d.get('unavailable_providers'),'delivery=',d.get('delivery_row_count'),'binance=',b.get('delivery_contracts'))"
+          for i in $(seq 1 20); do curl --compressed -fsS --max-time 20 "$BASE/api/contract-basis/current-snapshot" >/dev/null; done
+          curl --compressed -fsS --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/after.json
+          python3 -c "import json; h=json.load(open('/tmp/after.json')); de=h.get('delivery') or {}; assert h.get('snapshot_reads_start_exchange_requests') is False; assert h.get('snapshot_reads_scale_with_users') is False; assert de.get('user_reads_start_exchange_requests') is False; assert de.get('reads_scale_with_users') is False; assert de.get('binance_contract_rest_requests')==0; assert de.get('binance_delivery_additional_websocket_connections')==0; print('PASS 20 user reads preserve isolation')"
