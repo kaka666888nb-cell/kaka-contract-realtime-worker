@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.44';
+const VERSION = '650.8.15.44.1';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -59,6 +59,11 @@ const wsConnectStats = { attempts: 0, waits: 0, window_blocks: 0 };
 const universeBySymbol = new Map();
 const tickerBySymbol = new Map();
 const realtimeMetaBySymbol = new Map();
+// Step1060.33.5: reuse the existing merged Binance futures public WebSocket streams
+// for COIN-M dated delivery contracts. No new socket and no Binance REST request is
+// introduced. st=2 rows are kept separate from the existing USDⓈ-M perpetual maps.
+const deliveryBySymbol = new Map();
+let lastDeliveryEventAt = 0;
 const connectionState = new Map();
 const waiters = new Set();
 
@@ -194,6 +199,68 @@ function iso(value = Date.now()) {
 function isUsdmPayload(item) {
   const unifiedType = finite(item?.st);
   return unifiedType === null || unifiedType === 1;
+}
+
+function isCoinMPayload(item) {
+  return finite(item?.st) === 2;
+}
+
+function deliveryExpiryFromSymbol(rawSymbol) {
+  const match = String(rawSymbol || '').trim().toUpperCase().match(/_(\d{2})(\d{2})(\d{2})$/);
+  if (!match) return 0;
+  const year = 2000 + Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (!Number.isInteger(year) || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+  // Binance quarterly delivery symbols encode YYMMDD and expire at 08:00 UTC.
+  // contractInfo.dt, when observed, always overrides this cold-start convention.
+  const ms = Date.UTC(year, month - 1, day, 8, 0, 0, 0);
+  const check = new Date(ms);
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return 0;
+  return ms;
+}
+
+export function normalizeBinanceCoinMDeliveryPublicRow(item) {
+  if (!item || typeof item !== 'object' || !isCoinMPayload(item)) return null;
+  const rawSymbol = String(item.s ?? item.symbol ?? '').trim().toUpperCase();
+  if (!/_\d{6}$/.test(rawSymbol)) return null;
+  const rawPair = String(item.ps ?? item.pair ?? rawSymbol.replace(/_\d{6}$/, '')).trim().toUpperCase();
+  const pair = compact(rawPair);
+  const [base, quote] = splitQuote(pair);
+  if (!rawSymbol || !pair || !base || !quote) return null;
+  const expiryMs = finite(item.dt ?? item.deliveryDate ?? item.delivery_time_ms) || deliveryExpiryFromSymbol(rawSymbol);
+  return { symbol: rawSymbol, rawSymbol, pair, base, quote, expiryMs };
+}
+
+function upsertCoinMDelivery(item, source, observedAt = Date.now()) {
+  const identity = normalizeBinanceCoinMDeliveryPublicRow(item);
+  if (!identity) return false;
+  const status = String(item.cs ?? item.contractStatus ?? item.status ?? 'TRADING').trim().toUpperCase() || 'TRADING';
+  if (!['TRADING', 'PRE_DELIVERING', 'PRE_SETTLE'].includes(status)) return deliveryBySymbol.delete(identity.symbol);
+  const previous = deliveryBySymbol.get(identity.symbol) || {};
+  const sourceTimeMs = finite(item.E ?? item.time ?? item.source_time) || observedAt;
+  const expiryMs = finite(item.dt ?? item.deliveryDate) || previous.expiry_timestamp_ms || identity.expiryMs;
+  const last = finite(item.c ?? item.lastPrice ?? item.last_price ?? item.price);
+  const mark = finite(item.p ?? item.markPrice ?? item.mark_price);
+  const index = finite(item.i ?? item.indexPrice ?? item.index_price);
+  const contractType = String(item.ct ?? item.contractType ?? previous.contract_type ?? 'DELIVERY').trim().toUpperCase();
+  const next = mergeNonNull(previous, {
+    provider: PROVIDER, market_type: 'delivery', symbol: identity.symbol, raw_symbol: identity.rawSymbol,
+    pair: identity.pair, base_asset: identity.base, quote_asset: identity.quote, quote_symbol: identity.quote,
+    settle_asset: identity.base, contract_type: contractType, status, active: true,
+    expiry_timestamp_ms: expiryMs && expiryMs > 0 ? expiryMs : null,
+    expiry_at: expiryMs && expiryMs > 0 ? iso(expiryMs) : null,
+    expiry_source: finite(item.dt ?? item.deliveryDate) ? 'binance_contract_info_dt' : (previous.expiry_source || 'binance_symbol_yymmdd_0800utc'),
+    last_price: last, price: last, mark_price: mark, index_price: index,
+    source_time: iso(sourceTimeMs), cached_at: iso(observedAt), source, symbol_type: 2,
+  });
+  if (!(finite(next.expiry_timestamp_ms) > Date.now())) {
+    deliveryBySymbol.delete(identity.symbol);
+    return false;
+  }
+  deliveryBySymbol.set(identity.symbol, next);
+  lastDeliveryEventAt = Math.max(lastDeliveryEventAt, sourceTimeMs);
+  return true;
 }
 
 function normalizedPerpetual(item) {
@@ -441,7 +508,9 @@ function handleTickerMessage(raw) {
   if (!rows.length) return;
   const now = Date.now();
   let accepted = 0;
+  let deliveryAccepted = 0;
   for (const item of rows) {
+    if (upsertCoinMDelivery(item, 'binance_official_public_merged_ticker_websocket', now)) deliveryAccepted += 1;
     const identity = normalizedPerpetual(item);
     if (!identity || !symbolAllowedByConfirmedIdentity(identity.symbol)) continue;
     upsertTicker(item, identity, 'binance_official_public_ticker_websocket', now);
@@ -451,6 +520,7 @@ function handleTickerMessage(raw) {
     lastTickerEventAt = now;
     schedulePersist();
   }
+  if (deliveryAccepted) lastDeliveryEventAt = now;
 }
 
 function handleBookTickerMessage(raw) {
@@ -498,8 +568,10 @@ function handleMarkPriceMessage(raw) {
   const rows = Array.isArray(payload) ? payload : [payload];
   const now = Date.now();
   let accepted = 0;
+  let deliveryAccepted = 0;
   const currentSymbols = new Set();
   for (const item of rows) {
+    if (upsertCoinMDelivery(item, 'binance_official_public_merged_mark_price_websocket', now)) deliveryAccepted += 1;
     const identity = normalizedPerpetual(item);
     if (!identity || !symbolAllowedByConfirmedIdentity(identity.symbol)) continue;
     currentSymbols.add(identity.symbol);
@@ -540,6 +612,7 @@ function handleMarkPriceMessage(raw) {
       scheduleCurrentPriceBaseline(750);
     }
   }
+  if (deliveryAccepted) lastDeliveryEventAt = now;
 }
 
 function handleContractInfoMessage(raw) {
@@ -551,7 +624,12 @@ function handleContractInfoMessage(raw) {
   let requiresIdentityRefresh = false;
 
   for (const item of rows) {
-    if (!item || typeof item !== 'object' || !isUsdmPayload(item)) continue;
+    if (!item || typeof item !== 'object') continue;
+    if (isCoinMPayload(item)) {
+      if (upsertCoinMDelivery(item, 'binance_official_public_contract_info_websocket', now)) accepted += 1;
+      continue;
+    }
+    if (!isUsdmPayload(item)) continue;
     const symbol = compact(item.s ?? item.symbol);
     if (!symbol) continue;
     const contractType = String(item.ct ?? item.contractType ?? '').toUpperCase();
@@ -900,6 +978,7 @@ function applyCurrentPriceBaseline(resultRows, observedAt = Date.now()) {
   const currentSymbols = new Set();
   let seeded = 0;
   for (const item of rows) {
+    upsertCoinMDelivery(item, 'binance_official_public_ws_api_ticker_price_all_symbols', observedAt);
     const identity = normalizedPerpetual(item);
     if (!identity) continue;
     const last = finite(item?.price ?? item?.c ?? item?.lastPrice);
@@ -1331,6 +1410,26 @@ export async function getBinanceContractTickers({ symbols = [], waitMs = START_W
   return rows;
 }
 
+export function getBinanceDeliveryContractsSnapshot({ nowMs = Date.now() } = {}) {
+  startBinanceContractMarket();
+  const rows = [...deliveryBySymbol.values()]
+    .filter((row) => {
+      const expiry = finite(row?.expiry_timestamp_ms);
+      const price = finite(row?.mark_price ?? row?.last_price ?? row?.price);
+      return expiry != null && expiry > nowMs && price != null && price > 0 && row?.active !== false;
+    })
+    .sort((a, b) => Number(a.expiry_timestamp_ms || 0) - Number(b.expiry_timestamp_ms || 0) || String(a.symbol).localeCompare(String(b.symbol)));
+  return {
+    ok: true, version: VERSION, provider: PROVIDER, market_type: 'delivery',
+    source: 'binance_existing_merged_public_futures_websocket_reuse', ready: rows.length > 0,
+    row_count: rows.length, rows: rows.map((row) => ({ ...row })),
+    last_delivery_event_at: lastDeliveryEventAt ? iso(lastDeliveryEventAt) : null,
+    binance_contract_rest_requests: 0, additional_websocket_connections: 0,
+    reuses_existing_contract_info_stream: true, reuses_existing_all_market_ticker_stream: true,
+    reuses_existing_mark_price_stream: true, reads_scale_with_users: false,
+  };
+}
+
 export function getBinanceContractRealtimeMeta(symbol) {
   startBinanceContractMarket();
   const normalized = compact(symbol);
@@ -1480,6 +1579,12 @@ export function getBinanceContractMarketHealth() {
     snapshot_persist_stats: {
       ...snapshotPersistStats,
       last_attempt_at: snapshotPersistStats.last_attempt_at ? iso(snapshotPersistStats.last_attempt_at) : null,
+    },
+    delivery_ws_reuse: {
+      mode: 'coin_m_delivery_from_existing_merged_public_futures_websockets', symbol_type_filter: 2,
+      rows: deliveryBySymbol.size, last_delivery_event_at: lastDeliveryEventAt ? iso(lastDeliveryEventAt) : null,
+      additional_websocket_connections: 0, additional_rest_requests: 0, user_reads_start_connections: false,
+      reuses_contract_info_stream: true, reuses_all_market_ticker_stream: true, reuses_mark_price_stream: true,
     },
     websocket_ingress: Object.fromEntries(
       Object.entries(marketWsTraffic).map(([name, value]) => [name, { ...value }]),

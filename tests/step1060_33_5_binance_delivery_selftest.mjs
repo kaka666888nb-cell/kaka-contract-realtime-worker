@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { normalizeBinanceCoinMDeliveryPublicRow } from '../src/binance-contract-market.mjs';
+const exactDt = Date.UTC(2026, 8, 25, 8, 0, 0, 0);
+const exact = normalizeBinanceCoinMDeliveryPublicRow({s:'BTCUSD_260925',ps:'BTCUSD',ct:'CURRENT_QUARTER',dt:exactDt,cs:'TRADING',st:2});
+assert.ok(exact); assert.equal(exact.base,'BTC'); assert.equal(exact.quote,'USD'); assert.equal(exact.expiryMs,exactDt);
+const fallback = normalizeBinanceCoinMDeliveryPublicRow({s:'ETHUSD_261225',ps:'ETHUSD',c:'5000',st:2});
+assert.ok(fallback); assert.equal(fallback.expiryMs,Date.UTC(2026,11,25,8,0,0,0));
+assert.equal(normalizeBinanceCoinMDeliveryPublicRow({s:'BTCUSDT',ps:'BTCUSDT',st:1}),null);
+assert.equal(normalizeBinanceCoinMDeliveryPublicRow({s:'BTCUSD_PERP',ps:'BTCUSD',st:2}),null);
+console.log('PASS Step1060.33.5 Binance COIN-M delivery public WS parser');

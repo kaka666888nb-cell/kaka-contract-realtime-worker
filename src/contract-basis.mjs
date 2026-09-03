@@ -2,15 +2,16 @@
 // Extends the existing shared contract-basis scanner without changing its legacy perpetual contract.
 // Legacy /api/contract-basis/current-snapshot fields remain backward-compatible.
 // Delivery collection is backend-shared and runs on a bounded five-minute cadence; user reads never start exchange work.
-// Binance COIN-M delivery REST is intentionally NOT called here because KakaWeb3's existing Binance contract REST guard remains permanent.
+// Binance COIN-M delivery reuses the already-running merged Binance public futures WebSocket streams; Binance REST remains permanently disabled.
 
 import { getMarketLightInternalSnapshot } from './market-light-bridge.mjs';
+import { getBinanceDeliveryContractsSnapshot } from './binance-contract-market.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.32.4-basis-delivery-2';
+const STEP_VERSION = '650.8.15.197.3.3.32.5-basis-delivery-binance-ws';
 const CURRENT_ROUTE = '/api/contract-basis/current-snapshot';
 const HEALTH_ROUTE = '/api/contract-basis/health';
 const PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
-const DELIVERY_SOURCE_PROVIDERS = Object.freeze(['okx', 'bybit', 'bitget', 'gate']);
+const DELIVERY_SOURCE_PROVIDERS = Object.freeze(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const REFRESH_INTERVAL_MS = Math.max(15_000, Number(process.env.KAKA_CONTRACT_BASIS_REFRESH_INTERVAL_MS || 30_000));
 const START_DELAY_MS = Math.max(5_000, Number(process.env.KAKA_CONTRACT_BASIS_START_DELAY_MS || 12_000));
 const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_CONTRACT_BASIS_RESPONSE_CACHE_TTL_MS || 20_000));
@@ -428,6 +429,31 @@ function buildDeliveryRow({
   };
 }
 
+async function collectBinanceDelivery({ spotByBase, nowMs }) {
+  const snapshot = getBinanceDeliveryContractsSnapshot({ nowMs });
+  if (!snapshot?.ok || snapshot?.ready !== true || !Array.isArray(snapshot?.rows) || !snapshot.rows.length) {
+    throw new Error('binance_delivery_shared_ws_not_ready');
+  }
+  const rows = [];
+  for (const item of snapshot.rows) {
+    const row = buildDeliveryRow({
+      provider: 'binance', symbol: item?.symbol, base: item?.base_asset,
+      quote: item?.quote_asset || 'USD', settle: item?.settle_asset || item?.base_asset,
+      contractType: item?.contract_type || 'COIN_M_DELIVERY', cycle: '', expiryMs: item?.expiry_timestamp_ms,
+      lastPrice: item?.last_price ?? item?.price, markPrice: item?.mark_price, indexPrice: item?.index_price,
+      sourceMs: timeMs(item?.source_time) || nowMs, sourceUrl: 'binance_existing_merged_public_futures_websocket',
+      spotByBase, nowMs,
+    });
+    if (row) {
+      row.delivery_identity_source = item?.expiry_source || 'binance_public_websocket';
+      row.binance_contract_rest_requests = 0;
+      row.binance_shared_ws_reuse = true;
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
 async function collectGateDelivery({ spotByBase, nowMs }) {
   const sourceUrl = 'https://api.gateio.ws/api/v4/delivery/usdt/contracts';
   const payload = await fetchJson(sourceUrl, 'gate');
@@ -637,22 +663,13 @@ async function refreshDeliverySnapshot(inputByProvider, { reason = 'scheduled', 
   deliveryTotalRefreshes += 1;
   deliveryLastStartedAt = new Date(nowMs).toISOString();
 
-  const providerCoverage = {
-    binance: {
-      provider: 'binance',
-      source_supported: false,
-      delivery_contracts: 0,
-      comparable_pairs: 0,
-      status: 'guarded',
-      reason: 'binance_contract_rest_guard_no_new_rest',
-      upstream_requests: 0,
-    },
-  };
+  const providerCoverage = {};
   const rows = [];
   const errors = [];
   const requestsBefore = deliveryTotalUpstreamRequests;
 
   const jobs = [
+    ['binance', collectBinanceDelivery],
     ['okx', collectOkxDelivery],
     ['bybit', collectBybitDelivery],
     ['bitget', collectBitgetDelivery],
@@ -684,6 +701,8 @@ async function refreshDeliverySnapshot(inputByProvider, { reason = 'scheduled', 
         comparable_pairs: comparable,
         status: result.ok ? 'ready' : 'error',
         reason: result.ok ? '' : result.error,
+        upstream_requests: result.provider === 'binance' ? 0 : null,
+        shared_ws_reuse: result.provider === 'binance',
       };
       if (!result.ok) errors.push(`${result.provider}:${result.error}`);
     }
@@ -752,6 +771,9 @@ async function refreshDeliverySnapshot(inputByProvider, { reason = 'scheduled', 
       user_reads_scale_exchange_upstream: false,
       binance_contract_rest_requests: 0,
       binance_contract_rest_guard_preserved: true,
+      binance_delivery_source: 'existing_merged_public_futures_websocket_st_2',
+      binance_delivery_additional_websocket_connections: 0,
+      binance_delivery_user_reads_start_connections: false,
       reason,
       errors,
       built_at: new Date(nowMs).toISOString(),
@@ -956,6 +978,8 @@ export function getContractBasisHealth() {
       reads_scale_with_users: false,
       binance_contract_rest_requests: 0,
       binance_contract_rest_guard_preserved: true,
+      binance_delivery_source: 'existing_merged_public_futures_websocket_st_2',
+      binance_delivery_additional_websocket_connections: 0,
     },
     time: new Date().toISOString(),
   };
