@@ -64,6 +64,19 @@ const realtimeMetaBySymbol = new Map();
 // introduced. st=2 rows are kept separate from the existing USDⓈ-M perpetual maps.
 const deliveryBySymbol = new Map();
 let lastDeliveryEventAt = 0;
+const coinMDeliveryDiagnostics = {
+  st2_seen: 0,
+  normalized: 0,
+  rejected_no_dated_symbol: 0,
+  rejected_other: 0,
+  last_st2_symbol: '',
+  last_st2_pair: '',
+  last_st2_contract_type: '',
+  last_st2_source: '',
+  last_st2_keys: [],
+  last_st2_seen_at: 0,
+  by_source: {},
+};
 const connectionState = new Map();
 const waiters = new Set();
 
@@ -233,8 +246,27 @@ export function normalizeBinanceCoinMDeliveryPublicRow(item) {
 }
 
 function upsertCoinMDelivery(item, source, observedAt = Date.now()) {
+  const isCoinM = isCoinMPayload(item);
+  if (isCoinM) {
+    coinMDeliveryDiagnostics.st2_seen += 1;
+    coinMDeliveryDiagnostics.last_st2_symbol = String(item?.s ?? item?.symbol ?? '').trim().toUpperCase();
+    coinMDeliveryDiagnostics.last_st2_pair = String(item?.ps ?? item?.pair ?? '').trim().toUpperCase();
+    coinMDeliveryDiagnostics.last_st2_contract_type = String(item?.ct ?? item?.contractType ?? '').trim().toUpperCase();
+    coinMDeliveryDiagnostics.last_st2_source = String(source || '');
+    coinMDeliveryDiagnostics.last_st2_keys = Object.keys(item || {}).slice(0, 32);
+    coinMDeliveryDiagnostics.last_st2_seen_at = observedAt;
+    coinMDeliveryDiagnostics.by_source[source] = Number(coinMDeliveryDiagnostics.by_source[source] || 0) + 1;
+  }
   const identity = normalizeBinanceCoinMDeliveryPublicRow(item);
-  if (!identity) return false;
+  if (!identity) {
+    if (isCoinM) {
+      const rawSymbol = String(item?.s ?? item?.symbol ?? '').trim().toUpperCase();
+      if (!/_\d{6}$/.test(rawSymbol)) coinMDeliveryDiagnostics.rejected_no_dated_symbol += 1;
+      else coinMDeliveryDiagnostics.rejected_other += 1;
+    }
+    return false;
+  }
+  coinMDeliveryDiagnostics.normalized += 1;
   const status = String(item.cs ?? item.contractStatus ?? item.status ?? 'TRADING').trim().toUpperCase() || 'TRADING';
   if (!['TRADING', 'PRE_DELIVERING', 'PRE_SETTLE'].includes(status)) return deliveryBySymbol.delete(identity.symbol);
   const previous = deliveryBySymbol.get(identity.symbol) || {};
@@ -1427,6 +1459,11 @@ export function getBinanceDeliveryContractsSnapshot({ nowMs = Date.now() } = {})
     binance_contract_rest_requests: 0, additional_websocket_connections: 0,
     reuses_existing_contract_info_stream: true, reuses_existing_all_market_ticker_stream: true,
     reuses_existing_mark_price_stream: true, reads_scale_with_users: false,
+    diagnostics: {
+      ...coinMDeliveryDiagnostics,
+      last_st2_seen_at: coinMDeliveryDiagnostics.last_st2_seen_at ? iso(coinMDeliveryDiagnostics.last_st2_seen_at) : null,
+      by_source: { ...coinMDeliveryDiagnostics.by_source },
+    },
   };
 }
 
