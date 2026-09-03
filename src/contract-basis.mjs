@@ -813,6 +813,13 @@ export async function runContractBasisCycle({ reason = 'scheduled' } = {}) {
   lastStartedAt = new Date().toISOString();
   try {
     const { inputByProvider, sharedRound } = collectInputs();
+
+    // Step1060.33.5: delivery refresh is independent from the five-provider perpetual
+    // completeness gate. A transient Gate/other market-light outage must not prevent
+    // Binance COIN-M WS-only delivery (or another healthy delivery venue) from refreshing.
+    // This remains background-shared and non-fatal; user reads still start zero upstream work.
+    await maybeRefreshDeliverySnapshot(inputByProvider, { reason: `contract_basis_${reason}` });
+
     const snapshot = buildContractBasisSnapshotFromInputs(inputByProvider, { nowMs: Date.now(), sharedRound });
     if (!snapshot.full_input_ready) {
       const reasons = PROVIDERS.flatMap((provider) => {
@@ -821,10 +828,6 @@ export async function runContractBasisCycle({ reason = 'scheduled' } = {}) {
       });
       throw new Error(`market_light_inputs_not_ready:${reasons.join('|')}`);
     }
-
-    // Delivery is deliberately non-fatal to the already-stable perpetual basis layer.
-    // A provider outage can only make delivery partial; it cannot remove the existing basis snapshot.
-    await maybeRefreshDeliverySnapshot(inputByProvider, { reason: `contract_basis_${reason}` });
 
     latestVerifiedSnapshot = {
       ...snapshot,
