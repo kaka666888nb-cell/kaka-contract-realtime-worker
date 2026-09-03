@@ -37,16 +37,7 @@ jobs:
           READY=0
           for i in $(seq 1 120); do
             curl --compressed -sS --connect-timeout 8 --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/basis-health.json || true
-            vals="$(python3 - <<'PY' 2>/dev/null || true
-import json
-try:
- d=json.load(open('/tmp/basis-health.json'))
- b=((d.get('delivery') or {}).get('latest_provider_coverage') or {}).get('binance') or {}
- print(d.get('version',''), b.get('status',''), b.get('delivery_contracts',0), b.get('upstream_requests',-1), str(bool(b.get('shared_ws_reuse'))).lower(), (d.get('delivery') or {}).get('binance_contract_rest_requests',-1), (d.get('delivery') or {}).get('binance_delivery_additional_websocket_connections',-1))
-except Exception:
- print('')
-PY
-)"
+            vals="$(python3 -c 'import json; d=json.load(open("/tmp/basis-health.json")); de=d.get("delivery") or {}; b=(de.get("latest_provider_coverage") or {}).get("binance") or {}; print(d.get("version",""), b.get("status",""), b.get("delivery_contracts",0), b.get("upstream_requests",-1), str(bool(b.get("shared_ws_reuse"))).lower(), de.get("binance_contract_rest_requests",-1), de.get("binance_delivery_additional_websocket_connections",-1))' 2>/dev/null || echo '')"
             echo "poll=$i $vals"
             read -r ver status rows up ws rest extra <<<"$vals" || true
             if [ "$ver" = "$EXPECTED" ] && [ "$status" = 'ready' ] && [ "${rows:-0}" -gt 0 ] && [ "$up" = '0' ] && [ "$ws" = 'true' ] && [ "$rest" = '0' ] && [ "$extra" = '0' ]; then
@@ -62,32 +53,7 @@ PY
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
           curl --compressed -fsS --connect-timeout 8 --max-time 30 "$BASE/api/contract-basis/current-snapshot" -o /tmp/basis.json
-          python3 - <<'PY'
-import json, time
-p=json.load(open('/tmp/basis.json'))
-assert p.get('ok') is True
-assert p.get('version')=='650.8.15.197.3.3.32.5-basis-delivery-binance-ws'
-d=p.get('delivery') or {}
-assert d.get('binance_contract_rest_requests')==0
-assert d.get('binance_contract_rest_guard_preserved') is True
-assert d.get('binance_delivery_additional_websocket_connections')==0
-assert d.get('user_reads_start_delivery_upstream_requests') is False
-rows=[r for r in (d.get('rows') or []) if str(r.get('provider','')).lower()=='binance']
-assert rows, 'no Binance delivery rows'
-now=int(time.time()*1000)
-for r in rows:
-    assert r.get('market_type')=='delivery'
-    assert str(r.get('quote_asset','')).upper()=='USD'
-    assert int(r.get('expiry_timestamp_ms') or 0)>now
-    assert float(r.get('delivery_price') or 0)>0
-    assert r.get('basis_comparable') is False
-    assert r.get('delivery_basis_percent') is None
-    assert r.get('annualized_delivery_basis_percent') is None
-    assert r.get('comparison_reason')=='quote_not_usdt_same_quote_required'
-    assert r.get('binance_contract_rest_requests')==0
-    assert r.get('binance_shared_ws_reuse') is True
-print('PASS Binance delivery rows=',len(rows),'sample=',rows[0].get('symbol'),rows[0].get('expiry_at'),rows[0].get('delivery_price'))
-PY
+          python3 -c 'import json,time; p=json.load(open("/tmp/basis.json")); assert p.get("ok") is True; assert p.get("version")=="650.8.15.197.3.3.32.5-basis-delivery-binance-ws"; d=p.get("delivery") or {}; assert d.get("binance_contract_rest_requests")==0; assert d.get("binance_contract_rest_guard_preserved") is True; assert d.get("binance_delivery_additional_websocket_connections")==0; assert d.get("user_reads_start_delivery_upstream_requests") is False; rows=[r for r in (d.get("rows") or []) if str(r.get("provider","")).lower()=="binance"]; assert rows; now=int(time.time()*1000); assert all(r.get("market_type")=="delivery" and str(r.get("quote_asset","")).upper()=="USD" and int(r.get("expiry_timestamp_ms") or 0)>now and float(r.get("delivery_price") or 0)>0 and r.get("basis_comparable") is False and r.get("delivery_basis_percent") is None and r.get("annualized_delivery_basis_percent") is None and r.get("comparison_reason")=="quote_not_usdt_same_quote_required" and r.get("binance_contract_rest_requests")==0 and r.get("binance_shared_ws_reuse") is True for r in rows); print("PASS Binance delivery rows=",len(rows),"sample=",rows[0].get("symbol"),rows[0].get("expiry_at"),rows[0].get("delivery_price"))'
       - name: Repeated user reads preserve Binance isolation
         shell: bash
         run: |
@@ -96,14 +62,4 @@ PY
           curl --compressed -fsS "$BASE/api/contract-basis/health" -o /tmp/before.json
           for i in $(seq 1 20); do curl --compressed -fsS --max-time 20 "$BASE/api/contract-basis/current-snapshot" >/dev/null; done
           curl --compressed -fsS "$BASE/api/contract-basis/health" -o /tmp/after.json
-          python3 - <<'PY'
-import json
-b=json.load(open('/tmp/before.json')); a=json.load(open('/tmp/after.json'))
-for d in (b,a):
-  de=d.get('delivery') or {}
-  assert de.get('binance_contract_rest_requests')==0
-  assert de.get('binance_delivery_additional_websocket_connections')==0
-  assert de.get('user_reads_start_exchange_requests') is False
-  assert de.get('reads_scale_with_users') is False
-print('PASS 20 user reads keep Binance REST=0 and per-user connections=0')
-PY
+          python3 -c 'import json; b=json.load(open("/tmp/before.json")); a=json.load(open("/tmp/after.json")); ds=[b,a]; assert all((d.get("delivery") or {}).get("binance_contract_rest_requests")==0 and (d.get("delivery") or {}).get("binance_delivery_additional_websocket_connections")==0 and (d.get("delivery") or {}).get("user_reads_start_exchange_requests") is False and (d.get("delivery") or {}).get("reads_scale_with_users") is False for d in ds); print("PASS 20 user reads keep Binance REST=0 and per-user connections=0")'
