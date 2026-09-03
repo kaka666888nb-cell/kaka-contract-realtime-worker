@@ -1,0 +1,43 @@
+name: Step1060.33.5 Binance delivery diagnostics apply
+
+on:
+  push:
+    branches: [step1060-33-5-binance-delivery]
+    paths:
+      - '.github/step1060_33_5_binance_delivery_diag_patch.py'
+      - '.github/workflows/step1060-33-5-binance-delivery-diag-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Fetch diagnostic patch
+        shell: bash
+        run: git show origin/step1060-33-5-binance-delivery:.github/step1060_33_5_binance_delivery_diag_patch.py > /tmp/diag.py
+      - name: Apply and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python /tmp/diag.py
+          npm run check
+          git diff --check
+          ! grep -nE 'https://(dapi|fapi)\.binance\.com' src/contract-basis.mjs
+          grep -q "const AUTOMATIC_REST_ENABLED = false" src/binance-contract-market.mjs
+          grep -q "coinMDeliveryDiagnostics" src/binance-contract-market.mjs
+      - name: Commit diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka666888nb-cell'
+          git config user.email 'kaka666888nb@gmail.com'
+          git add src/binance-contract-market.mjs
+          git commit -m 'Step1060.33.5 diagnose Binance merged WS delivery payload'
+          git push origin HEAD:main
