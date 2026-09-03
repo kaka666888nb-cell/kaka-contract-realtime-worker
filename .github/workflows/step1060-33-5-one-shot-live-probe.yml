@@ -1,0 +1,23 @@
+name: Step1060.33.5 one-shot live probe
+
+on:
+  push:
+    branches: [step1060-33-5-binance-delivery]
+    paths:
+      - '.github/workflows/step1060-33-5-one-shot-live-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Read live contract-basis health only
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/h.json
+          python3 -c "import json; d=json.load(open('/tmp/h.json')); de=d.get('delivery') or {}; print('VERSION',d.get('version')); print('DELIVERY_READY',de.get('ready'),'PARTIAL',de.get('partial'),'ROWS',de.get('row_count')); print('BINANCE_COVERAGE',json.dumps((de.get('latest_provider_coverage') or {}).get('binance'),ensure_ascii=False)); print('BINANCE_REST',de.get('binance_contract_rest_requests'),'EXTRA_WS',de.get('binance_delivery_additional_websocket_connections')); print('DELIVERY_ERROR',de.get('last_error'))"
