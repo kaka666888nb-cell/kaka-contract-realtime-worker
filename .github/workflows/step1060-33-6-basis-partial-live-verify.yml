@@ -1,0 +1,45 @@
+name: Step1060.33.6 contract basis partial-provider live verify
+
+on:
+  push:
+    branches: [step1060-33-6-basis-partial-provider]
+    paths:
+      - '.github/workflows/step1060-33-6-basis-partial-live-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Wait Render deploy and verify partial basis
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          READY=0
+          for i in $(seq 1 70); do
+            curl --compressed -sS --connect-timeout 8 --max-time 25 "$BASE/api/contract-basis/current-snapshot" -o /tmp/b.json || true
+            python3 -c "import json; d=json.load(open('/tmp/b.json')); print('poll',${i},'version',d.get('version'),'ready',d.get('ready'),'full',d.get('full_input_ready'),'partial',d.get('partial_input_ready'),'providers',d.get('provider_ready_count'),'rows',d.get('row_count'),'delivery',d.get('delivery_row_count'),'error',d.get('last_error'))" 2>/dev/null || true
+            if python3 -c "import json,sys; d=json.load(open('/tmp/b.json')); ok=(d.get('version')=='650.8.15.197.3.3.32.6-basis-partial-provider-isolation' and d.get('ready') is True and int(d.get('provider_ready_count') or 0)>=4 and int(d.get('row_count') or 0)>0 and d.get('delivery_ready') is True and int(d.get('delivery_row_count') or 0)>0 and d.get('reads_scale_with_users') is False and d.get('no_cross_provider_substitution') is True and d.get('missing_values_remain_null') is True); sys.exit(0 if ok else 1)" 2>/dev/null; then READY=1; break; fi
+            sleep 8
+          done
+          test "$READY" = '1'
+      - name: Validate provider isolation and Binance delivery safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl --compressed -fsS --max-time 25 "$BASE/api/contract-basis/current-snapshot" -o /tmp/b.json
+          curl --compressed -fsS --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/h.json
+          python3 -c "import json; d=json.load(open('/tmp/b.json')); h=json.load(open('/tmp/h.json')); de=d.get('delivery') or {}; cov=d.get('provider_coverage') or {}; healthy=d.get('healthy_providers') or []; unavailable=d.get('unavailable_providers') or []; assert d.get('ready') is True; assert int(d.get('provider_ready_count') or 0)>=4; assert int(d.get('row_count') or 0)>0; assert len(healthy)>=4; assert all(cov.get(p,{}).get('input_ready') is True for p in healthy); assert d.get('preserve_unavailable_cache') is True; assert de.get('binance_contract_rest_requests')==0; assert de.get('binance_delivery_additional_websocket_connections')==0; assert (de.get('provider_coverage') or {}).get('binance',{}).get('delivery_contracts',0)>0; assert h.get('latest_ready') is True; assert int(h.get('latest_provider_ready_count') or 0)>=4; print('PASS Step1060.33.6 live basis rows=',d.get('row_count'),'healthy=',healthy,'unavailable=',unavailable,'preserved=',d.get('preserved_unavailable_provider_rows'),'delivery=',d.get('delivery_row_count'),'binance_delivery=',(de.get('provider_coverage') or {}).get('binance',{}).get('delivery_contracts'))"
+      - name: Repeated user-read isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 20); do curl --compressed -fsS --max-time 20 "$BASE/api/contract-basis/current-snapshot" >/dev/null; done
+          curl --compressed -fsS --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/after.json
+          python3 -c "import json; h=json.load(open('/tmp/after.json')); de=h.get('delivery') or {}; assert h.get('snapshot_reads_start_exchange_requests') is False; assert h.get('snapshot_reads_scale_with_users') is False; assert de.get('user_reads_start_exchange_requests') is False; assert de.get('reads_scale_with_users') is False; assert de.get('binance_contract_rest_requests')==0; assert de.get('binance_delivery_additional_websocket_connections')==0; print('PASS 20 user reads no user-scaled exchange work')"
