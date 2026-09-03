@@ -1,0 +1,51 @@
+name: Step1060.33.6.1 Binance delivery warm retry apply
+
+on:
+  push:
+    branches: [step1060-33-6-basis-partial-provider]
+    paths:
+      - '.github/workflows/step1060-33-6-1-binance-delivery-warm-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout production main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Fetch candidate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL 'https://raw.githubusercontent.com/kaka666888nb-cell/kaka-contract-realtime-worker/step1060-33-6-basis-partial-provider/.github/step1060_33_6_1_binance_delivery_warm_patch.py' -o /tmp/patch.py
+      - name: Apply and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/patch.py
+          npm run check
+          grep -q "650.8.15.197.3.3.32.6.1-basis-partial-binance-warm" src/contract-basis.mjs
+          grep -q "BINANCE_DELIVERY_WARM_RETRY_MS" src/contract-basis.mjs
+          grep -q "maybeWarmBinanceDeliveryFromSharedWs" src/contract-basis.mjs
+          ! grep -nE 'https://(dapi|fapi)\.binance\.com' src/contract-basis.mjs
+          grep -q "const AUTOMATIC_REST_ENABLED = false" src/binance-contract-market.mjs
+          echo 'PASS Step1060.33.6.1 static Binance shared-WS warm gate'
+      - name: Commit production fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'kaka666888nb-cell'
+          git config user.email 'kaka666888nb@gmail.com'
+          git add src/contract-basis.mjs
+          if git diff --cached --quiet; then
+            echo 'No production change to commit'
+            exit 0
+          fi
+          git commit -m 'Step1060.33.6.1 warm Binance delivery from existing shared WS'
+          git push origin HEAD:main
