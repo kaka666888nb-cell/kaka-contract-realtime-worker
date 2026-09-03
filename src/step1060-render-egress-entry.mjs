@@ -21,4 +21,8 @@ installContractFlowPersistContractGuard();
 // the localhost collector reads. The existing HTTP exact route remains the App
 // fallback and no client stream opens an exchange request or exchange connection.
 await import('./step1060-market-light-ticker-stream.mjs');
+// Step1061.5: one mixed downstream SSE multiplexes exact spot/contract, exchange-assets and
+// on-chain pool identities for the system overlay. It reuses existing shared focus collectors;
+// only on-chain 24h change gets one bounded backend-wide DEX refresh lane, never per-user polling.
+await import('./step1061-overlay-ticker-stream.mjs');
 await import('./step1042-bitget-long-kline-continuity-proxy.mjs');
