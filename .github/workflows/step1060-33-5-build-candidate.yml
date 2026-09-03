@@ -29,6 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # npm run check only calls node --check; no dependency install is required.
           npm run check
           git diff --check
           ! grep -nE 'https://(dapi|fapi)\.binance\.com' src/contract-basis.mjs
