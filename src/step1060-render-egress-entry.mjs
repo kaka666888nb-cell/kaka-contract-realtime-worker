@@ -2,6 +2,7 @@ import { installRenderEgressCostGuard } from './render-egress-cost-guard.mjs';
 import { installRenderSupabaseEgressProxy } from './render-supabase-egress-proxy.mjs';
 import { installLiquidation1hNoopEgressGuard } from './liquidation-noop-egress-guard.mjs';
 import { installContractFlowPersistContractGuard } from './contract-flow-persist-contract-guard.mjs';
+import { installOverlayNonpositiveEgressGuard } from './step1061-overlay-nonpositive-egress-guard.mjs';
 
 // Step1060.3: install metering/compression first, then route only the known
 // large background Supabase JSON writes through the authenticated gzip ingest.
@@ -16,6 +17,10 @@ installLiquidation1hNoopEgressGuard();
 // USDT-only. Preserve realtime native USD/USDC flow in memory, but never send
 // those identities into the USDT-only Supabase history contract.
 installContractFlowPersistContractGuard();
+// Step1061.8.1: one final overlay-only downstream invariant covers spot,
+// contract, exchange-assets and on-chain. A zero/negative/missing price can
+// never overwrite the last positive price already shown to a device.
+installOverlayNonpositiveEgressGuard();
 // Step1060.31.7: public-device ticker fan-out reads only the already isolated
 // market-light shared snapshot. Active exact identities, not client count, bound
 // the localhost collector reads. The existing HTTP exact route remains the App
