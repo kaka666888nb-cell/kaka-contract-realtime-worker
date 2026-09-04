@@ -2,8 +2,8 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
-const STEP = '1062.1';
-const SCHEMA = 'step1062_1_rtc_secure_control_plane_v1';
+const STEP = '1062.1.2';
+const SCHEMA = 'step1062_1_2_rtc_accept_before_media_v1';
 const ROUTE_PREFIX = '/api/rtc';
 
 const text = (value) => String(value ?? '').trim();
@@ -168,7 +168,7 @@ function rpcErrorCode(error) {
     'rtc_users_blocked', 'rtc_peer_no_private_messages', 'rtc_user_busy',
     'rtc_daily_voice_limit', 'rtc_daily_video_limit', 'rtc_monthly_stop',
     'rtc_video_monthly_stop', 'rtc_call_not_found', 'rtc_call_not_ringing',
-    'rtc_not_callee', 'rtc_not_participant',
+    'rtc_not_callee', 'rtc_not_participant', 'rtc_call_not_active',
   ];
   return known.find((code) => msg.includes(code)) || 'rtc_database_rejected';
 }
@@ -246,6 +246,8 @@ async function handleHealth(_req, res) {
     db_schema_ready: dbReady,
     media_proxy_on_render: false,
     server_generated_usersig: true,
+    credential_issued_only_after_accept: true,
+    caller_media_enters_before_accept: false,
     raw_supabase_uuid_used_as_rtc_user_id: false,
     limits: {
       ring_timeout_seconds: RING_TIMEOUT_SECONDS,
@@ -296,11 +298,35 @@ async function handleCreate(req, res) {
       step: STEP,
       schema: SCHEMA,
       call: publicCall(row),
-      credential: credentialFor(row, user.id),
+      // Step1062.1.2: never hand the caller a TRTC UserSig while the peer is only ringing.
+      // This prevents ring time from entering a Tencent room and burning RTC minutes.
+      credential: null,
+      credential_available: false,
       single_call_max_seconds: callType === 'video' ? VIDEO_SINGLE_MAX_SECONDS : VOICE_SINGLE_MAX_SECONDS,
     });
   } catch (error) {
     stats.create_rejected += 1;
+    return fail(res, 409, rpcErrorCode(error));
+  }
+}
+
+async function handleCredential(req, res, callId) {
+  if (!configReady()) return fail(res, 503, 'rtc_not_configured');
+  const user = await authenticatedUser(req);
+  try {
+    const row = await dbRpc('app_rtc_server_get_call', { p_call_id: callId, p_actor_user_id: user.id });
+    if (!row) throw new Error('rtc_call_not_found');
+    if (text(row.status) !== 'active') return fail(res, 409, 'rtc_call_not_active');
+    return json(res, 200, {
+      ok: true,
+      step: STEP,
+      schema: SCHEMA,
+      call: publicCall(row),
+      credential: credentialFor(row, user.id),
+      credential_available: true,
+      single_call_max_seconds: text(row.call_type) === 'video' ? VIDEO_SINGLE_MAX_SECONDS : VOICE_SINGLE_MAX_SECONDS,
+    });
+  } catch (error) {
     return fail(res, 409, rpcErrorCode(error));
   }
 }
@@ -387,7 +413,7 @@ async function routeRtc(req, res, url) {
   if (method === 'GET' && pathname === `${ROUTE_PREFIX}/health`) return handleHealth(req, res);
   if (method === 'POST' && pathname === `${ROUTE_PREFIX}/calls`) return handleCreate(req, res);
   if (method === 'GET' && pathname === `${ROUTE_PREFIX}/incoming`) return handleIncoming(req, res);
-  const match = pathname.match(/^\/api\/rtc\/calls\/([0-9a-f-]{36})(?:\/(accept|reject|end))?$/i);
+  const match = pathname.match(/^\/api\/rtc\/calls\/([0-9a-f-]{36})(?:\/(accept|reject|end|credential))?$/i);
   if (match) {
     const callId = match[1];
     const action = match[2] || '';
@@ -395,6 +421,7 @@ async function routeRtc(req, res, url) {
     if (method === 'POST' && action === 'accept') return handleAccept(req, res, callId);
     if (method === 'POST' && action === 'reject') return handleReject(req, res, callId);
     if (method === 'POST' && action === 'end') return handleEnd(req, res, callId);
+    if (method === 'POST' && action === 'credential') return handleCredential(req, res, callId);
   }
   return fail(res, 404, 'rtc_route_not_found');
 }
