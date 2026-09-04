@@ -5,6 +5,7 @@ import { installContractFlowPersistContractGuard } from './contract-flow-persist
 import { installOverlayCapacityNatGuard } from './step1061-overlay-capacity-nat-guard.mjs';
 import { installOverlayDeltaEgressGuard } from './step1061-overlay-delta-egress-guard.mjs';
 import { installOverlayNonpositiveEgressGuard } from './step1061-overlay-nonpositive-egress-guard.mjs';
+import { installRtcControlPlane } from './step1062-rtc-control.mjs';
 
 // Step1060.3: install metering/compression first, then route only the known
 // large background Supabase JSON writes through the authenticated gzip ingest.
@@ -30,6 +31,9 @@ installOverlayDeltaEgressGuard();
 // contract, exchange-assets and on-chain. A zero/negative/missing price can
 // never overwrite the last positive price already shown to a device.
 installOverlayNonpositiveEgressGuard();
+// Step1062.1: secure RTC control plane only. Render authenticates users, enforces
+// call/cost limits and signs short-lived TRTC UserSig; media never traverses Render.
+installRtcControlPlane();
 // Step1060.31.7: public-device ticker fan-out reads only the already isolated
 // market-light shared snapshot. Active exact identities, not client count, bound
 // the localhost collector reads. The existing HTTP exact route remains the App
