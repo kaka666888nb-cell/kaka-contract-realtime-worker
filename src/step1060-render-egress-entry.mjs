@@ -5,6 +5,7 @@ import { installContractFlowPersistContractGuard } from './contract-flow-persist
 import { installOverlayCapacityNatGuard } from './step1061-overlay-capacity-nat-guard.mjs';
 import { installOverlayDeltaEgressGuard } from './step1061-overlay-delta-egress-guard.mjs';
 import { installOverlayNonpositiveEgressGuard } from './step1061-overlay-nonpositive-egress-guard.mjs';
+import { installRtcHealthRedactionGuard } from './step1062-rtc-health-redaction-guard.mjs';
 import { installRtcControlPlane } from './step1062-rtc-control.mjs';
 
 // Step1060.3: install metering/compression first, then route only the known
@@ -31,6 +32,10 @@ installOverlayDeltaEgressGuard();
 // contract, exchange-assets and on-chain. A zero/negative/missing price can
 // never overwrite the last positive price already shown to a device.
 installOverlayNonpositiveEgressGuard();
+// Step1062.1.3: public RTC health is intentionally unauthenticated, so install
+// a response guard before the RTC route is exposed. Diagnostics are booleans only;
+// secret-like values can never leave Render even if a future truthy-chain regresses.
+installRtcHealthRedactionGuard();
 // Step1062.1: secure RTC control plane only. Render authenticates users, enforces
 // call/cost limits and signs short-lived TRTC UserSig; media never traverses Render.
 installRtcControlPlane();
