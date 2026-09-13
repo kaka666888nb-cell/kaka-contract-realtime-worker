@@ -6,6 +6,7 @@ import { installOverlayCapacityNatGuard } from './step1061-overlay-capacity-nat-
 import { installOverlayDeltaEgressGuard } from './step1061-overlay-delta-egress-guard.mjs';
 import { installOverlayNonpositiveEgressGuard } from './step1061-overlay-nonpositive-egress-guard.mjs';
 import { installRtcHealthRedactionGuard } from './step1062-rtc-health-redaction-guard.mjs';
+import { installRtcRingStateVerify } from './step1072-rtc-ring-state-verify.mjs';
 import { installRtcControlPlane } from './step1062-rtc-control.mjs';
 
 // Step1060.3: install metering/compression first, then route only the known
@@ -32,6 +33,12 @@ installOverlayDeltaEgressGuard();
 // contract, exchange-assets and on-chain. A zero/negative/missing price can
 // never overwrite the last positive price already shown to a device.
 installOverlayNonpositiveEgressGuard();
+// Step1072.7.6.1: install the public no-PII ring-state verifier BEFORE the
+// existing RTC control-plane createServer wrapper. That makes /ring-state the
+// outer route and prevents the older /api/rtc catch-all from returning 404.
+// It performs no idle polling; it is called only when a device receives a
+// background/lock-screen rtc_call push and needs a server-authoritative fact.
+installRtcRingStateVerify();
 // Step1062.1.3: public RTC health is intentionally unauthenticated, so install
 // a response guard before the RTC route is exposed. Diagnostics are booleans only;
 // secret-like values can never leave Render even if a future truthy-chain regresses.
