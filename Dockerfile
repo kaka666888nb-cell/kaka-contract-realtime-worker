@@ -3,6 +3,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev --registry=https://registry.npmjs.org
 COPY src ./src
+RUN node src/step1072-9-32-2-build-patch.mjs && npm run check
 ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080
