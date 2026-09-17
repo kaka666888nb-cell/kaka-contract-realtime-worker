@@ -234,10 +234,16 @@ snapshot = replaceExactlyOnce(snapshot, snapshotIdentityOld, snapshotIdentityNew
 snapshot = replaceExactlyOnce(snapshot, okxClassifierOld, okxClassifierNew, 'okx_asset_category_classifier');
 
 const green = {
-  rest_category_field: countExact(rest, '    instrument_asset_category:'),
+  rest_category_field: countExact(
+    rest,
+    "    instrument_asset_category: String(extra.instrument_asset_category ?? extra.inst_category ?? '').trim() || null,",
+  ),
   rest_okx_category_assignment: countExact(rest, '              instrument_asset_category: item.instCategory,'),
   rest_category_self_test: countExact(rest, "'okx_spot_stock_inst_category_metadata_preserved'"),
-  snapshot_category_field: countExact(snapshot, '    instrument_asset_category:'),
+  snapshot_category_field: countExact(
+    snapshot,
+    '    instrument_asset_category:\n      identity?.instrument_asset_category ?? raw.instrument_asset_category ?? raw.inst_category ?? raw.instCategory ?? null,',
+  ),
   snapshot_stock_classifier: countExact(snapshot, "    if (assetCategory === '3') return 'tokenized_equity';"),
   snapshot_noncrypto_classifier: countExact(snapshot, "    if (['4', '5', '6'].includes(assetCategory)) return 'rwa';"),
   old_classifier_remaining: countExact(snapshot, okxClassifierOld),
