@@ -1539,17 +1539,28 @@ function tickerRow(provider, market, item, rawSymbol, displaySymbol = null) {
   if (!symbol || !nativeSymbol) return null;
   const last = num(item.last_price ?? item.lastPrice ?? item.last ?? item.close ?? item.lastPr);
   const open = num(item.open_24h ?? item.openPrice ?? item.open ?? item.open24h ?? item.prevPrice24h);
-  let percent = num(
-    item.price_change_percent_24h ??
-    item.priceChangePercent ??
-    item.change_percentage ??
-    item.change24h ??
-    item.price24hPcnt
-  );
-  if (percent !== null &&
-      (provider === 'bitget' || provider === 'bybit') &&
-      Math.abs(percent) <= 2) {
-    percent *= 100;
+  // Step1072.9.32.1: normalize 24h change by official FIELD semantics,
+  // never by magnitude. Bitget change24h/price24hPcnt and Bybit
+  // price24hPcnt are ratios (0.01 = 1%). Canonical Kaka percent fields,
+  // Binance priceChangePercent and Gate change_percentage are already percent.
+  let percent = null;
+  if (item.price_change_percent_24h != null) {
+    percent = num(item.price_change_percent_24h);
+  } else if (item.priceChangePercent != null) {
+    percent = num(item.priceChangePercent);
+  } else if (item.change_percentage != null) {
+    percent = num(item.change_percentage);
+  } else if (provider === 'bitget' && item.change24h != null) {
+    const ratio = num(item.change24h);
+    percent = ratio === null ? null : ratio * 100;
+  } else if (
+    (provider === 'bitget' || provider === 'bybit') &&
+    item.price24hPcnt != null
+  ) {
+    const ratio = num(item.price24hPcnt);
+    percent = ratio === null ? null : ratio * 100;
+  } else {
+    percent = num(item.change24h ?? item.price24hPcnt);
   }
   if (percent === null && last !== null && open) {
     percent = ((last - open) / open) * 100;
@@ -4131,6 +4142,42 @@ function marketUnitSelfTest() {
     'binance_spot_base_and_quote',
     binance.base_volume_24h === 2 && binance.quote_volume_24h === 200,
     binance,
+  );
+
+  const bitgetExtremePercent = tickerRow(
+    'bitget',
+    'spot',
+    { lastPr: '1', change24h: '2.5' },
+    'TESTUSDT',
+  );
+  add(
+    'bitget_spot_change24h_ratio_above_200_percent',
+    bitgetExtremePercent?.price_change_percent_24h === 250,
+    bitgetExtremePercent,
+  );
+
+  const bybitExtremePercent = tickerRow(
+    'bybit',
+    'spot',
+    { lastPrice: '1', price24hPcnt: '2.5' },
+    'TESTUSDT',
+  );
+  add(
+    'bybit_spot_price24hPcnt_ratio_above_200_percent',
+    bybitExtremePercent?.price_change_percent_24h === 250,
+    bybitExtremePercent,
+  );
+
+  const canonicalPercentNoDoubleScale = tickerRow(
+    'bitget',
+    'spot',
+    { lastPr: '1', price_change_percent_24h: '2.5' },
+    'TESTUSDT',
+  );
+  add(
+    'canonical_percent_is_not_scaled_twice',
+    canonicalPercentNoDoubleScale?.price_change_percent_24h === 2.5,
+    canonicalPercentNoDoubleScale,
   );
 
   const coinbase = tickerVolumeSemantics(

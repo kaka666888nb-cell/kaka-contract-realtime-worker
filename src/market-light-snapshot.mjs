@@ -770,8 +770,10 @@ function bitgetV3Row(item, market, observedAt) {
   if (!symbol || !symbol.endsWith('USDT')) return null;
   const last = positive(item?.lastPrice);
   if (last == null) return null;
-  let change = finite(item?.price24hPcnt);
-  if (change != null && Math.abs(change) <= 2) change *= 100;
+  // Step1072.9.32.1: Bitget v3 price24hPcnt is an official ratio
+  // (0.01 = 1%). Convert by field semantics, never by magnitude.
+  const changeRatio = finite(item?.price24hPcnt);
+  const change = changeRatio == null ? null : changeRatio * 100;
   const bid = positive(item?.bid1Price);
   const ask = positive(item?.ask1Price);
   const baseVolume = finite(item?.volume24h);
