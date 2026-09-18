@@ -1,6 +1,6 @@
 import { getContractFocusPoolInternalSnapshot } from './deep-market-bridge.mjs';
 
-const VERSION = '650.8.15.4';
+const VERSION = '650.8.15.5';
 const SNAPSHOT_ROUTE = '/api/gate-advanced/current-snapshot';
 const HEALTH_ROUTE = '/api/gate-advanced/health';
 const CONTRACT_STATS_HISTORY_ROUTE = '/api/gate-advanced/contract-stats-history';
@@ -12,6 +12,7 @@ const BASES = Object.freeze([
 const START_DELAY_MS = Math.max(2_000, Number(process.env.KAKA_GATE_ADVANCED_START_DELAY_MS || 9_000));
 const STARTUP_RETRY_MS = Math.max(10_000, Number(process.env.KAKA_GATE_ADVANCED_STARTUP_RETRY_MS || 15_000));
 const FOCUS_REFRESH_MS = Math.max(2 * 60_000, Number(process.env.KAKA_GATE_ADVANCED_FOCUS_REFRESH_MS || 5 * 60_000));
+const FOCUS_CHANGE_WATCH_MS = Math.max(20_000, Number(process.env.KAKA_GATE_ADVANCED_FOCUS_CHANGE_WATCH_MS || 30_000));
 const INSURANCE_REFRESH_MS = Math.max(2 * 60_000, Number(process.env.KAKA_GATE_ADVANCED_INSURANCE_REFRESH_MS || 5 * 60_000));
 const RESPONSE_CACHE_TTL_MS = Math.max(3_000, Number(process.env.KAKA_GATE_ADVANCED_RESPONSE_CACHE_TTL_MS || 20_000));
 const STALE_MS = Math.max(5 * 60_000, Number(process.env.KAKA_GATE_ADVANCED_STALE_MS || 12 * 60_000));
@@ -36,6 +37,7 @@ let focusTimer = null;
 let insuranceTimer = null;
 let focusRecoveryTimer = null;
 let focusInterval = null;
+let focusChangeWatcher = null;
 let insuranceInterval = null;
 let round = 0;
 let totalReads = 0;
@@ -49,6 +51,13 @@ let lastInsuranceCompletedAt = null;
 let lastInsuranceError = '';
 let totalFocusBuilds = 0;
 let totalFocusFailures = 0;
+let lastSuccessfulFocusSignature = '';
+let focusChangeDetections = 0;
+let focusChangeRecoveryAttempts = 0;
+let focusChangeRecoverySuccesses = 0;
+let focusChangeRecoveryFailures = 0;
+let lastFocusChangeRecoveryAt = null;
+let lastFocusChangeRecoveryError = '';
 let totalInsuranceBuilds = 0;
 let totalInsuranceFailures = 0;
 
@@ -181,10 +190,33 @@ function gateFocusTargets() {
     seen.add(row.symbol);
     unique.push(row);
   }
+  const selected = unique.slice(0, FOCUS_TARGET);
   return {
     focus_ready: focus?.ready === true,
     focus_round: Number(focus?.round || 0),
-    rows: unique.slice(0, FOCUS_TARGET),
+    rows: selected,
+    signature: selected.map((row) => row.symbol).sort().join('|'),
+  };
+}
+
+function gateAdvancedRowComplete(row) {
+  if (!row || !fresh(row.updated_at)) return false;
+  if (row.official_contract_stats_available !== true) return false;
+  if (row.official_risk_limit_tiers_available !== true) return false;
+  const stat = row.contract_stats || {};
+  return stat.open_interest_contracts != null || stat.open_interest_usd != null;
+}
+
+function gateAdvancedFocusCoverage(focus, rowsMap = contractRows) {
+  const targets = Array.isArray(focus?.rows) ? focus.rows : [];
+  const completeSymbols = targets
+    .filter((target) => gateAdvancedRowComplete(rowsMap.get(target.symbol)))
+    .map((target) => target.symbol);
+  return {
+    target: targets.length,
+    complete: completeSymbols.length,
+    missing: targets.map((target) => target.symbol).filter((symbol) => !completeSymbols.includes(symbol)),
+    ready: focus?.focus_ready === true && targets.length === FOCUS_TARGET && completeSymbols.length === FOCUS_TARGET,
   };
 }
 
@@ -738,7 +770,7 @@ function parseInsurance(payload) {
   }).filter((row) => row.time != null || row.balance != null);
 }
 
-async function collectContractStats(targets) {
+async function collectContractStats(targets, { updateLane = true } = {}) {
   await restoreContractStatsHistorySnapshots().catch(() => false);
   const result = new Map();
 
@@ -770,12 +802,14 @@ async function collectContractStats(targets) {
     if (i < targets.length - 1) await sleep(PER_SYMBOL_GAP_MS);
   }
 
-  setLane('contract_stats', {
-    last_rows: result.size,
-    official_limit: CONTRACT_STATS_HISTORY_LIMIT,
-    current_and_history_same_request: true,
-    additional_exchange_requests_vs_step992: 0,
-  });
+  if (updateLane) {
+    setLane('contract_stats', {
+      last_rows: result.size,
+      official_limit: CONTRACT_STATS_HISTORY_LIMIT,
+      current_and_history_same_request: true,
+      additional_exchange_requests_vs_step992: 0,
+    });
+  }
 
   const historyHealth = contractStatsHistoryHealthPayload();
   if (historyHealth.official_5m_coverage === FOCUS_TARGET) {
@@ -787,7 +821,7 @@ async function collectContractStats(targets) {
   return result;
 }
 
-async function collectRiskTiers(targets) {
+async function collectRiskTiers(targets, { updateLane = true } = {}) {
   const result = new Map();
   for (let i = 0; i < targets.length; i += 1) {
     const target = targets[i];
@@ -798,7 +832,7 @@ async function collectRiskTiers(targets) {
     } catch (_) {}
     if (i < targets.length - 1) await sleep(PER_SYMBOL_GAP_MS);
   }
-  setLane('risk_limit_tiers', { last_rows: result.size });
+  if (updateLane) setLane('risk_limit_tiers', { last_rows: result.size });
   return result;
 }
 
@@ -849,12 +883,104 @@ async function refreshFocusStats(reason = 'scheduled') {
       round += 1;
       lastFocusCompletedAt = updatedAt;
       responseCache.clear();
-      return true;
+      const coverage = gateAdvancedFocusCoverage(focus, contractRows);
+      if (coverage.ready) {
+        lastSuccessfulFocusSignature = focus.signature;
+        lastFocusError = '';
+        return true;
+      }
+      totalFocusFailures += 1;
+      lastFocusError = `${reason}:gate_focus_incomplete:${coverage.complete}/${FOCUS_TARGET}:${coverage.missing.join(',')}`.slice(0, 320);
+      return false;
     } catch (error) {
       totalFocusFailures += 1;
       lastFocusError = `${reason}:${String(error?.message || error)}`.slice(0, 320);
       return false;
     }
+  })();
+
+  focusRunning = task;
+  try {
+    return await task;
+  } finally {
+    if (focusRunning === task) focusRunning = null;
+  }
+}
+
+async function refreshMissingFocusStats(reason = 'focus_change_watch') {
+  if (focusRunning) {
+    await focusRunning.catch(() => false);
+  }
+  if (focusRunning) return false;
+
+  const task = (async () => {
+    focusChangeRecoveryAttempts += 1;
+    lastFocusChangeRecoveryAt = new Date().toISOString();
+    lastFocusChangeRecoveryError = '';
+
+    const focus = gateFocusTargets();
+    if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET) {
+      focusChangeRecoveryFailures += 1;
+      lastFocusChangeRecoveryError = `gate_focus_not_ready:${focus.rows.length}/${FOCUS_TARGET}`;
+      return false;
+    }
+
+    const coverageBefore = gateAdvancedFocusCoverage(focus, contractRows);
+    if (coverageBefore.ready) {
+      lastSuccessfulFocusSignature = focus.signature;
+      return true;
+    }
+
+    const missingSet = new Set(coverageBefore.missing);
+    const missingTargets = focus.rows.filter((target) => missingSet.has(target.symbol));
+    const [stats, risks] = await Promise.all([
+      collectContractStats(missingTargets, { updateLane: false }),
+      collectRiskTiers(missingTargets, { updateLane: false }),
+    ]);
+
+    const updatedAt = new Date().toISOString();
+    const next = new Map();
+    for (const target of focus.rows) {
+      const existing = contractRows.get(target.symbol) || null;
+      const recoveredStat = stats.get(target.symbol) || null;
+      const recoveredRisk = risks.get(target.symbol) || null;
+      const stat = recoveredStat || existing?.contract_stats || null;
+      const riskTiers = recoveredRisk?.tiers || existing?.risk_limit_tiers || null;
+      if (!stat && !riskTiers) continue;
+      next.set(target.symbol, {
+        ...(existing || {}),
+        provider: 'gate',
+        market_type: 'contract',
+        symbol: target.symbol,
+        native_symbol: target.native_symbol,
+        base_asset: target.base_asset,
+        quote_asset: 'USDT',
+        focus_role: target.role,
+        focus_slot: target.slot,
+        contract_stats: stat,
+        risk_limit_tiers: riskTiers,
+        official_contract_stats_available: Boolean(stat),
+        official_risk_limit_tiers_available: Boolean(riskTiers),
+        updated_at: recoveredStat || recoveredRisk ? updatedAt : existing?.updated_at,
+        source: 'gate_official_public_advanced_shared_stats',
+      });
+    }
+    contractRows = next;
+    responseCache.clear();
+
+    const coverageAfter = gateAdvancedFocusCoverage(focus, contractRows);
+    if (coverageAfter.ready) {
+      focusChangeRecoverySuccesses += 1;
+      lastSuccessfulFocusSignature = focus.signature;
+      lastFocusCompletedAt = updatedAt;
+      lastFocusError = '';
+      return true;
+    }
+
+    focusChangeRecoveryFailures += 1;
+    lastFocusChangeRecoveryError = `${reason}:gate_focus_recovery_incomplete:${coverageAfter.complete}/${FOCUS_TARGET}:${coverageAfter.missing.join(',')}`.slice(0, 320);
+    lastFocusError = lastFocusChangeRecoveryError;
+    return false;
   })();
 
   focusRunning = task;
@@ -931,6 +1057,17 @@ export function startGateAdvancedStatsScanner() {
   insuranceTimer.unref?.();
   focusInterval = setInterval(() => refreshFocusStats('interval').catch(() => {}), FOCUS_REFRESH_MS);
   focusInterval.unref?.();
+  focusChangeWatcher = setInterval(async () => {
+    const focus = gateFocusTargets();
+    if (!focus.focus_ready || focus.rows.length !== FOCUS_TARGET || !lastSuccessfulFocusSignature) return;
+    if (focus.signature === lastSuccessfulFocusSignature) return;
+    focusChangeDetections += 1;
+    await refreshMissingFocusStats('focus_change_watch').catch((error) => {
+      focusChangeRecoveryFailures += 1;
+      lastFocusChangeRecoveryError = String(error?.message || error).slice(0, 320);
+    });
+  }, FOCUS_CHANGE_WATCH_MS);
+  focusChangeWatcher.unref?.();
   insuranceInterval = setInterval(() => refreshInsurance('interval').catch(() => {}), INSURANCE_REFRESH_MS);
   insuranceInterval.unref?.();
 }
@@ -984,10 +1121,12 @@ function snapshotPayload({ includeRows = true } = {}) {
     source: 'render_shared_gate_official_public_advanced_statistics',
     ready: focus.focus_ready &&
       targetSymbols.length === FOCUS_TARGET &&
+      rows.length === FOCUS_TARGET &&
+      statsRows.length === FOCUS_TARGET &&
+      riskRows.length === FOCUS_TARGET &&
+      oiRows === FOCUS_TARGET &&
       coreTargetCount === 10 &&
       coreStatsRows === coreTargetCount &&
-      riskRows.length >= coreTargetCount &&
-      oiRows >= coreTargetCount &&
       insuranceFresh,
     focus_target: FOCUS_TARGET,
     focus_round: focus.focus_round,
@@ -1008,6 +1147,21 @@ function snapshotPayload({ includeRows = true } = {}) {
     contract_stats_history: contractStatsHistoryHealthPayload(),
     contract_stats_history_route: CONTRACT_STATS_HISTORY_ROUTE,
     focus_refresh_seconds: Math.round(FOCUS_REFRESH_MS / 1000),
+    focus_change_watch_seconds: Math.round(FOCUS_CHANGE_WATCH_MS / 1000),
+    focus_change_detection: 'order_invariant_symbol_membership_signature',
+    focus_change_background_only: true,
+    focus_change_user_read_triggered: false,
+    focus_change_missing_only_recovery: true,
+    focus_change_max_requests_per_missing_symbol: 2,
+    current_focus_signature: focus.signature,
+    last_successful_focus_signature: lastSuccessfulFocusSignature || null,
+    focus_change_detections: focusChangeDetections,
+    focus_change_recovery_attempts: focusChangeRecoveryAttempts,
+    focus_change_recovery_successes: focusChangeRecoverySuccesses,
+    focus_change_recovery_failures: focusChangeRecoveryFailures,
+    last_focus_change_recovery_at: lastFocusChangeRecoveryAt,
+    last_focus_change_recovery_error: lastFocusChangeRecoveryError,
+    full_focus_advanced_coverage_ready: rows.length === FOCUS_TARGET && statsRows.length === FOCUS_TARGET && riskRows.length === FOCUS_TARGET && oiRows === FOCUS_TARGET,
     insurance_refresh_seconds: Math.round(INSURANCE_REFRESH_MS / 1000),
     per_symbol_gap_ms: PER_SYMBOL_GAP_MS,
     official_endpoint_policy: {
@@ -1057,6 +1211,20 @@ function snapshotPayload({ includeRows = true } = {}) {
   responseCache.set(cacheKey, { at: Date.now(), payload });
   return { ...clone(payload), cache_hit: false, cache_age_ms: 0 };
 }
+
+export const __gateAdvancedFocusRecoveryTest = Object.freeze({
+  focusMembershipSignature(rows = []) {
+    return rows.map((row) => compact(row?.symbol)).filter(Boolean).sort().join('|');
+  },
+  coverageFromRows(targetSymbols = [], rows = []) {
+    const map = new Map(rows.map((row) => [compact(row?.symbol), row]));
+    const focus = {
+      focus_ready: true,
+      rows: targetSymbols.map((symbol) => ({ symbol: compact(symbol) })),
+    };
+    return gateAdvancedFocusCoverage(focus, map);
+  },
+});
 
 export function getGateAdvancedStatsHealth() {
   const snapshot = snapshotPayload({ includeRows: false });
