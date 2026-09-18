@@ -23,6 +23,7 @@ jobs:
             static CONNECTING = 0;
             static CLOSED = 3;
           }
+          export default WebSocket;
           export class WebSocketServer {}
           JS
       - run: node tests/step1072_9_gate_flow_bridge_selftest.mjs
