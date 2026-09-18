@@ -1,0 +1,45 @@
+name: Jinse upstream shape probe
+on:
+  push:
+    branches: [step1072-9-contract-advanced-health-probe]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: |
+          node - <<'NODE'
+          const url='http://api.coinmeta.info/live/list';
+          const r=await fetch(url,{headers:{accept:'application/json,text/plain,*/*','user-agent':'KakaWeb3-Jinse-Shape-Audit/1.0'}});
+          console.log('HTTP',r.status,r.url);
+          const t=await r.text();
+          let j; try{j=JSON.parse(t)}catch{console.log('RAW',t.slice(0,500)); process.exit(2);}
+          const tv=(v)=>v==null?'':String(v);
+          const newsKeys=['title','name','headline','content_prefix','contentPrefix','prefix','content','description','summary','text','body'];
+          const looks=(o)=>o&&typeof o==='object'&&!Array.isArray(o)&&newsKeys.some(k=>tv(o[k]).length>0);
+          const out=[];
+          const walk=(v,d=0)=>{
+            if(d>8||v==null||out.length>=20)return;
+            if(Array.isArray(v)){for(const x of v){walk(x,d+1);if(out.length>=20)break;}return;}
+            if(typeof v!=='object')return;
+            if(looks(v)){out.push(v);return;}
+            for(const k of ['lives','live','list','items','news','records','rows','data','result','children']){
+              if(v[k]!=null)walk(v[k],d+1);
+            }
+          };
+          walk(j);
+          console.log('ROOT_TYPE',Array.isArray(j)?'array':typeof j,'ROOT_KEYS',j&&typeof j==='object'&&!Array.isArray(j)?Object.keys(j).slice(0,30):[]);
+          console.log('ITEM_COUNT',out.length);
+          out.slice(0,12).forEach((o,i)=>{
+            console.log('ITEM',i,JSON.stringify({
+              keys:Object.keys(o).slice(0,40),
+              id:o.id,external_id:o.external_id,externalId:o.externalId,
+              news_id:o.news_id,newsId:o.newsId,live_id:o.live_id,liveId:o.liveId,
+              flash_id:o.flash_id,flashId:o.flashId,uuid:o.uuid,
+              title:tv(o.title||o.name||o.headline||o.content_prefix||o.contentPrefix||o.prefix||o.content).slice(0,120),
+              published:o.published_at||o.publish_time||o.created_at||o.create_time||o.time||o.timestamp
+            }));
+          });
+          NODE
