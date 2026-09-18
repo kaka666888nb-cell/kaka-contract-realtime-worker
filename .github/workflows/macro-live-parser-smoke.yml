@@ -76,9 +76,17 @@ jobs:
           const index=fedText.match(/At\s+([0-9.]+)\s+percent of its 2017 average, total (?:industrial production|IP)/i);
           const yoy=fedText.match(/total (?:industrial production|IP)[^.]{0,100}?was\s+([0-9.]+)\s+percent\s+(above|below)\s+its year-earlier level/i);
           const util=fedText.match(/Capacity utilization(?: was unchanged at| remained unchanged at| edged up to| moved up to| rose to| stepped up to| receded to| declined to| fell to)\s+([0-9.]+)\s+percent/i);
-          const fed={releaseDate,reference:`${year}-${String(month).padStart(2,'0')}`,ipMom,mfg,index:index?Number(index[1]):null,yoy:yoy?(yoy[2].toLowerCase()==='below'?-Number(yoy[1]):Number(yoy[1])):null,util:util?Number(util[1]):null};
+          const previous=fedText.match(/Industrial production(?: \(IP\))?[^.]{0,220}?\s+in\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+after\s+(increasing|decreasing|rising|falling|growing|declining|dropping|edging up|edging down|ticking up|ticking down|moving up|moving down)\s+([0-9.]+)\s+percent in\s+(January|February|March|April|May|June|July|August|September|October|November|December)/i);
+          let previousRow=null;
+          if(previous){
+            const previousMonth=monthNum(previous[4]);
+            let previousYear=year;
+            if(previousMonth>month) previousYear-=1;
+            previousRow={reference:`${previousYear}-${String(previousMonth).padStart(2,'0')}`,ipMom:signed(previous[2],previous[3])};
+          }
+          const fed={releaseDate,reference:`${year}-${String(month).padStart(2,'0')}`,ipMom,mfg,index:index?Number(index[1]):null,yoy:yoy?(yoy[2].toLowerCase()==='below'?-Number(yoy[1]):Number(yoy[1])):null,util:util?Number(util[1]):null,previousRow};
           console.log('FED_ROW',JSON.stringify(fed));
-          if(fed.releaseDate!=='2026-09-18'||fed.reference!=='2026-08'||fed.ipMom!==0||fed.mfg!==-0.3||fed.index!==103.1||fed.yoy!==1.4||fed.util!==76.3){
+          if(fed.releaseDate!=='2026-09-18'||fed.reference!=='2026-08'||fed.ipMom!==0||fed.mfg!==-0.3||fed.index!==103.1||fed.yoy!==1.4||fed.util!==76.3||fed.previousRow?.reference!=='2026-07'||fed.previousRow?.ipMom!==0.2){
             throw new Error('fed_latest_mismatch:'+JSON.stringify(fed));
           }
           console.log('MACRO_PARSER_SMOKE_PASS');
