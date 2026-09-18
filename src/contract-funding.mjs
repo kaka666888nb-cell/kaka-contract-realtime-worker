@@ -6,7 +6,7 @@ import {
 import { getMarketUniverseRows } from './market-rest.mjs';
 
 const ROUTE = '/api/contract-funding';
-const VERSION = '650.8.15.42';
+const VERSION = '650.8.15.43';
 const SUPPORTED = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const CACHE = new Map();
 const INFLIGHT = new Map();
@@ -33,6 +33,7 @@ const PERSISTED_HISTORY_INFLIGHT = new Map();
 const PERSISTED_HISTORY_CACHE_TTL_MS = 5 * 60_000;
 const PERSISTED_HISTORY_STALE_MS = 30 * 60_000;
 const PERSISTED_HISTORY_CACHE_MAX = 256;
+const SHARED_CURRENT_STALE_MS = Math.max(5 * 60_000, Number(process.env.KAKA_FUNDING_SHARED_CURRENT_STALE_MS || 30 * 60_000));
 const FUNDING_PERSIST_QUEUE_MAX = 2500;
 const fundingCurrentPersistQueue = new Map();
 const fundingHistoryPersistQueue = new Map();
@@ -125,6 +126,60 @@ function normalizePersistedHistory(raw) {
     time: raw.funding_time,
     mark: raw.mark_price,
   });
+}
+
+function persistedFundingCurrentFreshness(current, nowMs = Date.now()) {
+  if (!current || typeof current !== 'object') {
+    return { present: false, stale: false, age_ms: null, source_time: null };
+  }
+  const sourceMs = Date.parse(String(current.source_time || ''));
+  if (!Number.isFinite(sourceMs) || sourceMs <= 0) {
+    return { present: true, stale: true, age_ms: null, source_time: current.source_time || null };
+  }
+  const ageMs = Math.max(0, Number(nowMs) - sourceMs);
+  return {
+    present: true,
+    stale: ageMs > SHARED_CURRENT_STALE_MS,
+    age_ms: ageMs,
+    source_time: current.source_time || null,
+  };
+}
+
+function sharedFundingReadPayload({ provider, symbol, limit, includeHistory, bundle, nowMs = Date.now() }) {
+  const freshness = persistedFundingCurrentFreshness(bundle?.current, nowMs);
+  const history = includeHistory
+    ? mergeFundingHistoryRows(bundle?.history || []).slice(0, limit)
+    : [];
+  const current = bundle?.current || null;
+  return {
+    ok: true,
+    version: VERSION,
+    provider,
+    market_type: 'contract',
+    symbol,
+    native_symbol: nativeSymbol(provider, symbol),
+    source: 'render_shared_persisted_funding_cache',
+    current,
+    history,
+    warnings: [
+      ...(bundle?.warning ? [bundle.warning] : []),
+      ...(freshness.stale ? ['shared_current_stale_retained'] : []),
+      ...(!freshness.present ? ['shared_current_missing'] : []),
+    ],
+    current_stale: freshness.stale,
+    current_age_ms: freshness.age_ms,
+    current_source_time: freshness.source_time,
+    partial: !freshness.present || freshness.stale || (includeHistory && history.length === 0),
+    cache_hit: bundle?.cache_hit === true,
+    cache_stale: bundle?.cache_stale === true,
+    cache_age_ms: Number(bundle?.cache_age_ms || 0),
+    exchange_requests_started: 0,
+    exchange_connections_started: 0,
+    user_reads_trigger_exchange_requests: false,
+    user_reads_trigger_exchange_connections: false,
+    reads_scale_with_users: false,
+    timestamp_ms: Number(nowMs),
+  };
 }
 
 function mergeFundingHistoryRows(...groups) {
@@ -1020,6 +1075,11 @@ async function load(provider, symbol, limit, { includeHistory = true } = {}) {
   }
 }
 
+export const __contractFundingSharedReadTest = Object.freeze({
+  persistedFundingCurrentFreshness,
+  sharedFundingReadPayload,
+});
+
 export async function handleContractFunding(req, res, url) {
   if (url.pathname === `${ROUTE}/health`) {
     sendJson(res, 200, {
@@ -1060,6 +1120,13 @@ export async function handleContractFunding(req, res, url) {
       },
       old_binance_cron_parallel_observation_retained: true,
       history_reads_open_exchange_connection: false,
+      current_route_mode: 'shared_persisted_cache_only',
+      shared_current_stale_seconds: Math.round(SHARED_CURRENT_STALE_MS / 1000),
+      current_route_exchange_requests_started_by_user_read: 0,
+      current_route_exchange_connections_started_by_user_read: 0,
+      user_reads_trigger_exchange_requests: false,
+      user_reads_trigger_exchange_connections: false,
+      reads_scale_with_users: false,
       persisted_history_read_market_type_mode: 'dedicated_funding_table_provider_symbol_compat_then_normalize_contract',
       missing_mark_and_index_price_zero_normalized_to_null: true,
       cache_entries: CACHE.size,
@@ -1138,70 +1205,52 @@ export async function handleContractFunding(req, res, url) {
     return true;
   }
   const includeHistory = String(url.searchParams.get('history_mode') || '').toLowerCase() !== 'none';
-  const key = `${provider}|${symbol}|${limit}|${includeHistory ? 'history' : 'current'}`;
-  if (provider === 'binance') {
-    await serveBinanceFunding(res, symbol, limit, key, {
-      scheduleHistory: includeHistory,
+  if (!FUNDING_PERSISTENCE_ENABLED) {
+    sendJson(res, 503, {
+      ok: false,
+      version: VERSION,
+      provider,
+      symbol,
+      error: 'funding_shared_cache_disabled',
+      exchange_requests_started: 0,
+      user_reads_trigger_exchange_requests: false,
     });
     return true;
   }
-  const now = Date.now();
-  const cached = CACHE.get(key);
-  if (cached && now - cached.storedAt <= FRESH_MS) {
-    sendJson(res, 200, { ...cached.payload, cache_state: 'fresh' });
-    return true;
-  }
-  let pending = INFLIGHT.get(key);
-  if (!pending) {
-    pending = Promise.allSettled([
-      load(provider, symbol, limit, { includeHistory }),
-      includeHistory ? readPersistedFundingBundle(provider, symbol, limit) : Promise.resolve({ current: null, history: [] }),
-    ])
-      .then((results) => {
-        if (results[0].status === 'rejected') throw results[0].reason;
-        const data = results[0].value;
-        const persisted = results[1].status === 'fulfilled' ? results[1].value : { current: null, history: [] };
-        const history = includeHistory
-          ? mergeFundingHistoryRows(data.history, persisted.history).slice(0, limit)
-          : [];
-        const current = data.current || persisted.current || null;
-        const payload = {
-          ok: true,
-          version: VERSION,
-          provider,
-          market_type: 'contract',
-          symbol,
-          native_symbol: data.native_symbol || nativeSymbol(provider, symbol),
-          source: data.source,
-          current,
-          history,
-          warnings: Array.isArray(data.warnings) ? data.warnings : [],
-          persisted_history_fallback_used: includeHistory && (!Array.isArray(data.history) || data.history.length === 0) && history.length > 0,
-          timestamp_ms: Date.now(),
-        };
-        queueFundingPersistence(current, history);
-        CACHE.set(key, { storedAt: Date.now(), payload });
-        return payload;
-      })
-      .finally(() => INFLIGHT.delete(key));
-    INFLIGHT.set(key, pending);
-  }
   try {
-    const payload = await pending;
-    sendJson(res, 200, { ...payload, cache_state: 'miss' });
+    const bundle = await readPersistedFundingBundle(provider, symbol, includeHistory ? limit : 1);
+    const payload = sharedFundingReadPayload({
+      provider,
+      symbol,
+      limit,
+      includeHistory,
+      bundle,
+      nowMs: Date.now(),
+    });
+    sendJson(res, 200, {
+      ...payload,
+      cache_state: payload.current_stale
+        ? 'shared-stale'
+        : payload.current
+          ? 'shared-current'
+          : payload.history.length
+            ? 'shared-history-only'
+            : 'shared-empty',
+    });
   } catch (error) {
-    if (cached && now - cached.storedAt <= STALE_MS) {
-      sendJson(res, 200, { ...cached.payload, cache_state: 'stale', warning: String(error?.message || error) });
-    } else {
-      sendJson(res, 502, {
-        ok: false,
-        version: VERSION,
-        provider,
-        symbol,
-        error: String(error?.message || error),
-        reason: 'upstream_unavailable',
-      });
-    }
+    sendJson(res, 502, {
+      ok: false,
+      version: VERSION,
+      provider,
+      symbol,
+      error: String(error?.message || error),
+      reason: 'shared_funding_cache_unavailable',
+      exchange_requests_started: 0,
+      exchange_connections_started: 0,
+      user_reads_trigger_exchange_requests: false,
+      user_reads_trigger_exchange_connections: false,
+      reads_scale_with_users: false,
+    });
   }
   return true;
 }
