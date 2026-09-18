@@ -1,0 +1,29 @@
+name: Step1072.9 funding shared read CI
+on:
+  push:
+    branches: [step1072-9-contract-funding-shared-read-only]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm run check
+      - name: Install local ws import stub
+        run: |
+          mkdir -p node_modules/ws
+          cat > node_modules/ws/package.json <<'JSON'
+          {"name":"ws","version":"0.0.0-test","type":"module","exports":"./index.js"}
+          JSON
+          cat > node_modules/ws/index.js <<'JS'
+          export class WebSocket {
+            static OPEN = 1;
+            static CONNECTING = 0;
+            static CLOSED = 3;
+          }
+          export default WebSocket;
+          export class WebSocketServer {}
+          JS
+      - run: node tests/step1072_9_contract_funding_shared_read_only.mjs
