@@ -19,7 +19,9 @@ jobs:
             '/api/contract-funding/history?provider=okx&symbol=BTCUSDT&limit=5',
             '/api/gate-advanced/health',
             '/api/contract-deep-shared/health',
-            '/api/contract-flow/health'
+            '/api/contract-flow/health',
+            '/api/contract-basis/health',
+            '/api/contract-liquidation/health'
           ];
           for(const path of paths){
             try{
@@ -46,6 +48,57 @@ jobs:
                   provider_coverage:j.provider_coverage,
                   exchange_requests_started_by_user_read:j.exchange_requests_started_by_user_read,
                   exchange_connections_started_by_user_read:j.exchange_connections_started_by_user_read,
+                  last_error:j.last_error
+                };
+              }else if(path==='/api/contract-basis/health'){
+                out={
+                  ok:j.ok,enabled:j.enabled,latest_ready:j.latest_ready,
+                  latest_full_input_ready:j.latest_full_input_ready,
+                  latest_partial_input_ready:j.latest_partial_input_ready,
+                  latest_provider_ready_count:j.latest_provider_ready_count,
+                  latest_row_count:j.latest_row_count,
+                  additional_exchange_requests_per_build:j.additional_exchange_requests_per_build,
+                  additional_exchange_connections_per_build:j.additional_exchange_connections_per_build,
+                  snapshot_reads_start_exchange_requests:j.snapshot_reads_start_exchange_requests,
+                  snapshot_reads_start_exchange_connections:j.snapshot_reads_start_exchange_connections,
+                  snapshot_reads_scale_with_users:j.snapshot_reads_scale_with_users,
+                  no_cross_provider_substitution:j.no_cross_provider_substitution,
+                  no_cross_quote_substitution:j.no_cross_quote_substitution,
+                  missing_values_remain_null:j.missing_values_remain_null,
+                  last_error:j.last_error,
+                  delivery:j.delivery?{
+                    latest_ready:j.delivery.latest_ready,
+                    latest_partial:j.delivery.latest_partial,
+                    latest_provider_ready_count:j.delivery.latest_provider_ready_count,
+                    latest_row_count:j.delivery.latest_row_count,
+                    user_reads_start_exchange_requests:j.delivery.user_reads_start_exchange_requests,
+                    reads_scale_with_users:j.delivery.reads_scale_with_users,
+                    binance_contract_rest_requests:j.delivery.binance_contract_rest_requests,
+                    binance_shared_ws_warm_last_error:j.delivery.binance_shared_ws_warm_last_error
+                  }:null
+                };
+              }else if(path==='/api/contract-liquidation/health'){
+                out={
+                  ok:j.ok,
+                  current_snapshot_rows:j.current_snapshot_rows,
+                  current_snapshot_connected_provider_count:j.current_snapshot_connected_provider_count,
+                  current_snapshot_reads_start_exchange_connections:j.current_snapshot_reads_start_exchange_connections,
+                  current_snapshot_exchange_connections_started_per_read:j.current_snapshot_exchange_connections_started_per_read,
+                  current_snapshot_scales_with_users:j.current_snapshot_scales_with_users,
+                  market_snapshot_directory_symbols:j.market_snapshot_directory_symbols,
+                  market_snapshot_connected_symbols:j.market_snapshot_connected_symbols,
+                  market_snapshot_complete_symbols:j.market_snapshot_complete_symbols,
+                  market_snapshot_full_directory_connected:j.market_snapshot_full_directory_connected,
+                  market_snapshot_full_window_coverage_complete:j.market_snapshot_full_window_coverage_complete,
+                  market_snapshot_reads_start_exchange_connections:j.market_snapshot_reads_start_exchange_connections,
+                  market_snapshot_exchange_connections_started_per_read:j.market_snapshot_exchange_connections_started_per_read,
+                  market_snapshot_scales_with_users:j.market_snapshot_scales_with_users,
+                  market_collector_topology_exact:j.market_collector_topology_exact,
+                  focused_usdt_duplicate_feed_count:j.focused_usdt_duplicate_feed_count,
+                  step998_liquidation_heatmap_ready:j.step998_liquidation_heatmap_ready,
+                  step998_heatmap_user_reads_trigger_requests:j.step998_heatmap_user_reads_trigger_requests,
+                  step998_heatmap_reads_scale_with_users:j.step998_heatmap_reads_scale_with_users,
+                  step998_heatmap_exchange_requests_started_by_reads:j.step998_heatmap_exchange_requests_started_by_reads,
                   last_error:j.last_error
                 };
               }else if(path==='/api/contract-flow/health'){
