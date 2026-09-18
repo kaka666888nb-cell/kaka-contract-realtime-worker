@@ -16,33 +16,81 @@ jobs:
             '/api/contract-funding/health',
             '/api/contract-funding?provider=okx&symbol=BTCUSDT&history_mode=none',
             '/api/contract-funding?provider=gate&symbol=XMRUSDT&history_mode=none',
-            '/api/contract-funding/history?provider=okx&symbol=BTCUSDT&limit=5'
+            '/api/contract-funding/history?provider=okx&symbol=BTCUSDT&limit=5',
+            '/api/gate-advanced/health',
+            '/api/contract-deep-shared/health',
+            '/api/contract-flow/health'
           ];
           for(const path of paths){
             try{
-              const r=await fetch(base+path,{headers:{accept:'application/json','user-agent':'KakaWeb3-Funding-Audit/1.0'}});
+              const r=await fetch(base+path,{headers:{accept:'application/json','user-agent':'KakaWeb3-Funding-Audit/1.1'}});
               const t=await r.text(); let j; try{j=JSON.parse(t)}catch{j={raw:t.slice(0,1000)}}
-              const out={
-                ok:j?.ok,version:j?.version,provider:j?.provider,symbol:j?.symbol,
-                source:j?.source,current_route_mode:j?.current_route_mode,
-                user_reads_trigger_exchange_requests:j?.user_reads_trigger_exchange_requests,
-                user_reads_trigger_exchange_connections:j?.user_reads_trigger_exchange_connections,
-                reads_scale_with_users:j?.reads_scale_with_users,
-                exchange_requests_started:j?.exchange_requests_started,
-                exchange_connections_started:j?.exchange_connections_started,
-                current_stale:j?.current_stale,current_age_ms:j?.current_age_ms,
-                partial:j?.partial,cache_state:j?.cache_state,
-                current:j?.current?{
-                  last_funding_rate:j.current.last_funding_rate,
-                  next_funding_time:j.current.next_funding_time,
-                  source_time:j.current.source_time,
-                  mark_price:j.current.mark_price,
-                  index_price:j.current.index_price
-                }:null,
-                history_count:Array.isArray(j?.history)?j.history.length:j?.history_count,
-                warning:j?.warning,warnings:j?.warnings,
-                error:j?.error,reason:j?.reason
-              };
+              let out;
+              if(path==='/api/gate-advanced/health'){
+                out={
+                  ok:j.ok,ready:j.ready,focus_target:j.focus_target,
+                  contract_row_count:j.contract_row_count,contract_stats_rows:j.contract_stats_rows,
+                  risk_limit_rows:j.risk_limit_rows,open_interest_rows:j.open_interest_rows,
+                  contract_stats_history_ready:j.contract_stats_history_ready,
+                  contract_stats_history_official_5m_coverage:j.contract_stats_history_official_5m_coverage,
+                  full_focus_advanced_coverage_ready:j.full_focus_advanced_coverage_ready,
+                  exchange_requests_started_by_user_read:j.exchange_requests_started_by_user_read,
+                  user_reads_trigger_collector:j.user_reads_trigger_collector,
+                  last_focus_error:j.last_focus_error,last_focus_change_recovery_error:j.last_focus_change_recovery_error
+                };
+              }else if(path==='/api/contract-deep-shared/health'){
+                out={
+                  ok:j.ok,ready:j.ready,row_count:j.row_count,target_rows:j.target_rows,
+                  depth_fresh_rows:j.depth_fresh_rows,flow_active_rows:j.flow_active_rows,
+                  flow_connected_rows:j.flow_connected_rows,flow_value_rows:j.flow_value_rows,
+                  provider_coverage:j.provider_coverage,
+                  exchange_requests_started_by_user_read:j.exchange_requests_started_by_user_read,
+                  exchange_connections_started_by_user_read:j.exchange_connections_started_by_user_read,
+                  last_error:j.last_error
+                };
+              }else if(path==='/api/contract-flow/health'){
+                out={
+                  ok:j.ok,
+                  binance_official_taker:j.binance_official_taker?{
+                    ready:j.binance_official_taker.ready,
+                    current_instance_full_sweep_completed:j.binance_official_taker.current_instance_full_sweep_completed,
+                    current_instance_success_coverage_rows:j.binance_official_taker.current_instance_success_coverage_rows,
+                    current_instance_success_missing_symbols:j.binance_official_taker.current_instance_success_missing_symbols,
+                    official_coverage_rows:j.binance_official_taker.official_coverage_rows,
+                    pending_refresh_debt_count:j.binance_official_taker.pending_refresh_debt_count,
+                    pending_refresh_debt_symbols:j.binance_official_taker.pending_refresh_debt_symbols,
+                    last_error:j.binance_official_taker.last_error
+                  }:null,
+                  gate_advanced_flow_bridge:j.gate_advanced_flow_bridge?{
+                    rows_seen:j.gate_advanced_flow_bridge.rows_seen,
+                    rows_hydrated:j.gate_advanced_flow_bridge.rows_hydrated,
+                    failures:j.gate_advanced_flow_bridge.failures,
+                    last_error:j.gate_advanced_flow_bridge.last_error,
+                    exchange_requests_added:j.gate_advanced_flow_bridge.exchange_requests_added
+                  }:null,
+                  focus_pool_binding:j.focus_pool_binding
+                };
+              }else{
+                out={
+                  ok:j?.ok,version:j?.version,provider:j?.provider,symbol:j?.symbol,
+                  source:j?.source,current_route_mode:j?.current_route_mode,
+                  user_reads_trigger_exchange_requests:j?.user_reads_trigger_exchange_requests,
+                  user_reads_trigger_exchange_connections:j?.user_reads_trigger_exchange_connections,
+                  reads_scale_with_users:j?.reads_scale_with_users,
+                  exchange_requests_started:j?.exchange_requests_started,
+                  exchange_connections_started:j?.exchange_connections_started,
+                  current_stale:j?.current_stale,current_age_ms:j?.current_age_ms,
+                  partial:j?.partial,cache_state:j?.cache_state,
+                  current:j?.current?{
+                    last_funding_rate:j.current.last_funding_rate,
+                    next_funding_time:j.current.next_funding_time,
+                    source_time:j.current.source_time,
+                    mark_price:j.current.mark_price,index_price:j.current.index_price
+                  }:null,
+                  history_count:Array.isArray(j?.history)?j.history.length:j?.history_count,
+                  warning:j?.warning,warnings:j?.warnings,error:j?.error,reason:j?.reason
+                };
+              }
               console.log('AUDIT_PATH',path,'HTTP',r.status);
               console.log('AUDIT_JSON',JSON.stringify(out));
             }catch(e){
