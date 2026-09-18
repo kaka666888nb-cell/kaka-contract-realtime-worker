@@ -12,40 +12,27 @@ jobs:
       - run: |
           node - <<'NODE'
           const base='https://kaka-contract-realtime-worker.onrender.com';
-          async function get(path){
-            const r=await fetch(base+path,{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
-            const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch{}
-            console.log('\nPATH',path,'HTTP',r.status); return j;
+          const h=await (await fetch(base+'/api/gate-advanced/health')).json();
+          const syms=h?.contract_stats_history?.focus_symbols||[];
+          const out=[];
+          for(const s of syms){
+            const native=s.replace(/USDT$/,'_USDT');
+            const r=await fetch('https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract='+encodeURIComponent(native)+'&interval=5m&limit=3',{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
+            const j=await r.json().catch(()=>null);
+            const row=Array.isArray(j)&&j.length?j[0]:null;
+            out.push({
+              symbol:s,http:r.status,rows:Array.isArray(j)?j.length:null,
+              time:row?.time??null,lsr_taker:row?.lsr_taker??null,
+              long_taker_size:row?.long_taker_size??null,short_taker_size:row?.short_taker_size??null,
+              long_taker_present:row?Object.prototype.hasOwnProperty.call(row,'long_taker_size'):false,
+              short_taker_present:row?Object.prototype.hasOwnProperty.call(row,'short_taker_size'):false
+            });
+            await new Promise(r=>setTimeout(r,260));
           }
-          const root=await get('/health');
-          function walk(o,p='',out=[]){
-            if(!o||typeof o!=='object') return out;
-            for(const [k,v] of Object.entries(o)){
-              const q=p? p+'.'+k:k;
-              if(/depth|binance_ws_connect|contract_deep/i.test(q) && (v==null||typeof v!=='object')) out.push([q,v]);
-              if(v&&typeof v==='object'&&q.split('.').length<5) walk(v,q,out);
-            }
-            return out;
-          }
-          console.log('ROOT_DEPTH',JSON.stringify(walk(root).slice(0,300)));
-          const deep=await get('/api/contract-deep-shared/health');
-          console.log('DEEP',JSON.stringify({
-            ready:deep?.ready,live_ready:deep?.live_ready,
-            depth_fresh_rows:deep?.depth_fresh_rows,depth_refresh_error_rows:deep?.depth_refresh_error_rows,
-            flow_active_rows:deep?.flow_active_rows,flow_connected_rows:deep?.flow_connected_rows,
-            provider_coverage:deep?.provider_coverage,
-            last_completed_at:deep?.last_completed_at,last_error:deep?.last_error
-          }));
-          const gateH=await get('/api/gate-advanced/health');
-          console.log('GATE_H',JSON.stringify({
-            ready:gateH?.ready,row_count:gateH?.row_count,
-            last_focus_started_at:gateH?.last_focus_started_at,last_focus_completed_at:gateH?.last_focus_completed_at,
-            last_focus_error:gateH?.last_focus_error,contract_stats_rows:gateH?.contract_stats_rows,
-            risk_limit_rows:gateH?.risk_limit_rows,
-            hist_ready:gateH?.contract_stats_history_ready,
-            hist_coverage:gateH?.contract_stats_history_official_5m_coverage,
-            focus_symbols:gateH?.contract_stats_history?.focus_symbols
-          }));
-          const gate=await get('/api/gate-advanced/current-snapshot');
-          console.log('GATE_ZBT',JSON.stringify((gate?.rows||[]).find(x=>String(x.symbol||'').toUpperCase()==='ZBTUSDT')||null));
+          console.log('GATE_TAKER_OFFICIAL',JSON.stringify(out));
+          const deep=await (await fetch(base+'/api/contract-deep-shared/current-snapshot')).json();
+          console.log('GATE_DEEP_FLOW',JSON.stringify((deep?.rows||[]).filter(x=>x.provider==='gate').map(x=>({
+            symbol:x.symbol,flow_ready:x.flow_ready,flow_buy_quote:x.flow_buy_quote,
+            flow_sell_quote:x.flow_sell_quote,flow_source:x.flow_source
+          }))));
           NODE
