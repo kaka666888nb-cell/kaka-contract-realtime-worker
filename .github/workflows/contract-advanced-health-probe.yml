@@ -1,0 +1,56 @@
+name: Contract advanced production health probe
+on:
+  push:
+    branches: [step1072-9-contract-advanced-health-probe]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: |
+          node - <<'NODE'
+          const base='https://kaka-contract-realtime-worker.onrender.com';
+          const paths=[
+            '/api/contract-deep-shared/health',
+            '/api/contract-basis/health',
+            '/api/binance-advanced/health',
+            '/api/okx-advanced/health',
+            '/api/bybit-advanced/health',
+            '/api/bitget-advanced/health',
+            '/api/gate-advanced/health',
+            '/api/derivatives-public/health',
+            '/api/contract-flow/health',
+            '/api/contract-liquidation/health'
+          ];
+          const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>Object.prototype.hasOwnProperty.call(o,k)).map(k=>[k,o[k]]));
+          for(const path of paths){
+            try{
+              const r=await fetch(base+path,{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
+              const text=await r.text();
+              let j=null; try{j=JSON.parse(text)}catch{}
+              console.log('\nPATH',path,'HTTP',r.status);
+              if(!j){console.log('RAW',text.slice(0,500));continue;}
+              const summary=pick(j,[
+                'ok','version','step','ready','live_ready','focus_pool_ready','rows','row_count',
+                'focus_rows','core_rows','depth_fresh_rows','depth_missing_rows','depth_refresh_error_rows',
+                'flow_ready_rows','large_trade_ready_rows','provider_ready_count','ready_providers',
+                'last_error','last_focus_error','last_insurance_error','last_security_fund_error',
+                'last_completed_at','last_focus_completed_at','last_insurance_completed_at','last_security_fund_completed_at',
+                'open_interest_rows','core_open_interest_rows','risk_limit_rows','insurance_record_count',
+                'price_limit_rows','index_component_rows','adl_rows','adl_ready_rows',
+                'contract_stats_history_ready','contract_stats_history_official_5m_coverage',
+                'open_interest_history_ready','open_interest_history_official_5m_coverage',
+                'history_ready','official_5m_coverage','coverage',
+                'exchange_requests_started_by_user_read','user_reads_trigger_collector','user_reads_trigger_scan',
+                'reads_scale_with_users','user_reads_scale_with_users',
+                'background_depth_collection_is_bounded','shared_metric_rotation_does_not_scale_with_users'
+              ]);
+              console.log('SUMMARY',JSON.stringify(summary));
+              for(const k of ['provider_health','providers','lanes','background_rotation','contract_stats_history','open_interest_history','risk_history','insurance','delivery']){
+                if(j[k]!=null) console.log(k.toUpperCase(),JSON.stringify(j[k]).slice(0,4000));
+              }
+            }catch(e){console.log('\nPATH',path,'ERR',String(e));}
+          }
+          NODE
