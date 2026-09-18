@@ -12,27 +12,52 @@ jobs:
       - run: |
           node - <<'NODE'
           const base='https://kaka-contract-realtime-worker.onrender.com';
-          const h=await (await fetch(base+'/api/gate-advanced/health')).json();
-          const syms=h?.contract_stats_history?.focus_symbols||[];
-          const out=[];
-          for(const s of syms){
-            const native=s.replace(/USDT$/,'_USDT');
-            const r=await fetch('https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract='+encodeURIComponent(native)+'&interval=5m&limit=3',{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
-            const j=await r.json().catch(()=>null);
-            const row=Array.isArray(j)&&j.length?j[0]:null;
-            out.push({
-              symbol:s,http:r.status,rows:Array.isArray(j)?j.length:null,
-              time:row?.time??null,lsr_taker:row?.lsr_taker??null,
-              long_taker_size:row?.long_taker_size??null,short_taker_size:row?.short_taker_size??null,
-              long_taker_present:row?Object.prototype.hasOwnProperty.call(row,'long_taker_size'):false,
-              short_taker_present:row?Object.prototype.hasOwnProperty.call(row,'short_taker_size'):false
-            });
-            await new Promise(r=>setTimeout(r,260));
+          async function get(path){
+            const r=await fetch(base+path,{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
+            const t=await r.text(); let j=null; try{j=JSON.parse(t)}catch{}
+            console.log('\nPATH',path,'HTTP',r.status);
+            if(!j) console.log('RAW',t.slice(0,1000));
+            return j;
           }
-          console.log('GATE_TAKER_OFFICIAL',JSON.stringify(out));
-          const deep=await (await fetch(base+'/api/contract-deep-shared/current-snapshot')).json();
-          console.log('GATE_DEEP_FLOW',JSON.stringify((deep?.rows||[]).filter(x=>x.provider==='gate').map(x=>({
-            symbol:x.symbol,flow_ready:x.flow_ready,flow_buy_quote:x.flow_buy_quote,
-            flow_sell_quote:x.flow_sell_quote,flow_source:x.flow_source
-          }))));
+          const flowH=await get('/api/contract-flow/health');
+          console.log('FLOW_BRIDGE',JSON.stringify(flowH?.gate_advanced_flow_bridge||null));
+          console.log('FLOW_ISOLATION',JSON.stringify({
+            shared_metric_rotation_does_not_scale_with_users:flowH?.shared_metric_rotation_does_not_scale_with_users,
+            shared_current_snapshot_reads_open_exchange_connection:flowH?.shared_current_snapshot_reads_open_exchange_connection,
+            gate_contract_stats_taker_aggregate:flowH?.gate_contract_stats_taker_aggregate
+          }));
+          const deep=await get('/api/contract-deep-shared/current-snapshot');
+          const gateRows=(deep?.rows||[]).filter(x=>x.provider==='gate').map(x=>({
+            symbol:x.symbol,depth_ready:x.depth_ready,flow_ready:x.flow_ready,
+            flow_buy_quote:x.flow_buy_quote,flow_sell_quote:x.flow_sell_quote,
+            flow_source:x.flow_source,business_official:x.business_policy_taker_quote_flow_5m_official_current
+          }));
+          console.log('GATE_DEEP_ROWS',JSON.stringify(gateRows));
+          console.log('GATE_DEEP_COUNTS',JSON.stringify({
+            rows:gateRows.length,
+            depth_ready:gateRows.filter(x=>x.depth_ready===true).length,
+            flow_ready:gateRows.filter(x=>x.flow_ready===true).length,
+            official_flow:gateRows.filter(x=>x.business_official===true).length
+          }));
+          const deepH=await get('/api/contract-deep-shared/health');
+          console.log('DEEP_H',JSON.stringify({
+            ready:deepH?.ready,live_ready:deepH?.live_ready,row_count:deepH?.row_count,
+            depth_fresh_rows:deepH?.depth_fresh_rows,depth_refresh_error_rows:deepH?.depth_refresh_error_rows,
+            flow_active_rows:deepH?.flow_active_rows,flow_connected_rows:deepH?.flow_connected_rows,
+            flow_value_rows:deepH?.flow_value_rows,provider_coverage:deepH?.provider_coverage,
+            exchange_requests_started_by_user_read:deepH?.exchange_requests_started_by_user_read,
+            exchange_connections_started_by_user_read:deepH?.exchange_connections_started_by_user_read,
+            reads_scale_with_users:deepH?.reads_scale_with_users
+          }));
+          const gateH=await get('/api/gate-advanced/health');
+          console.log('GATE_ADV_H',JSON.stringify({
+            ready:gateH?.ready,contract_stats_rows:gateH?.contract_stats_rows,
+            risk_limit_rows:gateH?.risk_limit_rows,open_interest_rows:gateH?.open_interest_rows,
+            contract_stats_history_ready:gateH?.contract_stats_history_ready,
+            contract_stats_history_official_5m_coverage:gateH?.contract_stats_history_official_5m_coverage,
+            last_focus_error:gateH?.last_focus_error,last_insurance_error:gateH?.last_insurance_error,
+            exchange_requests_started_by_user_read:gateH?.exchange_requests_started_by_user_read,
+            user_reads_trigger_collector:gateH?.user_reads_trigger_collector,
+            reads_scale_with_users:gateH?.reads_scale_with_users
+          }));
           NODE
