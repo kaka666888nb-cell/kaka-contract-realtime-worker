@@ -119,11 +119,26 @@ jobs:
                     coverage_complete:g.coverage_complete
                   },
                   bitget_liquidations_history:{
-                    enabled:b.enabled,ready:b.ready,last_error:b.last_error,
+                    enabled:b.enabled,collector_ready:b.collector_ready,
+                    official_endpoint_operational:b.official_endpoint_operational,
+                    official_response_cycles:b.official_response_cycles,
+                    official_category_responses:b.official_category_responses,
+                    official_empty_category_responses:b.official_empty_category_responses,
+                    attempts:b.attempts,successes:b.successes,failures:b.failures,
+                    complete_windows:b.complete_windows,deferred_windows:b.deferred_windows,
+                    deferred_windows_total:b.deferred_windows_total,
+                    delayed_conflict_deferred_windows:b.delayed_conflict_deferred_windows,
+                    incomplete_deferred_windows:b.incomplete_deferred_windows,
+                    official_empty_windows_seen:b.official_empty_windows_seen,
+                    ws_conflict_retry_windows:b.ws_conflict_retry_windows,
+                    last_rows:b.last_rows,last_requests:b.last_requests,
+                    last_window_start:b.last_window_start,last_window_end:b.last_window_end,
+                    next_deferred_retry_at:b.next_deferred_retry_at,
+                    last_deferred_reason:b.last_deferred_reason,
+                    last_official_response_at:b.last_official_response_at,
+                    last_completed_at:b.last_completed_at,last_error:b.last_error,
                     user_reads_trigger_requests:b.user_reads_trigger_requests,
-                    reads_scale_with_users:b.reads_scale_with_users,
-                    last_completed_at:b.last_completed_at,last_rows:b.last_rows,
-                    coverage_complete:b.coverage_complete
+                    reads_scale_with_users:b.reads_scale_with_users
                   }
                 };
               }else if(path==='/api/contract-flow/health'){
