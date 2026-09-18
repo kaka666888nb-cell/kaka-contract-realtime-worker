@@ -12,45 +12,48 @@ jobs:
       - run: |
           node - <<'NODE'
           const base='https://kaka-contract-realtime-worker.onrender.com';
-          const paths=[
-            '/api/contract-deep-shared/health',
-            '/api/contract-basis/health',
-            '/api/binance-advanced/health',
-            '/api/okx-advanced/health',
-            '/api/bybit-advanced/health',
-            '/api/bitget-advanced/health',
-            '/api/gate-advanced/health',
-            '/api/derivatives-public/health',
-            '/api/contract-flow/health',
-            '/api/contract-liquidation/health'
-          ];
-          const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>Object.prototype.hasOwnProperty.call(o,k)).map(k=>[k,o[k]]));
-          for(const path of paths){
-            try{
-              const r=await fetch(base+path,{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
-              const text=await r.text();
-              let j=null; try{j=JSON.parse(text)}catch{}
-              console.log('\nPATH',path,'HTTP',r.status);
-              if(!j){console.log('RAW',text.slice(0,500));continue;}
-              const summary=pick(j,[
-                'ok','version','step','ready','live_ready','focus_pool_ready','rows','row_count',
-                'focus_rows','core_rows','depth_fresh_rows','depth_missing_rows','depth_refresh_error_rows',
-                'flow_ready_rows','large_trade_ready_rows','provider_ready_count','ready_providers',
-                'last_error','last_focus_error','last_insurance_error','last_security_fund_error',
-                'last_completed_at','last_focus_completed_at','last_insurance_completed_at','last_security_fund_completed_at',
-                'open_interest_rows','core_open_interest_rows','risk_limit_rows','insurance_record_count',
-                'price_limit_rows','index_component_rows','adl_rows','adl_ready_rows',
-                'contract_stats_history_ready','contract_stats_history_official_5m_coverage',
-                'open_interest_history_ready','open_interest_history_official_5m_coverage',
-                'history_ready','official_5m_coverage','coverage',
-                'exchange_requests_started_by_user_read','user_reads_trigger_collector','user_reads_trigger_scan',
-                'reads_scale_with_users','user_reads_scale_with_users',
-                'background_depth_collection_is_bounded','shared_metric_rotation_does_not_scale_with_users'
-              ]);
-              console.log('SUMMARY',JSON.stringify(summary));
-              for(const k of ['provider_health','providers','lanes','background_rotation','contract_stats_history','open_interest_history','risk_history','insurance','delivery']){
-                if(j[k]!=null) console.log(k.toUpperCase(),JSON.stringify(j[k]).slice(0,4000));
-              }
-            }catch(e){console.log('\nPATH',path,'ERR',String(e));}
+          async function get(path){
+            const r=await fetch(base+path,{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
+            const t=await r.text();
+            let j=null;try{j=JSON.parse(t)}catch{}
+            console.log('\nPATH',path,'HTTP',r.status);
+            return j;
           }
+          const deep=await get('/api/contract-deep-shared/health');
+          console.log('DEEP_CORE',JSON.stringify({
+            ready:deep?.ready,live_ready:deep?.live_ready,
+            flow_active_rows:deep?.flow_active_rows,flow_connected_rows:deep?.flow_connected_rows,
+            flow_value_rows:deep?.flow_value_rows,large_trade_schema_rows:deep?.large_trade_schema_rows,
+            large_trade_value_rows:deep?.large_trade_value_rows,
+            depth_fresh_rows:deep?.depth_fresh_rows,depth_refresh_error_rows:deep?.depth_refresh_error_rows,
+            focus_handover_pending:deep?.focus_handover_pending,
+            transient_degraded:deep?.transient_degraded,
+            transient_last_good_served_reads:deep?.transient_last_good_served_reads,
+            provider_coverage:deep?.provider_coverage
+          }));
+          const ds=await get('/api/contract-deep-shared/current-snapshot');
+          const bad=(ds?.rows||[]).filter(x=>String(x.depth_last_refresh_error||'').trim()).map(x=>({
+            provider:x.provider,symbol:x.symbol,depth_ready:x.depth_ready,depth_age_ms:x.depth_age_ms,
+            err:x.depth_last_refresh_error,retry:x.depth_retry_not_before,
+            flow_ready:x.flow_ready,large_trade_ready:x.large_trade_ready
+          }));
+          console.log('DEEP_BAD_ROWS',JSON.stringify(bad));
+          const gate=await get('/api/gate-advanced/current-snapshot');
+          const z=(gate?.rows||[]).find(x=>String(x.symbol||'').toUpperCase()==='ZBTUSDT')||null;
+          console.log('GATE_ZBT_ROW',JSON.stringify(z));
+          try{
+            const u='https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract=ZBT_USDT&interval=5m&limit=100';
+            const r=await fetch(u,{headers:{accept:'application/json','user-agent':'KakaWeb3-Audit-Probe/1.0'}});
+            const t=await r.text();
+            let j=null;try{j=JSON.parse(t)}catch{}
+            console.log('GATE_ZBT_OFFICIAL',JSON.stringify({status:r.status,is_array:Array.isArray(j),rows:Array.isArray(j)?j.length:null,raw:t.slice(0,500)}));
+          }catch(e){console.log('GATE_ZBT_OFFICIAL_ERR',String(e))}
+          const basis=await get('/api/contract-basis/health');
+          console.log('BASIS_CORE',JSON.stringify({
+            ready:basis?.ready,partial:basis?.partial,last_error:basis?.last_error,
+            row_count:basis?.row_count,ready_provider_count:basis?.ready_provider_count,
+            provider_coverage:basis?.provider_coverage,delivery:basis?.delivery,
+            user_reads_start_exchange_requests:basis?.user_reads_start_exchange_requests,
+            reads_scale_with_users:basis?.reads_scale_with_users
+          }).slice(0,12000));
           NODE
