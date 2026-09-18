@@ -10,6 +10,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: npm install --omit=dev
       - run: npm run check
+      - name: Install local ws import stub for pure selftest
+        run: |
+          mkdir -p node_modules/ws
+          cat > node_modules/ws/package.json <<'JSON'
+          {"name":"ws","version":"0.0.0-test","type":"module","exports":"./index.js"}
+          JSON
+          cat > node_modules/ws/index.js <<'JS'
+          export class WebSocket {
+            static OPEN = 1;
+            static CONNECTING = 0;
+            static CLOSED = 3;
+          }
+          export class WebSocketServer {}
+          JS
       - run: node tests/step1072_9_gate_flow_bridge_selftest.mjs
