@@ -1,0 +1,15 @@
+name: Step1072.9 Gate focus15 flow bridge CI
+on:
+  push:
+    branches: [step1072-9-contract-gate-flow-focus15-bridge]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --omit=dev
+      - run: npm run check
+      - run: node tests/step1072_9_gate_flow_bridge_selftest.mjs
