@@ -1,4 +1,4 @@
-name: Jinse upstream shape probe
+name: Jinse historical identity probe
 on:
   push:
     branches: [step1072-9-contract-advanced-health-probe]
@@ -11,13 +11,7 @@ jobs:
           node-version: '22'
       - run: |
           node - <<'NODE'
-          const urls=[
-            'http://api.coinmeta.info/live/list?limit=200&id=530050',
-            'http://api.coinmeta.info/live/list?limit=200&bottom_id=530050',
-            'http://api.coinmeta.info/live/list?limit=200&top_id=530050',
-            'http://api.coinmeta.info/live/list?limit=200&before=530051',
-            'http://api.coinmeta.info/live/list?limit=200&max_id=530050'
-          ];
+          const ids=[529973,529977,529982,529983,530020,530050,530071,530074,530112,530131,530137,530151,530158,530159,530160,530180,530191,530199,530224,530239,530267,530308,530367,530376,530389,530417,530439,530489,530491];
           const tv=v=>v==null?'':String(v);
           const collect=(j)=>{
             const out=[];
@@ -31,19 +25,21 @@ jobs:
             };
             walk(j); return out;
           };
-          for(const url of urls){
+          for(const id of ids){
+            const url='http://api.coinmeta.info/live/list?limit=200&id='+(id+1);
             try{
-              const r=await fetch(url,{headers:{accept:'application/json,text/plain,*/*','user-agent':'KakaWeb3-Jinse-History-Audit/1.0'}});
-              const t=await r.text(); let j; try{j=JSON.parse(t)}catch{console.log('CASE',url,'HTTP',r.status,'NONJSON',t.slice(0,120));continue;}
-              const items=collect(j);
-              const ids=items.map(x=>Number(x.id)).filter(Number.isFinite);
-              const wanted=items.filter(x=>String(x.id)==='530050'||String(x.id)==='530151').map(x=>({
-                id:x.id,
-                title:tv(x.title||x.content_prefix||x.content).slice(0,180),
-                created_at:x.created_at,
-                link:x.link||x.url||x.link_url||''
-              }));
-              console.log('CASE',url,'HTTP',r.status,'COUNT',items.length,'MIN',ids.length?Math.min(...ids):null,'MAX',ids.length?Math.max(...ids):null,'ROOT_BOTTOM',j?.bottom_id,'ROOT_TOP',j?.top_id,'WANTED',JSON.stringify(wanted));
-            }catch(e){console.log('CASE',url,'ERROR',String(e?.message||e));}
+              const r=await fetch(url,{headers:{accept:'application/json,text/plain,*/*','user-agent':'KakaWeb3-Jinse-History-Audit/1.1'}});
+              const t=await r.text(); let j; try{j=JSON.parse(t)}catch{console.log('JINSE_OFFICIAL',id,JSON.stringify({http:r.status,error:'non_json'}));continue;}
+              const item=collect(j).find(x=>String(x.id)===String(id));
+              console.log('JINSE_OFFICIAL',id,JSON.stringify(item?{
+                http:r.status,id:item.id,
+                title:tv(item.title||item.name||item.headline||item.content_prefix||item.contentPrefix||item.prefix||item.content).slice(0,500),
+                content:tv(item.content||item.description||item.summary||item.text||item.body).slice(0,1000),
+                link:tv(item.link||item.url||item.link_url||item.source_url||item.origin_url||item.jump_url),
+                created_at:item.created_at??item.create_time??item.time??item.timestamp??item.published_at
+              }:{http:r.status,error:'target_not_found',bottom:j?.bottom_id,top:j?.top_id}));
+            }catch(e){
+              console.log('JINSE_OFFICIAL',id,JSON.stringify({error:String(e?.message||e)}));
+            }
           }
           NODE
