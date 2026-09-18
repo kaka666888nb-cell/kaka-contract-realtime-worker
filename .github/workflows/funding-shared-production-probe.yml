@@ -78,28 +78,53 @@ jobs:
                   }:null
                 };
               }else if(path==='/api/contract-liquidation/health'){
+                const s=j.shared_current_health||{};
+                const g=j.gate_liq_orders||{};
+                const b=j.bitget_liquidations_history||{};
                 out={
-                  ok:j.ok,
-                  current_snapshot_rows:j.current_snapshot_rows,
-                  current_snapshot_connected_provider_count:j.current_snapshot_connected_provider_count,
+                  ok:j.ok,version:j.version,persistence_enabled:j.persistence_enabled,
+                  persist_queue:j.persist_queue,persist_inflight:j.persist_inflight,
+                  minute_persist_queue:j.minute_persist_queue,minute_persist_inflight:j.minute_persist_inflight,
+                  flush_error:j.flush_error,minute_flush_error:j.minute_flush_error,cleanup_error:j.cleanup_error,
+                  exchange_requests_started_by_history_reads:j.exchange_requests_started_by_history_reads,
                   current_snapshot_reads_start_exchange_connections:j.current_snapshot_reads_start_exchange_connections,
-                  current_snapshot_exchange_connections_started_per_read:j.current_snapshot_exchange_connections_started_per_read,
                   current_snapshot_scales_with_users:j.current_snapshot_scales_with_users,
-                  market_snapshot_directory_symbols:j.market_snapshot_directory_symbols,
-                  market_snapshot_connected_symbols:j.market_snapshot_connected_symbols,
-                  market_snapshot_complete_symbols:j.market_snapshot_complete_symbols,
-                  market_snapshot_full_directory_connected:j.market_snapshot_full_directory_connected,
-                  market_snapshot_full_window_coverage_complete:j.market_snapshot_full_window_coverage_complete,
-                  market_snapshot_reads_start_exchange_connections:j.market_snapshot_reads_start_exchange_connections,
-                  market_snapshot_exchange_connections_started_per_read:j.market_snapshot_exchange_connections_started_per_read,
-                  market_snapshot_scales_with_users:j.market_snapshot_scales_with_users,
-                  market_collector_topology_exact:j.market_collector_topology_exact,
-                  focused_usdt_duplicate_feed_count:j.focused_usdt_duplicate_feed_count,
                   step998_liquidation_heatmap_ready:j.step998_liquidation_heatmap_ready,
                   step998_heatmap_user_reads_trigger_requests:j.step998_heatmap_user_reads_trigger_requests,
                   step998_heatmap_reads_scale_with_users:j.step998_heatmap_reads_scale_with_users,
                   step998_heatmap_exchange_requests_started_by_reads:j.step998_heatmap_exchange_requests_started_by_reads,
-                  last_error:j.last_error
+                  shared_current_health:{
+                    current_snapshot_rows:s.current_snapshot_rows,
+                    current_snapshot_connected_provider_count:s.current_snapshot_connected_provider_count,
+                    market_snapshot_directory_symbols:s.market_snapshot_directory_symbols,
+                    market_snapshot_connected_symbols:s.market_snapshot_connected_symbols,
+                    market_snapshot_complete_symbols:s.market_snapshot_complete_symbols,
+                    market_snapshot_event_symbols:s.market_snapshot_event_symbols,
+                    market_snapshot_event_rows:s.market_snapshot_event_rows,
+                    market_snapshot_full_directory_connected:s.market_snapshot_full_directory_connected,
+                    market_snapshot_full_window_coverage_complete:s.market_snapshot_full_window_coverage_complete,
+                    market_snapshot_reads_start_exchange_connections:s.market_snapshot_reads_start_exchange_connections,
+                    market_snapshot_exchange_connections_started_per_read:s.market_snapshot_exchange_connections_started_per_read,
+                    market_snapshot_scales_with_users:s.market_snapshot_scales_with_users,
+                    market_collector_topology_exact:s.market_collector_topology_exact,
+                    focused_usdt_duplicate_feed_count:s.focused_usdt_duplicate_feed_count,
+                    market_collector_feed_count:s.market_collector_feed_count,
+                    market_collector_expected_feed_count:s.market_collector_expected_feed_count
+                  },
+                  gate_liq_orders:{
+                    enabled:g.enabled,ready:g.ready,last_error:g.last_error,
+                    user_reads_trigger_requests:g.user_reads_trigger_requests,
+                    reads_scale_with_users:g.reads_scale_with_users,
+                    last_completed_at:g.last_completed_at,last_rows:g.last_rows,
+                    coverage_complete:g.coverage_complete
+                  },
+                  bitget_liquidations_history:{
+                    enabled:b.enabled,ready:b.ready,last_error:b.last_error,
+                    user_reads_trigger_requests:b.user_reads_trigger_requests,
+                    reads_scale_with_users:b.reads_scale_with_users,
+                    last_completed_at:b.last_completed_at,last_rows:b.last_rows,
+                    coverage_complete:b.coverage_complete
+                  }
                 };
               }else if(path==='/api/contract-flow/health'){
                 out={
