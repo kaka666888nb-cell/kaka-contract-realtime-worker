@@ -5,10 +5,29 @@ import { getMarketUniverseRows } from './market-rest.mjs';
 import { getContractFocusPoolInternalSnapshot } from './contract-focus-pool.mjs';
 import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './business-source-policy.mjs';
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
+import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.103';
+const VERSION = '650.8.15.104';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
+const gateAdvancedFlowBridge = {
+  started: false,
+  running: null,
+  timer: null,
+  last_started_at: 0,
+  last_completed_at: 0,
+  last_success_at: 0,
+  last_error: '',
+  polls: 0,
+  successes: 0,
+  failures: 0,
+  rows_seen: 0,
+  rows_hydrated: 0,
+  rows_skipped_stale: 0,
+  rows_skipped_missing_state: 0,
+  rows_skipped_sizing: 0,
+  last_symbols: [],
+};
 const MAX_TRADES_PER_STREAM = 120000;
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const IDLE_CLOSE_MS = 12 * 60 * 1000;
@@ -17,6 +36,18 @@ const GATE_CONTRACT_STATS_INTERVAL = '5m';
 // Gate official SDK validates list_contract_stats limit in the range 1..100.
 // Step660.2.1 incorrectly requested 288 and therefore received no live rows.
 const GATE_CONTRACT_STATS_LIMIT = 100;
+// Step1072.9 contract advanced audit: Gate advanced already owns the official
+// focus15 contract_stats requests in slow-stats. Deep-market consumes that
+// localhost snapshot instead of duplicating 11 extra exchange requests.
+const GATE_ADVANCED_FLOW_BRIDGE_ENABLED = process.env.KAKA_GATE_ADVANCED_FLOW_BRIDGE_ENABLED !== '0';
+const GATE_ADVANCED_FLOW_BRIDGE_POLL_MS = Math.max(
+  15_000,
+  Number(process.env.KAKA_GATE_ADVANCED_FLOW_BRIDGE_POLL_MS || 30_000),
+);
+const GATE_ADVANCED_FLOW_BRIDGE_STALE_MS = Math.max(
+  5 * 60_000,
+  Number(process.env.KAKA_GATE_ADVANCED_FLOW_BRIDGE_STALE_MS || 12 * 60_000),
+);
 // Gate official BTC-margined perpetual specification:
 // one BTC_USD inverse contract has a face value of 1 USD.
 const GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT = 1;
@@ -1699,6 +1730,7 @@ export async function reconcileContractFlowFocusPool() {
 }
 
 export function startContractFlowUniverseScanner() {
+  startGateAdvancedFlowBridge();
   startSharedFlowMaintenance();
   startMarketFlowSharedSnapshotMaintainer();
   if (flowScanState.started || !FLOW_SCAN_ENABLED) return;
@@ -3492,6 +3524,115 @@ function parseGateContractStatItem(
   };
 }
 
+
+function gateAdvancedStatSourceTimeMs(stat) {
+  const seconds = Number(stat?.source_time_s);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.floor(seconds * 1000);
+  const parsed = Date.parse(String(stat?.source_time || ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function gateAdvancedStatToOfficialFlow(state, stat, nowMs = Date.now()) {
+  if (!state || state.provider !== 'gate' || !stat || typeof stat !== 'object') return null;
+  const sourceTimeMs = gateAdvancedStatSourceTimeMs(stat);
+  if (sourceTimeMs == null || nowMs - sourceTimeMs > GATE_ADVANCED_FLOW_BRIDGE_STALE_MS) return null;
+  if (!gateContractSizingReady(state)) return null;
+  const raw = {
+    ...stat,
+    time: Math.floor(sourceTimeMs / 1000),
+  };
+  const parsed = parseGateContractStatItem(raw, {
+    provider: 'gate',
+    symbol: state.symbol,
+    multiplier: state.gateQuantoMultiplier,
+    quoteValuePerContract: state.gateQuoteValuePerContract,
+    fallbackPrice: firstFinite(stat?.mark_price, state.lastPrice),
+  });
+  return parsed?.flow || null;
+}
+
+async function hydrateGateOfficialFlowFromSlowStats() {
+  if (!GATE_ADVANCED_FLOW_BRIDGE_ENABLED) return gateAdvancedFlowBridge;
+  if (gateAdvancedFlowBridge.running) return await gateAdvancedFlowBridge.running;
+  gateAdvancedFlowBridge.last_started_at = Date.now();
+  gateAdvancedFlowBridge.polls += 1;
+  gateAdvancedFlowBridge.running = (async () => {
+    const payload = await requestIsolatedJson(
+      'slow-stats',
+      '/api/gate-advanced/current-snapshot',
+      8_000,
+    );
+    if (!payload?.ok || !Array.isArray(payload.contract_rows)) {
+      throw new Error('gate_advanced_flow_bridge_invalid_snapshot');
+    }
+    const focus = focusPoolSymbolsByProvider();
+    const focusSet = new Set(focus.byProvider?.gate || []);
+    const nowMs = Date.now();
+    let hydrated = 0;
+    let stale = 0;
+    let missingState = 0;
+    let missingSizing = 0;
+    const symbols = [];
+    for (const row of payload.contract_rows) {
+      const symbol = symbolKey(row?.symbol);
+      if (!symbol || !focusSet.has(symbol)) continue;
+      const state = states.get(`gate:${symbol}`) || null;
+      if (!state) {
+        missingState += 1;
+        continue;
+      }
+      if (!gateContractSizingReady(state)) {
+        missingSizing += 1;
+        continue;
+      }
+      const sourceTimeMs = gateAdvancedStatSourceTimeMs(row?.contract_stats);
+      if (sourceTimeMs == null || nowMs - sourceTimeMs > GATE_ADVANCED_FLOW_BRIDGE_STALE_MS) {
+        stale += 1;
+        continue;
+      }
+      const flow = gateAdvancedStatToOfficialFlow(state, row.contract_stats, nowMs);
+      if (!flow) continue;
+      updateGateOfficialFlowRows(state, [flow]);
+      hydrated += 1;
+      symbols.push(symbol);
+    }
+    gateAdvancedFlowBridge.rows_seen = payload.contract_rows.length;
+    gateAdvancedFlowBridge.rows_hydrated = hydrated;
+    gateAdvancedFlowBridge.rows_skipped_stale = stale;
+    gateAdvancedFlowBridge.rows_skipped_missing_state = missingState;
+    gateAdvancedFlowBridge.rows_skipped_sizing = missingSizing;
+    gateAdvancedFlowBridge.last_symbols = symbols;
+    gateAdvancedFlowBridge.last_completed_at = Date.now();
+    gateAdvancedFlowBridge.last_success_at = gateAdvancedFlowBridge.last_completed_at;
+    gateAdvancedFlowBridge.last_error = '';
+    gateAdvancedFlowBridge.successes += 1;
+    return gateAdvancedFlowBridge;
+  })().catch((error) => {
+    gateAdvancedFlowBridge.failures += 1;
+    gateAdvancedFlowBridge.last_completed_at = Date.now();
+    gateAdvancedFlowBridge.last_error = String(error?.message || error).slice(0, 300);
+    return gateAdvancedFlowBridge;
+  }).finally(() => {
+    gateAdvancedFlowBridge.running = null;
+  });
+  return await gateAdvancedFlowBridge.running;
+}
+
+function startGateAdvancedFlowBridge() {
+  if (gateAdvancedFlowBridge.started || !GATE_ADVANCED_FLOW_BRIDGE_ENABLED) return;
+  gateAdvancedFlowBridge.started = true;
+  const first = setTimeout(
+    () => hydrateGateOfficialFlowFromSlowStats().catch(() => {}),
+    12_000,
+  );
+  first.unref?.();
+  gateAdvancedFlowBridge.timer = setInterval(
+    () => hydrateGateOfficialFlowFromSlowStats().catch(() => {}),
+    GATE_ADVANCED_FLOW_BRIDGE_POLL_MS,
+  );
+  gateAdvancedFlowBridge.timer.unref?.();
+}
+
 function updateGateOfficialFlowRows(state, flowRows) {
   if (!state || state.provider !== 'gate' || !(state.gateOfficialFlowRows instanceof Map)) return;
   const cutoff = Date.now() - HISTORY_MS - FIVE_MIN_MS;
@@ -4653,7 +4794,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,binance_open_interest_history_official_ready:PERSISTENCE_ENABLED,binance_open_interest_history_endpoint:'/futures/data/openInterestHist',binance_open_interest_history_period:'5m',binance_open_interest_history_edge_relay_only:true,binance_long_short_history_official_ready:PERSISTENCE_ENABLED,binance_long_short_history_endpoints:['/futures/data/globalLongShortAccountRatio','/futures/data/topLongShortAccountRatio','/futures/data/topLongShortPositionRatio'],binance_long_short_history_edge_relay_only:true,binance_official_taker:binanceOfficialTakerHealthPayload(),flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,focus_pool_binding:focusFlowBindingPayload(),focus_pool_15_each_kept_active:true,focus_pool_extra_full_universe_rotation_preserved:true,market_snapshot_rotates_scan:false,market_snapshot_shared_cache:marketFlowSharedSnapshotHealth(),shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,hot_score_metrics:{...getHotScoreMetricsHealth(),persistence_hydrate_last_at:hotScoreFlowHydrateAt?new Date(hotScoreFlowHydrateAt).toISOString():null,persistence_hydrate_rows:hotScoreFlowHydrateRows,persistence_hydrate_error:hotScoreFlowHydrateError,persistence_hydrate_every_minutes:HOT_SCORE_FLOW_HYDRATE_MS/60_000},shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,binance_open_interest_history_official_ready:PERSISTENCE_ENABLED,binance_open_interest_history_endpoint:'/futures/data/openInterestHist',binance_open_interest_history_period:'5m',binance_open_interest_history_edge_relay_only:true,binance_long_short_history_official_ready:PERSISTENCE_ENABLED,binance_long_short_history_endpoints:['/futures/data/globalLongShortAccountRatio','/futures/data/topLongShortAccountRatio','/futures/data/topLongShortPositionRatio'],binance_long_short_history_edge_relay_only:true,binance_official_taker:binanceOfficialTakerHealthPayload(),flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,focus_pool_binding:focusFlowBindingPayload(),focus_pool_15_each_kept_active:true,focus_pool_extra_full_universe_rotation_preserved:true,market_snapshot_rotates_scan:false,market_snapshot_shared_cache:marketFlowSharedSnapshotHealth(),shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,hot_score_metrics:{...getHotScoreMetricsHealth(),persistence_hydrate_last_at:hotScoreFlowHydrateAt?new Date(hotScoreFlowHydrateAt).toISOString():null,persistence_hydrate_rows:hotScoreFlowHydrateRows,persistence_hydrate_error:hotScoreFlowHydrateError,persistence_hydrate_every_minutes:HOT_SCORE_FLOW_HYDRATE_MS/60_000},shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,gate_advanced_flow_bridge:{enabled:GATE_ADVANCED_FLOW_BRIDGE_ENABLED,mode:'localhost_slow_stats_focus15_reuse_zero_exchange_requests',poll_ms:GATE_ADVANCED_FLOW_BRIDGE_POLL_MS,stale_ms:GATE_ADVANCED_FLOW_BRIDGE_STALE_MS,running:Boolean(gateAdvancedFlowBridge.running),last_started_at:gateAdvancedFlowBridge.last_started_at?new Date(gateAdvancedFlowBridge.last_started_at).toISOString():null,last_completed_at:gateAdvancedFlowBridge.last_completed_at?new Date(gateAdvancedFlowBridge.last_completed_at).toISOString():null,last_success_at:gateAdvancedFlowBridge.last_success_at?new Date(gateAdvancedFlowBridge.last_success_at).toISOString():null,last_error:gateAdvancedFlowBridge.last_error,polls:gateAdvancedFlowBridge.polls,successes:gateAdvancedFlowBridge.successes,failures:gateAdvancedFlowBridge.failures,rows_seen:gateAdvancedFlowBridge.rows_seen,rows_hydrated:gateAdvancedFlowBridge.rows_hydrated,rows_skipped_stale:gateAdvancedFlowBridge.rows_skipped_stale,rows_skipped_missing_state:gateAdvancedFlowBridge.rows_skipped_missing_state,rows_skipped_sizing:gateAdvancedFlowBridge.rows_skipped_sizing,last_symbols:gateAdvancedFlowBridge.last_symbols,exchange_requests_added:0,user_reads_trigger_bridge:false,reads_scale_with_users:false},shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
@@ -4927,5 +5068,11 @@ startBinanceOfficialTakerCollector();
 
 setInterval(()=>{const now=Date.now();for(const [key,state] of states.entries()){finalizeReadyBuckets(state,now);if(now-state.lastRequestedAt<=IDLE_CLOSE_MS)continue;closeAndDeleteState(state,'idle');}},60000).unref();
 setInterval(()=>{flushPersistQueue().catch(()=>{});flushMetricPersistQueue().catch(()=>{});},20000).unref();
+
+export const __contractFlowGateAdvancedBridgeTest = Object.freeze({
+  gateAdvancedStatSourceTimeMs,
+  gateAdvancedStatToOfficialFlow,
+});
+
 
 export const __contractFlowV46ClosureTest = Object.freeze({ parseBinanceOfficialTakerRows, sanitizeBinanceOfficialTakerPersistedEntry });
