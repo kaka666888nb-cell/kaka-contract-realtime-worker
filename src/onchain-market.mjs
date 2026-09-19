@@ -572,15 +572,16 @@ async function dexFetchJson(url, { priority = 0, label = '' } = {}) {
 }
 
 
-const geckoScheduler = createScheduler({ name: 'geckoterminal', minGapMs: GECKO_MIN_GAP_MS, maxQueue: GECKO_MAX_QUEUE });
-// Step1072.8.6.34.21: keep exact-pool Kline fallback out of the background
-// discovery/Alpha Gecko queue. This is still one shared bounded backend lane,
-// independent of user count, with its own singleflight/caches at the Kline layer.
-const geckoKlineScheduler = createScheduler({
-  name: 'geckoterminal-kline',
-  minGapMs: GECKO_MIN_GAP_MS,
-  maxQueue: Math.min(8, GECKO_MAX_QUEUE),
+const geckoScheduler = createScheduler({
+  name: 'geckoterminal',
+  minGapMs: Math.max(7_500, GECKO_MIN_GAP_MS),
+  maxQueue: GECKO_MAX_QUEUE,
 });
+// Step1072.8.6.34.22:
+// GeckoTerminal's public limit applies to the Render egress as a whole, not per
+// local scheduler. Keep every Gecko request on ONE global lane and let exact-pool
+// Kline jobs jump ahead by priority. This preserves a bounded shared architecture
+// and keeps total starts safely below the public ~10 calls/minute limit.
 async function geckoFetchJson(url, { priority = 0, label = '' } = {}) {
   return geckoScheduler.enqueue(async () => {
     stats.gecko_upstream_started += 1;
@@ -609,7 +610,7 @@ async function geckoFetchJson(url, { priority = 0, label = '' } = {}) {
 }
 
 async function geckoKlineFetchJson(url, { label = '' } = {}) {
-  return geckoKlineScheduler.enqueue(async () => {
+  return geckoScheduler.enqueue(async () => {
     stats.gecko_upstream_started += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), GECKO_TIMEOUT_MS);
@@ -619,20 +620,82 @@ async function geckoKlineFetchJson(url, { label = '' } = {}) {
         signal: controller.signal,
         headers: {
           accept: 'application/json;version=20230203',
-          'user-agent': 'KakaWeb3-Onchain-Shared/1072.8.6.34.21',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1072.8.6.34.22',
         },
       });
       const body = await response.text();
-      if (!response.ok) throw new Error(`geckoterminal_http_${response.status}:${body.slice(0, 220)}`);
+      if (!response.ok) {
+        const error = new Error(`geckoterminal_http_${response.status}:${body.slice(0, 220)}`);
+        console.warn(
+          '[Step1072.8.6.34.22] gecko kline upstream failure ' +
+          JSON.stringify({ label, status: response.status, body: body.slice(0, 220) }),
+        );
+        throw error;
+      }
       let parsed;
-      try { parsed = JSON.parse(body); } catch { throw new Error('geckoterminal_invalid_json'); }
+      try { parsed = JSON.parse(body); } catch {
+        console.warn(
+          '[Step1072.8.6.34.22] gecko kline upstream failure ' +
+          JSON.stringify({ label, status: response.status, body: 'invalid_json' }),
+        );
+        throw new Error('geckoterminal_invalid_json');
+      }
       stats.gecko_upstream_succeeded += 1;
       return parsed;
     } catch (error) {
       stats.gecko_upstream_failed += 1;
+      if (!String(error?.message || error).startsWith('geckoterminal_http_')) {
+        console.warn(
+          '[Step1072.8.6.34.22] gecko kline upstream failure ' +
+          JSON.stringify({ label, status: null, body: String(error?.message || error).slice(0, 220) }),
+        );
+      }
       throw error;
     } finally { clearTimeout(timer); }
   }, { priority: 100, label });
+}
+
+let moralisKlineCircuitOpenUntil = 0;
+let moralisKlineCircuitReason = '';
+const MORALIS_KLINE_CIRCUIT_MS = 30 * 60_000;
+
+function moralisKlineCircuitState() {
+  const now = Date.now();
+  if (moralisKlineCircuitOpenUntil <= now) {
+    if (moralisKlineCircuitOpenUntil > 0) {
+      moralisKlineCircuitOpenUntil = 0;
+      moralisKlineCircuitReason = '';
+    }
+    return { open: false, until: null, reason: '' };
+  }
+  return {
+    open: true,
+    until: new Date(moralisKlineCircuitOpenUntil).toISOString(),
+    reason: moralisKlineCircuitReason,
+  };
+}
+
+function maybeOpenMoralisKlineCircuit(error) {
+  const message = String(error?.message || error || '');
+  const lowerMessage = message.toLowerCase();
+  const usagePaused =
+    lowerMessage.includes('moralis_http_401') &&
+    (
+      lowerMessage.includes('usage is paused') ||
+      lowerMessage.includes('upgrade to a paid plan') ||
+      lowerMessage.includes('planselect')
+    );
+  if (!usagePaused) return false;
+  moralisKlineCircuitOpenUntil = Date.now() + MORALIS_KLINE_CIRCUIT_MS;
+  moralisKlineCircuitReason = 'moralis_free_usage_paused';
+  console.warn(
+    '[Step1072.8.6.34.22] moralis kline circuit opened ' +
+    JSON.stringify({
+      reason: moralisKlineCircuitReason,
+      until: new Date(moralisKlineCircuitOpenUntil).toISOString(),
+    }),
+  );
+  return true;
 }
 
 let binanceWalletLastCycleSucceeded = false;
@@ -3092,6 +3155,7 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
   let exactPair = false;
   let fallbackPromise = null;
   let fallbackTimer = null;
+  const moralisCircuit = moralisKlineCircuitState();
 
   const startFallback = () => {
     if (fallbackPromise) return fallbackPromise;
@@ -3106,12 +3170,18 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
 
   // Historical left-backfill stays Moralis-first/bounded. Latest pages get a
   // delayed hedge only when the requested interval is supported by Gecko.
-  if (!endTimeMs && geckoKlineSpec(interval)) {
+  if (moralisCircuit.open && geckoKlineSpec(interval)) {
+    moralisError = `moralis_kline_circuit_open:${moralisCircuit.reason}`;
+    startFallback();
+  } else if (!endTimeMs && geckoKlineSpec(interval)) {
     fallbackTimer = setTimeout(() => { startFallback(); }, latestHedgeDelayMs);
     fallbackTimer.unref?.();
   }
 
   try {
+    if (moralisCircuit.open) {
+      throw new Error(`moralis_kline_circuit_open:${moralisCircuit.reason}`);
+    }
     primary = await buildMoralisKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
     primaryRows = Array.isArray(primary?.rows) ? primary.rows : [];
     exactProof = text(primary?.identity_proof);
@@ -3165,7 +3235,9 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
       ? `moralis_exact_pool_ohlcv_shallow:${primaryRows.length}`
       : 'moralis_exact_pool_ohlcv_empty';
   } catch (error) {
-    moralisError = text(error?.message || error).slice(0, 240);
+    maybeOpenMoralisKlineCircuit(error);
+    const errorText = text(error?.message || error).slice(0, 240);
+    moralisError = moralisError || errorText;
   } finally {
     if (fallbackTimer) {
       clearTimeout(fallbackTimer);
@@ -4690,7 +4762,7 @@ function healthPayload() {
         step1040_wallet_history_internal_reserved_cu: MORALIS_WALLET_HISTORY_BUDGET_CU,
         wallet_insights_premium_endpoint_used: false,
         scheduler: moralisScheduler.state(),
-        gecko_kline_scheduler: geckoKlineScheduler.state(),
+        kline_circuit: moralisKlineCircuitState(),
         budget: moralisBudgetState(),
       },
       goplus: {
