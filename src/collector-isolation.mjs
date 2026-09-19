@@ -254,6 +254,28 @@ function sendSharedResponse(req, res, entry, cacheState, policy) {
   res.end(body || Buffer.alloc(0));
 }
 
+function sharedResponseEntryCacheable(role, path, entry) {
+  const status = Number(entry?.statusCode || 0);
+  if (status < 200 || status >= 300) return false;
+
+  // Step1072.8.6.34.19: the on-chain collector already owns exact-key
+  // cache/singleflight. A one-candle response is a shallow transient snapshot,
+  // not a healthy chart payload, so the parent response cache must not pin it
+  // for the stale window. Healthy multi-candle responses remain shared.
+  if (role === 'onchain-market' && String(path || '').startsWith('/api/onchain/klines')) {
+    try {
+      const payload = JSON.parse(Buffer.isBuffer(entry?.body)
+        ? entry.body.toString('utf8')
+        : String(entry?.body || ''));
+      const rows = Array.isArray(payload?.rows) ? payload.rows.length : Number(payload?.row_count || 0);
+      return rows >= 2 || payload?.history_exhausted === true;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 function startSharedResponseRefresh(key, role, path) {
   let pending = sharedResponseInflight.get(key);
   if (pending) return pending;
@@ -262,7 +284,7 @@ function startSharedResponseRefresh(key, role, path) {
   }
   pending = buildSharedResponseEntry(role, path)
     .then((entry) => {
-      if (entry.statusCode >= 200 && entry.statusCode < 300) {
+      if (sharedResponseEntryCacheable(role, path, entry)) {
         sharedResponseCache.set(key, entry);
         pruneSharedResponseCache();
       }
