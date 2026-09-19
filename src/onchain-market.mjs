@@ -75,7 +75,7 @@ const DEX_BASE = 'https://api.dexscreener.com';
 // Paid DEX Screener boosts/ads/CTO remain supplemental identity discovery only and never
 // participate in the hot rank score.
 const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
-const GECKO_MIN_GAP_MS = Math.max(12_500, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 15_000));
+const GECKO_MIN_GAP_MS = Math.max(6_500, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 7_000));
 const GECKO_MAX_QUEUE = Math.max(6, Math.min(32, Number(process.env.KAKA_GECKO_MAX_QUEUE || 20)));
 const GECKO_TIMEOUT_MS = Math.max(6_000, Math.min(25_000, Number(process.env.KAKA_GECKO_TIMEOUT_MS || 15_000)));
 const GECKO_NETWORK = Object.freeze({
@@ -2826,8 +2826,11 @@ function moralisKlineUrl(network, poolAddress, interval, limit, endTimeMs) {
   u.searchParams.set('chain', chain);
   u.searchParams.set('timeframe', range.sourceInterval);
   u.searchParams.set('currency', 'usd');
-  u.searchParams.set('fromDate', new Date(range.fromMs).toISOString());
-  u.searchParams.set('toDate', new Date(range.toMs).toISOString());
+  // Step1072.8.6.34.16: current Moralis EVM pair OHLCV documents
+  // snake_case range parameters. Keep the exact time window explicit so a
+  // busy pool cannot silently collapse to only the provider's default slice.
+  u.searchParams.set('from_date', new Date(range.fromMs).toISOString());
+  u.searchParams.set('to_date', new Date(range.toMs).toISOString());
   u.searchParams.set('limit', String(range.sourceLimit));
   return { url: u.toString(), ...range };
 }
@@ -3018,6 +3021,41 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
         primary_row_count: primaryRows.length,
       };
     }
+
+    // Step1072.8.6.34.16: keep historical left-backfill bounded. If Moralis
+    // already returned any real rows for this same exact pool, return those
+    // immediately instead of waiting behind the shared Gecko lane. The App can
+    // continue paginating older history from the new oldest real row.
+    if (endTimeMs && primaryRows.length > 0) {
+      return {
+        ...primary,
+        source: 'moralis_official_data_api_pair_ohlcv',
+        fallback_used: false,
+        history_exhausted: false,
+        exact_pool_source_compare: 'historical_primary_nonempty_bounded',
+        primary_row_count: primaryRows.length,
+        fallback_candidate_row_count: 0,
+      };
+    }
+
+    if (endTimeMs &&
+        primaryRows.length === 0 &&
+        exactProof &&
+        exactPair &&
+        historicalRangeReachesPoolCreation(pool, interval, limit, endTimeMs)) {
+      return {
+        ...primary,
+        rows: [],
+        source: 'moralis_official_data_api_pair_ohlcv',
+        fallback_used: false,
+        history_exhausted: true,
+        history_exhausted_reason: 'exact_pool_primary_empty_requested_range_reaches_pool_creation',
+        primary_row_count: 0,
+        fallback_candidate_row_count: 0,
+        exact_pool_source_compare: 'historical_primary_exhausted_bounded',
+      };
+    }
+
     moralisError = primaryRows.length > 0
       ? `moralis_exact_pool_ohlcv_shallow:${primaryRows.length}`
       : 'moralis_exact_pool_ohlcv_empty';
