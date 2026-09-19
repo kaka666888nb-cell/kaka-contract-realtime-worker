@@ -2991,34 +2991,117 @@ function historicalRangeReachesPoolCreation(pool, interval, limit, endTimeMs) {
   return Number.isFinite(range?.fromMs) && range.fromMs <= createdMs;
 }
 async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, limit, endTimeMs) {
+  // Step1072.8.6.34.15:
+  // Moralis can occasionally prove the exact pair but return only one/few OHLCV rows.
+  // Treat that as a shallow exact source, not as sufficient history. Compare the SAME
+  // exact pool on GeckoTerminal and use it only when it provides more real OHLCV rows.
+  // Never merge different providers candle-by-candle, never switch pool/token, never fill gaps.
+  const shallowThreshold = Math.min(24, Math.max(2, Number(limit) || 24));
+  let primary = null;
+  let primaryRows = [];
   let moralisError = '';
+  let exactProof = '';
+  let exactPair = false;
+
   try {
-    const primary = await buildMoralisKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
-    if (Array.isArray(primary?.rows) && primary.rows.length > 0) {
-      return { ...primary, source: 'moralis_official_data_api_pair_ohlcv', fallback_used: false, history_exhausted: false };
-    }
-    const exactProof = text(primary?.identity_proof);
-    const exactPair = exactAddressEqual(network, primary?.source_pair_address, pool?.pool_address);
-    if (endTimeMs && exactProof && exactPair && historicalRangeReachesPoolCreation(pool, interval, limit, endTimeMs)) {
+    primary = await buildMoralisKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
+    primaryRows = Array.isArray(primary?.rows) ? primary.rows : [];
+    exactProof = text(primary?.identity_proof);
+    exactPair = exactAddressEqual(network, primary?.source_pair_address, pool?.pool_address);
+    if (primaryRows.length >= shallowThreshold) {
       return {
         ...primary,
         source: 'moralis_official_data_api_pair_ohlcv',
         fallback_used: false,
-        history_exhausted: true,
-        history_exhausted_reason: 'exact_pool_primary_empty_and_requested_range_reaches_pool_creation',
+        history_exhausted: false,
+        exact_pool_source_compare: 'primary_sufficient',
+        primary_row_count: primaryRows.length,
       };
     }
-    moralisError = 'moralis_exact_pool_ohlcv_empty';
+    moralisError = primaryRows.length > 0
+      ? `moralis_exact_pool_ohlcv_shallow:${primaryRows.length}`
+      : 'moralis_exact_pool_ohlcv_empty';
   } catch (error) {
     moralisError = text(error?.message || error).slice(0, 240);
   }
+
+  let fallback = null;
+  let fallbackErrorText = '';
   try {
-    return { ...(await buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs)), fallback_used: true, primary_error: moralisError, history_exhausted: false };
+    fallback = await buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
   } catch (fallbackError) {
-    const error = new Error(`exact_pool_kline_unavailable:primary=${moralisError};fallback=${text(fallbackError?.message || fallbackError).slice(0, 220)}`);
-    error.statusCode = 503;
-    throw error;
+    fallbackErrorText = text(fallbackError?.message || fallbackError).slice(0, 220);
   }
+
+  const fallbackRows = Array.isArray(fallback?.rows) ? fallback.rows : [];
+  if (fallback && fallbackRows.length > primaryRows.length) {
+    return {
+      ...fallback,
+      fallback_used: true,
+      fallback_from: primaryRows.length > 0
+        ? 'moralis_pair_ohlcv_shallow'
+        : 'moralis_pair_ohlcv_unavailable_or_empty',
+      primary_error: moralisError,
+      primary_row_count: primaryRows.length,
+      fallback_candidate_row_count: fallbackRows.length,
+      exact_pool_source_compare: 'fallback_richer_same_exact_pool',
+      history_exhausted: false,
+    };
+  }
+
+  if (primaryRows.length > 0) {
+    return {
+      ...primary,
+      source: 'moralis_official_data_api_pair_ohlcv',
+      fallback_used: false,
+      history_exhausted: false,
+      primary_error: moralisError,
+      primary_row_count: primaryRows.length,
+      fallback_candidate_row_count: fallbackRows.length,
+      fallback_probe_error: fallbackErrorText || null,
+      exact_pool_source_compare: fallbackRows.length > 0
+        ? 'primary_kept_same_or_richer'
+        : 'primary_kept_fallback_unavailable',
+    };
+  }
+
+  if (fallback && fallbackRows.length > 0) {
+    return {
+      ...fallback,
+      fallback_used: true,
+      fallback_from: 'moralis_pair_ohlcv_unavailable_or_empty',
+      primary_error: moralisError,
+      primary_row_count: 0,
+      fallback_candidate_row_count: fallbackRows.length,
+      exact_pool_source_compare: 'fallback_only_exact_pool_source',
+      history_exhausted: false,
+    };
+  }
+
+  if (endTimeMs &&
+      exactProof &&
+      exactPair &&
+      historicalRangeReachesPoolCreation(pool, interval, limit, endTimeMs)) {
+    return {
+      ...(primary || {}),
+      rows: [],
+      source: 'moralis_official_data_api_pair_ohlcv',
+      fallback_used: false,
+      history_exhausted: true,
+      history_exhausted_reason: 'exact_pool_primary_and_fallback_empty_requested_range_reaches_pool_creation',
+      primary_error: moralisError,
+      fallback_probe_error: fallbackErrorText || null,
+      primary_row_count: 0,
+      fallback_candidate_row_count: 0,
+      exact_pool_source_compare: 'both_empty_history_exhausted',
+    };
+  }
+
+  const error = new Error(
+    `exact_pool_kline_unavailable:primary=${moralisError};fallback=${fallbackErrorText || 'empty'}`,
+  );
+  error.statusCode = 503;
+  throw error;
 }
 
 async function buildSharedContinuityKlines(network, tokenAddress, pool, interval, limit, endTimeMs) {
