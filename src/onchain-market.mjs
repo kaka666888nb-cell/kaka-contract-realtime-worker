@@ -5864,28 +5864,26 @@ export async function handleOnchainMarket(req, res, url) {
         interval,
         source: built.source || 'moralis_official_data_api_pair_ohlcv',
       }));
-      if (rows.length < 2 || built.fallback_used === true) {
-        console.warn(
-          '[Step1072.8.6.34.17] onchain kline diagnostic ' +
-          JSON.stringify({
-            network,
-            interval,
-            token: tokenAddress,
-            pool: poolAddress,
-            rows: rows.length,
-            source: built.source || 'moralis_official_data_api_pair_ohlcv',
-            cache_status: result.cache_status,
-            fallback_used: built.fallback_used === true,
-            fallback_from: built.fallback_from || null,
-            primary_row_count: Number(built.primary_row_count || 0),
-            fallback_candidate_row_count: Number(built.fallback_candidate_row_count || 0),
-            exact_pool_source_compare: built.exact_pool_source_compare || null,
-            fallback_probe_error: built.fallback_probe_error || null,
-            history_exhausted: built.history_exhausted === true,
-            historical_end_time_ms: endTimeMs,
-          }),
-        );
-      }
+      console.warn(
+        '[Step1072.8.6.34.17.1] onchain kline response ' +
+        JSON.stringify({
+          network,
+          interval,
+          token: tokenAddress,
+          pool: poolAddress,
+          rows: rows.length,
+          source: built.source || 'moralis_official_data_api_pair_ohlcv',
+          cache_status: result.cache_status,
+          fallback_used: built.fallback_used === true,
+          fallback_from: built.fallback_from || null,
+          primary_row_count: Number(built.primary_row_count || 0),
+          fallback_candidate_row_count: Number(built.fallback_candidate_row_count || 0),
+          exact_pool_source_compare: built.exact_pool_source_compare || null,
+          fallback_probe_error: built.fallback_probe_error || null,
+          history_exhausted: built.history_exhausted === true,
+          historical_end_time_ms: endTimeMs,
+        }),
+      );
       sendJson(res, 200, responseBase({
         network,
         address: tokenAddress,
