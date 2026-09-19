@@ -3108,11 +3108,13 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
   u.searchParams.set('token', tokenAddress);
   if (endTimeMs) u.searchParams.set('before_timestamp', String(Math.floor(Number(endTimeMs) / 1000)));
   const payload = await geckoKlineFetchJson(u.toString(), { label: `kline_fallback:${network}:${poolAddress}:${interval}` });
-  const id = text(payload?.data?.id);
-  if (id) {
-    const returnedPool = id.includes('_') ? id.slice(id.indexOf('_') + 1) : id;
-    if (!exactAddressEqual(network, returnedPool, poolAddress)) throw new Error('geckoterminal_pool_identity_mismatch');
-  }
+  // Step1072.8.6.34.23:
+  // GeckoTerminal's OHLCV endpoint is already bound to the exact pool in the
+  // request path, and the requested token is bound through the exact token
+  // query parameter. payload.data.id is an API resource/request identifier and
+  // is not a documented canonical pool-address field; treating it as one caused
+  // valid OHLCV payloads to be rejected as pool_identity_mismatch.
+  const responseResourceId = text(payload?.data?.id);
   const list = Array.isArray(payload?.data?.attributes?.ohlcv_list) ? payload.data.attributes.ohlcv_list : [];
   const rows = list.map(normalizeGeckoCandle).filter(Boolean).sort((a, b) => a.open_time_ms - b.open_time_ms).slice(-limit);
   if (!rows.length) throw new Error('geckoterminal_exact_pool_ohlcv_empty');
@@ -3120,6 +3122,7 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
     queried_token_address: tokenAddress,
     exact_pool_endpoint: true,
     token_query_parameter: true,
+    response_resource_id: responseResourceId || null,
   });
   return {
     rows,
@@ -3128,6 +3131,7 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
     source_timeframe: `${spec.timeframe}:${spec.aggregate}`,
     derived_15m_from_5m: false,
     identity_proof: 'geckoterminal_exact_pool_exact_token_address',
+    response_resource_id: responseResourceId || null,
     source: 'geckoterminal_keyless_public_exact_pool_ohlcv_fallback',
     fallback_from: 'moralis_pair_ohlcv_unavailable_or_empty',
   };
