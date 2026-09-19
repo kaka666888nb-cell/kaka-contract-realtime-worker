@@ -4,7 +4,7 @@
 // exchange/Binance Wallet/Supabase upstream work. Binance Wallet rankType=40 supplies the
 // external mature "Popular" order for tokenized securities; it never substitutes product prices.
 
-const VERSION = '650.8.15.196.11.3.1';
+const VERSION = '650.8.15.196.11.3.2';
 const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1041_6_4_kline_asset_rank_page_v1';
 const ROUTE = '/api/asset-market/ranked-page';
@@ -16,7 +16,9 @@ const ORDER_MAX = Math.max(8, Math.min(32, Number(process.env.KAKA_KLINE_ASSET_R
 const CATALOG_REFRESH_MS = Math.max(10 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_CATALOG_REFRESH_MS || 30 * 60_000));
 const MARKET_REFRESH_MS = Math.max(60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_MARKET_REFRESH_MS || 2 * 60_000));
 const HOT_REFRESH_MS = Math.max(2 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_HOT_REFRESH_MS || 5 * 60_000));
-const START_DELAY_MS = Math.max(8_000, Number(process.env.KAKA_KLINE_ASSET_RANK_START_DELAY_MS || 22_000));
+const START_DELAY_MS = Math.max(750, Number(process.env.KAKA_KLINE_ASSET_RANK_START_DELAY_MS || 1_200));
+const START_RETRY_MS = Math.max(1_500, Number(process.env.KAKA_KLINE_ASSET_RANK_START_RETRY_MS || 2_500));
+const START_RETRY_MAX = Math.max(1, Math.min(8, Number(process.env.KAKA_KLINE_ASSET_RANK_START_RETRY_MAX || 6)));
 const RETAIN_MS = Math.max(10 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_RETAIN_MS || 45 * 60_000));
 const FETCH_TIMEOUT_MS = Math.max(5_000, Number(process.env.KAKA_KLINE_ASSET_RANK_FETCH_TIMEOUT_MS || 15_000));
 const SUPABASE_PAGE = 1000;
@@ -65,6 +67,8 @@ let lastHotError = '';
 let catalogInflight = null;
 let marketInflight = null;
 let hotInflight = null;
+let bootWarmupTimer = null;
+let bootWarmupAttempt = 0;
 let assetWatchlistTimer = null;
 let assetWatchlistInflight = null;
 const assetWatchlistFocus = new Map();
@@ -88,6 +92,10 @@ const stats = {
   hot_refresh_started: 0,
   hot_refresh_succeeded: 0,
   hot_refresh_failed: 0,
+  boot_warmup_started: 0,
+  boot_warmup_succeeded: 0,
+  boot_warmup_failed: 0,
+  boot_warmup_retried: 0,
   binance_stock_rank_requests: 0,
   binance_stock_detail_requests: 0,
   rank_builds: 0,
@@ -603,6 +611,7 @@ function healthPayload() {
     market:{ready:marketByKey.size>0&&age(marketUpdatedAt)<=RETAIN_MS,rows:marketByKey.size,version:marketVersion,updated_at:marketUpdatedAt?new Date(marketUpdatedAt).toISOString():null,age_ms:age(marketUpdatedAt),refresh_ms:MARKET_REFRESH_MS,last_error:lastMarketError},
     popular:{ready:hotByTicker.size>0&&age(hotUpdatedAt)<=RETAIN_MS,rows:hotByTicker.size,version:hotVersion,updated_at:hotUpdatedAt?new Date(hotUpdatedAt).toISOString():null,age_ms:age(hotUpdatedAt),refresh_ms:HOT_REFRESH_MS,source:'binance_wallet_unified_token_rank_stock',rank_type:BINANCE_STOCK_RANK_TYPE,period:BINANCE_STOCK_PERIOD,sort_by:BINANCE_STOCK_SORT_BY,size:BINANCE_STOCK_SIZE,detail_exact_identity_source:'binance_wallet_tokenized_stock_detail_list',last_error:lastHotError},
     watchlist_realtime:{ready:true,route:WATCHLIST_ROUTE,batch_max:WATCHLIST_BATCH_MAX,focus_max:WATCHLIST_FOCUS_MAX,refresh_ms:WATCHLIST_REFRESH_MS,focus_ttl_ms:WATCHLIST_FOCUS_TTL_MS,active_focus:assetWatchlistFocus.size,cached_rows:assetWatchlistRows.size,user_reads_start_upstream:false,user_read_upstream_requests:0,fixed_background_refresh_independent_of_user_count:true},
+    boot_warmup:{start_delay_ms:START_DELAY_MS,retry_ms:START_RETRY_MS,retry_max:START_RETRY_MAX,attempt:bootWarmupAttempt,ready:catalogRows.length>0&&marketByKey.size>0&&hotByTicker.size>0},
     pagination:{ranking_happens_before_pagination:true,pagination_order_frozen_by_rank_version:true,order_ttl_ms:ORDER_TTL_MS,snapshots:orders.size},
     pressure:{catalog_supabase_reads_per_refresh_max:5,market_group_shared_reads_per_refresh_max:12,binance_popular_requests_per_refresh:2,watchlist_fixed_refresh_ms:WATCHLIST_REFRESH_MS,watchlist_focus_max:WATCHLIST_FOCUS_MAX,user_scale_upstream_amplification:0},
     stats:{...stats},
@@ -610,11 +619,71 @@ function healthPayload() {
 }
 
 export function getKlineAssetRankHealth() { return healthPayload(); }
+
+async function runBootWarmup() {
+  stats.boot_warmup_started += 1;
+  bootWarmupAttempt += 1;
+
+  // Step1072.8.6.34.25:
+  // Do not leave ranked-page intentionally empty for 22 seconds after every
+  // Render restart/deploy. Catalog and Popular are independent, so start them
+  // together. Market follows the catalog. User reads still NEVER start any
+  // upstream work; this remains one fixed backend warmup independent of users.
+  const hotPromise = refreshHot();
+  let catalogReady = false;
+  try {
+    await refreshCatalog();
+    catalogReady = catalogRows.length > 0;
+  } catch (_) {
+    catalogReady = catalogRows.length > 0;
+  }
+
+  if (catalogReady) {
+    await Promise.allSettled([
+      hotPromise,
+      refreshMarket(),
+    ]);
+  } else {
+    await Promise.allSettled([hotPromise]);
+  }
+
+  const ready =
+    catalogRows.length > 0 &&
+    marketByKey.size > 0 &&
+    hotByTicker.size > 0;
+
+  if (ready) {
+    stats.boot_warmup_succeeded += 1;
+    console.log(
+      `[${VERSION}] asset-rank boot warmup ready attempt=${bootWarmupAttempt} catalog=${catalogRows.length} market=${marketByKey.size} hot=${hotByTicker.size}`,
+    );
+    return;
+  }
+
+  stats.boot_warmup_failed += 1;
+  if (bootWarmupAttempt < START_RETRY_MAX) {
+    stats.boot_warmup_retried += 1;
+    bootWarmupTimer = setTimeout(() => {
+      bootWarmupTimer = null;
+      runBootWarmup().catch(() => {});
+    }, START_RETRY_MS);
+    bootWarmupTimer.unref?.();
+  } else {
+    console.warn(
+      `[${VERSION}] asset-rank boot warmup incomplete attempts=${bootWarmupAttempt} catalog=${catalogRows.length} market=${marketByKey.size} hot=${hotByTicker.size} catalog_error=${lastCatalogError} market_error=${lastMarketError} hot_error=${lastHotError}`,
+    );
+  }
+}
+
 export function startKlineAssetRankCollector(options) {
   if (started) return; started=true; deps=options;
   if (!deps?.requestIsolatedJson || !deps?.getMarketLightInternalSnapshot) throw new Error('kline_asset_rank_dependencies_missing');
   const safe=(fn)=>fn().catch(()=>{});
-  setTimeout(()=>safe(async()=>{await refreshCatalog(); await Promise.allSettled([refreshMarket(),refreshHot()]);}),START_DELAY_MS).unref?.();
+  bootWarmupTimer=setTimeout(()=>{
+    bootWarmupTimer=null;
+    runBootWarmup().catch(()=>{});
+  },START_DELAY_MS);
+  bootWarmupTimer.unref?.();
   catalogTimer=setInterval(()=>safe(refreshCatalog),CATALOG_REFRESH_MS); catalogTimer.unref?.();
   marketTimer=setInterval(()=>safe(refreshMarket),MARKET_REFRESH_MS); marketTimer.unref?.();
   hotTimer=setInterval(()=>safe(refreshHot),HOT_REFRESH_MS); hotTimer.unref?.();
@@ -644,7 +713,21 @@ export async function handleKlineAssetRank(req,res,url) {
   if (assetClass===CASH_CLASS) { send(res,400,{ok:false,version:VERSION,error:'cash_equities_not_ranked',cash_equities_excluded:true,user_read_upstream_requests:0}); return true; }
   if (sort==='hot' && !['stocks','rwa','all'].includes(group)) { send(res,400,{ok:false,version:VERSION,error:'popular_sort_only_for_securities',user_read_upstream_requests:0}); return true; }
   if (offset>0&&!requested) { send(res,400,{ok:false,version:VERSION,error:'rank_version_required_after_first_page',restart_from_offset:0,user_read_upstream_requests:0}); return true; }
-  if (!catalogRows.length) { send(res,503,{ok:false,version:VERSION,error:'kline_asset_catalog_not_ready',user_read_upstream_requests:0}); return true; }
+  if (!catalogRows.length) {
+    send(res,503,{ok:false,version:VERSION,error:'kline_asset_catalog_not_ready',boot_warmup_attempt:bootWarmupAttempt,user_read_upstream_requests:0});
+    return true;
+  }
+  // Keep ranking semantically correct while boot warmup is still finishing.
+  // Name sort only needs the catalog. Market sorts need market data; Popular
+  // needs the official hot map. These gates do not trigger upstream work.
+  if (sort === 'hot' && !hotByTicker.size) {
+    send(res,503,{ok:false,version:VERSION,error:'kline_asset_hot_not_ready',boot_warmup_attempt:bootWarmupAttempt,user_read_upstream_requests:0});
+    return true;
+  }
+  if (['change_desc','change_asc','volume_desc'].includes(sort) && !marketByKey.size) {
+    send(res,503,{ok:false,version:VERSION,error:'kline_asset_market_not_ready',boot_warmup_attempt:bootWarmupAttempt,user_read_upstream_requests:0});
+    return true;
+  }
   const scope={group,assetClass,provider,sort};
   let snapshot=requested?requestedOrder(requested,scope):null;
   if (requested&&!snapshot) { send(res,409,{ok:false,version:VERSION,error:'rank_version_expired_or_scope_mismatch',rank_version:requested,restart_from_offset:0,user_read_upstream_requests:0}); return true; }
