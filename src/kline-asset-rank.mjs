@@ -4,7 +4,7 @@
 // exchange/Binance Wallet/Supabase upstream work. Binance Wallet rankType=40 supplies the
 // external mature "Popular" order for tokenized securities; it never substitutes product prices.
 
-const VERSION = '650.8.15.196.11.3.3';
+const VERSION = '650.8.15.196.11.3.4';
 const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1041_6_4_kline_asset_rank_page_v1';
 const ROUTE = '/api/asset-market/ranked-page';
@@ -16,7 +16,7 @@ const ORDER_MAX = Math.max(8, Math.min(32, Number(process.env.KAKA_KLINE_ASSET_R
 const CATALOG_REFRESH_MS = Math.max(10 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_CATALOG_REFRESH_MS || 30 * 60_000));
 const MARKET_REFRESH_MS = Math.max(60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_MARKET_REFRESH_MS || 2 * 60_000));
 const HOT_REFRESH_MS = Math.max(2 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_HOT_REFRESH_MS || 5 * 60_000));
-const START_DELAY_MS = Math.max(100, Number(process.env.KAKA_KLINE_ASSET_RANK_START_DELAY_MS || 250));
+const START_DELAY_MS = Math.max(750, Number(process.env.KAKA_KLINE_ASSET_RANK_START_DELAY_MS || 1_200));
 const START_RETRY_MS = Math.max(1_500, Number(process.env.KAKA_KLINE_ASSET_RANK_START_RETRY_MS || 2_500));
 const START_RETRY_MAX = Math.max(1, Math.min(8, Number(process.env.KAKA_KLINE_ASSET_RANK_START_RETRY_MAX || 6)));
 const RETAIN_MS = Math.max(10 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_RETAIN_MS || 45 * 60_000));
@@ -170,21 +170,39 @@ async function loadSupabaseCatalog() {
     'base_asset','quote_asset','settle_asset','status','exchange_name','product_venue','is_reality','is_rwa','source_verified','official_kline_capability',
     'official_kline_source','official_kline_identity','secondary_source_status','icon_url','quote_currency_symbol'
   ].join(',');
-  const rows=[];
-  for (let offset=0; offset<5000; offset+=SUPABASE_PAGE) {
-    const q = new URLSearchParams();
-    q.set('source_verified','eq.true');
-    q.set('official_kline_capability','in.(supported,supported_sparse)');
-    q.set('asset_group','in.(stocks,rwa,commodities,fx,events)');
-    q.set('asset_class','neq.equity_cash');
-    q.set('select',select);
-    q.set('order','asset_id.asc');
-    stats.supabase_reads += 1;
-    const part = await fetchJson(`${SUPABASE_URL}/rest/v1/kaka_exchange_asset_catalog?${q}`, { headers:supabaseHeaders({ range:`${offset}-${offset+SUPABASE_PAGE-1}`, prefer:'count=none' }), label:'asset_rank_supabase_catalog' });
+  const q = new URLSearchParams();
+  q.set('source_verified','eq.true');
+  q.set('official_kline_capability','in.(supported,supported_sparse)');
+  q.set('asset_group','in.(stocks,rwa,commodities,fx,events)');
+  q.set('asset_class','neq.equity_cash');
+  q.set('select',select);
+  q.set('order','asset_id.asc');
+
+  // Step1072.8.6.34.25.2:
+  // The catalog is bounded to five 1000-row windows. Reading them serially made
+  // cold-start latency roughly the sum of five HTTP round trips. Read the same
+  // fixed five windows concurrently; request count stays capped at 5 and remains
+  // one backend refresh independent of user count.
+  const offsets = [0, 1000, 2000, 3000, 4000];
+  stats.supabase_reads += offsets.length;
+  const parts = await Promise.all(offsets.map(async (offset) => {
+    const part = await fetchJson(
+      `${SUPABASE_URL}/rest/v1/kaka_exchange_asset_catalog?${q}`,
+      {
+        headers: supabaseHeaders({
+          range: `${offset}-${offset + SUPABASE_PAGE - 1}`,
+          prefer: 'count=none',
+        }),
+        label: `asset_rank_supabase_catalog_${offset}`,
+      },
+    );
     if (!Array.isArray(part)) throw new Error('asset_rank_supabase_rows_invalid');
-    rows.push(...part.filter(supportedRow));
-    if (part.length < SUPABASE_PAGE) break;
-  }
+    return { offset, part };
+  }));
+
+  parts.sort((a,b)=>a.offset-b.offset);
+  const rows=[];
+  for (const page of parts) rows.push(...page.part.filter(supportedRow));
   return rows;
 }
 
@@ -228,6 +246,7 @@ async function refreshCatalog() {
       return catalogRows;
     } catch(e) {
       stats.catalog_refresh_failed += 1; lastCatalogError=String(e?.message||e);
+      console.warn(`[${VERSION}] asset-rank catalog refresh failed error=${lastCatalogError}`);
       if (catalogRows.length && Date.now()-catalogUpdatedAt <= RETAIN_MS) return catalogRows;
       throw e;
     } finally { catalogInflight=null; }
