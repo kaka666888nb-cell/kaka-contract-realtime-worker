@@ -4,7 +4,7 @@
 // exchange/Binance Wallet/Supabase upstream work. Binance Wallet rankType=40 supplies the
 // external mature "Popular" order for tokenized securities; it never substitutes product prices.
 
-const VERSION = '650.8.15.196.11.3.2';
+const VERSION = '650.8.15.196.11.3.3';
 const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1041_6_4_kline_asset_rank_page_v1';
 const ROUTE = '/api/asset-market/ranked-page';
@@ -16,7 +16,7 @@ const ORDER_MAX = Math.max(8, Math.min(32, Number(process.env.KAKA_KLINE_ASSET_R
 const CATALOG_REFRESH_MS = Math.max(10 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_CATALOG_REFRESH_MS || 30 * 60_000));
 const MARKET_REFRESH_MS = Math.max(60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_MARKET_REFRESH_MS || 2 * 60_000));
 const HOT_REFRESH_MS = Math.max(2 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_HOT_REFRESH_MS || 5 * 60_000));
-const START_DELAY_MS = Math.max(750, Number(process.env.KAKA_KLINE_ASSET_RANK_START_DELAY_MS || 1_200));
+const START_DELAY_MS = Math.max(100, Number(process.env.KAKA_KLINE_ASSET_RANK_START_DELAY_MS || 250));
 const START_RETRY_MS = Math.max(1_500, Number(process.env.KAKA_KLINE_ASSET_RANK_START_RETRY_MS || 2_500));
 const START_RETRY_MAX = Math.max(1, Math.min(8, Number(process.env.KAKA_KLINE_ASSET_RANK_START_RETRY_MAX || 6)));
 const RETAIN_MS = Math.max(10 * 60_000, Number(process.env.KAKA_KLINE_ASSET_RANK_RETAIN_MS || 45 * 60_000));
@@ -224,6 +224,7 @@ async function refreshCatalog() {
       if (map.size < 500) throw new Error(`kline_asset_catalog_too_small:${map.size}`);
       catalogMap=map; catalogRows=[...map.values()]; catalogUpdatedAt=Date.now(); catalogVersion += 1; lastCatalogError='';
       stats.catalog_refresh_succeeded += 1;
+      console.log(`[${VERSION}] asset-rank catalog ready rows=${catalogRows.length}`);
       return catalogRows;
     } catch(e) {
       stats.catalog_refresh_failed += 1; lastCatalogError=String(e?.message||e);
@@ -350,17 +351,25 @@ async function refreshHot() {
   if (hotInflight) return hotInflight;
   hotInflight=(async()=>{
     stats.hot_refresh_started += 1;
+    const startedAt=Date.now();
     try {
+      // Step1072.8.6.34.25.1:
+      // Detail and Popular rank are independent HTTP reads. They were
+      // previously serialized, making the default "热门" asset page inherit
+      // both network latencies on every Render restart. Launch them together;
+      // mapping still happens only after both verified responses arrive.
       stats.binance_stock_detail_requests += 1;
-      const detail=await fetchJson(BINANCE_STOCK_DETAIL_URL,{label:'binance_wallet_stock_detail'});
+      stats.binance_stock_rank_requests += 1;
+      const [detail,rank]=await Promise.all([
+        fetchJson(BINANCE_STOCK_DETAIL_URL,{label:'binance_wallet_stock_detail'}),
+        fetchJson(BINANCE_STOCK_RANK_URL,{
+          label:'binance_wallet_stock_rank', method:'POST',
+          body:JSON.stringify({ rankType:BINANCE_STOCK_RANK_TYPE, period:BINANCE_STOCK_PERIOD, sortBy:BINANCE_STOCK_SORT_BY, orderAsc:false, page:1, size:BINANCE_STOCK_SIZE }),
+        }),
+      ]);
       const detailRows=dataArray(detail);
       if (!detailRows.length) throw new Error('binance_stock_detail_empty');
       rebuildDetailMaps(detailRows);
-      stats.binance_stock_rank_requests += 1;
-      const rank=await fetchJson(BINANCE_STOCK_RANK_URL,{
-        label:'binance_wallet_stock_rank', method:'POST',
-        body:JSON.stringify({ rankType:BINANCE_STOCK_RANK_TYPE, period:BINANCE_STOCK_PERIOD, sortBy:BINANCE_STOCK_SORT_BY, orderAsc:false, page:1, size:BINANCE_STOCK_SIZE }),
-      });
       const rankRows=rankArray(rank);
       if (!rankRows.length) throw new Error('binance_stock_rank_empty');
       const next=new Map();
@@ -377,6 +386,7 @@ async function refreshHot() {
       }
       if (!next.size) throw new Error('binance_stock_rank_no_exact_ticker_matches');
       hotByTicker=next; hotUpdatedAt=Date.now(); hotVersion += 1; lastHotError=''; stats.hot_refresh_succeeded += 1;
+      console.log(`[${VERSION}] asset-rank hot ready rows=${hotByTicker.size} elapsed_ms=${Date.now()-startedAt}`);
       return next;
     } catch(e) {
       stats.hot_refresh_failed += 1; lastHotError=String(e?.message||e);
