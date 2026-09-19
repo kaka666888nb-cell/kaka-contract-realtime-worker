@@ -573,6 +573,14 @@ async function dexFetchJson(url, { priority = 0, label = '' } = {}) {
 
 
 const geckoScheduler = createScheduler({ name: 'geckoterminal', minGapMs: GECKO_MIN_GAP_MS, maxQueue: GECKO_MAX_QUEUE });
+// Step1072.8.6.34.21: keep exact-pool Kline fallback out of the background
+// discovery/Alpha Gecko queue. This is still one shared bounded backend lane,
+// independent of user count, with its own singleflight/caches at the Kline layer.
+const geckoKlineScheduler = createScheduler({
+  name: 'geckoterminal-kline',
+  minGapMs: GECKO_MIN_GAP_MS,
+  maxQueue: Math.min(8, GECKO_MAX_QUEUE),
+});
 async function geckoFetchJson(url, { priority = 0, label = '' } = {}) {
   return geckoScheduler.enqueue(async () => {
     stats.gecko_upstream_started += 1;
@@ -598,6 +606,33 @@ async function geckoFetchJson(url, { priority = 0, label = '' } = {}) {
       throw error;
     } finally { clearTimeout(timer); }
   }, { priority, label });
+}
+
+async function geckoKlineFetchJson(url, { label = '' } = {}) {
+  return geckoKlineScheduler.enqueue(async () => {
+    stats.gecko_upstream_started += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GECKO_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json;version=20230203',
+          'user-agent': 'KakaWeb3-Onchain-Shared/1072.8.6.34.21',
+        },
+      });
+      const body = await response.text();
+      if (!response.ok) throw new Error(`geckoterminal_http_${response.status}:${body.slice(0, 220)}`);
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { throw new Error('geckoterminal_invalid_json'); }
+      stats.gecko_upstream_succeeded += 1;
+      return parsed;
+    } catch (error) {
+      stats.gecko_upstream_failed += 1;
+      throw error;
+    } finally { clearTimeout(timer); }
+  }, { priority: 100, label });
 }
 
 let binanceWalletLastCycleSucceeded = false;
@@ -2998,8 +3033,6 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
   const gtNetwork = GECKO_NETWORK[network];
   const spec = geckoKlineSpec(interval);
   if (!gtNetwork || !spec) throw new Error('geckoterminal_interval_not_supported');
-  const orientation = tokenOrientationInPair(pool, tokenAddress);
-  if (!orientation) throw new Error('geckoterminal_token_not_in_exact_pool');
   const poolAddress = text(pool.pool_address);
   const u = new URL(`${GECKO_BASE}/networks/${encodeURIComponent(gtNetwork)}/pools/${encodeURIComponent(poolAddress)}/ohlcv/${spec.timeframe}`);
   u.searchParams.set('aggregate', String(spec.aggregate));
@@ -3011,7 +3044,7 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
   // orientation ambiguity while preserving the exact pool identity.
   u.searchParams.set('token', tokenAddress);
   if (endTimeMs) u.searchParams.set('before_timestamp', String(Math.floor(Number(endTimeMs) / 1000)));
-  const payload = await geckoFetchJson(u.toString(), { priority: endTimeMs ? 4 : 18, label: `kline_fallback:${network}:${poolAddress}:${interval}` });
+  const payload = await geckoKlineFetchJson(u.toString(), { label: `kline_fallback:${network}:${poolAddress}:${interval}` });
   const id = text(payload?.data?.id);
   if (id) {
     const returnedPool = id.includes('_') ? id.slice(id.indexOf('_') + 1) : id;
@@ -3021,8 +3054,9 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
   const rows = list.map(normalizeGeckoCandle).filter(Boolean).sort((a, b) => a.open_time_ms - b.open_time_ms).slice(-limit);
   if (!rows.length) throw new Error('geckoterminal_exact_pool_ohlcv_empty');
   setIdentityProof(network, tokenAddress, poolAddress, 'geckoterminal_exact_pool_exact_token_address', {
-    token_orientation_from_preflight: orientation,
     queried_token_address: tokenAddress,
+    exact_pool_endpoint: true,
+    token_query_parameter: true,
   });
   return {
     rows,
@@ -4656,6 +4690,7 @@ function healthPayload() {
         step1040_wallet_history_internal_reserved_cu: MORALIS_WALLET_HISTORY_BUDGET_CU,
         wallet_insights_premium_endpoint_used: false,
         scheduler: moralisScheduler.state(),
+        gecko_kline_scheduler: geckoKlineScheduler.state(),
         budget: moralisBudgetState(),
       },
       goplus: {
@@ -5870,8 +5905,21 @@ export async function handleOnchainMarket(req, res, url) {
       return true;
     }
 
+    let pool = null;
     try {
-      const pool = await exactPoolPreflight(network, tokenAddress, poolAddress);
+      if (path === TRADES_ROUTE) {
+        pool = await exactPoolPreflight(network, tokenAddress, poolAddress);
+      } else {
+        pool = exactPoolFromVerifiedSnapshot(network, tokenAddress, poolAddress) || {
+          pool_address: poolAddress,
+          dex_id: null,
+          base_token: null,
+          quote_token: null,
+          pool_created_at: null,
+          price_usd: null,
+          _kline_preflight_source: 'provider_exact_pair_and_token_identity',
+        };
+      }
 
       if (path === TRADES_ROUTE) {
         const tradeLimit = intRange(url.searchParams.get('limit'), 1, TRADE_MAX_ROWS, 30);
@@ -5998,12 +6046,25 @@ export async function handleOnchainMarket(req, res, url) {
       const status = Number(error?.statusCode || 0);
       const code = text(error?.message || error);
       const httpStatus = status === 400 || code.includes('pool_not_owned') ? 400 : 503;
+      console.warn(
+        '[Step1072.8.6.34.21] onchain exact route failure ' +
+        JSON.stringify({
+          path,
+          network,
+          token: tokenAddress,
+          pool: poolAddress,
+          preflight_source: pool?._kline_preflight_source || null,
+          error: code.slice(0, 300),
+          status: httpStatus,
+        }),
+      );
       sendJson(res, httpStatus, responseBase({
         ok: false,
         error: code,
         network,
         address: tokenAddress,
         pool_address: poolAddress,
+        preflight_source: pool?._kline_preflight_source || null,
       }));
     }
     return true;
