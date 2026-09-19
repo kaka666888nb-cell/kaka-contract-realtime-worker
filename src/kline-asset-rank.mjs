@@ -4,7 +4,7 @@
 // exchange/Binance Wallet/Supabase upstream work. Binance Wallet rankType=40 supplies the
 // external mature "Popular" order for tokenized securities; it never substitutes product prices.
 
-const VERSION = '650.8.15.196.11.3.1';
+const VERSION = '650.8.15.196.11.3.2';
 const DATA_VERSION = 1041064;
 const SCHEMA_VERSION = 'step1041_6_4_kline_asset_rank_page_v1';
 const ROUTE = '/api/asset-market/ranked-page';
