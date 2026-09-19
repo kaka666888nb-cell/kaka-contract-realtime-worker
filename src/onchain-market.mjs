@@ -2662,7 +2662,38 @@ function pairContainsToken(network, pair, tokenAddress) {
   return [pair?.base_token?.address, pair?.quote_token?.address]
     .some((candidate) => exactAddressEqual(network, candidate, tokenAddress));
 }
+
+function exactPoolFromVerifiedSnapshot(network, tokenAddress, poolAddress) {
+  for (const row of trendingSnapshot) {
+    if (row?.network !== network) continue;
+    if (!exactAddressEqual(network, row?.token?.address, tokenAddress)) continue;
+    const pool = row?.best_pool;
+    if (!pool || !exactAddressEqual(network, pool?.pool_address, poolAddress)) continue;
+    if (!pairContainsToken(network, pool, tokenAddress)) continue;
+    return {
+      ...pool,
+      _kline_preflight_source: 'verified_shared_snapshot',
+    };
+  }
+  return null;
+}
+
 async function exactPoolPreflight(network, tokenAddress, poolAddress) {
+  // Step1072.8.6.34.20:
+  // The App's on-chain rows already originate from this collector's verified
+  // shared snapshot. Reuse that exact chain+token+pool identity first instead
+  // of forcing every Kline view through another DexScreener token-pairs call.
+  // This does NOT weaken identity checks: token membership and exact pool
+  // address are re-verified against the in-memory verified row. DexScreener
+  // remains the fallback for identities that are not present in the current
+  // shared snapshot (for example a direct search/detail route).
+  const snapshotPool = exactPoolFromVerifiedSnapshot(
+    network,
+    tokenAddress,
+    poolAddress,
+  );
+  if (snapshotPool) return snapshotPool;
+
   const result = await cachedBuild(
     `token_pairs:${network}:${lower(tokenAddress)}`,
     { freshMs: 20_000, staleMs: 5 * 60_000 },
@@ -2677,7 +2708,10 @@ async function exactPoolPreflight(network, tokenAddress, poolAddress) {
     error.statusCode = 400;
     throw error;
   }
-  return pool;
+  return {
+    ...pool,
+    _kline_preflight_source: 'dexscreener_exact_token_pairs',
+  };
 }
 
 function intervalPolicy(interval, endTimeMs = null) {
@@ -5909,6 +5943,7 @@ export async function handleOnchainMarket(req, res, url) {
           fallback_probe_error: built.fallback_probe_error || null,
           history_exhausted: built.history_exhausted === true,
           historical_end_time_ms: endTimeMs,
+          preflight_source: pool?._kline_preflight_source || null,
         }),
       );
       sendJson(res, 200, responseBase({
@@ -5940,6 +5975,7 @@ export async function handleOnchainMarket(req, res, url) {
         source_token_address: built.source_token_address || null,
         identity_proof: built.identity_proof || null,
         exact_chain_token_pool_preflight: true,
+        preflight_source: pool?._kline_preflight_source || null,
         derived_15m_from_5m: built.derived_15m_from_5m === true,
         kline_feature_schema_version: built.kline_feature_schema_version || KLINE_FEATURE_SCHEMA_VERSION,
         interval_mode: built.interval_mode || 'native_shared',
