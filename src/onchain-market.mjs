@@ -3040,7 +3040,7 @@ async function buildSharedContinuityKlines(network, tokenAddress, pool, interval
     const continuity = deriveAndFillKlines(built.rows || [], interval, {
       sourceInterval: interval,
       source: built.source || 'moralis_official_data_api_pair_ohlcv',
-      sessionMode: 'continuous_24x7',
+      sessionMode: 'none',
       maxGapBars: 96,
       limit,
     });
@@ -3048,7 +3048,7 @@ async function buildSharedContinuityKlines(network, tokenAddress, pool, interval
       ...built,
       rows: continuity.rows,
       kline_feature_schema_version: KLINE_FEATURE_SCHEMA_VERSION,
-      interval_mode: 'native_shared_with_bounded_gap_continuity',
+      interval_mode: 'native_shared_real_rows_only',
       derived_from_interval: null,
       zero_trade_fill_count: continuity.zero_trade_fill_count,
       zero_trade_fill_policy: continuity.zero_trade_fill_policy,
@@ -3092,7 +3092,7 @@ async function buildSharedContinuityKlines(network, tokenAddress, pool, interval
   const continuity = deriveAndFillKlines(base.rows, interval, {
     sourceInterval: plan.base,
     source: base.source || 'moralis_official_data_api_pair_ohlcv',
-    sessionMode: 'continuous_24x7',
+    sessionMode: 'none',
     maxGapBars: 96,
     limit,
   });
@@ -4761,8 +4761,9 @@ function healthPayload() {
       derived_intervals: Object.keys(KAKA_DERIVED_PLAN).filter((x) => !Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, x)),
       derived_base_cache_limit: KLINE_MAX_ROWS,
       derived_15m_from_same_pool_5m: true,
-      bounded_zero_trade_gap_fill: true,
-      zero_trade_fill_evidence: 'internal_missing_bucket_bounded_by_real_bars_same_exact_pool',
+      bounded_zero_trade_gap_fill: false,
+      zero_trade_fill_evidence: 'disabled_real_source_rows_only',
+      synthetic_zero_trade_gap_bars: false,
       zero_trade_tail_extrapolation: false,
       max_rows_per_response: KLINE_MAX_ROWS,
       cache_entries: klineCache.size,
