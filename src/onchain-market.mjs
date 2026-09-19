@@ -574,7 +574,10 @@ async function dexFetchJson(url, { priority = 0, label = '' } = {}) {
 
 const geckoScheduler = createScheduler({
   name: 'geckoterminal',
-  minGapMs: Math.max(7_500, GECKO_MIN_GAP_MS),
+  // Step1072.8.6.34.24: production showed intermittent 429 even at 7.5s
+  // spacing. GeckoTerminal documents an approximate/fluctuating public limit,
+  // so keep a more conservative global cadence for the single Render egress.
+  minGapMs: Math.max(10_000, GECKO_MIN_GAP_MS),
   maxQueue: GECKO_MAX_QUEUE,
 });
 // Step1072.8.6.34.22:
@@ -610,49 +613,45 @@ async function geckoFetchJson(url, { priority = 0, label = '' } = {}) {
 }
 
 async function geckoKlineFetchJson(url, { label = '' } = {}) {
-  return geckoScheduler.enqueue(async () => {
-    stats.gecko_upstream_started += 1;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GECKO_TIMEOUT_MS);
-    timer.unref?.();
+  // Step1072.8.6.34.24: Kline is user-visible and should not require a manual
+  // pull-to-refresh just because one public Gecko call landed inside a 429
+  // bucket. Every attempt still goes through the SAME global scheduler, so the
+  // retry does not bypass the shared rate gate or become user-linear upstream.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          accept: 'application/json;version=20230203',
-          'user-agent': 'KakaWeb3-Onchain-Shared/1072.8.6.34.22',
-        },
+      return await geckoFetchJson(url, {
+        priority: 100,
+        label: attempt === 0 ? label : `${label}:429_retry`,
       });
-      const body = await response.text();
-      if (!response.ok) {
-        const error = new Error(`geckoterminal_http_${response.status}:${body.slice(0, 220)}`);
+    } catch (error) {
+      const message = String(error?.message || error || '');
+      const is429 = message.startsWith('geckoterminal_http_429:');
+      if (!is429 || attempt >= 1) {
         console.warn(
-          '[Step1072.8.6.34.22] gecko kline upstream failure ' +
-          JSON.stringify({ label, status: response.status, body: body.slice(0, 220) }),
+          '[Step1072.8.6.34.24] gecko kline upstream failure ' +
+          JSON.stringify({
+            label,
+            attempt: attempt + 1,
+            error: message.slice(0, 260),
+          }),
         );
         throw error;
       }
-      let parsed;
-      try { parsed = JSON.parse(body); } catch {
-        console.warn(
-          '[Step1072.8.6.34.22] gecko kline upstream failure ' +
-          JSON.stringify({ label, status: response.status, body: 'invalid_json' }),
-        );
-        throw new Error('geckoterminal_invalid_json');
-      }
-      stats.gecko_upstream_succeeded += 1;
-      return parsed;
-    } catch (error) {
-      stats.gecko_upstream_failed += 1;
-      if (!String(error?.message || error).startsWith('geckoterminal_http_')) {
-        console.warn(
-          '[Step1072.8.6.34.22] gecko kline upstream failure ' +
-          JSON.stringify({ label, status: null, body: String(error?.message || error).slice(0, 220) }),
-        );
-      }
-      throw error;
-    } finally { clearTimeout(timer); }
-  }, { priority: 100, label });
+      console.warn(
+        '[Step1072.8.6.34.24] gecko kline 429 queued retry ' +
+        JSON.stringify({
+          label,
+          attempt: attempt + 1,
+          delay_ms: 12_000,
+        }),
+      );
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 12_000);
+        timer.unref?.();
+      });
+    }
+  }
+  throw new Error('geckoterminal_kline_retry_exhausted');
 }
 
 let moralisKlineCircuitOpenUntil = 0;
