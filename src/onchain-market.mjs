@@ -2697,6 +2697,14 @@ function pruneSimpleCache(map, max) {
   while (entries.length > max) map.delete(entries.shift()[0]);
 }
 
+function klineValueCacheable(value) {
+  const count = Array.isArray(value?.rows) ? value.rows.length : 0;
+  // Step1072.8.6.34.17: a one-candle latest/history result is useful as a
+  // transient fact but is not a healthy reusable chart snapshot. Do not pin it
+  // behind a 30s/15m or 6h/7d cache window; let the next shared request retry.
+  return count >= 2 || value?.history_exhausted === true;
+}
+
 async function cachedKlineBuild(key, policy, builder) {
   const now = Date.now();
   const cached = klineCache.get(key);
@@ -2709,7 +2717,7 @@ async function cachedKlineBuild(key, policy, builder) {
     stats.kline_cache_stale_hits += 1;
     if (!klineInflight.has(key)) {
       const pending = Promise.resolve().then(builder).then((value) => {
-        if (value?.rows?.length || value?.history_exhausted === true) {
+        if (klineValueCacheable(value)) {
           klineCache.set(key, { value, storedAt: Date.now() });
           pruneSimpleCache(klineCache, KLINE_CACHE_MAX_ENTRIES);
         }
@@ -2725,7 +2733,7 @@ async function cachedKlineBuild(key, policy, builder) {
   } else {
     stats.kline_cache_misses += 1;
     pending = Promise.resolve().then(builder).then((value) => {
-      if (value?.rows?.length || value?.history_exhausted === true) {
+      if (klineValueCacheable(value)) {
         klineCache.set(key, { value, storedAt: Date.now() });
         pruneSimpleCache(klineCache, KLINE_CACHE_MAX_ENTRIES);
       }
@@ -2963,7 +2971,11 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
   u.searchParams.set('aggregate', String(spec.aggregate));
   u.searchParams.set('limit', String(Math.min(1000, Math.max(1, limit))));
   u.searchParams.set('currency', 'usd');
-  u.searchParams.set('token', orientation);
+  // Step1072.8.6.34.17: query GeckoTerminal by the exact requested token
+  // address, not by DexScreener's base/quote ordering. Gecko explicitly accepts
+  // a token address for this endpoint, so this removes cross-provider
+  // orientation ambiguity while preserving the exact pool identity.
+  u.searchParams.set('token', tokenAddress);
   if (endTimeMs) u.searchParams.set('before_timestamp', String(Math.floor(Number(endTimeMs) / 1000)));
   const payload = await geckoFetchJson(u.toString(), { priority: endTimeMs ? 4 : 18, label: `kline_fallback:${network}:${poolAddress}:${interval}` });
   const id = text(payload?.data?.id);
@@ -2974,14 +2986,17 @@ async function buildGeckoKlines(network, tokenAddress, pool, interval, limit, en
   const list = Array.isArray(payload?.data?.attributes?.ohlcv_list) ? payload.data.attributes.ohlcv_list : [];
   const rows = list.map(normalizeGeckoCandle).filter(Boolean).sort((a, b) => a.open_time_ms - b.open_time_ms).slice(-limit);
   if (!rows.length) throw new Error('geckoterminal_exact_pool_ohlcv_empty');
-  setIdentityProof(network, tokenAddress, poolAddress, 'geckoterminal_exact_pool_token_orientation', { token_orientation: orientation });
+  setIdentityProof(network, tokenAddress, poolAddress, 'geckoterminal_exact_pool_exact_token_address', {
+    token_orientation_from_preflight: orientation,
+    queried_token_address: tokenAddress,
+  });
   return {
     rows,
     source_token_address: tokenAddress,
     source_pair_address: poolAddress,
     source_timeframe: `${spec.timeframe}:${spec.aggregate}`,
     derived_15m_from_5m: false,
-    identity_proof: 'geckoterminal_exact_pool_token_orientation',
+    identity_proof: 'geckoterminal_exact_pool_exact_token_address',
     source: 'geckoterminal_keyless_public_exact_pool_ohlcv_fallback',
     fallback_from: 'moralis_pair_ohlcv_unavailable_or_empty',
   };
@@ -5849,6 +5864,28 @@ export async function handleOnchainMarket(req, res, url) {
         interval,
         source: built.source || 'moralis_official_data_api_pair_ohlcv',
       }));
+      if (rows.length < 2 || built.fallback_used === true) {
+        console.warn(
+          '[Step1072.8.6.34.17] onchain kline diagnostic ' +
+          JSON.stringify({
+            network,
+            interval,
+            token: tokenAddress,
+            pool: poolAddress,
+            rows: rows.length,
+            source: built.source || 'moralis_official_data_api_pair_ohlcv',
+            cache_status: result.cache_status,
+            fallback_used: built.fallback_used === true,
+            fallback_from: built.fallback_from || null,
+            primary_row_count: Number(built.primary_row_count || 0),
+            fallback_candidate_row_count: Number(built.fallback_candidate_row_count || 0),
+            exact_pool_source_compare: built.exact_pool_source_compare || null,
+            fallback_probe_error: built.fallback_probe_error || null,
+            history_exhausted: built.history_exhausted === true,
+            historical_end_time_ms: endTimeMs,
+          }),
+        );
+      }
       sendJson(res, 200, responseBase({
         network,
         address: tokenAddress,
