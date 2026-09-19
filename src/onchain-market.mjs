@@ -3009,17 +3009,39 @@ function historicalRangeReachesPoolCreation(pool, interval, limit, endTimeMs) {
   return Number.isFinite(range?.fromMs) && range.fromMs <= createdMs;
 }
 async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, interval, limit, endTimeMs) {
-  // Step1072.8.6.34.15:
-  // Moralis can occasionally prove the exact pair but return only one/few OHLCV rows.
-  // Treat that as a shallow exact source, not as sufficient history. Compare the SAME
-  // exact pool on GeckoTerminal and use it only when it provides more real OHLCV rows.
-  // Never merge different providers candle-by-candle, never switch pool/token, never fill gaps.
+  // Step1072.8.6.34.19:
+  // Latest exact-pool Kline reads may need both Moralis and GeckoTerminal.
+  // Do not wait for a full Moralis timeout before starting the SAME exact-pool
+  // Gecko fallback. Hedge only after a short delay, then choose one complete
+  // provider batch; never merge providers candle-by-candle, never switch pool
+  // or token, and never synthesize missing candles.
   const shallowThreshold = Math.min(24, Math.max(2, Number(limit) || 24));
+  const latestHedgeDelayMs = 2_500;
   let primary = null;
   let primaryRows = [];
   let moralisError = '';
   let exactProof = '';
   let exactPair = false;
+  let fallbackPromise = null;
+  let fallbackTimer = null;
+
+  const startFallback = () => {
+    if (fallbackPromise) return fallbackPromise;
+    fallbackPromise = Promise.resolve()
+      .then(() => buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs))
+      .then(
+        (value) => ({ value, error: '' }),
+        (error) => ({ value: null, error: text(error?.message || error).slice(0, 220) }),
+      );
+    return fallbackPromise;
+  };
+
+  // Historical left-backfill stays Moralis-first/bounded. Latest pages get a
+  // delayed hedge only when the requested interval is supported by Gecko.
+  if (!endTimeMs && geckoKlineSpec(interval)) {
+    fallbackTimer = setTimeout(() => { startFallback(); }, latestHedgeDelayMs);
+    fallbackTimer.unref?.();
+  }
 
   try {
     primary = await buildMoralisKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
@@ -3027,6 +3049,7 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
     exactProof = text(primary?.identity_proof);
     exactPair = exactAddressEqual(network, primary?.source_pair_address, pool?.pool_address);
     if (primaryRows.length >= shallowThreshold) {
+      if (fallbackTimer) clearTimeout(fallbackTimer);
       return {
         ...primary,
         source: 'moralis_official_data_api_pair_ohlcv',
@@ -3034,13 +3057,12 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
         history_exhausted: false,
         exact_pool_source_compare: 'primary_sufficient',
         primary_row_count: primaryRows.length,
+        fallback_candidate_row_count: 0,
       };
     }
 
-    // Step1072.8.6.34.16: keep historical left-backfill bounded. If Moralis
-    // already returned any real rows for this same exact pool, return those
-    // immediately instead of waiting behind the shared Gecko lane. The App can
-    // continue paginating older history from the new oldest real row.
+    // Historical left-backfill: any exact Moralis rows are returned immediately
+    // so the App can continue paging from the new oldest real candle.
     if (endTimeMs && primaryRows.length > 0) {
       return {
         ...primary,
@@ -3076,17 +3098,21 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
       : 'moralis_exact_pool_ohlcv_empty';
   } catch (error) {
     moralisError = text(error?.message || error).slice(0, 240);
+  } finally {
+    if (fallbackTimer) {
+      clearTimeout(fallbackTimer);
+      fallbackTimer = null;
+    }
   }
 
-  let fallback = null;
-  let fallbackErrorText = '';
-  try {
-    fallback = await buildGeckoKlines(network, tokenAddress, pool, interval, limit, endTimeMs);
-  } catch (fallbackError) {
-    fallbackErrorText = text(fallbackError?.message || fallbackError).slice(0, 220);
-  }
-
+  // If the hedge did not start yet, start it now because the primary was
+  // shallow/empty/failed. Historical requests reach here only when Moralis
+  // returned no usable rows and did not prove exhaustion.
+  const fallbackResult = await startFallback();
+  const fallback = fallbackResult?.value || null;
+  const fallbackErrorText = text(fallbackResult?.error).slice(0, 220);
   const fallbackRows = Array.isArray(fallback?.rows) ? fallback.rows : [];
+
   if (fallback && fallbackRows.length > primaryRows.length) {
     return {
       ...fallback,
@@ -3097,7 +3123,9 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
       primary_error: moralisError,
       primary_row_count: primaryRows.length,
       fallback_candidate_row_count: fallbackRows.length,
-      exact_pool_source_compare: 'fallback_richer_same_exact_pool',
+      exact_pool_source_compare: fallbackPromise
+        ? 'fallback_richer_same_exact_pool_hedged'
+        : 'fallback_richer_same_exact_pool',
       history_exhausted: false,
     };
   }
@@ -3156,7 +3184,6 @@ async function buildKlinesWithExactPoolFallback(network, tokenAddress, pool, int
   error.statusCode = 503;
   throw error;
 }
-
 async function buildSharedContinuityKlines(network, tokenAddress, pool, interval, limit, endTimeMs) {
   const nativeInterval = Object.prototype.hasOwnProperty.call(MORALIS_TIMEFRAME, interval);
   if (nativeInterval) {
