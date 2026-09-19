@@ -1051,12 +1051,10 @@ async function getSharedNativeRows(identity, signal) {
   }
 }
 
-function klineContinuitySessionMode(identity) {
-  if (identity.sparse) return 'none';
-  const scope = `${assetClassKey(identity.assetClass)}|${marketTypeKey(identity.marketType)}`;
-  // Stocks/RWA/FX/commodities have sessions. Never fill overnight/weekend closures.
-  if (/(equity|stock|rwa|commodity|metal|fx|forex)/.test(scope)) return 'intraday_only';
-  return 'continuous_24x7';
+function klineContinuitySessionMode(_identity) {
+  // Step1072.8.6.34.13: never manufacture flat zero-volume candles.
+  // Native rows remain exact official rows; derived intervals aggregate only real base rows.
+  return 'none';
 }
 
 function applyNativeContinuity(identity, payload) {
@@ -1074,7 +1072,7 @@ function applyNativeContinuity(identity, payload) {
     ...payload,
     rows,
     row_count: rows.length,
-    interval_mode: 'native_shared_with_bounded_gap_continuity',
+    interval_mode: 'native_shared_real_rows_only',
     derived_from_interval: null,
     zero_trade_fill_count: continuity.zero_trade_fill_count,
     zero_trade_fill_policy: continuity.zero_trade_fill_policy,
@@ -1320,9 +1318,10 @@ export function getAssetKlineHealth() {
     native_intervals: [...NATIVE_INTERVALS],
     derived_intervals: Object.keys(KAKA_DERIVED_PLAN),
     derived_base_cache_limit: 300,
-    bounded_zero_trade_gap_fill: true,
+    bounded_zero_trade_gap_fill: false,
     zero_trade_tail_extrapolation: false,
-    stock_session_fill_policy: 'internal_same_utc_day_only_no_overnight_weekend_fill',
+    stock_session_fill_policy: 'disabled_real_source_rows_only',
+    synthetic_zero_trade_gap_bars: false,
     mode: 'exact_identity_shared_cache_singleflight_official_asset_klines_plus_shared_derived_intervals',
     read_only_shared: true,
     app_direct_exchange_requests: 0,
