@@ -1,4 +1,4 @@
-const VERSION = '1073.r11.kline-refresh-hint.1';
+const VERSION = '1073.r11.kline-refresh-hint.2';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 
@@ -21,10 +21,21 @@ const CONTRACT_INTERVALS = new Set([
 
 const CACHE_TTL_MS = 90_000;
 const STALE_MS = 5 * 60_000;
+const DEFERRED_CACHE_TTL_MS = 10_000;
+const DEFERRED_STALE_MS = 30_000;
 const CACHE_MAX = 256;
 const BUILD_MAX_ACTIVE = 3;
 const BUILD_MAX_QUEUE = 48;
 const RPC_TIMEOUT_MS = 12_000;
+
+const LOCAL_BUDGET_LIMITS = {
+  spot: { minute: 12, hour: 60 },
+  contract: { minute: 24, hour: 120 },
+};
+const localBudgetState = {
+  spot: { minuteStartedAt: 0, minuteCount: 0, hourStartedAt: 0, hourCount: 0 },
+  contract: { minuteStartedAt: 0, minuteCount: 0, hourStartedAt: 0, hourCount: 0 },
+};
 
 const cache = new Map();
 const inflight = new Map();
@@ -42,6 +53,7 @@ const stats = {
   builds_failed: 0,
   queue_rejections: 0,
   rpc_calls: 0,
+  local_budget_deferred: 0,
   cache_evictions: 0,
 };
 
@@ -78,12 +90,8 @@ function intervalKey(market, raw) {
   return allowed.has(value) ? value : '';
 }
 
-function canonicalLimit(market, raw) {
-  const parsed = Number.parseInt(String(raw ?? ''), 10);
-  const fallback = market === 'contract' ? 180 : 80;
-  const value = Number.isFinite(parsed) ? parsed : fallback;
-  if (market === 'contract') return Math.max(20, Math.min(500, value));
-  return Math.max(1, Math.min(300, value));
+function canonicalLimit(market) {
+  return market === 'contract' ? 500 : 300;
 }
 
 function pruneCache() {
@@ -124,6 +132,40 @@ function acquireBuildSlot() {
   });
 }
 
+function claimLocalBudget(market) {
+  const now = Date.now();
+  const state = localBudgetState[market];
+  const limits = LOCAL_BUDGET_LIMITS[market];
+
+  if (!state.minuteStartedAt || now - state.minuteStartedAt >= 60_000) {
+    state.minuteStartedAt = now;
+    state.minuteCount = 0;
+  }
+  if (!state.hourStartedAt || now - state.hourStartedAt >= 60 * 60_000) {
+    state.hourStartedAt = now;
+    state.hourCount = 0;
+  }
+
+  const allowed =
+    state.minuteCount < limits.minute &&
+    state.hourCount < limits.hour;
+
+  if (allowed) {
+    state.minuteCount += 1;
+    state.hourCount += 1;
+  }
+
+  return {
+    allowed,
+    minute_count: state.minuteCount,
+    minute_limit: limits.minute,
+    minute_reset_at: new Date(state.minuteStartedAt + 60_000).toISOString(),
+    hour_count: state.hourCount,
+    hour_limit: limits.hour,
+    hour_reset_at: new Date(state.hourStartedAt + 60 * 60_000).toISOString(),
+  };
+}
+
 async function callRpc({ market, provider, symbol, interval, limit }) {
   if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
     throw new Error('supabase_service_role_not_configured');
@@ -132,19 +174,13 @@ async function callRpc({ market, provider, symbol, interval, limit }) {
   const rpc = market === 'contract'
     ? 'app_request_contract_kline_cache'
     : 'app_request_market_kline_cache';
-  const body = market === 'contract'
-    ? {
-        p_provider: provider,
-        p_symbol: symbol,
-        p_kline_interval: interval,
-        p_limit: limit,
-      }
-    : {
-        p_provider: provider,
-        p_symbol: symbol,
-        p_kline_interval: interval,
-        p_limit: limit,
-      };
+
+  const body = {
+    p_provider: provider,
+    p_symbol: symbol,
+    p_kline_interval: interval,
+    p_limit: limit,
+  };
 
   stats.rpc_calls += 1;
   const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${rpc}`, {
@@ -178,6 +214,30 @@ async function buildPayload(spec) {
   stats.builds_started += 1;
   try {
     release = await acquireBuildSlot();
+
+    const localBudget = claimLocalBudget(spec.market);
+    if (!localBudget.allowed) {
+      stats.local_budget_deferred += 1;
+      stats.builds_succeeded += 1;
+      return {
+        ok: true,
+        version: VERSION,
+        provider: spec.provider,
+        market_type: spec.market,
+        symbol: spec.symbol,
+        kline_interval: spec.interval,
+        limit: spec.limit,
+        rpc: null,
+        rpc_result: null,
+        local_budget_deferred: true,
+        local_budget: localBudget,
+        source: 'render_shared_kline_refresh_hint',
+        user_direct_supabase_rpc_calls: 0,
+        reads_scale_db_calls_with_users: false,
+        generated_at: new Date().toISOString(),
+      };
+    }
+
     const rpcResult = await callRpc(spec);
     const payload = {
       ok: true,
@@ -189,6 +249,8 @@ async function buildPayload(spec) {
       limit: spec.limit,
       rpc: rpcResult.rpc,
       rpc_result: rpcResult.result,
+      local_budget_deferred: false,
+      local_budget: localBudget,
       source: 'render_shared_kline_refresh_hint',
       user_direct_supabase_rpc_calls: 0,
       reads_scale_db_calls_with_users: false,
@@ -209,6 +271,17 @@ function cachePayload(entry, state) {
     ...entry.payload,
     cache_state: state,
     cache_age_seconds: Math.max(0, Math.floor((Date.now() - entry.storedAt) / 1000)),
+  };
+}
+
+function cacheEntryFor(payload) {
+  const storedAt = Date.now();
+  const deferred = payload?.local_budget_deferred === true;
+  return {
+    payload,
+    storedAt,
+    freshUntil: storedAt + (deferred ? DEFERRED_CACHE_TTL_MS : CACHE_TTL_MS),
+    staleUntil: storedAt + (deferred ? DEFERRED_STALE_MS : STALE_MS),
   };
 }
 
@@ -235,13 +308,7 @@ async function getShared(spec) {
     stats.stale_hits += 1;
     const task = buildPayload(spec)
       .then((payload) => {
-        const storedAt = Date.now();
-        const next = {
-          payload,
-          storedAt,
-          freshUntil: storedAt + CACHE_TTL_MS,
-          staleUntil: storedAt + STALE_MS,
-        };
+        const next = cacheEntryFor(payload);
         cache.set(key, next);
         pruneCache();
         return cachePayload(next, 'revalidated');
@@ -255,13 +322,7 @@ async function getShared(spec) {
   stats.cold_misses += 1;
   const task = buildPayload(spec)
     .then((payload) => {
-      const storedAt = Date.now();
-      const entry = {
-        payload,
-        storedAt,
-        freshUntil: storedAt + CACHE_TTL_MS,
-        staleUntil: storedAt + STALE_MS,
-      };
+      const entry = cacheEntryFor(payload);
       cache.set(key, entry);
       pruneCache();
       return cachePayload(entry, 'cold_build');
@@ -269,6 +330,17 @@ async function getShared(spec) {
     .finally(() => inflight.delete(key));
   inflight.set(key, task);
   return await task;
+}
+
+function budgetHealth(market) {
+  const state = localBudgetState[market];
+  const limits = LOCAL_BUDGET_LIMITS[market];
+  return {
+    minute_count: state.minuteCount,
+    minute_limit: limits.minute,
+    hour_count: state.hourCount,
+    hour_limit: limits.hour,
+  };
 }
 
 export function getKlineRefreshHintHealth() {
@@ -285,6 +357,11 @@ export function getKlineRefreshHintHealth() {
     cache_max: CACHE_MAX,
     build_max_active: BUILD_MAX_ACTIVE,
     build_max_queue: BUILD_MAX_QUEUE,
+    canonical_limits: { spot: 300, contract: 500 },
+    local_budget: {
+      spot: budgetHealth('spot'),
+      contract: budgetHealth('contract'),
+    },
     supported_markets: ['spot', 'contract'],
     supported_provider: 'binance',
     supported_symbols: [...SYMBOLS],
@@ -325,7 +402,7 @@ export async function handleKlineRefreshHint(req, res, url) {
     return true;
   }
 
-  const limit = canonicalLimit(market, url.searchParams.get('limit'));
+  const limit = canonicalLimit(market);
   try {
     const payload = await getShared({ market, provider, symbol, interval, limit });
     sendJson(res, 200, payload, {
