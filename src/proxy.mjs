@@ -12,6 +12,7 @@ import { getSpotCurrentSnapshotHealth, handleSpotCurrentSnapshot, startSpotCurre
 import { getSpotExactTickerHealth, handleSpotExactTicker } from './spot-exact-ticker.mjs';
 import { getSpotFlowHistoryHealth, handleSpotFlowHistory } from './spot-flow-history.mjs';
 import { getSpotFlowSnapshotHealth, handleSpotFlowSnapshot } from './spot-flow-snapshot.mjs';
+import { handleContractHistoryShared } from './contract-history-shared.mjs';
 import { getMarketLightSnapshotHealth, getMarketLightInternalSnapshot, startMarketLightBridge } from './market-light-bridge.mjs';
 import { getContractBasisHealth, handleContractBasis, startContractBasisScanner } from './contract-basis.mjs';
 import { getSourceCapabilityRegistryHealth, handleSourceCapabilityRegistry } from './source-capability-registry.mjs';
@@ -38,7 +39,7 @@ import { getAirdropWatchHealth, handleAirdropWatch, startAirdropWatch, stopAirdr
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.197.3.3.32.3';
+const STEP_VERSION = '650.8.15.197.3.3.32.4';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -1326,6 +1327,7 @@ const server = http.createServer(async (req, res) => {
       if (await handleSpotExactTicker(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowSnapshot(req, res, url, requestAbortController.signal)) return true;
       if (await handleSpotFlowHistory(req, res, url)) return true;
+      if (await handleContractHistoryShared(req, res, url, requestAbortController.signal)) return true;
       if (await handleMarketApi(req, res, url)) return true;
       if (await handleContractDepth(req, res, url)) return true;
       if (await handleContractFunding(req, res, url)) return true;
