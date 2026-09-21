@@ -27,8 +27,8 @@ const BUILD_MAX_QUEUE = 48;
 const RPC_TIMEOUT_MS = 12_000;
 
 const FIXED_BUDGETS = {
-  spot: { minute: 24, hour: 120 },
-  contract: { minute: 48, hour: 240 },
+  spot: { minute: 12, hour: 60 },
+  contract: { minute: 24, hour: 120 },
 };
 const budgetStarts = {
   spot: [],
@@ -90,12 +90,8 @@ function intervalKey(market, raw) {
   return allowed.has(value) ? value : '';
 }
 
-function canonicalLimit(market, raw) {
-  const parsed = Number.parseInt(String(raw ?? ''), 10);
-  const fallback = market === 'contract' ? 180 : 80;
-  const value = Number.isFinite(parsed) ? parsed : fallback;
-  if (market === 'contract') return Math.max(20, Math.min(500, value));
-  return Math.max(1, Math.min(300, value));
+function canonicalLimit(market, _raw) {
+  return market === 'contract' ? 500 : 300;
 }
 
 function pruneCache() {
