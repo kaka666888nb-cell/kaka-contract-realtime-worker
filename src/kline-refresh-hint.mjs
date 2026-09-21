@@ -21,6 +21,8 @@ const CONTRACT_INTERVALS = new Set([
 
 const CACHE_TTL_MS = 90_000;
 const STALE_MS = 5 * 60_000;
+const DEFERRED_CACHE_TTL_MS = 10_000;
+const DEFERRED_STALE_MS = 30_000;
 const CACHE_MAX = 256;
 const BUILD_MAX_ACTIVE = 3;
 const BUILD_MAX_QUEUE = 48;
@@ -173,16 +175,22 @@ async function callRpc({ market, provider, symbol, interval, limit }) {
 
   const budget = claimBudget(market);
   if (!budget.ok) {
-    throw new Error(
-      'kline_refresh_hint_fixed_budget_exceeded:' +
-      JSON.stringify({
-        market,
-        minute_used: budget.minute_used,
-        minute_limit: budget.minute_limit,
-        hour_used: budget.hour_used,
-        hour_limit: budget.hour_limit,
-      }),
-    );
+    return {
+      rpc: null,
+      result: {
+        ok: true,
+        mode: 'render_fixed_budget_deferred',
+        provider,
+        market_type: market,
+        symbol,
+        kline_interval: interval,
+        limit,
+        upstream_dispatched: false,
+        fixed_cost_guard: true,
+      },
+      budget,
+      deferred: true,
+    };
   }
 
   const rpc = market === 'contract'
@@ -218,7 +226,7 @@ async function callRpc({ market, provider, symbol, interval, limit }) {
     catch (_) { result = text; }
   }
 
-  return { rpc, result, budget };
+  return { rpc, result, budget, deferred: false };
 }
 
 async function buildPayload(spec) {
@@ -238,6 +246,7 @@ async function buildPayload(spec) {
       rpc: rpcResult.rpc,
       rpc_result: rpcResult.result,
       fixed_budget: rpcResult.budget,
+      local_budget_deferred: rpcResult.deferred === true,
       source: 'render_shared_kline_refresh_hint',
       user_direct_supabase_rpc_calls: 0,
       reads_scale_db_calls_with_users: false,
@@ -258,6 +267,17 @@ function cachePayload(entry, state) {
     ...entry.payload,
     cache_state: state,
     cache_age_seconds: Math.max(0, Math.floor((Date.now() - entry.storedAt) / 1000)),
+  };
+}
+
+function cacheEntry(payload) {
+  const storedAt = Date.now();
+  const deferred = payload?.local_budget_deferred === true;
+  return {
+    payload,
+    storedAt,
+    freshUntil: storedAt + (deferred ? DEFERRED_CACHE_TTL_MS : CACHE_TTL_MS),
+    staleUntil: storedAt + (deferred ? DEFERRED_STALE_MS : STALE_MS),
   };
 }
 
@@ -284,13 +304,7 @@ async function getShared(spec) {
     stats.stale_hits += 1;
     const task = buildPayload(spec)
       .then((payload) => {
-        const storedAt = Date.now();
-        const next = {
-          payload,
-          storedAt,
-          freshUntil: storedAt + CACHE_TTL_MS,
-          staleUntil: storedAt + STALE_MS,
-        };
+        const next = cacheEntry(payload);
         cache.set(key, next);
         pruneCache();
         return cachePayload(next, 'revalidated');
@@ -304,13 +318,7 @@ async function getShared(spec) {
   stats.cold_misses += 1;
   const task = buildPayload(spec)
     .then((payload) => {
-      const storedAt = Date.now();
-      const entry = {
-        payload,
-        storedAt,
-        freshUntil: storedAt + CACHE_TTL_MS,
-        staleUntil: storedAt + STALE_MS,
-      };
+      const entry = cacheEntry(payload);
       cache.set(key, entry);
       pruneCache();
       return cachePayload(entry, 'cold_build');
