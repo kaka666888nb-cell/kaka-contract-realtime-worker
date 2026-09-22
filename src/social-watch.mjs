@@ -27,6 +27,10 @@ const RULE_ACCOUNT_STATUS_HEARTBEAT_MS = Math.max(
 const X_USAGE_MIN_REFRESH_MS = 5 * 60_000;
 const DEFAULT_X_USAGE_REFRESH_MS = 10 * 60_000;
 const X_CREDITS_REFRESH_MS = 5 * 60_000;
+const DEFAULT_X_CREDIT_WARNING_BALANCE_USD = 5;
+const DEFAULT_X_CREDIT_RESTRICT_BALANCE_USD = 3;
+const DEFAULT_X_CREDIT_STOP_BALANCE_USD = 1;
+const DEFAULT_X_CREDIT_MAX_STALE_MS = 15 * 60_000;
 const PUBLIC_EVENT_CACHE_LIMIT = 1000;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
 const PUBLIC_EVENT_RELOAD_MS = 5 * 60_000;
@@ -66,6 +70,7 @@ const state = {
   usageProjectPosts: null,
   usageProjectCap: null,
   creditLastCheckedAt: null,
+  creditLastVerifiedAt: null,
   creditHttpStatus: null,
   creditEndpointState: 'unknown',
   creditPrepaidBalanceUsd: null,
@@ -73,7 +78,15 @@ const state = {
   creditTotalBalanceUsd: null,
   creditReads: 0,
   creditFailures: 0,
+  creditBlockedRequests: 0,
   creditLastError: null,
+  providerCreditWarningBalanceUsd: DEFAULT_X_CREDIT_WARNING_BALANCE_USD,
+  providerCreditRestrictBalanceUsd: DEFAULT_X_CREDIT_RESTRICT_BALANCE_USD,
+  providerCreditStopBalanceUsd: DEFAULT_X_CREDIT_STOP_BALANCE_USD,
+  providerCreditMaxStaleMs: DEFAULT_X_CREDIT_MAX_STALE_MS,
+  providerCreditFailClosed: true,
+  providerCreditMode: 'stopped',
+  providerCreditGateReason: 'not_verified_yet',
   estimatedBillingPostCostUsd: null,
   budgetMode: 'normal',
   budgetWarning: false,
@@ -453,6 +466,58 @@ function updateBudgetMode() {
   else if (cost >= state.monthlyRestrictBudgetUsd) state.budgetMode = 'restricted';
   else state.budgetMode = 'normal';
 }
+
+function updateProviderCreditMode() {
+  const total = finiteNumber(state.creditTotalBalanceUsd, NaN);
+  const verifiedMs = Date.parse(state.creditLastVerifiedAt || '');
+  const stale =
+    !Number.isFinite(verifiedMs) ||
+    Date.now() - verifiedMs > state.providerCreditMaxStaleMs;
+
+  let mode = 'normal';
+  let reason = 'balance_ok';
+
+  if (!Number.isFinite(total) || stale) {
+    mode = state.providerCreditFailClosed ? 'stopped' : 'unverified';
+    reason = !Number.isFinite(total)
+      ? 'provider_balance_unknown'
+      : 'provider_balance_stale';
+  } else if (total <= state.providerCreditStopBalanceUsd) {
+    mode = 'stopped';
+    reason = 'provider_balance_stop_threshold';
+  } else if (total <= state.providerCreditRestrictBalanceUsd) {
+    mode = 'restricted';
+    reason = 'provider_balance_restrict_threshold';
+  } else if (total <= state.providerCreditWarningBalanceUsd) {
+    mode = 'warning';
+    reason = 'provider_balance_warning_threshold';
+  }
+
+  const changed =
+    mode !== state.providerCreditMode ||
+    reason !== state.providerCreditGateReason;
+  state.providerCreditMode = mode;
+  state.providerCreditGateReason = reason;
+
+  if (
+    mode === 'stopped' &&
+    streamAbort &&
+    !streamAbort.signal.aborted
+  ) {
+    streamAbort.abort('social_watch_provider_credit_gate');
+  }
+  return changed;
+}
+
+function effectiveBudgetMode() {
+  if (state.providerCreditMode === 'stopped') return 'stopped';
+  if (
+    state.providerCreditMode === 'restricted' ||
+    state.budgetMode === 'restricted'
+  ) return 'restricted';
+  if (state.budgetMode === 'stopped') return 'stopped';
+  return 'normal';
+}
 function resetDailyIfNeeded() {
   const today = new Date().toISOString().slice(0, 10);
   if (today === state.dailyDateUtc) return;
@@ -494,15 +559,25 @@ function publicHealth() {
       endpoint: '/2/usage/credits',
       state: state.creditEndpointState,
       last_checked_at: state.creditLastCheckedAt,
+      last_verified_at: state.creditLastVerifiedAt,
       http_status: state.creditHttpStatus,
       prepaid_balance_usd: state.creditPrepaidBalanceUsd,
       free_balance_usd: state.creditFreeBalanceUsd,
       total_balance_usd: state.creditTotalBalanceUsd,
       reads: state.creditReads,
       failures: state.creditFailures,
+      blocked_requests: state.creditBlockedRequests,
       last_error: state.creditLastError,
-      passive_only: true,
-      hard_gate_enabled: false,
+      passive_only: false,
+      hard_gate_enabled: true,
+      fail_closed: state.providerCreditFailClosed,
+      mode: state.providerCreditMode,
+      reason: state.providerCreditGateReason,
+      warning_balance_usd: state.providerCreditWarningBalanceUsd,
+      restrict_balance_usd: state.providerCreditRestrictBalanceUsd,
+      stop_balance_usd: state.providerCreditStopBalanceUsd,
+      max_stale_minutes: Math.round(state.providerCreditMaxStaleMs / 60_000),
+      effective_budget_mode: effectiveBudgetMode(),
     },
     estimated_billing_post_cost_usd: state.estimatedBillingPostCostUsd,
     budget_mode: state.budgetMode,
@@ -720,6 +795,21 @@ async function translateSocialPublicSnapshot() {
 
 async function xFetch(path, init = {}) {
   if (!state.xTokenConfigured) throw new Error('social_watch_x_token_not_configured');
+
+  const usagePath = String(path || '').startsWith('/2/usage/');
+  if (!usagePath) {
+    updateProviderCreditMode();
+    if (state.providerCreditMode === 'stopped') {
+      state.creditBlockedRequests++;
+      const error = new Error(
+        'social_watch_x_provider_credit_gate:' +
+        state.providerCreditGateReason
+      );
+      error.code = 'SOCIAL_WATCH_X_PROVIDER_CREDIT_GATE';
+      throw error;
+    }
+  }
+
   const response = await fetch(`${X_API_BASE}${path}`, {
     ...init,
     headers: { ...xHeaders(), ...(init.headers || {}) },
@@ -775,6 +865,7 @@ async function refreshXCredits({ force = false } = {}) {
     state.creditEndpointState = 'network_error';
     state.creditLastError = String(error?.message || error).slice(0, 280);
     state.creditLastCheckedAt = nowIso();
+    updateProviderCreditMode();
     throw error;
   }
 
@@ -785,6 +876,7 @@ async function refreshXCredits({ force = false } = {}) {
   state.creditLastCheckedAt = nowIso();
 
   if (!response.ok) {
+    updateProviderCreditMode();
     state.creditFailures++;
     state.creditEndpointState =
       response.status === 404 ? 'not_available_404' : 'http_error';
@@ -811,11 +903,14 @@ async function refreshXCredits({ force = false } = {}) {
     state.creditFailures++;
     state.creditEndpointState = 'invalid_payload';
     state.creditLastError = 'x_usage_credits_missing_total_balance';
+    updateProviderCreditMode();
     return false;
   }
 
   state.creditEndpointState = 'available';
+  state.creditLastVerifiedAt = nowIso();
   state.creditLastError = null;
+  updateProviderCreditMode();
   return true;
 }
 
@@ -1059,7 +1154,29 @@ async function readConfig() {
   state.monthlyRestrictBudgetUsd = Math.max(state.monthlySoftBudgetUsd, finiteNumber(settings.monthly_restrict_budget_usd, 7));
   state.monthlyStopBudgetUsd = Math.max(state.monthlyRestrictBudgetUsd + 0.01, finiteNumber(settings.monthly_stop_budget_usd, 9));
   state.usageRefreshMs = clampInt(settings.usage_refresh_minutes, 5, 1440, 10) * 60_000;
+  state.providerCreditWarningBalanceUsd = Math.max(
+    0,
+    finiteNumber(settings.provider_credit_warning_balance_usd, DEFAULT_X_CREDIT_WARNING_BALANCE_USD),
+  );
+  state.providerCreditRestrictBalanceUsd = Math.max(
+    0,
+    Math.min(
+      state.providerCreditWarningBalanceUsd,
+      finiteNumber(settings.provider_credit_restrict_balance_usd, DEFAULT_X_CREDIT_RESTRICT_BALANCE_USD),
+    ),
+  );
+  state.providerCreditStopBalanceUsd = Math.max(
+    0,
+    Math.min(
+      state.providerCreditRestrictBalanceUsd,
+      finiteNumber(settings.provider_credit_stop_balance_usd, DEFAULT_X_CREDIT_STOP_BALANCE_USD),
+    ),
+  );
+  state.providerCreditMaxStaleMs =
+    clampInt(settings.provider_credit_max_stale_minutes, 5, 1440, 15) * 60_000;
+  state.providerCreditFailClosed = settings.provider_credit_fail_closed !== false;
   updateBudgetMode();
+  updateProviderCreditMode();
   state.allTotalAccounts = accounts.length;
   state.totalAccounts = accounts.filter((account) => account?.public_visible === true).length;
   state.internalTotalAccounts = state.allTotalAccounts - state.totalAccounts;
@@ -1071,9 +1188,10 @@ async function readConfig() {
   const activeCandidates = accounts
     .filter((a) => a?.is_active === true && normalizeHandle(a?.handle))
     .slice(0, state.maxActiveAccounts);
-  const valid = state.budgetMode === 'stopped'
+  const effectiveMode = effectiveBudgetMode();
+  const valid = effectiveMode === 'stopped'
     ? []
-    : state.budgetMode === 'restricted'
+    : effectiveMode === 'restricted'
       ? activeCandidates.filter((a) => budgetPriority(a?.budget_priority) === 'core')
       : activeCandidates;
   state.allActiveAccounts = valid.length;
@@ -1089,6 +1207,9 @@ async function readConfig() {
     max: state.maxActiveAccounts,
     cap: state.maxDailyPosts,
     budgetMode: state.budgetMode,
+    effectiveBudgetMode: effectiveMode,
+    providerCreditMode: state.providerCreditMode,
+    providerCreditBalance: state.creditTotalBalanceUsd,
     budgetSoft: state.monthlySoftBudgetUsd,
     budgetRestrict: state.monthlyRestrictBudgetUsd,
     budgetStop: state.monthlyStopBudgetUsd,
@@ -1118,7 +1239,7 @@ async function readConfig() {
     a?.is_active === true &&
     candidateIds.has(text(a?.id)) &&
     !activeIds.has(text(a?.id)) &&
-    (state.budgetMode === 'stopped' || state.budgetMode === 'restricted') &&
+    (effectiveMode === 'stopped' || effectiveMode === 'restricted') &&
     (text(a?.rule_status) !== 'paused_budget' || text(a?.rule_id))
   );
   const overflowActive = accounts.filter((a) =>
@@ -1289,7 +1410,7 @@ async function syncRules() {
 
 async function backfillOfficialAirdropRecentOnce() {
   if (state.airdropRecentBackfillCompleted || state.airdropRecentBackfillExhausted || !state.enabled || !state.xTokenConfigured) return false;
-  if (state.budgetMode === 'stopped' || state.dailyCapReached) return false;
+  if (effectiveBudgetMode() === 'stopped' || state.dailyCapReached) return false;
   const nextAllowedMs = Date.parse(state.airdropRecentBackfillNextAllowedAt || '');
   if (Number.isFinite(nextAllowedMs) && Date.now() < nextAllowedMs) return false;
   const accounts = [...desiredAccountsByTag.values()]
@@ -1605,7 +1726,7 @@ async function streamLoop() {
   let backoff = 1_000;
   while (!stopping) {
     resetDailyIfNeeded();
-    if (!state.enabled || !state.xTokenConfigured || desiredAccountsByTag.size === 0 || state.dailyCapReached) {
+    if (!state.enabled || !state.xTokenConfigured || desiredAccountsByTag.size === 0 || state.dailyCapReached || effectiveBudgetMode() === 'stopped') {
       state.streamConnected = false;
       state.streamConnecting = false;
       await sleep(2_000);
