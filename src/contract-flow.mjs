@@ -7,7 +7,7 @@ import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './busines
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.104';
+const VERSION = '650.8.15.105';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const gateAdvancedFlowBridge = {
@@ -2484,16 +2484,15 @@ async function persistBinanceOfficialTakerSharedSnapshot() {
     }];
     try {
       const response = await fetch(
-        `${SUPABASE_URL}/rest/v1/${BINANCE_OFFICIAL_TAKER_SNAPSHOT_TABLE}?on_conflict=provider,market_type,snapshot_type,quote_asset`,
+        `${SUPABASE_URL}/rest/v1/rpc/app_upsert_market_backend_snapshots_diff`,
         {
           method: 'POST',
           headers: {
             apikey: SUPABASE_SERVICE_ROLE_KEY,
             authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
             'content-type': 'application/json',
-            prefer: 'resolution=merge-duplicates,return=minimal',
           },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ p_rows: body }),
           signal: AbortSignal.timeout(8_000),
         },
       );

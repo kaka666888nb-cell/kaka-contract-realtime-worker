@@ -4,7 +4,7 @@ import {
   isBinanceValidationAdminConfigured,
 } from './binance-rest-guard.mjs';
 
-const VERSION = '650.8.15.70';
+const VERSION = '650.8.15.71';
 const EDGE_PROTOCOL_VERSION = '650.8.11';
 const SCHEMA_VERSION = '650.8.11';
 const PROVIDER = 'binance';
@@ -232,16 +232,15 @@ async function persistStateStrict() {
   }];
   try {
     const response = await fetchWithTimeout(
-      `${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}?on_conflict=provider,market_type,snapshot_type,quote_asset`,
+      `${SUPABASE_URL}/rest/v1/rpc/app_upsert_market_backend_snapshots_diff`,
       {
         method: 'POST',
         headers: {
           apikey: SUPABASE_SERVICE_ROLE_KEY,
           authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
           'content-type': 'application/json',
-          prefer: 'resolution=merge-duplicates,return=minimal',
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ p_rows: body }),
       },
       SNAPSHOT_IO_TIMEOUT_MS,
     );

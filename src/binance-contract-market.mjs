@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.44.1';
+const VERSION = '650.8.15.44.2';
 const PROVIDER = 'binance';
 const MARKET_TYPE = 'contract';
 const DEFAULT_QUOTE = 'USDT';
@@ -1260,7 +1260,7 @@ async function persistSnapshot(snapshotType, rows, source) {
     source_time: nowIso,
     updated_at: nowIso,
   }];
-  const bodyText = JSON.stringify(body);
+  const bodyText = JSON.stringify({ p_rows: body });
   const requestBytes = Buffer.byteLength(bodyText, 'utf8');
   snapshotPersistStats.attempts += 1;
   snapshotPersistStats.request_bytes += requestBytes;
@@ -1269,7 +1269,7 @@ async function persistSnapshot(snapshotType, rows, source) {
   snapshotPersistStats.last_attempt_at = Date.now();
   try {
     const response = await fetchWithTimeout(
-      `${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}?on_conflict=provider,market_type,snapshot_type,quote_asset`,
+      `${SUPABASE_URL}/rest/v1/rpc/app_upsert_market_backend_snapshots_diff`,
       {
         method: 'POST',
         headers: supabaseHeaders('resolution=merge-duplicates,return=minimal'),

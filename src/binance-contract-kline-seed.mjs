@@ -1086,15 +1086,14 @@ async function persistRows(symbol, interval, rows, source = 'binance_official_pu
     source_time: safeRows.at(-1)?.open_time || iso(Date.now()),
     updated_at: iso(Date.now()),
   }];
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}?on_conflict=provider,market_type,snapshot_type,quote_asset`, {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/app_upsert_market_backend_snapshots_diff`, {
     method: 'POST',
     headers: {
       apikey: SUPABASE_SERVICE_ROLE_KEY,
       authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       'content-type': 'application/json',
-      prefer: 'resolution=merge-duplicates,return=minimal',
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ p_rows: body }),
     signal: AbortSignal.timeout(SNAPSHOT_IO_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`snapshot_persist_${response.status}`);
