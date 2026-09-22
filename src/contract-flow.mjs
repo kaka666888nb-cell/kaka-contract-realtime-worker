@@ -7,7 +7,7 @@ import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './busines
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.105';
+const VERSION = '650.8.15.106';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const gateAdvancedFlowBridge = {
@@ -504,9 +504,14 @@ const flowPersistHealth = {
   success_batches: 0,
   failed_batches: 0,
   persisted_rows: 0,
+  physical_written_rows: 0,
+  unchanged_rows: 0,
   quarantined_rows: 0,
   last_quarantine_error: '',
   last_batch_size: 0,
+  persistence_rpc: 'app_upsert_contract_flow_5m_batch_diff',
+  exact_replay_noop: true,
+  float_relative_epsilon: 1e-13,
 };
 const METRIC_HISTORY_MS = 24 * 60 * 60 * 1000;
 const METRIC_REFRESH_MS = 5 * 60 * 1000;
@@ -738,49 +743,51 @@ function queuePersist(row) {
 
 async function postFlowPersistBatch(rows) {
   const endpoint =
-    `${SUPABASE_URL}/rest/v1/app_contract_flow_5m_cache?on_conflict=provider,symbol,bucket_time`;
+    `${SUPABASE_URL}/rest/v1/rpc/app_upsert_contract_flow_5m_batch_diff`;
   const headers = {
     apikey: SUPABASE_SERVICE_ROLE_KEY,
     authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
     'content-type': 'application/json',
-    prefer: 'resolution=merge-duplicates,return=minimal',
   };
 
-  let response = await fetch(endpoint, {
+  const response = await fetch(endpoint, {
     method: 'POST',
     headers,
-    body: JSON.stringify(rows),
+    body: JSON.stringify({ p_rows: rows }),
     signal: AbortSignal.timeout(15000),
   });
+  const text = await response.text();
 
   if (!response.ok) {
-    const text = await response.text();
-    const baseColumnsMissing =
-      response.status === 400 && /buy_base|sell_base|column/i.test(text);
-
-    if (!baseColumnsMissing) {
-      throw kakaPersistError('persist_http', response, text);
-    }
-
-    const compatibleRows = rows.map(
-      ({ buy_base, sell_base, ...row }) => row,
-    );
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(compatibleRows),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!response.ok) {
-      throw kakaPersistError(
-        'persist_compat_http',
-        response,
-        await response.text(),
-      );
-    }
+    throw kakaPersistError('persist_diff_rpc_http', response, text);
   }
 
+  let payload = null;
+  try {
+    payload = JSON.parse(text || '{}');
+  } catch {
+    payload = null;
+  }
+
+  const written = Number(payload?.written);
+  const unchanged = Number(payload?.unchanged);
+  if (
+    !Number.isFinite(written) ||
+    !Number.isFinite(unchanged) ||
+    written < 0 ||
+    unchanged < 0 ||
+    written + unchanged !== rows.length
+  ) {
+    throw new Error(
+      `persist_diff_rpc_invalid_result:${String(text || '').slice(0, 260)}`,
+    );
+  }
+
+  flowPersistHealth.physical_written_rows += written;
+  flowPersistHealth.unchanged_rows += unchanged;
+
+  // Preserve the existing health contract: persisted_rows means logical rows
+  // accepted by persistence, while physical writes are exposed separately.
   return rows.length;
 }
 

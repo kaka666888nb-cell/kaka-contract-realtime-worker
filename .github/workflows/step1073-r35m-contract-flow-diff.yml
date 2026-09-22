@@ -1,0 +1,32 @@
+name: Step1073 R35M contract flow diff persistence
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/contract-flow.mjs'
+      - '.github/workflows/step1073-r35m-contract-flow-diff.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Verify production contract-flow diff persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 60); do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 25 -o /tmp/health.json -w '%{http_code}' "$BASE/api/contract-flow/health" || true)"
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); h=b.get('flow_persist_health') or {}; good=(b.get('version')=='650.8.15.106' and h.get('persistence_rpc')=='app_upsert_contract_flow_5m_batch_diff' and h.get('exact_replay_noop') is True and str(h.get('last_error') or '')==''); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$code" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$code" = "200"
+          test "$ok" = "1"
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); h=b.get('flow_persist_health') or {}; print('PASS version=',b.get('version'),'rpc=',h.get('persistence_rpc'),'logical=',h.get('persisted_rows'),'physical=',h.get('physical_written_rows'),'unchanged=',h.get('unchanged_rows'),'epsilon=',h.get('float_relative_epsilon'))"
