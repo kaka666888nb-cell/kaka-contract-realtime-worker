@@ -188,7 +188,7 @@ const EVM_GOPLUS_CHAIN_ID = Object.freeze({
 });
 
 // Step1039 wallet intelligence. Heavy wallet enrichment is strictly on-demand, cached,
-// singleflight and shares the same Moralis daily CU guard / Helius scheduler as Step1038.
+// singleflight and shares the same Moralis daily CU guard / Helius monthly DB credit guard as Step1038.
 // Wallet Insights is intentionally NOT used because Moralis currently classifies it as a
 // Pro/premium endpoint. This step stays compatible with the existing free-key deployment:
 // EVM age comes from Wallet Chain Activity and PnL from Wallet PnL Breakdown; Solana
@@ -255,6 +255,27 @@ const HELIUS_TIMEOUT_MS = Math.max(5_000, Math.min(30_000, Number(process.env.KA
 const HELIUS_PAGE_LIMIT = Math.max(100, Math.min(1_000, Number(process.env.KAKA_HELIUS_HOLDER_PAGE_LIMIT || 1_000)));
 const HELIUS_MAX_EXACT_TOKEN_ACCOUNTS = Math.max(5_000, Math.min(100_000, Number(process.env.KAKA_HELIUS_HOLDER_MAX_ACCOUNTS || 50_000)));
 const HELIUS_MAX_HOLDER_PAGES = Math.max(5, Math.min(100, Math.ceil(HELIUS_MAX_EXACT_TOKEN_ACCOUNTS / HELIUS_PAGE_LIMIT) + 2));
+
+// Step1073 R52: Helius credits are monthly. Kaka caps itself below the
+// current 1M-credit Free allocation and fails closed if the shared DB ledger
+// is unavailable. The September reserve is migration safety headroom, not a
+// claim about historical provider usage.
+const HELIUS_MONTHLY_CREDIT_BUDGET = Math.max(
+  10_000,
+  Math.min(900_000, Number(process.env.KAKA_HELIUS_MONTHLY_CREDIT_BUDGET || 900_000)),
+);
+const HELIUS_BUDGET_RPC = 'app_claim_external_provider_monthly_budget';
+const HELIUS_BUDGET_RPC_TIMEOUT_MS = 5_000;
+const HELIUS_DB_CUTOVER_MONTH_UTC = '2026-09-01';
+const HELIUS_DB_CUTOVER_SAFETY_RESERVE_CREDITS = 850_000;
+const HELIUS_WALLET_REST_RESERVED_CREDITS = 100;
+const HELIUS_UNKNOWN_RPC_RESERVED_CREDITS = 100;
+const HELIUS_RPC_CREDIT_COSTS = Object.freeze({
+  getTokenSupply: 1,
+  getTokenAccounts: 10,
+  getSignaturesForAddress: 10,
+  getAssetsByOwner: 10,
+});
 
 const MORALIS_EVM_CHAIN = Object.freeze({
   ethereum: 'eth',
@@ -373,6 +394,7 @@ const stats = {
   helius_upstream_started: 0,
   helius_upstream_succeeded: 0,
   helius_upstream_failed: 0,
+  helius_budget_rejections: 0,
   helius_key_missing_rejections: 0,
   helius_holder_complete_scans: 0,
   helius_holder_incomplete_scans: 0,
@@ -1287,6 +1309,161 @@ async function goplusFetchJson(url, { priority = 0, label = '' } = {}) {
 
 
 
+function utcBudgetMonth() {
+  return new Date().toISOString().slice(0, 7) + '-01';
+}
+
+let heliusLedger = {
+  month: utcBudgetMonth(),
+  used_credits: 0,
+  remaining_credits: 0,
+  calls: 0,
+  kind_counts: {},
+  updated_at: null,
+  database_ready: false,
+  last_error: 'database_budget_not_loaded',
+};
+
+function applyHeliusBudgetRow(row) {
+  if (!row || typeof row !== 'object') throw new Error('helius_budget_db_invalid_row');
+  heliusLedger = {
+    month: String(row.month_key || utcBudgetMonth()),
+    used_credits: Math.max(0, Number(row.used_units || 0)),
+    remaining_credits: Math.max(0, Number(row.remaining_units || 0)),
+    calls: Math.max(0, Number(row.requests || 0)),
+    kind_counts:
+      row.kind_counts && typeof row.kind_counts === 'object'
+        ? row.kind_counts
+        : {},
+    updated_at: new Date().toISOString(),
+    database_ready: true,
+    last_error: null,
+  };
+}
+
+function heliusBudgetKindCount(kind) {
+  return Math.max(0, Number(heliusLedger.kind_counts?.[kind] || 0));
+}
+
+function heliusRpcCreditCost(method) {
+  const exact = Number(HELIUS_RPC_CREDIT_COSTS[String(method || '')]);
+  return Number.isFinite(exact) && exact > 0
+    ? exact
+    : HELIUS_UNKNOWN_RPC_RESERVED_CREDITS;
+}
+
+function heliusBudgetKind(method) {
+  return ('rpc_' + String(method || 'unknown'))
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .slice(0, 64);
+}
+
+async function callHeliusBudgetRpc(credits, kind) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    heliusLedger.database_ready = false;
+    heliusLedger.remaining_credits = 0;
+    heliusLedger.last_error = 'helius_budget_supabase_service_role_not_configured';
+    const error = new Error(heliusLedger.last_error);
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HELIUS_BUDGET_RPC_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/rpc/${HELIUS_BUDGET_RPC}`,
+      {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify({
+          p_provider: 'helius',
+          p_units: Math.max(0, Math.trunc(Number(credits) || 0)),
+          p_hard_limit: HELIUS_MONTHLY_CREDIT_BUDGET,
+          p_kind: String(kind || 'other'),
+        }),
+      },
+    );
+    const raw = await response.text();
+    let payload = null;
+    try { payload = raw ? JSON.parse(raw) : null; } catch (_) { payload = null; }
+    if (!response.ok) {
+      throw new Error(
+        `helius_budget_db_http_${response.status}:${String(raw || '').slice(0, 220)}`
+      );
+    }
+    const row = Array.isArray(payload) ? payload[0] : payload;
+    applyHeliusBudgetRow(row);
+    if (row?.allowed !== true) {
+      stats.helius_budget_rejections += 1;
+      const error = new Error(
+        String(row?.reason || 'helius_monthly_credit_budget_exhausted')
+      );
+      error.statusCode = 503;
+      throw error;
+    }
+    return row;
+  } catch (error) {
+    if (!heliusLedger.database_ready) heliusLedger.remaining_credits = 0;
+    heliusLedger.last_error = String(
+      error?.name === 'AbortError'
+        ? 'helius_budget_db_timeout'
+        : error?.message || error
+    ).slice(0, 300);
+    const out = new Error(heliusLedger.last_error);
+    out.statusCode = Number(error?.statusCode) || 503;
+    throw out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshHeliusBudgetFromDb() {
+  return await callHeliusBudgetRpc(0, 'health');
+}
+
+function heliusBudgetState() {
+  const transitionMonth = utcBudgetMonth() === HELIUS_DB_CUTOVER_MONTH_UTC;
+  return {
+    month_utc: heliusLedger.month,
+    used_credits: heliusLedger.used_credits,
+    remaining_credits:
+      heliusLedger.database_ready ? heliusLedger.remaining_credits : 0,
+    hard_budget_credits: HELIUS_MONTHLY_CREDIT_BUDGET,
+    provider_current_free_plan_reference_credits_per_month: 1_000_000,
+    calls: heliusLedger.calls,
+    rpc_gettokensupply_calls: heliusBudgetKindCount('rpc_gettokensupply'),
+    rpc_gettokenaccounts_calls: heliusBudgetKindCount('rpc_gettokenaccounts'),
+    rpc_getsignaturesforaddress_calls:
+      heliusBudgetKindCount('rpc_getsignaturesforaddress'),
+    rpc_getassetsbyowner_calls:
+      heliusBudgetKindCount('rpc_getassetsbyowner'),
+    wallet_rest_calls: heliusBudgetKindCount('wallet_rest'),
+    ledger_path_kind: 'supabase_atomic_monthly_budget_rpc',
+    database_write: true,
+    database_ready: heliusLedger.database_ready,
+    cross_instance_shared: true,
+    fail_closed_on_db_error: true,
+    rpc: HELIUS_BUDGET_RPC,
+    last_error: heliusLedger.last_error,
+    updated_at: heliusLedger.updated_at,
+    rpc_credit_costs: { ...HELIUS_RPC_CREDIT_COSTS },
+    unknown_rpc_reserved_credits: HELIUS_UNKNOWN_RPC_RESERVED_CREDITS,
+    wallet_rest_reserved_credits: HELIUS_WALLET_REST_RESERVED_CREDITS,
+    migration_month_prior_usage_exactly_known: !transitionMonth,
+    migration_month_safety_reserve_credits:
+      transitionMonth ? HELIUS_DB_CUTOVER_SAFETY_RESERVE_CREDITS : 0,
+  };
+}
+
 const heliusScheduler = createScheduler({
   name: 'helius',
   minGapMs: HELIUS_MIN_GAP_MS,
@@ -1305,6 +1482,8 @@ async function heliusRpc(method, params, { priority = 0, label = '' } = {}) {
     throw error;
   }
   return heliusScheduler.enqueue(async () => {
+    const reservedCredits = heliusRpcCreditCost(method);
+    await callHeliusBudgetRpc(reservedCredits, heliusBudgetKind(method));
     stats.helius_upstream_started += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HELIUS_TIMEOUT_MS);
@@ -1352,6 +1531,10 @@ async function heliusRestJson(url, { priority = 0, label = '' } = {}) {
     throw error;
   }
   return heliusScheduler.enqueue(async () => {
+    await callHeliusBudgetRpc(
+      HELIUS_WALLET_REST_RESERVED_CREDITS,
+      'wallet_rest',
+    );
     stats.helius_upstream_started += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HELIUS_TIMEOUT_MS);
@@ -4764,6 +4947,13 @@ export function startOnchainMarketCollector() {
     moralisLedger.remaining_cu = 0;
     moralisLedger.last_error = String(error?.message || error).slice(0, 300);
   });
+  // Step1073 R52: startup read is health-only. Every Helius upstream
+  // attempt performs a fresh atomic monthly-credit claim immediately before fetch.
+  refreshHeliusBudgetFromDb().catch((error) => {
+    heliusLedger.database_ready = false;
+    heliusLedger.remaining_credits = 0;
+    heliusLedger.last_error = String(error?.message || error).slice(0, 300);
+  });
   const first = setTimeout(() => refreshDiscovery().catch(() => {}), 2_500);
   first.unref?.();
   const timer = setInterval(() => refreshDiscovery().catch(() => {}), DISCOVERY_REFRESH_MS);
@@ -4878,8 +5068,12 @@ function healthPayload() {
         backend_global_min_gap_ms: HELIUS_MIN_GAP_MS,
         backend_global_max_starts_per_second: Math.floor(1_000 / HELIUS_MIN_GAP_MS),
         das_free_tier_reference_rps: 2,
+        standard_rpc_credits_per_request: 1,
         das_credits_per_request: 10,
+        historical_rpc_credits_per_request: 10,
+        wallet_rest_reserved_credits: HELIUS_WALLET_REST_RESERVED_CREDITS,
         scheduler: heliusScheduler.state(),
+        budget: heliusBudgetState(),
       },
     },
     step1038_holder_security: {
@@ -5229,6 +5423,7 @@ function healthPayload() {
     goplus_scheduler: goplusScheduler.state(),
     helius_scheduler: heliusScheduler.state(),
     moralis_budget: moralisBudgetState(),
+    helius_budget: heliusBudgetState(),
     stats: { ...stats },
     memory_usage: { rss_mb: Math.round(process.memoryUsage().rss / 1048576), heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576) },
   });
@@ -5328,6 +5523,12 @@ function runSelfTest() {
   t('moralis_budget_db_atomic_mode', moralisBudgetState().ledger_path_kind === 'supabase_atomic_daily_budget_rpc');
   t('moralis_budget_fail_closed', moralisBudgetState().fail_closed_on_db_error === true);
   t('moralis_budget_cross_instance_shared', moralisBudgetState().cross_instance_shared === true);
+  t('helius_budget_db_atomic_mode', heliusBudgetState().ledger_path_kind === 'supabase_atomic_monthly_budget_rpc');
+  t('helius_budget_fail_closed', heliusBudgetState().fail_closed_on_db_error === true);
+  t('helius_budget_cross_instance_shared', heliusBudgetState().cross_instance_shared === true);
+  t('helius_budget_below_current_free_reference', HELIUS_MONTHLY_CREDIT_BUDGET < 1_000_000);
+  t('helius_budget_known_costs', heliusRpcCreditCost('getTokenSupply') === 1 && heliusRpcCreditCost('getTokenAccounts') === 10 && heliusRpcCreditCost('getSignaturesForAddress') === 10 && heliusRpcCreditCost('getAssetsByOwner') === 10);
+  t('helius_budget_unknown_rpc_conservative', heliusRpcCreditCost('futureUnknownMethod') >= 100);
   t('moralis_secret_never_exposed', healthPayload().sources.moralis.api_key_exposed === false);
   t('moralis_single_auth_header_only', healthPayload().sources.moralis.auth_header_count_per_request === 1 && healthPayload().sources.moralis.duplicate_case_variant_headers === false);
   t('moralis_pair_swap_schema_not_token_swap_schema', healthPayload().recent_trades.token_swaps_bought_sold_schema_not_assumed === true);
