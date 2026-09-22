@@ -79,6 +79,8 @@ const state = {
   creditReads: 0,
   creditFailures: 0,
   creditBlockedRequests: 0,
+  creditSnapshotPersistedAt: null,
+  creditSnapshotPersistFailures: 0,
   creditLastError: null,
   providerCreditWarningBalanceUsd: DEFAULT_X_CREDIT_WARNING_BALANCE_USD,
   providerCreditRestrictBalanceUsd: DEFAULT_X_CREDIT_RESTRICT_BALANCE_USD,
@@ -567,6 +569,8 @@ function publicHealth() {
       reads: state.creditReads,
       failures: state.creditFailures,
       blocked_requests: state.creditBlockedRequests,
+      snapshot_persisted_at: state.creditSnapshotPersistedAt,
+      snapshot_persist_failures: state.creditSnapshotPersistFailures,
       last_error: state.creditLastError,
       passive_only: false,
       hard_gate_enabled: true,
@@ -847,6 +851,56 @@ async function refreshXUsage({ force = false } = {}) {
   return true;
 }
 
+async function persistXCreditRuntimeSnapshot() {
+  if (!state.supabaseConfigured) return false;
+  const total = finiteNumber(state.creditTotalBalanceUsd, NaN);
+  if (!Number.isFinite(total)) return false;
+  try {
+    const observedAt = state.creditLastVerifiedAt || nowIso();
+    await supabaseFetch(
+      'app_external_provider_runtime_snapshots?on_conflict=provider',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          prefer: 'resolution=merge-duplicates,return=minimal',
+        },
+        body: JSON.stringify({
+          provider: 'x_twitter',
+          source: 'x_api_usage_credits',
+          status: state.creditEndpointState,
+          snapshot: {
+            prepaid_balance_usd: state.creditPrepaidBalanceUsd,
+            free_balance_usd: state.creditFreeBalanceUsd,
+            total_balance_usd: state.creditTotalBalanceUsd,
+            hard_gate_enabled: true,
+            fail_closed: state.providerCreditFailClosed,
+            mode: state.providerCreditMode,
+            reason: state.providerCreditGateReason,
+            warning_balance_usd: state.providerCreditWarningBalanceUsd,
+            restrict_balance_usd: state.providerCreditRestrictBalanceUsd,
+            stop_balance_usd: state.providerCreditStopBalanceUsd,
+            estimated_post_cost_usd: state.estimatedBillingPostCostUsd,
+            usage_project_posts: state.usageProjectPosts,
+            usage_project_cap: state.usageProjectCap,
+          },
+          observed_at: observedAt,
+          stale_after_seconds: Math.max(
+            300,
+            Math.round(state.providerCreditMaxStaleMs / 1000),
+          ),
+          updated_at: nowIso(),
+        }),
+      },
+    );
+    state.creditSnapshotPersistedAt = nowIso();
+    return true;
+  } catch (error) {
+    state.creditSnapshotPersistFailures += 1;
+    return false;
+  }
+}
+
 async function refreshXCredits({ force = false } = {}) {
   if (!state.xTokenConfigured) return false;
   const lastMs = Date.parse(state.creditLastCheckedAt || '');
@@ -911,6 +965,7 @@ async function refreshXCredits({ force = false } = {}) {
   state.creditLastVerifiedAt = nowIso();
   state.creditLastError = null;
   updateProviderCreditMode();
+  await persistXCreditRuntimeSnapshot();
   return true;
 }
 
