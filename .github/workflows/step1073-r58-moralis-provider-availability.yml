@@ -1,0 +1,38 @@
+name: Step1073 R58 Moralis provider availability audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/step1073-r58-moralis-provider-availability.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: One bounded exact-pool Moralis availability probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          TOKEN='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+          POOL='0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640'
+          END_MS="$(python3 -c "import time; print(int((time.time()-7*24*3600)*1000))")"
+          URL="$BASE/api/onchain/klines?network=ethereum&address=$TOKEN&pool_address=$POOL&interval=1h&limit=2&end_time=$END_MS"
+          code="$(curl -sS --connect-timeout 8 --max-time 45 -o /tmp/kline.json -w '%{http_code}' "$URL" || true)"
+          echo "kline_http=$code"
+          test "$code" = "200"
+          python3 -c "import json; b=json.load(open('/tmp/kline.json')); assert b.get('ok') is True,b; assert str(b.get('network'))=='ethereum',b; assert str(b.get('pool_address') or '').lower()=='0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640',b; err=str(b.get('primary_error') or '').lower(); paused=('usage is paused' in err or 'upgrade to a paid plan' in err or 'planselect' in err); unauthorized=('moralis_http_401' in err); cls='paused_free_usage' if paused else ('unauthorized_other' if unauthorized else 'provider_available_or_primary_nonerror'); print('probe_source=',b.get('source')); print('probe_fallback_used=',b.get('fallback_used')); print('probe_primary_row_count=',b.get('primary_row_count')); print('probe_row_count=',b.get('row_count')); print('probe_primary_error_class=',cls); assert cls!='unauthorized_other',cls"
+
+      - name: Read Moralis circuit and budget after probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/onchain/health" -o /tmp/health.json
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); m=((b.get('sources') or {}).get('moralis') or {}); c=m.get('kline_circuit') or {}; q=m.get('budget') or {}; print('moralis_api_key_configured=',m.get('api_key_configured')); print('moralis_circuit_open=',c.get('open')); print('moralis_circuit_reason=',c.get('reason')); print('moralis_circuit_until=',c.get('until')); print('moralis_budget_database_ready=',q.get('database_ready')); print('moralis_budget_used_cu=',q.get('used_cu')); print('moralis_budget_remaining_cu=',q.get('remaining_cu')); print('moralis_budget_hard_cu=',q.get('hard_budget_cu')); assert m.get('api_key_configured') is True,m; assert q.get('database_ready') is True,q; assert q.get('fail_closed_on_db_error') is True,q"
