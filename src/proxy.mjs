@@ -35,12 +35,13 @@ import { startKlineAssetRankCollector, handleKlineAssetRank, getKlineAssetRankHe
 import { getSocialWatchHealth, handleSocialWatch, startSocialWatch, stopSocialWatch } from './social-watch.mjs';
 import { getContentPublicationTranslationHealth, handleContentPublicationTranslation, startContentPublicationTranslation, stopContentPublicationTranslation } from './content-publication-translation.mjs';
 import { getContentOnDemandTranslationHealth, handleContentOnDemandTranslation } from './content-on-demand-translation.mjs';
+import { handlePrivateTranslation } from './private-translation.mjs';
 import { getAirdropWatchHealth, handleAirdropWatch, startAirdropWatch, stopAirdropWatch } from './airdrop-watch.mjs';
 
 import { getCmeExpirySharedHealth, handleCmeExpirySharedCalendar, startCmeExpirySharedCollector } from './cme-expiry-shared-calendar.mjs';
 const PORT = Number(process.env.PORT || 10000);
 const CHILD_PORT = Number(process.env.KAKA_CHILD_PORT || 10001);
-const STEP_VERSION = '650.8.15.197.3.3.32.5';
+const STEP_VERSION = '650.8.15.197.3.3.32.6';
 installProviderGovernorFetch({ role: 'parent-http-api' });
 startCollectorIsolationSupervisor();
 startMarketLightBridge();
@@ -1302,6 +1303,7 @@ const server = http.createServer(async (req, res) => {
   if (await handleSocialWatch(req, res, url)) return;
   if (await handleContentPublicationTranslation(req, res, url)) return;
   if (await handleContentOnDemandTranslation(req, res, url)) return;
+  if (await handlePrivateTranslation(req, res, url)) return;
   if (await handleAirdropWatch(req, res, url)) return;
   if (await handleRealityRankedPage(req, res, url)) return;
   if (await handleKlineAssetRank(req, res, url)) return;
