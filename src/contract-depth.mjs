@@ -34,6 +34,7 @@ const DEPTH_STREAM_CLIENT_MAX = Math.max(1000, Number(process.env.KAKA_DEPTH_STR
 const DEPTH_STREAM_CLIENTS_PER_IP_MAX = Math.max(10, Number(process.env.KAKA_DEPTH_STREAM_CLIENTS_PER_IP_MAX || 50));
 const DEPTH_STREAM_CONNECTS_PER_IP_PER_MINUTE = Math.max(10, Number(process.env.KAKA_DEPTH_STREAM_CONNECTS_PER_IP_PER_MINUTE || 60));
 const DEPTH_STREAM_ACTIVE_KEY_MAX = Math.max(24, Math.min(128, Number(process.env.KAKA_DEPTH_STREAM_ACTIVE_KEY_MAX || 96)));
+const DEPTH_STREAM_LIMIT_MAX = Math.max(80, Math.min(100, Number(process.env.KAKA_DEPTH_STREAM_LIMIT_MAX || 100)));
 const DEPTH_STREAM_TICK_MS = Math.max(200, Number(process.env.KAKA_DEPTH_STREAM_TICK_MS || 250));
 const DEPTH_STREAM_MEMORY_POLL_MS = Math.max(750, Number(process.env.KAKA_DEPTH_STREAM_MEMORY_POLL_MS || 1000));
 const DEPTH_STREAM_NETWORK_POLL_MS = Math.max(1000, Number(process.env.KAKA_DEPTH_STREAM_NETWORK_POLL_MS || 1200));
@@ -2491,7 +2492,14 @@ function depthStreamIsMemoryBacked(group) {
 
 function depthStreamSemanticFingerprint(payload) {
   return JSON.stringify(payload, (key, value) => {
-    if (key === 'generated_at' || key === 'cache_state' || key === 'cache_age_ms') return undefined;
+    if (
+      key === 'generated_at' ||
+      key === 'cache_state' ||
+      key === 'cache_age_ms' ||
+      key === 'timestamp_ms' ||
+      key === 'official_metrics_age_ms' ||
+      key === 'product_facts_age_ms'
+    ) return undefined;
     return value;
   });
 }
@@ -2680,6 +2688,8 @@ function contractDepthStreamSelfTest() {
   const tests = [
     ['client_capacity_at_least_1000', DEPTH_STREAM_CLIENT_MAX >= 1000],
     ['active_key_bound', DEPTH_STREAM_ACTIVE_KEY_MAX >= 24 && DEPTH_STREAM_ACTIVE_KEY_MAX <= 128],
+    ['stream_payload_limit_bounded', DEPTH_STREAM_LIMIT_MAX >= 80 && DEPTH_STREAM_LIMIT_MAX <= 100],
+    ['semantic_fingerprint_ignores_volatile_time_fields', depthStreamSemanticFingerprint({ bids:[[1,2]], timestamp_ms:1, official_metrics_age_ms:1, product_facts_age_ms:1 }) === depthStreamSemanticFingerprint({ bids:[[1,2]], timestamp_ms:2, official_metrics_age_ms:2, product_facts_age_ms:2 })],
     ['provider_gap_not_weaker_than_global_governor', DEPTH_STREAM_PROVIDER_MIN_GAP_MS >= 220],
     ['provider_network_inflight_bounded', DEPTH_STREAM_PROVIDER_MAX_INFLIGHT <= 2],
     ['tick_not_busy_loop', DEPTH_STREAM_TICK_MS >= 200],
@@ -2707,6 +2717,7 @@ function contractDepthStreamHealthPayload() {
     client_max: DEPTH_STREAM_CLIENT_MAX,
     active_key_count: DEPTH_STREAM_GROUPS.size,
     active_key_max: DEPTH_STREAM_ACTIVE_KEY_MAX,
+    stream_limit_max: DEPTH_STREAM_LIMIT_MAX,
     clients_per_ip_max: DEPTH_STREAM_CLIENTS_PER_IP_MAX,
     connects_per_ip_per_minute: DEPTH_STREAM_CONNECTS_PER_IP_PER_MINUTE,
     tick_ms: DEPTH_STREAM_TICK_MS,
@@ -2764,6 +2775,17 @@ function handleContractDepthStream(req, res, url) {
   if (!symbol) {
     DEPTH_STREAM_STATS.rejected_invalid += 1;
     sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'invalid_symbol' });
+    return true;
+  }
+  if (limit > DEPTH_STREAM_LIMIT_MAX) {
+    DEPTH_STREAM_STATS.rejected_invalid += 1;
+    sendJson(res, 409, {
+      ok: false,
+      version: STEP_VERSION,
+      error: 'depth_stream_limit_requires_http_fallback',
+      stream_limit_max: DEPTH_STREAM_LIMIT_MAX,
+      requested_limit: limit,
+    });
     return true;
   }
 
