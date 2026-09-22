@@ -1,0 +1,32 @@
+name: Step1073 R35C Bybit second chunk persistence
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/bybit-second-history.mjs'
+      - '.github/workflows/step1073-r35c-bybit-second-chunks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Verify chunk persistence and legacy-write retirement
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 60); do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 25 -o /tmp/health.json -w '%{http_code}' "$BASE/api/bybit-second-history-health" || true)"
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); good=(b.get('version')=='650.8.15.71' and b.get('persistence_storage')=='supabase_5m_chunks_with_legacy_snapshot_read_fallback' and b.get('legacy_snapshot_writes_enabled') is False and int(b.get('persistence_chunk_minutes') or 0)==5 and int(b.get('persistence_checkpoint_minutes') or 0)==15 and int(b.get('persist_success') or 0)>=1 and int(b.get('chunk_persist_written') or 0)>=1); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$code" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$code" = "200"
+          test "$ok" = "1"
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); print('PASS version=',b.get('version'),'entries=',len(b.get('entries') or []),'persist_success=',b.get('persist_success'),'chunk_received=',b.get('chunk_persist_received'),'chunk_written=',b.get('chunk_persist_written'),'chunk_unchanged=',b.get('chunk_persist_unchanged'),'legacy_restore=',b.get('legacy_snapshot_restore_hits'),'chunk_restore=',b.get('chunk_restore_hits'))"

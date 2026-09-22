@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.70';
+const VERSION = '650.8.15.71';
 const PROVIDER = 'bybit';
 const MAX_ROWS = 3600;
 const MAX_ENTRIES = 64;
@@ -12,12 +12,17 @@ const ON_DEMAND_LEASE_MS = 10 * 60_000;
 const RECONNECT_MAX_MS = 30_000;
 const FIRST_PERSIST_MS = 60_000;
 const PERSIST_INTERVAL_MS = 15 * 60_000;
+const PERSIST_CHUNK_MS = 5 * 60_000;
+const PERSIST_CHUNK_RETENTION_MS = 2 * 60 * 60_000;
+const PERSIST_CHUNK_RESTORE_LIMIT = 30;
 const SEED_REFRESH_MS = 60_000;
 const SUPABASE_URL =
   String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY =
   String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 const SNAPSHOT_TABLE = 'app_market_backend_snapshots';
+const CHUNK_TABLE = 'app_bybit_second_history_chunks';
+const CHUNK_UPSERT_RPC = 'app_upsert_bybit_second_history_chunks';
 const STATIC_HOT_TARGETS = [
   { market: 'spot', symbol: 'BTCUSDT', nativeSymbol: 'BTCUSDT', category: 'spot' },
   { market: 'spot', symbol: 'ETHUSDT', nativeSymbol: 'ETHUSDT', category: 'spot' },
@@ -49,6 +54,12 @@ const stats = {
   persist_attempts: 0,
   persist_success: 0,
   persist_errors: 0,
+  chunk_restore_hits: 0,
+  legacy_snapshot_restore_hits: 0,
+  chunk_persist_received: 0,
+  chunk_persist_written: 0,
+  chunk_persist_unchanged: 0,
+  chunk_persist_deleted: 0,
   spot_discovery_requests: 0,
   spot_discovery_success: 0,
   spot_discovery_errors: 0,
@@ -468,6 +479,8 @@ function createEntry({
     persistPromise: null,
     persistTimer: null,
     lastPersistAt: 0,
+    lastPersistedSourceTimeMs: 0,
+    restoreMode: 'none',
     dirty: false,
     closed: false,
     createdAt: Date.now(),
@@ -516,63 +529,125 @@ function evictIfNeeded() {
   }
 }
 
+async function restoreChunks(entry) {
+  const url =
+    `${SUPABASE_URL}/rest/v1/${CHUNK_TABLE}` +
+    `?select=rows,source_time,chunk_start` +
+    `&market_type=eq.${entry.market}` +
+    `&symbol=eq.${encodeURIComponent(entry.symbol)}` +
+    `&order=chunk_start.desc` +
+    `&limit=${PERSIST_CHUNK_RESTORE_LIMIT}`;
+  const response = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok) throw new Error(`bybit_second_chunk_restore_${response.status}`);
+  const chunks = await response.json();
+  if (!Array.isArray(chunks) || !chunks.length) return [];
+  const orderedRows = chunks
+    .slice()
+    .reverse()
+    .flatMap((chunk) => Array.isArray(chunk?.rows) ? chunk.rows : []);
+  return mergeRows([], orderedRows, entry.market, entry.symbol);
+}
+
+async function restoreLegacySnapshot(entry) {
+  const key = encodeURIComponent(snapshotKey(entry.market, entry.symbol));
+  const url =
+    `${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}` +
+    `?select=payload,updated_at` +
+    `&provider=eq.bybit` +
+    `&market_type=eq.${entry.market}` +
+    `&snapshot_type=eq.klines` +
+    `&quote_asset=eq.${key}` +
+    `&limit=1`;
+  const response = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok) throw new Error(`bybit_second_legacy_restore_${response.status}`);
+  const records = await response.json();
+  return mergeRows(
+    [],
+    Array.isArray(records) ? records[0]?.payload?.rows : [],
+    entry.market,
+    entry.symbol,
+  );
+}
+
 async function restore(entry) {
   if (entry.restored) return;
   if (entry.restorePromise) return entry.restorePromise;
   entry.restorePromise = (async () => {
     stats.restore_attempts += 1;
     if (!persistenceEnabled()) return;
-    const key = encodeURIComponent(
-      snapshotKey(entry.market, entry.symbol),
-    );
-    const url =
-      `${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}` +
-      `?select=payload,updated_at` +
-      `&provider=eq.bybit` +
-      `&market_type=eq.${entry.market}` +
-      `&snapshot_type=eq.klines` +
-      `&quote_asset=eq.${key}` +
-      `&limit=1`;
     try {
-      const response = await fetch(url, {
-        headers: {
-          apikey: SUPABASE_SERVICE_ROLE_KEY,
-          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-          accept: 'application/json',
-        },
-        signal: AbortSignal.timeout(8_000),
-      });
-      if (!response.ok) {
-        throw new Error(`bybit_second_restore_${response.status}`);
-      }
-      const records = await response.json();
-      const restored = mergeRows(
-        [],
-        Array.isArray(records) ? records[0]?.payload?.rows : [],
-        entry.market,
-        entry.symbol,
-      );
+      let restored = await restoreChunks(entry);
       if (restored.length) {
-        entry.rows = mergeRows(
-          restored,
-          entry.rows,
-          entry.market,
-          entry.symbol,
-        );
+        entry.restoreMode = 'chunks';
+        entry.lastPersistedSourceTimeMs = Number(restored.at(-1)?.open_time_ms || 0);
+        stats.chunk_restore_hits += 1;
+      } else {
+        restored = await restoreLegacySnapshot(entry);
+        if (restored.length) {
+          entry.restoreMode = 'legacy_snapshot_fallback';
+          entry.lastPersistedSourceTimeMs = 0;
+          stats.legacy_snapshot_restore_hits += 1;
+        }
+      }
+      if (restored.length) {
+        entry.rows = mergeRows(restored, entry.rows, entry.market, entry.symbol);
         rebuildRowIndex(entry);
         stats.restore_hits += 1;
         notify(entry);
       }
     } catch (error) {
       stats.restore_errors += 1;
-      stats.last_restore_error =
-        String(error?.message || error);
+      stats.last_restore_error = String(error?.message || error);
     }
   })().finally(() => {
     entry.restored = true;
     entry.restorePromise = null;
   });
   return entry.restorePromise;
+}
+
+function buildPersistChunks(entry) {
+  const rows = entry.rows.slice(-MAX_ROWS);
+  if (!rows.length) return { chunks: [], newestMs: 0 };
+  const newestMs = Number(rows.at(-1)?.open_time_ms || 0);
+  if (!Number.isFinite(newestMs) || newestMs <= 0) return { chunks: [], newestMs: 0 };
+
+  const previousMs = Number(entry.lastPersistedSourceTimeMs || 0);
+  const thresholdMs = previousMs > 0
+    ? Math.floor(previousMs / PERSIST_CHUNK_MS) * PERSIST_CHUNK_MS
+    : Number(rows[0]?.open_time_ms || 0);
+  const grouped = new Map();
+  for (const row of rows) {
+    const rowMs = Number(row?.open_time_ms || 0);
+    if (!Number.isFinite(rowMs) || rowMs <= 0 || rowMs < thresholdMs) continue;
+    const chunkStartMs = Math.floor(rowMs / PERSIST_CHUNK_MS) * PERSIST_CHUNK_MS;
+    if (!grouped.has(chunkStartMs)) grouped.set(chunkStartMs, []);
+    grouped.get(chunkStartMs).push(row);
+  }
+  const chunks = [...grouped.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([chunkStartMs, chunkRows]) => ({
+      chunk_start: new Date(chunkStartMs).toISOString(),
+      chunk_end: new Date(chunkStartMs + PERSIST_CHUNK_MS).toISOString(),
+      rows: chunkRows,
+      row_count: chunkRows.length,
+      source_time: chunkRows.at(-1)?.open_time || new Date(chunkStartMs).toISOString(),
+    }));
+  return { chunks, newestMs };
 }
 
 async function persist(entry) {
@@ -585,55 +660,50 @@ async function persist(entry) {
   }
   entry.persistPromise = (async () => {
     stats.persist_attempts += 1;
-    const now = new Date().toISOString();
-    const body = [{
-      provider: PROVIDER,
-      market_type: entry.market,
-      snapshot_type: 'klines',
-      quote_asset: snapshotKey(
-        entry.market,
-        entry.symbol,
-      ),
-      payload: {
-        rows: entry.rows.slice(-MAX_ROWS),
-      },
-      row_count: entry.rows.length,
-      source:
-        'bybit_official_public_trade_1s_shared_ws',
-      source_time:
-        entry.rows.at(-1)?.open_time || now,
-      updated_at: now,
-    }];
+    const { chunks, newestMs } = buildPersistChunks(entry);
+    if (!chunks.length || newestMs <= 0) return;
+    const retentionBefore = new Date(
+      newestMs - PERSIST_CHUNK_RETENTION_MS,
+    ).toISOString();
     try {
       const response = await fetch(
-        `${SUPABASE_URL}/rest/v1/${SNAPSHOT_TABLE}` +
-        `?on_conflict=provider,market_type,snapshot_type,quote_asset`,
+        `${SUPABASE_URL}/rest/v1/rpc/${CHUNK_UPSERT_RPC}`,
         {
           method: 'POST',
           headers: {
             apikey: SUPABASE_SERVICE_ROLE_KEY,
-            authorization:
-              `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
             'content-type': 'application/json',
-            prefer:
-              'resolution=merge-duplicates,return=minimal',
           },
-          body: JSON.stringify(body),
+          body: JSON.stringify({
+            p_market_type: entry.market,
+            p_symbol: entry.symbol,
+            p_chunks: chunks,
+            p_retention_before: retentionBefore,
+          }),
           signal: AbortSignal.timeout(8_000),
         },
       );
+      const responseText = await response.text();
       if (!response.ok) {
         throw new Error(
-          `bybit_second_persist_${response.status}`,
+          `bybit_second_chunk_persist_${response.status}:${responseText.slice(0, 180)}`,
         );
       }
+      let result = {};
+      try { result = JSON.parse(responseText || '{}'); } catch (_) {}
+      stats.chunk_persist_received += Number(result?.received || chunks.length);
+      stats.chunk_persist_written += Number(result?.written || 0);
+      stats.chunk_persist_unchanged += Number(result?.unchanged || 0);
+      stats.chunk_persist_deleted += Number(result?.deleted || 0);
       entry.lastPersistAt = Date.now();
+      entry.lastPersistedSourceTimeMs = newestMs;
+      entry.restoreMode = 'chunks';
       entry.dirty = false;
       stats.persist_success += 1;
     } catch (error) {
       stats.persist_errors += 1;
-      stats.last_persist_error =
-        String(error?.message || error);
+      stats.last_persist_error = String(error?.message || error);
     }
   })().finally(() => {
     entry.persistPromise = null;
@@ -885,6 +955,11 @@ export function getBybitSecondHistoryHealth() {
     on_demand_lease_seconds:
       Math.round(ON_DEMAND_LEASE_MS / 1000),
     persistence_enabled: persistenceEnabled(),
+    persistence_storage: 'supabase_5m_chunks_with_legacy_snapshot_read_fallback',
+    persistence_chunk_minutes: Math.round(PERSIST_CHUNK_MS / 60_000),
+    persistence_checkpoint_minutes: Math.round(PERSIST_INTERVAL_MS / 60_000),
+    persistence_retention_hours: Math.round(PERSIST_CHUNK_RETENTION_MS / 3_600_000),
+    legacy_snapshot_writes_enabled: false,
     render_direct_private_or_user_trade_api_used: false,
     recent_trade_time_range_parameters_used: false,
     empty_seconds_generated_by_backend: false,
@@ -922,6 +997,11 @@ export function getBybitSecondHistoryHealth() {
       lease_until: entry.hotPinned
         ? 'pinned'
         : new Date(entry.leaseUntil).toISOString(),
+      restore_mode: entry.restoreMode,
+      last_persisted_source_time:
+        Number(entry.lastPersistedSourceTimeMs || 0) > 0
+          ? new Date(entry.lastPersistedSourceTimeMs).toISOString()
+          : null,
     })),
     ...stats,
     time: new Date().toISOString(),
