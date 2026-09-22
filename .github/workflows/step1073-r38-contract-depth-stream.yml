@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm ci --ignore-scripts
+          npm install --no-save --package-lock=false --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org ws@8.21.1
 
       - name: Syntax and self-test
         shell: bash
