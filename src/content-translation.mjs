@@ -16,6 +16,7 @@ const AUTO_DAILY_CHAR_LIMIT = Math.max(1_000, Math.min(DAILY_SOFT_CHAR_LIMIT, Nu
 const DAILY_BUCKET_LIMITS = Object.freeze({
   auto_zh: AUTO_DAILY_CHAR_LIMIT,
   user_on_demand: DAILY_SOFT_CHAR_LIMIT,
+  private_user: DAILY_SOFT_CHAR_LIMIT,
   // Legacy bucket names remain readable so an in-progress Pacific day created by older
   // versions is accounted for exactly instead of being forgotten after deploy/restart.
   news_title: DAILY_SOFT_CHAR_LIMIT,
@@ -162,6 +163,93 @@ function rollDailyBudgetViewIfNeeded() {
 function normalizeBudgetBucket(value) {
   const key = text(value).toLowerCase();
   return Object.prototype.hasOwnProperty.call(DAILY_BUCKET_LIMITS, key) ? key : 'legacy_bootstrap';
+}
+
+
+async function claimAtomicTranslationBudget(bucket, chargeChars, userId = '') {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    state.usage_persistence_healthy = false;
+    state.daily_budget_persistence_healthy = false;
+    const error = new Error('translation_atomic_budget_not_configured');
+    error.code = 'TRANSLATION_BUDGET_UNAVAILABLE';
+    throw error;
+  }
+
+  const normalized = normalizeBudgetBucket(bucket);
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/rpc/app_claim_translation_budget`,
+    {
+      method: 'POST',
+      headers: usageHeaders({ accept: 'application/json' }),
+      body: JSON.stringify({
+        p_bucket: normalized,
+        p_chars: chargeChars,
+        p_user_id: userId || null,
+        p_daily_limit: DAILY_SOFT_CHAR_LIMIT,
+        p_monthly_limit: MONTHLY_CHAR_LIMIT,
+        p_auto_daily_limit: AUTO_DAILY_CHAR_LIMIT,
+        p_private_user_daily_chars: 3000,
+        p_private_user_daily_requests: 20,
+      }),
+    },
+  );
+  const raw = await response.text();
+  if (!response.ok) {
+    state.usage_persistence_healthy = false;
+    state.daily_budget_persistence_healthy = false;
+    const error = new Error(
+      `translation_atomic_budget_http_${response.status}:${raw.slice(0, 180)}`,
+    );
+    error.code = 'TRANSLATION_BUDGET_UNAVAILABLE';
+    throw error;
+  }
+
+  let payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch (_) {}
+  const row = Array.isArray(payload) ? payload[0] : payload;
+  if (!row || typeof row !== 'object') {
+    const error = new Error('translation_atomic_budget_invalid_payload');
+    error.code = 'TRANSLATION_BUDGET_UNAVAILABLE';
+    throw error;
+  }
+
+  state.monthly_characters_used = Math.max(
+    0,
+    Number(row.monthly_characters_used || 0) || 0,
+  );
+  state.monthly_requests = Math.max(
+    0,
+    Number(row.monthly_requests || 0) || 0,
+  );
+  state.daily_characters_used = Math.max(
+    0,
+    Number(row.daily_characters_used || 0) || 0,
+  );
+  state.daily_requests = Math.max(
+    0,
+    Number(row.daily_requests || 0) || 0,
+  );
+  state.daily_by_bucket[normalized] = Math.max(
+    0,
+    Number(row.bucket_characters_used || 0) || 0,
+  );
+  state.daily_budget_day_key = text(row.day_key) || state.daily_budget_day_key;
+  usageLoadedMonth = text(row.month_key) || usageLoadedMonth;
+  dailyUsageLoadedKey = text(row.day_key) || dailyUsageLoadedKey;
+  state.usage_persistence_healthy = true;
+  state.daily_budget_persistence_healthy = true;
+
+  if (row.allowed !== true) {
+    const reason = text(row.reason) || 'translation_budget_exhausted';
+    const error = new Error(reason);
+    error.code =
+      reason.includes('monthly') ? 'TRANSLATION_MONTHLY_BUDGET' :
+      reason.includes('private_user') ? 'TRANSLATION_PRIVATE_USER_BUDGET' :
+      'TRANSLATION_DAILY_BUDGET';
+    throw error;
+  }
+
+  return { ...row, bucket: normalized };
 }
 function usageHeaders(extra = {}) {
   return {
@@ -391,17 +479,17 @@ function openCooldown(message, response = null) {
   state.last_error = message;
 }
 
-async function translateGoogleSegment(value, source, target, budgetBucket = 'airdrop') {
+async function translateGoogleSegment(
+  value,
+  source,
+  target,
+  budgetBucket = 'airdrop',
+  userId = '',
+) {
   if (!GOOGLE_API_KEY) throw new Error('translation_provider_not_configured:KAKA_GOOGLE_TRANSLATION_API_KEY');
-  await ensureUsageLoaded();
-  await ensureDailyUsageLoaded();
   const chargeChars = Array.from(value).length;
-  const normalizedBucket = assertDailyBudget(budgetBucket, chargeChars);
-  if (state.monthly_characters_used + chargeChars > MONTHLY_CHAR_LIMIT) {
-    const error = new Error(`translation_monthly_budget_exhausted:${state.monthly_characters_used}/${MONTHLY_CHAR_LIMIT}`);
-    state.last_error = error.message;
-    throw error;
-  }
+  const normalizedBucket = normalizeBudgetBucket(budgetBucket);
+  await claimAtomicTranslationBudget(normalizedBucket, chargeChars, userId);
   state.requests++;
   return serializedProviderRequest(async () => {
     const startedAt = Date.now();
@@ -437,8 +525,6 @@ async function translateGoogleSegment(value, source, target, budgetBucket = 'air
       try { payload = JSON.parse(raw); } catch (_) {}
       const translated = decodeHtmlEntities(payload?.data?.translations?.[0]?.translatedText || '');
       if (!translated) throw new Error('google_translation_empty');
-      await persistUsage(chargeChars);
-      await persistDailyUsage(normalizedBucket, chargeChars);
       state.provider_last_success_at = new Date().toISOString();
       state.provider_consecutive_failures = 0;
       state.cooldown_reason = null;
@@ -459,12 +545,91 @@ async function translateGoogleSegment(value, source, target, budgetBucket = 'air
   });
 }
 
-async function translateField(raw, source, target, budgetBucket = 'airdrop') {
+async function translateField(
+  raw,
+  source,
+  target,
+  budgetBucket = 'airdrop',
+  userId = '',
+) {
   const segments = splitText(raw);
   if (!segments.length) return '';
   const translated = [];
-  for (const segment of segments) translated.push(await translateGoogleSegment(segment, source, target, budgetBucket));
+  for (const segment of segments) {
+    translated.push(
+      await translateGoogleSegment(
+        segment,
+        source,
+        target,
+        budgetBucket,
+        userId,
+      ),
+    );
+  }
   return normalizeWhitespace(translated.join('\n\n'));
+}
+
+export async function translatePrivateText({
+  rawText,
+  sourceLanguage = '',
+  targetLanguage = '',
+  userId = '',
+}) {
+  const value = normalizeWhitespace(rawText);
+  if (!value) {
+    const error = new Error('private_translation_text_required');
+    error.code = 'PRIVATE_TRANSLATION_INVALID';
+    throw error;
+  }
+
+  const source = text(sourceLanguage).toLowerCase() || detectContentLanguage(value);
+  const target = text(targetLanguage).toLowerCase() || targetForSource(source);
+  if (!['zh', 'en'].includes(source) || !['zh', 'en'].includes(target) || source === target) {
+    const error = new Error('private_translation_language_pair_invalid');
+    error.code = 'PRIVATE_TRANSLATION_INVALID';
+    throw error;
+  }
+  if (!text(userId)) {
+    const error = new Error('private_translation_user_required');
+    error.code = 'PRIVATE_TRANSLATION_AUTH';
+    throw error;
+  }
+
+  const sourceBytes = Buffer.byteLength(value, 'utf8');
+  if (sourceBytes > 3000) {
+    const error = new Error('private_translation_text_too_large');
+    error.code = 'PRIVATE_TRANSLATION_TOO_LARGE';
+    throw error;
+  }
+
+  state.user_translation_requests += 1;
+  const translated = await translateField(
+    value,
+    source,
+    target,
+    'private_user',
+    text(userId),
+  );
+  if (!translated) {
+    const error = new Error('private_translation_empty');
+    error.code = 'PRIVATE_TRANSLATION_EMPTY';
+    throw error;
+  }
+
+  const sourceChars = Array.from(value).length;
+  state.successes += 1;
+  state.translated_fields += 1;
+  state.translated_characters += sourceChars;
+  state.last_success_at = new Date().toISOString();
+  state.last_error = null;
+
+  return {
+    translated_text: translated,
+    source_language: source,
+    target_language: target,
+    source_bytes: sourceBytes,
+    source_characters: sourceChars,
+  };
 }
 
 function normalizeTranslations(raw) {
@@ -574,6 +739,10 @@ export function getSharedTranslationHealth() {
     configured: Boolean(GOOGLE_API_KEY),
     provider_mode: GOOGLE_API_KEY ? 'google_cloud_translation_v2' : 'google_cloud_translation_key_required',
     provider_auth_mode: 'x_goog_api_key_header',
+    atomic_budget_claim: true,
+    atomic_budget_rpc: 'app_claim_translation_budget',
+    authenticated_private_text_translation_allowed: true,
+    private_text_persisted: false,
     cooldown_until: cooldownUntilMs > Date.now() ? new Date(cooldownUntilMs).toISOString() : null,
     provider_ready: Boolean(GOOGLE_API_KEY) && state.provider_consecutive_failures === 0 && cooldownUntilMs <= Date.now(),
     daily_budget_ready: state.daily_characters_used < DAILY_SOFT_CHAR_LIMIT,
