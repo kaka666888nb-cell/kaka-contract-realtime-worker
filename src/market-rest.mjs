@@ -204,6 +204,208 @@ function getSecondKlineShareHealth() {
   };
 }
 
+
+// Step1073 R3:
+// Ordinary historical Kline REST reads for OKX / Bybit / Bitget / Gate are
+// shared at the completed-result level. Current-page requests from different
+// phones naturally carry slightly different Date.now() values; canonicalize
+// only the cache key, never the official request boundary. Explicit end_time
+// pagination keeps its exact boundary.
+const ORDINARY_KLINE_SHARED_PROVIDERS = new Set(['okx', 'bybit', 'bitget', 'gate']);
+const ORDINARY_KLINE_CACHE_MAX = 512;
+const ORDINARY_KLINE_HISTORY_TTL_MS = 15 * 60_000;
+const ORDINARY_KLINE_NETWORK_COOLDOWN_MS = 8_000;
+const ordinaryKlineCache = new Map();
+const ordinaryKlineInflight = new Map();
+const ordinaryKlineProviderFailureUntil = new Map();
+const ordinaryKlineShareStats = {
+  reads: 0,
+  cache_hits: 0,
+  inflight_hits: 0,
+  builds_started: 0,
+  builds_succeeded: 0,
+  builds_failed: 0,
+  network_cooldowns_opened: 0,
+  network_cooldown_hits: 0,
+  evictions: 0,
+};
+
+function pruneOrdinaryKlineCache() {
+  const now = Date.now();
+  for (const [key, entry] of ordinaryKlineCache.entries()) {
+    if (Number(entry?.expiresAt || 0) <= now) ordinaryKlineCache.delete(key);
+  }
+  while (ordinaryKlineCache.size > ORDINARY_KLINE_CACHE_MAX) {
+    const oldest = ordinaryKlineCache.keys().next().value;
+    if (oldest == null) break;
+    ordinaryKlineCache.delete(oldest);
+    ordinaryKlineShareStats.evictions += 1;
+  }
+  for (const [provider, until] of ordinaryKlineProviderFailureUntil.entries()) {
+    if (Number(until || 0) <= now) ordinaryKlineProviderFailureUntil.delete(provider);
+  }
+}
+
+function ordinaryKlineLatestBucketMs(interval) {
+  const step = Math.max(1_000, intervalMs(interval));
+  return Math.max(2_000, Math.min(30_000, Math.floor(step / 12)));
+}
+
+function ordinaryKlineSharedKey(
+  provider,
+  market,
+  symbol,
+  interval,
+  end,
+  limit,
+  options = {},
+) {
+  const now = Date.now();
+  const rawEnd = Number(end);
+  const safeEnd = Number.isFinite(rawEnd) && rawEnd > 0
+    ? Math.min(rawEnd, now)
+    : now;
+  const explicitEnd = options.endTimeProvided === true;
+  const bucketMs = ordinaryKlineLatestBucketMs(interval);
+  const endKey = explicitEnd
+    ? Math.floor(safeEnd)
+    : Math.floor(safeEnd / bucketMs) * bucketMs;
+  return {
+    key:
+      'ordinary_kline:' +
+      [provider, market, compact(symbol), interval, Math.max(1, Number(limit) || 1), endKey].join(':'),
+    explicitEnd,
+    bucketMs,
+  };
+}
+
+function ordinaryKlineNetworkLikeError(error) {
+  const name = String(error?.name || '').toLowerCase();
+  const message = String(error?.message || error || '').toLowerCase();
+  return (
+    name.includes('abort') ||
+    message.includes('timeout') ||
+    message.includes('timed out') ||
+    message.includes('fetch failed') ||
+    message.includes('network') ||
+    message.includes('socket') ||
+    message.includes('econnreset') ||
+    message.includes('econnrefused') ||
+    message.includes('etimedout') ||
+    message.includes('enotfound') ||
+    message.includes('eai_again') ||
+    message.includes('upstream unavailable') ||
+    message.includes('official public api unavailable') ||
+    /(^|\s)50[234](\s|$)/.test(message)
+  );
+}
+
+async function sharedOrdinaryKlineResult(
+  provider,
+  market,
+  symbol,
+  interval,
+  end,
+  limit,
+  options,
+  loader,
+) {
+  ordinaryKlineShareStats.reads += 1;
+  pruneOrdinaryKlineCache();
+
+  const cooldownUntil = Number(
+    ordinaryKlineProviderFailureUntil.get(provider) || 0,
+  );
+  if (cooldownUntil > Date.now()) {
+    ordinaryKlineShareStats.network_cooldown_hits += 1;
+    const remainingMs = Math.max(1, cooldownUntil - Date.now());
+    const error = new Error(
+      `ordinary_kline_provider_network_cooldown provider=${provider} retry_after_ms=${remainingMs}`,
+    );
+    error.code = 'ORDINARY_KLINE_PROVIDER_NETWORK_COOLDOWN';
+    throw error;
+  }
+
+  const { key, explicitEnd, bucketMs } = ordinaryKlineSharedKey(
+    provider, market, symbol, interval, end, limit, options,
+  );
+  const cached = ordinaryKlineCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    ordinaryKlineShareStats.cache_hits += 1;
+    return cached.rows;
+  }
+
+  const running = ordinaryKlineInflight.get(key);
+  if (running) {
+    ordinaryKlineShareStats.inflight_hits += 1;
+    return await running;
+  }
+
+  ordinaryKlineShareStats.builds_started += 1;
+  const task = Promise.resolve()
+    .then(loader)
+    .then((rows) => {
+      const safeRows = Array.isArray(rows) ? rows : [];
+      const ttlMs = explicitEnd
+        ? ORDINARY_KLINE_HISTORY_TTL_MS
+        : Math.max(4_000, Math.min(30_000, bucketMs * 2));
+      ordinaryKlineCache.set(key, {
+        rows: safeRows,
+        expiresAt: Date.now() + (safeRows.length ? ttlMs : Math.min(ttlMs, 5_000)),
+      });
+      ordinaryKlineProviderFailureUntil.delete(provider);
+      pruneOrdinaryKlineCache();
+      ordinaryKlineShareStats.builds_succeeded += 1;
+      return safeRows;
+    })
+    .catch((error) => {
+      ordinaryKlineShareStats.builds_failed += 1;
+      if (ordinaryKlineNetworkLikeError(error)) {
+        ordinaryKlineProviderFailureUntil.set(
+          provider,
+          Date.now() + ORDINARY_KLINE_NETWORK_COOLDOWN_MS,
+        );
+        ordinaryKlineShareStats.network_cooldowns_opened += 1;
+      }
+      throw error;
+    });
+
+  ordinaryKlineInflight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (ordinaryKlineInflight.get(key) === task) {
+      ordinaryKlineInflight.delete(key);
+    }
+  }
+}
+
+function getOrdinaryKlineShareHealth() {
+  pruneOrdinaryKlineCache();
+  const now = Date.now();
+  return {
+    mode: 'provider_market_symbol_interval_limit_current_bucket_or_exact_end_shared_cache_singleflight',
+    providers: [...ORDINARY_KLINE_SHARED_PROVIDERS],
+    cache_entries: ordinaryKlineCache.size,
+    cache_max: ORDINARY_KLINE_CACHE_MAX,
+    inflight_entries: ordinaryKlineInflight.size,
+    historical_ttl_ms: ORDINARY_KLINE_HISTORY_TTL_MS,
+    current_bucket_min_ms: 2_000,
+    current_bucket_max_ms: 30_000,
+    network_failure_cooldown_ms: ORDINARY_KLINE_NETWORK_COOLDOWN_MS,
+    network_cooldown_providers: [...ordinaryKlineProviderFailureUntil.entries()]
+      .filter(([, until]) => Number(until || 0) > now)
+      .map(([provider, until]) => ({
+        provider,
+        remaining_ms: Math.max(0, Number(until) - now),
+      })),
+    explicit_end_time_preserves_exact_boundary: true,
+    cache_key_canonicalization_does_not_change_official_request_end: true,
+    same_business_key_reads_scale_upstream_with_users: false,
+    ...ordinaryKlineShareStats,
+  };
+}
+
 // Step788.1:
 // Verify exact provider + market + symbol against the official directory
 // before any Kline or trade-history upstream request.
@@ -4004,21 +4206,45 @@ export async function fetchMarketKlines(provider, market, symbol, interval, end,
       },
     );
   }
-  const sourceInterval = sourceIntervalFor(provider, market, interval);
-  const targetMs = intervalMs(interval);
-  const sourceMs = intervalMs(sourceInterval);
-  const factor = Math.max(1, Math.ceil(targetMs / sourceMs));
-  const sourceLimit = Math.min(5000, limit * factor + factor * 4);
-  const sourceRows = await fetchNativeMarketKlines(provider, market, symbol, sourceInterval, end, sourceLimit);
-  if (sourceInterval === interval) return sourceRows.slice(-limit);
-  const aggregated = aggregateCandles(sourceRows, provider, market, symbol, interval).slice(-limit);
-  if (provider === 'gate' && market === 'spot' && (interval === '3d' || interval === '1w')) {
-    return aggregated.map((row) => ({
-      ...row,
-      source: 'gate_official_public_kline_render_bounded_range_paged_v2',
-    }));
+  const loadOrdinaryKlines = async () => {
+    const sourceInterval = sourceIntervalFor(provider, market, interval);
+    const targetMs = intervalMs(interval);
+    const sourceMs = intervalMs(sourceInterval);
+    const factor = Math.max(1, Math.ceil(targetMs / sourceMs));
+    const sourceLimit = Math.min(5000, limit * factor + factor * 4);
+    const sourceRows = await fetchNativeMarketKlines(
+      provider, market, symbol, sourceInterval, end, sourceLimit,
+    );
+    if (sourceInterval === interval) return sourceRows.slice(-limit);
+    const aggregated = aggregateCandles(
+      sourceRows, provider, market, symbol, interval,
+    ).slice(-limit);
+    if (
+      provider === 'gate' &&
+      market === 'spot' &&
+      (interval === '3d' || interval === '1w')
+    ) {
+      return aggregated.map((row) => ({
+        ...row,
+        source: 'gate_official_public_kline_render_bounded_range_paged_v2',
+      }));
+    }
+    return aggregated;
+  };
+
+  if (ORDINARY_KLINE_SHARED_PROVIDERS.has(provider)) {
+    return await sharedOrdinaryKlineResult(
+      provider,
+      market,
+      symbol,
+      interval,
+      end,
+      limit,
+      options,
+      loadOrdinaryKlines,
+    );
   }
-  return aggregated;
+  return await loadOrdinaryKlines();
 }
 
 
@@ -4516,6 +4742,10 @@ export function getBinanceMarketRestHealth() {
     asset_market_tab_count_uses_visible_rows: true,
     one_second_history_shared_cache: getSecondKlineShareHealth(),
     one_second_history_same_exact_key_reads_share_cache_and_inflight: true,
+    ordinary_kline_shared_cache: getOrdinaryKlineShareHealth(),
+    ordinary_kline_current_page_canonical_end_bucket: true,
+    ordinary_kline_explicit_end_time_exact_boundary: true,
+    ordinary_kline_network_failure_cooldown: true,
     one_second_history_end_time_pagination: {
       binance_spot: 'native_1s_kline_end_time',
       binance_contract: 'protected_archive_edge_live_chain',
