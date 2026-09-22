@@ -1,0 +1,32 @@
+name: Step1073 R35B liquidation 1h diff persistence
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/contract-liquidation.mjs'
+      - '.github/workflows/step1073-r35b-liquidation-1h-diff.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify production liquidation persistence contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 45); do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 25 -o /tmp/health.json -w '%{http_code}' "$BASE/api/contract-liquidation/health" || true)"
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); good=(b.get('version')=='650.8.15.197.3.3.12' and b.get('persistence_enabled') is True and b.get('hour_persist_rpc')=='app_upsert_contract_liquidation_1h_batch_diff' and b.get('hour_closed_unchanged_noop') is True and b.get('hour_closed_same_signature_gate') is True and str(b.get('flush_error') or '')==''); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$code" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$code" = "200"
+          test "$ok" = "1"
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); print('PASS version=',b.get('version'),'rpc=',b.get('hour_persist_rpc'),'queue=',b.get('persist_queue'),'unchanged=',b.get('hour_rpc_unchanged_rows_total'),'closed_skips=',b.get('hour_closed_same_signature_skips'))"

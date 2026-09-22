@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.11';
+const STEP_VERSION = '650.8.15.197.3.3.12';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -303,6 +303,8 @@ const liquidationPersistenceHealth = {
   hour_persist_server_split_retries: 0,
   hour_persist_server_quarantined_rows: 0,
   hour_persist_last_quarantine: '',
+  hour_rpc_unchanged_rows_total: 0,
+  hour_closed_same_signature_skips: 0,
 };
 
 function liquidationSupabaseHeaders(extra = {}) {
@@ -470,6 +472,33 @@ function liquidationPersistSignature(row) {
   ]);
 }
 
+// Step1073 R35-B: hour persistence needs a full business signature. A closed
+// bucket with an identical signature never needs another cached_at-only write.
+// If a late event changes any business field, the signature changes and the
+// bucket is eligible for persistence again.
+function liquidationHourPersistSignature(row) {
+  return JSON.stringify([
+    Number(row.long_notional || 0).toFixed(8),
+    Number(row.short_notional || 0).toFixed(8),
+    Number(row.total_notional || 0).toFixed(8),
+    Number(row.long_count || 0),
+    Number(row.short_count || 0),
+    Number(row.event_count || 0),
+    row.largest_event_id || '',
+    row.largest_event_side || '',
+    row.largest_event_notional == null ? '' : Number(row.largest_event_notional).toFixed(8),
+    row.largest_event_price == null ? '' : Number(row.largest_event_price).toFixed(12),
+    row.largest_event_time || '',
+    row.latest_event_time || '',
+    row.bucket_closed === true,
+    row.provisional === true,
+    row.coverage_complete === true,
+    row.observed_since || '',
+    row.last_gap_at || '',
+    row.source || '',
+  ]);
+}
+
 function capLiquidationMinutePersistQueue() {
   while (liquidationMinutePersistQueue.size > LIQUIDATION_PERSIST_QUEUE_MAX) {
     const first = liquidationMinutePersistQueue.keys().next().value;
@@ -581,23 +610,28 @@ function queueLiquidationHourBucket(state, bucket, now = Date.now()) {
   const row = liquidationPersistRow(state, bucket, now);
   if (!row) return;
   const key = `${row.provider}|${row.symbol}|${row.bucket_start}`;
-  const signature = liquidationPersistSignature(row);
+  const signature = liquidationHourPersistSignature(row);
   const gate = liquidationPersistGate.get(key);
-  if (gate?.signature === signature && now - Number(gate.at || 0) < 5 * 60_000) return;
+  if (gate?.signature === signature) {
+    if (row.bucket_closed === true) {
+      liquidationPersistenceHealth.hour_closed_same_signature_skips += 1;
+      return;
+    }
+    if (now - Number(gate.at || 0) < 5 * 60_000) return;
+  }
   liquidationPersistQueue.set(key, { row, signature });
   capLiquidationPersistQueue();
 }
 
 async function postLiquidationHourChunk(chunk) {
   const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/${LIQUIDATION_HOUR_TABLE}?on_conflict=provider,market_type,symbol,bucket_start`,
+    `${SUPABASE_URL}/rest/v1/rpc/app_upsert_contract_liquidation_1h_batch_diff`,
     {
       method: 'POST',
       headers: liquidationSupabaseHeaders({
         'content-type': 'application/json',
-        prefer: 'resolution=merge-duplicates,return=minimal',
       }),
-      body: JSON.stringify(chunk),
+      body: JSON.stringify({ p_rows: chunk }),
       signal: AbortSignal.timeout(15000),
     },
   );
@@ -618,7 +652,19 @@ function isLiquidationHourTimestamp400(status, responseText) {
 async function upsertLiquidationHourChunkIsolated(chunk) {
   if (!Array.isArray(chunk) || chunk.length === 0) return 0;
   const result = await postLiquidationHourChunk(chunk);
-  if (result.ok) return chunk.length;
+  if (result.ok) {
+    let payload = null;
+    try { payload = JSON.parse(result.text || '{}'); } catch { payload = null; }
+    const written = Number(payload?.written);
+    const unchanged = Number(payload?.unchanged);
+    if (!Number.isFinite(written) || written < 0 || written > chunk.length) {
+      throw new Error(`liquidation_hour_diff_rpc_invalid_written:${result.text.slice(0, 220)}`);
+    }
+    if (Number.isFinite(unchanged) && unchanged > 0) {
+      liquidationPersistenceHealth.hour_rpc_unchanged_rows_total += unchanged;
+    }
+    return written;
+  }
 
   if (isLiquidationHourTimestamp400(result.status, result.text)) {
     if (chunk.length > 1) {
@@ -2375,6 +2421,9 @@ export function getContractLiquidationPersistenceHealth() {
     persist_flush_seconds: Math.trunc(LIQUIDATION_PERSIST_FLUSH_MS / 1000),
     persist_queue: liquidationPersistQueue.size,
     persist_inflight: Boolean(liquidationPersistInflight),
+    hour_persist_rpc: 'app_upsert_contract_liquidation_1h_batch_diff',
+    hour_closed_unchanged_noop: true,
+    hour_closed_same_signature_gate: true,
     history_cache_entries: liquidationHistoryCache.size,
     history_inflight_entries: liquidationHistoryInflight.size,
     history_cache_ttl_seconds: Math.trunc(LIQUIDATION_HISTORY_CACHE_TTL_MS / 1000),
