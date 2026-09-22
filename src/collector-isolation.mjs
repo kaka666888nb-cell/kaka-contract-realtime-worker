@@ -64,7 +64,7 @@ const watchlistTickerSharedCacheStats = {
   canonical_item_deduped: 0,
 };
 
-const ONCHAIN_COST_ADMISSION_VERSION = '1073.r53a.ip-cost-admission.1';
+const ONCHAIN_COST_ADMISSION_VERSION = '1073.r53a.ip-cost-admission.1.1';
 const ONCHAIN_COST_ADMISSION_WINDOW_MS = 60_000;
 const ONCHAIN_COST_ADMISSION_HOUR_MS = 60 * 60_000;
 // Deliberately generous for carrier-NAT compatibility. This is an abuse ceiling,
@@ -221,9 +221,13 @@ function onchainCostAdmissionHealth() {
     identity_mode: 'render_real_ip_until_app_auth_install_identity_cutover',
     login_required: false,
     app_change_required: false,
-    shared_cache_hits_do_not_consume_admission_points: true,
+    fresh_shared_cache_hits_do_not_consume_admission_points: true,
     inflight_coalesced_hits_do_not_consume_admission_points: true,
+    stale_refresh_requires_admission_only_when_new_refresh_starts: true,
     stale_cached_response_survives_refresh_admission_rejection: true,
+    holder_parent_fresh_ms: 15 * 60_000,
+    security_parent_fresh_ms: 30 * 60_000,
+    holder_security_parent_cache_aligned_with_child_freshness: true,
     per_ip_points_1m: ONCHAIN_COST_POINTS_PER_IP_1M,
     per_ip_points_1h: ONCHAIN_COST_POINTS_PER_IP_1H,
     carrier_nat_compatibility: 'generous_abuse_ceiling_not_normal_user_quota',
@@ -263,8 +267,11 @@ function sharedResponsePolicy(pathname) {
   if (path === '/api/onchain/smart-money') return { freshMs: 10_000, staleMs: 60_000, cdnSMaxAgeSec: 10 };
   if (path === '/api/onchain/top-wallets') return { freshMs: 15_000, staleMs: 90_000, cdnSMaxAgeSec: 15 };
   if (path === '/api/onchain/fx-reference') return { freshMs: 60_000, staleMs: 10 * 60_000, cdnSMaxAgeSec: 60 };
-  if (path === '/api/onchain/holders') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };
-  if (path === '/api/onchain/security') return { freshMs: 30_000, staleMs: 5 * 60_000, cdnSMaxAgeSec: 30 };
+  // Step1073 R53A.1: align the parent shared-response freshness with the
+  // child on-chain cache. Re-proxying every 30s only consumed admission points;
+  // it did not make holder/security facts fresher than the child source cache.
+  if (path === '/api/onchain/holders') return { freshMs: 15 * 60_000, staleMs: 6 * 60 * 60_000, cdnSMaxAgeSec: 60 };
+  if (path === '/api/onchain/security') return { freshMs: 30 * 60_000, staleMs: 24 * 60 * 60_000, cdnSMaxAgeSec: 120 };
   return null;
 }
 
