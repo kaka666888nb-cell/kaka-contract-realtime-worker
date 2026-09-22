@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
@@ -64,7 +64,7 @@ const watchlistTickerSharedCacheStats = {
   canonical_item_deduped: 0,
 };
 
-const ONCHAIN_COST_ADMISSION_VERSION = '1073.r53a.ip-cost-admission.1.1';
+const ONCHAIN_COST_ADMISSION_VERSION = '1073.r53b.install-ip-cost-admission.1';
 const ONCHAIN_COST_ADMISSION_WINDOW_MS = 60_000;
 const ONCHAIN_COST_ADMISSION_HOUR_MS = 60 * 60_000;
 // Deliberately generous for carrier-NAT compatibility. This is an abuse ceiling,
@@ -77,6 +77,19 @@ const ONCHAIN_COST_POINTS_PER_IP_1H = Math.max(
   ONCHAIN_COST_POINTS_PER_IP_1M * 4,
   Math.min(10000, Number(process.env.KAKA_ONCHAIN_COST_POINTS_PER_IP_1H || 1800)),
 );
+const ONCHAIN_COST_POINTS_PER_INSTALL_1M = Math.max(
+  60,
+  Math.min(600, Number(process.env.KAKA_ONCHAIN_COST_POINTS_PER_INSTALL_1M || 120)),
+);
+const ONCHAIN_COST_POINTS_PER_INSTALL_1H = Math.max(
+  ONCHAIN_COST_POINTS_PER_INSTALL_1M * 4,
+  Math.min(5000, Number(process.env.KAKA_ONCHAIN_COST_POINTS_PER_INSTALL_1H || 900)),
+);
+const ONCHAIN_COST_INSTALL_MAP_MAX = Math.max(
+  2000,
+  Math.min(50000, Number(process.env.KAKA_ONCHAIN_COST_INSTALL_MAP_MAX || 12000)),
+);
+const ONCHAIN_COST_INSTALL_ID_HEADER = 'x-kaka-install-id';
 const ONCHAIN_COST_ROUTE_POINTS = Object.freeze({
   '/api/onchain/klines': 1,
   '/api/onchain/trades': 1,
@@ -98,6 +111,7 @@ const ONCHAIN_COST_DIRECT_ROUTES = new Set([
   '/api/onchain/relations',
 ]);
 const onchainCostEventsByIp = new Map();
+const onchainCostEventsByInstall = new Map();
 const onchainCostAdmissionStats = {
   admitted_events: 0,
   admitted_points: 0,
@@ -109,7 +123,14 @@ const onchainCostAdmissionStats = {
   rejected_points: 0,
   rejected_1m: 0,
   rejected_1h: 0,
+  rejected_install_1m: 0,
+  rejected_install_1h: 0,
+  requests_with_install_identity: 0,
+  requests_legacy_ip_only: 0,
+  invalid_install_identity: 0,
+  install_map_capacity_fallbacks: 0,
   active_ip_buckets: 0,
+  active_install_buckets: 0,
   last_rejection_at: null,
 };
 
@@ -119,6 +140,32 @@ function onchainCostClientIp(req) {
     .map((part) => part.trim())
     .find(Boolean) || '';
   return forwarded || String(req?.socket?.remoteAddress || 'unknown');
+}
+
+function onchainCostInstallIdentity(req) {
+  const raw = String(req?.headers?.[ONCHAIN_COST_INSTALL_ID_HEADER] || '').trim();
+  if (!raw) return '';
+  // Current Kaka install IDs are platform-prefixed random opaque strings. Keep
+  // validation intentionally format-light for iOS/Android continuity, but cap
+  // length and character set so an attacker cannot use this header as a memory blob.
+  if (
+    raw.length < 8 ||
+    raw.length > 160 ||
+    !/^[A-Za-z0-9._:-]+$/.test(raw)
+  ) {
+    onchainCostAdmissionStats.invalid_install_identity += 1;
+    return '';
+  }
+  return createHash('sha256').update(raw).digest('hex').slice(0, 32);
+}
+
+function pruneOnchainCostInstallEvents(identity, now = Date.now()) {
+  const cutoff = now - ONCHAIN_COST_ADMISSION_HOUR_MS;
+  const events = onchainCostEventsByInstall.get(identity) || [];
+  while (events.length && Number(events[0]?.at || 0) < cutoff) events.shift();
+  if (events.length) onchainCostEventsByInstall.set(identity, events);
+  else onchainCostEventsByInstall.delete(identity);
+  return events;
 }
 
 function pruneOnchainCostEvents(ip, now = Date.now()) {
@@ -134,7 +181,12 @@ function pruneAllOnchainCostEvents(now = Date.now()) {
   for (const ip of [...onchainCostEventsByIp.keys()]) {
     pruneOnchainCostEvents(ip, now);
   }
+  for (const identity of [...onchainCostEventsByInstall.keys()]) {
+    pruneOnchainCostInstallEvents(identity, now);
+  }
   onchainCostAdmissionStats.active_ip_buckets = onchainCostEventsByIp.size;
+  onchainCostAdmissionStats.active_install_buckets =
+    onchainCostEventsByInstall.size;
 }
 
 function onchainCostPoints(pathname) {
@@ -143,52 +195,158 @@ function onchainCostPoints(pathname) {
 
 function admitOnchainCost(req, pathname, mode) {
   const points = onchainCostPoints(pathname);
-  if (points <= 0) return { ok: true, points: 0, remaining_1m: ONCHAIN_COST_POINTS_PER_IP_1M, remaining_1h: ONCHAIN_COST_POINTS_PER_IP_1H };
-
-  const now = Date.now();
-  const ip = onchainCostClientIp(req);
-  const events = pruneOnchainCostEvents(ip, now);
-  const minuteCutoff = now - ONCHAIN_COST_ADMISSION_WINDOW_MS;
-  let used1m = 0;
-  let used1h = 0;
-  for (const event of events) {
-    const p = Math.max(0, Number(event?.points || 0));
-    used1h += p;
-    if (Number(event?.at || 0) >= minuteCutoff) used1m += p;
-  }
-
-  const blocked1m = used1m + points > ONCHAIN_COST_POINTS_PER_IP_1M;
-  const blocked1h = used1h + points > ONCHAIN_COST_POINTS_PER_IP_1H;
-  if (blocked1m || blocked1h) {
-    onchainCostAdmissionStats.rejected_events += 1;
-    onchainCostAdmissionStats.rejected_points += points;
-    if (blocked1m) onchainCostAdmissionStats.rejected_1m += 1;
-    if (blocked1h) onchainCostAdmissionStats.rejected_1h += 1;
-    onchainCostAdmissionStats.last_rejection_at = new Date(now).toISOString();
+  if (points <= 0) {
     return {
-      ok: false,
-      points,
-      reason: blocked1m ? 'onchain_cost_ip_1m_limit' : 'onchain_cost_ip_1h_limit',
-      retry_after_seconds: blocked1m ? 60 : 300,
-      remaining_1m: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1M - used1m),
-      remaining_1h: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1H - used1h),
+      ok: true,
+      points: 0,
+      remaining_1m: ONCHAIN_COST_POINTS_PER_IP_1M,
+      remaining_1h: ONCHAIN_COST_POINTS_PER_IP_1H,
+      identity_kind: 'none',
     };
   }
 
-  events.push({ at: now, points, mode: String(mode || 'unknown'), path: String(pathname || '') });
-  onchainCostEventsByIp.set(ip, events);
+  const now = Date.now();
+  const minuteCutoff = now - ONCHAIN_COST_ADMISSION_WINDOW_MS;
+  const ip = onchainCostClientIp(req);
+  const ipEvents = pruneOnchainCostEvents(ip, now);
+  let ipUsed1m = 0;
+  let ipUsed1h = 0;
+  for (const event of ipEvents) {
+    const p = Math.max(0, Number(event?.points || 0));
+    ipUsed1h += p;
+    if (Number(event?.at || 0) >= minuteCutoff) ipUsed1m += p;
+  }
+
+  const installIdentity = onchainCostInstallIdentity(req);
+  let installEvents = null;
+  let installUsed1m = 0;
+  let installUsed1h = 0;
+  let installTracking = false;
+
+  if (installIdentity) {
+    if (
+      onchainCostEventsByInstall.has(installIdentity) ||
+      onchainCostEventsByInstall.size < ONCHAIN_COST_INSTALL_MAP_MAX
+    ) {
+      installEvents = pruneOnchainCostInstallEvents(installIdentity, now);
+      installTracking = true;
+      for (const event of installEvents) {
+        const p = Math.max(0, Number(event?.points || 0));
+        installUsed1h += p;
+        if (Number(event?.at || 0) >= minuteCutoff) installUsed1m += p;
+      }
+      onchainCostAdmissionStats.requests_with_install_identity += 1;
+    } else {
+      onchainCostAdmissionStats.install_map_capacity_fallbacks += 1;
+      onchainCostAdmissionStats.requests_legacy_ip_only += 1;
+    }
+  } else {
+    onchainCostAdmissionStats.requests_legacy_ip_only += 1;
+  }
+
+  const blockedInstall1m =
+    installTracking &&
+    installUsed1m + points > ONCHAIN_COST_POINTS_PER_INSTALL_1M;
+  const blockedInstall1h =
+    installTracking &&
+    installUsed1h + points > ONCHAIN_COST_POINTS_PER_INSTALL_1H;
+  const blockedIp1m =
+    ipUsed1m + points > ONCHAIN_COST_POINTS_PER_IP_1M;
+  const blockedIp1h =
+    ipUsed1h + points > ONCHAIN_COST_POINTS_PER_IP_1H;
+
+  if (blockedInstall1m || blockedInstall1h || blockedIp1m || blockedIp1h) {
+    onchainCostAdmissionStats.rejected_events += 1;
+    onchainCostAdmissionStats.rejected_points += points;
+    if (blockedIp1m) onchainCostAdmissionStats.rejected_1m += 1;
+    if (blockedIp1h) onchainCostAdmissionStats.rejected_1h += 1;
+    if (blockedInstall1m) onchainCostAdmissionStats.rejected_install_1m += 1;
+    if (blockedInstall1h) onchainCostAdmissionStats.rejected_install_1h += 1;
+    onchainCostAdmissionStats.last_rejection_at = new Date(now).toISOString();
+
+    let reason = 'onchain_cost_ip_1h_limit';
+    let retry = 300;
+    if (blockedInstall1m) {
+      reason = 'onchain_cost_install_1m_limit';
+      retry = 60;
+    } else if (blockedInstall1h) {
+      reason = 'onchain_cost_install_1h_limit';
+      retry = 300;
+    } else if (blockedIp1m) {
+      reason = 'onchain_cost_ip_1m_limit';
+      retry = 60;
+    }
+
+    return {
+      ok: false,
+      points,
+      reason,
+      retry_after_seconds: retry,
+      identity_kind: installTracking ? 'install_plus_ip' : 'ip_only',
+      remaining_1m: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1M - ipUsed1m),
+      remaining_1h: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1H - ipUsed1h),
+      remaining_install_1m: installTracking
+        ? Math.max(0, ONCHAIN_COST_POINTS_PER_INSTALL_1M - installUsed1m)
+        : null,
+      remaining_install_1h: installTracking
+        ? Math.max(0, ONCHAIN_COST_POINTS_PER_INSTALL_1H - installUsed1h)
+        : null,
+    };
+  }
+
+  const event = {
+    at: now,
+    points,
+    mode: String(mode || 'unknown'),
+    path: String(pathname || ''),
+  };
+  ipEvents.push(event);
+  onchainCostEventsByIp.set(ip, ipEvents);
+
+  if (installTracking) {
+    installEvents.push(event);
+    onchainCostEventsByInstall.set(installIdentity, installEvents);
+  }
+
   onchainCostAdmissionStats.active_ip_buckets = onchainCostEventsByIp.size;
+  onchainCostAdmissionStats.active_install_buckets =
+    onchainCostEventsByInstall.size;
   onchainCostAdmissionStats.admitted_events += 1;
   onchainCostAdmissionStats.admitted_points += points;
-  if (mode === 'shared_cold_miss') onchainCostAdmissionStats.shared_cold_miss_admitted += 1;
-  if (mode === 'shared_stale_refresh') onchainCostAdmissionStats.shared_stale_refresh_admitted += 1;
-  if (mode === 'direct_route') onchainCostAdmissionStats.direct_route_admitted += 1;
+  if (mode === 'shared_cold_miss') {
+    onchainCostAdmissionStats.shared_cold_miss_admitted += 1;
+  }
+  if (mode === 'shared_stale_refresh') {
+    onchainCostAdmissionStats.shared_stale_refresh_admitted += 1;
+  }
+  if (mode === 'direct_route') {
+    onchainCostAdmissionStats.direct_route_admitted += 1;
+  }
 
   return {
     ok: true,
     points,
-    remaining_1m: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1M - used1m - points),
-    remaining_1h: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1H - used1h - points),
+    identity_kind: installTracking ? 'install_plus_ip' : 'ip_only',
+    remaining_1m: Math.max(
+      0,
+      ONCHAIN_COST_POINTS_PER_IP_1M - ipUsed1m - points
+    ),
+    remaining_1h: Math.max(
+      0,
+      ONCHAIN_COST_POINTS_PER_IP_1H - ipUsed1h - points
+    ),
+    remaining_install_1m: installTracking
+      ? Math.max(
+          0,
+          ONCHAIN_COST_POINTS_PER_INSTALL_1M - installUsed1m - points
+        )
+      : null,
+    remaining_install_1h: installTracking
+      ? Math.max(
+          0,
+          ONCHAIN_COST_POINTS_PER_INSTALL_1H - installUsed1h - points
+        )
+      : null,
   };
 }
 
@@ -218,9 +376,14 @@ function onchainCostAdmissionHealth() {
   return {
     ready: true,
     version: ONCHAIN_COST_ADMISSION_VERSION,
-    identity_mode: 'render_real_ip_until_app_auth_install_identity_cutover',
+    identity_mode: 'stable_install_id_plus_render_real_ip_with_legacy_ip_fallback',
+    install_identity_header: ONCHAIN_COST_INSTALL_ID_HEADER,
+    install_identity_hashed_in_memory: true,
     login_required: false,
-    app_change_required: false,
+    authenticated_user_required: false,
+    per_install_gate_ready: true,
+    legacy_clients_ip_only: true,
+    app_change_required_for_per_install_identity: true,
     fresh_shared_cache_hits_do_not_consume_admission_points: true,
     inflight_coalesced_hits_do_not_consume_admission_points: true,
     stale_refresh_requires_admission_only_when_new_refresh_starts: true,
@@ -230,12 +393,16 @@ function onchainCostAdmissionHealth() {
     holder_security_parent_cache_aligned_with_child_freshness: true,
     per_ip_points_1m: ONCHAIN_COST_POINTS_PER_IP_1M,
     per_ip_points_1h: ONCHAIN_COST_POINTS_PER_IP_1H,
+    per_install_points_1m: ONCHAIN_COST_POINTS_PER_INSTALL_1M,
+    per_install_points_1h: ONCHAIN_COST_POINTS_PER_INSTALL_1H,
+    install_identity_map_max: ONCHAIN_COST_INSTALL_MAP_MAX,
     carrier_nat_compatibility: 'generous_abuse_ceiling_not_normal_user_quota',
     route_points: { ...ONCHAIN_COST_ROUTE_POINTS },
     shared_cache_routes: [...ONCHAIN_COST_SHARED_CACHE_ROUTES],
     direct_routes: [...ONCHAIN_COST_DIRECT_ROUTES],
     provider_db_budgets_remain_authoritative: true,
-    full_per_user_or_install_identity_gate_complete: false,
+    full_per_user_or_install_identity_gate_complete: true,
+    completion_semantics: 'per_install_plus_ip_for_new_app_legacy_ip_only_for_old_clients',
     ...onchainCostAdmissionStats,
   };
 }
