@@ -26,6 +26,7 @@ const RULE_ACCOUNT_STATUS_HEARTBEAT_MS = Math.max(
 );
 const X_USAGE_MIN_REFRESH_MS = 5 * 60_000;
 const DEFAULT_X_USAGE_REFRESH_MS = 10 * 60_000;
+const X_CREDITS_REFRESH_MS = 5 * 60_000;
 const PUBLIC_EVENT_CACHE_LIMIT = 1000;
 const PUBLIC_ENDPOINT_MAX_LIMIT = 200;
 const PUBLIC_EVENT_RELOAD_MS = 5 * 60_000;
@@ -64,6 +65,15 @@ const state = {
   usageLastCheckedAt: null,
   usageProjectPosts: null,
   usageProjectCap: null,
+  creditLastCheckedAt: null,
+  creditHttpStatus: null,
+  creditEndpointState: 'unknown',
+  creditPrepaidBalanceUsd: null,
+  creditFreeBalanceUsd: null,
+  creditTotalBalanceUsd: null,
+  creditReads: 0,
+  creditFailures: 0,
+  creditLastError: null,
   estimatedBillingPostCostUsd: null,
   budgetMode: 'normal',
   budgetWarning: false,
@@ -480,6 +490,20 @@ function publicHealth() {
     usage_last_checked_at: state.usageLastCheckedAt,
     usage_project_posts: state.usageProjectPosts,
     usage_project_cap: state.usageProjectCap,
+    provider_credit_balance: {
+      endpoint: '/2/usage/credits',
+      state: state.creditEndpointState,
+      last_checked_at: state.creditLastCheckedAt,
+      http_status: state.creditHttpStatus,
+      prepaid_balance_usd: state.creditPrepaidBalanceUsd,
+      free_balance_usd: state.creditFreeBalanceUsd,
+      total_balance_usd: state.creditTotalBalanceUsd,
+      reads: state.creditReads,
+      failures: state.creditFailures,
+      last_error: state.creditLastError,
+      passive_only: true,
+      hard_gate_enabled: false,
+    },
     estimated_billing_post_cost_usd: state.estimatedBillingPostCostUsd,
     budget_mode: state.budgetMode,
     budget_warning: state.budgetWarning,
@@ -730,6 +754,68 @@ async function refreshXUsage({ force = false } = {}) {
   state.usageProjectCap = Number.isFinite(cap) ? Math.max(0, Math.trunc(cap)) : null;
   state.usageLastCheckedAt = nowIso();
   updateBudgetMode();
+  return true;
+}
+
+async function refreshXCredits({ force = false } = {}) {
+  if (!state.xTokenConfigured) return false;
+  const lastMs = Date.parse(state.creditLastCheckedAt || '');
+  if (
+    !force &&
+    Number.isFinite(lastMs) &&
+    Date.now() - lastMs < X_CREDITS_REFRESH_MS
+  ) return false;
+
+  state.creditReads++;
+  let response;
+  try {
+    response = await xFetch('/2/usage/credits');
+  } catch (error) {
+    state.creditFailures++;
+    state.creditEndpointState = 'network_error';
+    state.creditLastError = String(error?.message || error).slice(0, 280);
+    state.creditLastCheckedAt = nowIso();
+    throw error;
+  }
+
+  state.creditHttpStatus = response.status;
+  const raw = await response.text();
+  let payload = {};
+  try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { payload = {}; }
+  state.creditLastCheckedAt = nowIso();
+
+  if (!response.ok) {
+    state.creditFailures++;
+    state.creditEndpointState =
+      response.status === 404 ? 'not_available_404' : 'http_error';
+    state.creditLastError =
+      'x_usage_credits_http_' + response.status + ':' + text(raw).slice(0, 220);
+    return false;
+  }
+
+  const data = payload?.data && typeof payload.data === 'object'
+    ? payload.data
+    : payload;
+  const prepaid = finiteNumber(data?.prepaid_balance, NaN);
+  const free = finiteNumber(data?.free_balance, NaN);
+  const total = finiteNumber(data?.total_balance, NaN);
+
+  state.creditPrepaidBalanceUsd =
+    Number.isFinite(prepaid) ? Number(prepaid.toFixed(4)) : null;
+  state.creditFreeBalanceUsd =
+    Number.isFinite(free) ? Number(free.toFixed(4)) : null;
+  state.creditTotalBalanceUsd =
+    Number.isFinite(total) ? Number(total.toFixed(4)) : null;
+
+  if (!Number.isFinite(total)) {
+    state.creditFailures++;
+    state.creditEndpointState = 'invalid_payload';
+    state.creditLastError = 'x_usage_credits_missing_total_balance';
+    return false;
+  }
+
+  state.creditEndpointState = 'available';
+  state.creditLastError = null;
   return true;
 }
 
@@ -1552,6 +1638,7 @@ async function configTick() {
   try {
     if (state.xTokenConfigured) {
       try { await refreshXUsage(); } catch (error) { state.lastError = `usage:${String(error?.message || error)}`; }
+      try { await refreshXCredits(); } catch (error) { state.creditLastError = String(error?.message || error).slice(0, 280); }
     }
     const changed = await readConfig();
     try { await loadPublicEventsSnapshot(); } catch (error) { state.lastError = `public_snapshot:${String(error?.message || error)}`; }
