@@ -1,0 +1,35 @@
+name: Step1073 R40 Coinbase state and backoff
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/stock-catalog-v2.mjs'
+      - '.github/workflows/step1073-r40-coinbase-state-backoff.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify R40 production health and self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 45); do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 30 -o /tmp/health.json -w '%{http_code}' "$BASE/api/stock-catalog-v2/health" || true)"
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); c=b.get('coinbase_market') or {}; good=(b.get('version')=='650.8.15.196.12' and c.get('snapshot_storage')=='dedicated_state_columns' and c.get('general_state_payload_contains_snapshot_blob') is False and c.get('failure_persistence_mode')=='runtime_health_sidecar_only' and int(c.get('backoff_base_ms') or 0)>=int(b.get('coinbase_market_refresh_interval_minutes') or 0)*60000); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$code" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$code" = "200"
+          test "$ok" = "1"
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); c=b.get('coinbase_market') or {}; print('PASS version=',b.get('version'),'storage=',c.get('snapshot_storage'),'error=',c.get('last_error'),'5xx=',c.get('consecutive_5xx_failures'),'next_retry=',c.get('next_retry_at'),'runtime_health_writes=',c.get('runtime_health_persist_successes'))"
+
+          curl --compressed -fsS --connect-timeout 8 --max-time 30 "$BASE/api/stock-catalog-v2/self-test" -o /tmp/self.json
+          python3 -c "import json; b=json.load(open('/tmp/self.json')); failed=[x for x in (b.get('tests') or []) if x.get('ok') is not True]; assert b.get('ok') is True,failed; print('PASS stock self-test checks=',b.get('checks'))"
