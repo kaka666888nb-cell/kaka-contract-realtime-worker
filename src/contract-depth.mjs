@@ -2,7 +2,7 @@ import { createPrivateKey, randomBytes, sign as cryptoSign } from 'node:crypto';
 import { fetchBinanceSpotWsApiAggregateTrades, fetchBinanceSpotWsApiDepth, getBinanceSpotWsApiHealth } from './binance-spot-ws-api.mjs';
 
 // Step656.1: dynamic Binance real quote discovery; common spot quote identities only; Binance contract REST remains disabled.
-const STEP_VERSION = '650.8.15.167';
+const STEP_VERSION = '650.8.15.168';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const RESPONSE_CACHE = new Map();
 const INFLIGHT = new Map();
@@ -23,6 +23,51 @@ const META_FRESH_MS = 6 * 60 * 60_000;
 const TRANSIENT_COOLDOWN_MS = 90_000;
 const RESTRICTED_COOLDOWN_MS = 30 * 60_000;
 const BITGET_ORDERBOOK_RATE_LIMIT_COOLDOWN_MS = 30_000;
+
+// Step1073 R38: downstream contract-depth SSE fan-out.
+// Exact-key work is shared by the key, never by the number of connected clients.
+const DEPTH_STREAM_ROUTE = '/api/contract-depth/stream';
+const DEPTH_STREAM_HEALTH_ROUTE = '/api/contract-depth/stream-health';
+const DEPTH_STREAM_SELF_TEST_ROUTE = '/api/contract-depth/stream-self-test';
+const DEPTH_STREAM_SCHEMA = 'step1073_r38_contract_depth_shared_sse_v1';
+const DEPTH_STREAM_CLIENT_MAX = Math.max(1000, Number(process.env.KAKA_DEPTH_STREAM_CLIENT_MAX || 1500));
+const DEPTH_STREAM_CLIENTS_PER_IP_MAX = Math.max(10, Number(process.env.KAKA_DEPTH_STREAM_CLIENTS_PER_IP_MAX || 50));
+const DEPTH_STREAM_CONNECTS_PER_IP_PER_MINUTE = Math.max(10, Number(process.env.KAKA_DEPTH_STREAM_CONNECTS_PER_IP_PER_MINUTE || 60));
+const DEPTH_STREAM_ACTIVE_KEY_MAX = Math.max(24, Math.min(128, Number(process.env.KAKA_DEPTH_STREAM_ACTIVE_KEY_MAX || 96)));
+const DEPTH_STREAM_TICK_MS = Math.max(200, Number(process.env.KAKA_DEPTH_STREAM_TICK_MS || 250));
+const DEPTH_STREAM_MEMORY_POLL_MS = Math.max(750, Number(process.env.KAKA_DEPTH_STREAM_MEMORY_POLL_MS || 1000));
+const DEPTH_STREAM_NETWORK_POLL_MS = Math.max(1000, Number(process.env.KAKA_DEPTH_STREAM_NETWORK_POLL_MS || 1200));
+const DEPTH_STREAM_PROVIDER_MIN_GAP_MS = Math.max(220, Number(process.env.KAKA_DEPTH_STREAM_PROVIDER_MIN_GAP_MS || 250));
+const DEPTH_STREAM_PROVIDER_MAX_INFLIGHT = Math.max(1, Math.min(2, Number(process.env.KAKA_DEPTH_STREAM_PROVIDER_MAX_INFLIGHT || 2)));
+const DEPTH_STREAM_HEARTBEAT_MS = Math.max(10_000, Number(process.env.KAKA_DEPTH_STREAM_HEARTBEAT_MS || 15_000));
+const DEPTH_STREAM_SLOW_CLIENT_MAX_BUFFERED_BYTES = Math.max(64 * 1024, Number(process.env.KAKA_DEPTH_STREAM_SLOW_CLIENT_MAX_BUFFERED_BYTES || 512 * 1024));
+
+const DEPTH_STREAM_CLIENTS = new Map();
+const DEPTH_STREAM_GROUPS = new Map();
+const DEPTH_STREAM_CLIENTS_BY_IP = new Map();
+const DEPTH_STREAM_CONNECT_ATTEMPTS_BY_IP = new Map();
+const DEPTH_STREAM_PROVIDER_LAST_START_AT = new Map();
+const DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES = new Map();
+let DEPTH_STREAM_CLIENT_SEQ = 0;
+let DEPTH_STREAM_TICK_TIMER = null;
+let DEPTH_STREAM_HEARTBEAT_TIMER = null;
+const DEPTH_STREAM_STATS = {
+  accepted_connections: 0,
+  closed_connections: 0,
+  rejected_capacity: 0,
+  rejected_invalid: 0,
+  rejected_ip_capacity: 0,
+  rejected_ip_rate: 0,
+  refresh_started: 0,
+  refresh_successes: 0,
+  refresh_failures: 0,
+  semantic_unchanged_skips: 0,
+  downstream_events: 0,
+  downstream_bytes: 0,
+  slow_client_disconnects: 0,
+  last_refresh_success_at: null,
+  last_error: '',
+};
 
 // Gate official BTC-M perpetual sizing:
 // BTC_USD is an inverse contract with a face value of 1 USD per contract.
@@ -2419,6 +2464,436 @@ export async function getContractDepthSharedOrderbook(providerRaw, symbolRaw, li
   }
 }
 
+
+function depthStreamIp(req) {
+  const forwarded = String(req?.headers?.['x-forwarded-for'] || '')
+    .split(',')
+    .map((part) => part.trim())
+    .find(Boolean);
+  return forwarded || String(req?.socket?.remoteAddress || 'unknown');
+}
+
+function pruneDepthStreamConnectAttempts(ip) {
+  const cutoff = Date.now() - 60_000;
+  const attempts = DEPTH_STREAM_CONNECT_ATTEMPTS_BY_IP.get(ip) || [];
+  while (attempts.length && attempts[0] < cutoff) attempts.shift();
+  if (attempts.length) DEPTH_STREAM_CONNECT_ATTEMPTS_BY_IP.set(ip, attempts);
+  else DEPTH_STREAM_CONNECT_ATTEMPTS_BY_IP.delete(ip);
+  return attempts;
+}
+
+function depthStreamIsMemoryBacked(group) {
+  return (
+    (group.provider === 'binance' && group.marketType === 'contract') ||
+    (group.provider === 'coinbase' && group.marketType === 'spot' && group.view === 'orderbook')
+  );
+}
+
+function depthStreamSemanticFingerprint(payload) {
+  return JSON.stringify(payload, (key, value) => {
+    if (key === 'generated_at' || key === 'cache_state' || key === 'cache_age_ms') return undefined;
+    return value;
+  });
+}
+
+function depthStreamGroupKey(provider, marketType, view, symbol, limit) {
+  return `${provider}|${marketType}|${view}|${compactSymbol(symbol)}|${limit}`;
+}
+
+function depthStreamWriteRaw(entry, body) {
+  if (!entry || entry.closed || entry.res.writableEnded || entry.res.destroyed) return false;
+  if (Number(entry.res.writableLength || 0) > DEPTH_STREAM_SLOW_CLIENT_MAX_BUFFERED_BYTES) {
+    DEPTH_STREAM_STATS.slow_client_disconnects += 1;
+    try { entry.res.destroy(); } catch (_) {}
+    closeDepthStreamClient(entry);
+    return false;
+  }
+  try {
+    entry.res.write(body);
+    DEPTH_STREAM_STATS.downstream_events += 1;
+    DEPTH_STREAM_STATS.downstream_bytes += Buffer.byteLength(body);
+    return true;
+  } catch (_) {
+    closeDepthStreamClient(entry);
+    return false;
+  }
+}
+
+function depthStreamBroadcast(group, payload) {
+  const wirePayload = {
+    ...payload,
+    downstream_stream: true,
+    downstream_fanout_shared: true,
+    same_exact_key_single_shared_refresh: true,
+    user_count_scales_exchange_requests: false,
+    refresh_scales_with_active_exact_identity: true,
+    stream_schema: DEPTH_STREAM_SCHEMA,
+  };
+  const body = `event: depth\ndata: ${JSON.stringify(wirePayload)}\n\n`;
+  group.lastWireBody = body;
+  for (const clientId of [...group.clientIds]) {
+    const entry = DEPTH_STREAM_CLIENTS.get(clientId);
+    if (!entry) {
+      group.clientIds.delete(clientId);
+      continue;
+    }
+    depthStreamWriteRaw(entry, body);
+  }
+}
+
+function closeDepthStreamClient(entry) {
+  if (!entry || entry.closed) return;
+  entry.closed = true;
+  DEPTH_STREAM_CLIENTS.delete(entry.id);
+  const group = DEPTH_STREAM_GROUPS.get(entry.groupKey);
+  if (group) {
+    group.clientIds.delete(entry.id);
+    if (!group.clientIds.size && !group.inflight) DEPTH_STREAM_GROUPS.delete(entry.groupKey);
+  }
+  const ipCount = Math.max(0, Number(DEPTH_STREAM_CLIENTS_BY_IP.get(entry.ip) || 0) - 1);
+  if (ipCount) DEPTH_STREAM_CLIENTS_BY_IP.set(entry.ip, ipCount);
+  else DEPTH_STREAM_CLIENTS_BY_IP.delete(entry.ip);
+  DEPTH_STREAM_STATS.closed_connections += 1;
+  stopDepthStreamTimersIfIdle();
+}
+
+function stopDepthStreamTimersIfIdle() {
+  if (DEPTH_STREAM_CLIENTS.size) return;
+  clearInterval(DEPTH_STREAM_TICK_TIMER);
+  clearInterval(DEPTH_STREAM_HEARTBEAT_TIMER);
+  DEPTH_STREAM_TICK_TIMER = null;
+  DEPTH_STREAM_HEARTBEAT_TIMER = null;
+  DEPTH_STREAM_GROUPS.clear();
+  DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.clear();
+}
+
+function depthStreamHeartbeat() {
+  const text = `: kaka-depth-r38-keepalive ${Date.now()}\n\n`;
+  for (const entry of [...DEPTH_STREAM_CLIENTS.values()]) {
+    if (entry.closed || entry.res.writableEnded || entry.res.destroyed) {
+      closeDepthStreamClient(entry);
+      continue;
+    }
+    if (Number(entry.res.writableLength || 0) > DEPTH_STREAM_SLOW_CLIENT_MAX_BUFFERED_BYTES) {
+      DEPTH_STREAM_STATS.slow_client_disconnects += 1;
+      try { entry.res.destroy(); } catch (_) {}
+      closeDepthStreamClient(entry);
+      continue;
+    }
+    try {
+      entry.res.write(text);
+      DEPTH_STREAM_STATS.downstream_bytes += Buffer.byteLength(text);
+    } catch (_) {
+      closeDepthStreamClient(entry);
+    }
+  }
+}
+
+async function refreshDepthStreamGroup(group) {
+  if (!group || group.inflight || !group.clientIds.size) return;
+  group.inflight = true;
+  const networkBacked = !depthStreamIsMemoryBacked(group);
+  if (networkBacked) {
+    DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.set(
+      group.provider,
+      Number(DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.get(group.provider) || 0) + 1,
+    );
+  }
+  DEPTH_STREAM_STATS.refresh_started += 1;
+  try {
+    const payload = await resolveCached(
+      group.provider,
+      group.marketType,
+      group.view,
+      group.symbol,
+      group.limit,
+    );
+    const fingerprint = depthStreamSemanticFingerprint(payload);
+    if (fingerprint === group.lastFingerprint) {
+      DEPTH_STREAM_STATS.semantic_unchanged_skips += 1;
+    } else {
+      group.lastFingerprint = fingerprint;
+      depthStreamBroadcast(group, payload);
+    }
+    group.lastError = '';
+    DEPTH_STREAM_STATS.refresh_successes += 1;
+    DEPTH_STREAM_STATS.last_refresh_success_at = new Date().toISOString();
+    DEPTH_STREAM_STATS.last_error = '';
+  } catch (error) {
+    group.lastError = String(error?.message || error).slice(0, 240);
+    DEPTH_STREAM_STATS.refresh_failures += 1;
+    DEPTH_STREAM_STATS.last_error = group.lastError;
+  } finally {
+    group.inflight = false;
+    group.lastRefreshAt = Date.now();
+    group.nextDueAt = group.lastRefreshAt + (
+      depthStreamIsMemoryBacked(group)
+        ? DEPTH_STREAM_MEMORY_POLL_MS
+        : DEPTH_STREAM_NETWORK_POLL_MS
+    );
+    if (networkBacked) {
+      const next = Math.max(
+        0,
+        Number(DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.get(group.provider) || 0) - 1,
+      );
+      if (next) DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.set(group.provider, next);
+      else DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.delete(group.provider);
+    }
+    if (!group.clientIds.size) DEPTH_STREAM_GROUPS.delete(group.key);
+  }
+}
+
+function depthStreamTick() {
+  if (!DEPTH_STREAM_CLIENTS.size || !DEPTH_STREAM_GROUPS.size) return;
+  const now = Date.now();
+  const groups = [...DEPTH_STREAM_GROUPS.values()]
+    .filter((group) => group.clientIds.size && !group.inflight && now >= Number(group.nextDueAt || 0))
+    .sort((a, b) => Number(a.lastRefreshAt || 0) - Number(b.lastRefreshAt || 0));
+
+  for (const group of groups) {
+    if (depthStreamIsMemoryBacked(group)) {
+      refreshDepthStreamGroup(group).catch(() => {});
+      continue;
+    }
+    const active = Number(DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.get(group.provider) || 0);
+    const lastStart = Number(DEPTH_STREAM_PROVIDER_LAST_START_AT.get(group.provider) || 0);
+    if (active >= DEPTH_STREAM_PROVIDER_MAX_INFLIGHT) continue;
+    if (now - lastStart < DEPTH_STREAM_PROVIDER_MIN_GAP_MS) continue;
+    DEPTH_STREAM_PROVIDER_LAST_START_AT.set(group.provider, now);
+    refreshDepthStreamGroup(group).catch(() => {});
+  }
+}
+
+function ensureDepthStreamTimers() {
+  if (!DEPTH_STREAM_TICK_TIMER) {
+    DEPTH_STREAM_TICK_TIMER = setInterval(depthStreamTick, DEPTH_STREAM_TICK_MS);
+    DEPTH_STREAM_TICK_TIMER.unref?.();
+  }
+  if (!DEPTH_STREAM_HEARTBEAT_TIMER) {
+    DEPTH_STREAM_HEARTBEAT_TIMER = setInterval(depthStreamHeartbeat, DEPTH_STREAM_HEARTBEAT_MS);
+    DEPTH_STREAM_HEARTBEAT_TIMER.unref?.();
+  }
+  depthStreamTick();
+}
+
+function contractDepthStreamSelfTest() {
+  const tests = [
+    ['client_capacity_at_least_1000', DEPTH_STREAM_CLIENT_MAX >= 1000],
+    ['active_key_bound', DEPTH_STREAM_ACTIVE_KEY_MAX >= 24 && DEPTH_STREAM_ACTIVE_KEY_MAX <= 128],
+    ['provider_gap_not_weaker_than_global_governor', DEPTH_STREAM_PROVIDER_MIN_GAP_MS >= 220],
+    ['provider_network_inflight_bounded', DEPTH_STREAM_PROVIDER_MAX_INFLIGHT <= 2],
+    ['tick_not_busy_loop', DEPTH_STREAM_TICK_MS >= 200],
+    ['heartbeat_at_least_10s', DEPTH_STREAM_HEARTBEAT_MS >= 10_000],
+    ['slow_client_buffer_bounded', DEPTH_STREAM_SLOW_CLIENT_MAX_BUFFERED_BYTES <= 2 * 1024 * 1024],
+    ['binance_contract_memory_backed', depthStreamIsMemoryBacked({ provider: 'binance', marketType: 'contract', view: 'orderbook' })],
+    ['coinbase_orderbook_memory_backed', depthStreamIsMemoryBacked({ provider: 'coinbase', marketType: 'spot', view: 'orderbook' })],
+    ['okx_network_scheduler_owned', !depthStreamIsMemoryBacked({ provider: 'okx', marketType: 'contract', view: 'orderbook' })],
+  ].map(([name, pass]) => ({ name, pass: Boolean(pass) }));
+  return { ok: tests.every((test) => test.pass), tests };
+}
+
+function contractDepthStreamHealthPayload() {
+  const providerGroups = {};
+  for (const group of DEPTH_STREAM_GROUPS.values()) {
+    providerGroups[group.provider] = Number(providerGroups[group.provider] || 0) + 1;
+  }
+  return {
+    ok: true,
+    version: STEP_VERSION,
+    schema: DEPTH_STREAM_SCHEMA,
+    stream_route: DEPTH_STREAM_ROUTE,
+    health_route: DEPTH_STREAM_HEALTH_ROUTE,
+    client_count: DEPTH_STREAM_CLIENTS.size,
+    client_max: DEPTH_STREAM_CLIENT_MAX,
+    active_key_count: DEPTH_STREAM_GROUPS.size,
+    active_key_max: DEPTH_STREAM_ACTIVE_KEY_MAX,
+    clients_per_ip_max: DEPTH_STREAM_CLIENTS_PER_IP_MAX,
+    connects_per_ip_per_minute: DEPTH_STREAM_CONNECTS_PER_IP_PER_MINUTE,
+    tick_ms: DEPTH_STREAM_TICK_MS,
+    memory_poll_ms: DEPTH_STREAM_MEMORY_POLL_MS,
+    network_poll_ms: DEPTH_STREAM_NETWORK_POLL_MS,
+    provider_min_gap_ms: DEPTH_STREAM_PROVIDER_MIN_GAP_MS,
+    provider_max_inflight: DEPTH_STREAM_PROVIDER_MAX_INFLIGHT,
+    heartbeat_ms: DEPTH_STREAM_HEARTBEAT_MS,
+    slow_client_max_buffered_bytes: DEPTH_STREAM_SLOW_CLIENT_MAX_BUFFERED_BYTES,
+    provider_groups: providerGroups,
+    provider_active_refreshes: Object.fromEntries(DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES),
+    same_exact_key_single_shared_refresh: true,
+    downstream_payload_serialized_once_per_group_change: true,
+    user_count_scales_exchange_requests: false,
+    refresh_scales_with_active_exact_identity: true,
+    rest_provider_refresh_is_additionally_global_governed: true,
+    rest_provider_stream_scheduler_gap_not_weaker_than_global_governor: true,
+    rest_fallback_route_preserved: true,
+    self_test: contractDepthStreamSelfTest(),
+    ...DEPTH_STREAM_STATS,
+    now: new Date().toISOString(),
+  };
+}
+
+function handleContractDepthStream(req, res, url) {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET, OPTIONS',
+      'access-control-allow-headers': 'accept, cache-control',
+      'cache-control': 'no-store',
+    });
+    res.end();
+    return true;
+  }
+  if (req.method !== 'GET') {
+    sendJson(res, 405, { ok: false, version: STEP_VERSION, error: 'method_not_allowed' });
+    return true;
+  }
+
+  const provider = normalizeProvider(url.searchParams.get('provider'));
+  const marketType = String(url.searchParams.get('market_type') || 'contract').trim().toLowerCase() === 'spot'
+    ? 'spot'
+    : 'contract';
+  const view = String(url.searchParams.get('view') || 'orderbook').trim().toLowerCase() === 'trades'
+    ? 'trades'
+    : 'orderbook';
+  const symbol = compactSymbol(url.searchParams.get('symbol'));
+  const limit = clampLimit(view, url.searchParams.get('limit'), provider, marketType);
+  if (!SUPPORTED_PROVIDERS.has(provider) || (marketType === 'contract' && provider === 'coinbase')) {
+    DEPTH_STREAM_STATS.rejected_invalid += 1;
+    sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'unsupported_provider', provider });
+    return true;
+  }
+  if (!symbol) {
+    DEPTH_STREAM_STATS.rejected_invalid += 1;
+    sendJson(res, 400, { ok: false, version: STEP_VERSION, error: 'invalid_symbol' });
+    return true;
+  }
+
+  const key = depthStreamGroupKey(provider, marketType, view, symbol, limit);
+  let group = DEPTH_STREAM_GROUPS.get(key);
+  if (!group && DEPTH_STREAM_GROUPS.size >= DEPTH_STREAM_ACTIVE_KEY_MAX) {
+    DEPTH_STREAM_STATS.rejected_capacity += 1;
+    sendJson(
+      res,
+      503,
+      { ok: false, version: STEP_VERSION, error: 'depth_stream_active_key_capacity', retry_after_seconds: 5 },
+      { 'retry-after': '5' },
+    );
+    return true;
+  }
+  if (DEPTH_STREAM_CLIENTS.size >= DEPTH_STREAM_CLIENT_MAX) {
+    DEPTH_STREAM_STATS.rejected_capacity += 1;
+    sendJson(
+      res,
+      503,
+      { ok: false, version: STEP_VERSION, error: 'depth_stream_client_capacity', retry_after_seconds: 5 },
+      { 'retry-after': '5' },
+    );
+    return true;
+  }
+
+  const ip = depthStreamIp(req);
+  const attempts = pruneDepthStreamConnectAttempts(ip);
+  if (attempts.length >= DEPTH_STREAM_CONNECTS_PER_IP_PER_MINUTE) {
+    DEPTH_STREAM_STATS.rejected_ip_rate += 1;
+    sendJson(
+      res,
+      429,
+      { ok: false, version: STEP_VERSION, error: 'depth_stream_ip_connect_rate', retry_after_seconds: 5 },
+      { 'retry-after': '5' },
+    );
+    return true;
+  }
+  if (Number(DEPTH_STREAM_CLIENTS_BY_IP.get(ip) || 0) >= DEPTH_STREAM_CLIENTS_PER_IP_MAX) {
+    DEPTH_STREAM_STATS.rejected_ip_capacity += 1;
+    sendJson(
+      res,
+      503,
+      { ok: false, version: STEP_VERSION, error: 'depth_stream_ip_capacity', retry_after_seconds: 5 },
+      { 'retry-after': '5' },
+    );
+    return true;
+  }
+
+  attempts.push(Date.now());
+  DEPTH_STREAM_CONNECT_ATTEMPTS_BY_IP.set(ip, attempts);
+
+  if (!group) {
+    group = {
+      key,
+      provider,
+      marketType,
+      view,
+      symbol,
+      limit,
+      clientIds: new Set(),
+      inflight: false,
+      lastFingerprint: '',
+      lastWireBody: '',
+      lastRefreshAt: 0,
+      nextDueAt: 0,
+      lastError: '',
+    };
+    DEPTH_STREAM_GROUPS.set(key, group);
+  }
+
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store, no-transform',
+    'connection': 'keep-alive',
+    'access-control-allow-origin': '*',
+    'x-kaka-stream-schema': DEPTH_STREAM_SCHEMA,
+  });
+  res.write(`event: ready\ndata: ${JSON.stringify({
+    ok: true,
+    version: STEP_VERSION,
+    schema: DEPTH_STREAM_SCHEMA,
+    provider,
+    market_type: marketType,
+    symbol,
+    view,
+    limit,
+    same_exact_key_single_shared_refresh: true,
+    user_count_scales_exchange_requests: false,
+    rest_fallback_preserved: true,
+  })}\n\n`);
+
+  const entry = {
+    id: ++DEPTH_STREAM_CLIENT_SEQ,
+    ip,
+    req,
+    res,
+    groupKey: key,
+    closed: false,
+    connectedAt: Date.now(),
+  };
+  DEPTH_STREAM_CLIENTS.set(entry.id, entry);
+  group.clientIds.add(entry.id);
+  DEPTH_STREAM_CLIENTS_BY_IP.set(ip, Number(DEPTH_STREAM_CLIENTS_BY_IP.get(ip) || 0) + 1);
+  DEPTH_STREAM_STATS.accepted_connections += 1;
+
+  if (group.lastWireBody) depthStreamWriteRaw(entry, group.lastWireBody);
+
+  const close = () => closeDepthStreamClient(entry);
+  req.once('aborted', close);
+  req.once('close', close);
+  res.once('close', close);
+  res.once('error', close);
+  ensureDepthStreamTimers();
+  if (!group.inflight && Date.now() >= Number(group.nextDueAt || 0)) {
+    if (depthStreamIsMemoryBacked(group)) {
+      refreshDepthStreamGroup(group).catch(() => {});
+    } else {
+      const active = Number(DEPTH_STREAM_PROVIDER_ACTIVE_REFRESHES.get(group.provider) || 0);
+      const lastStart = Number(DEPTH_STREAM_PROVIDER_LAST_START_AT.get(group.provider) || 0);
+      if (active < DEPTH_STREAM_PROVIDER_MAX_INFLIGHT &&
+          Date.now() - lastStart >= DEPTH_STREAM_PROVIDER_MIN_GAP_MS) {
+        DEPTH_STREAM_PROVIDER_LAST_START_AT.set(group.provider, Date.now());
+        refreshDepthStreamGroup(group).catch(() => {});
+      }
+    }
+  }
+  return true;
+}
+
 export function getContractDepthHealth() {
   pruneBinanceDepthConnectAttempts();
   return {
@@ -2431,6 +2906,7 @@ export function getContractDepthHealth() {
     shared_background_orderbook_last_error: SHARED_BACKGROUND_STATS.last_error,
     shared_background_orderbook_uses_same_cache_inflight_governor: true,
     shared_background_user_reads_open_upstream: false,
+    downstream_stream: contractDepthStreamHealthPayload(),
     bitget_contract_orderbook_rate_limit_recovery_enabled: true,
     bitget_contract_orderbook_429_cooldown_ms: BITGET_ORDERBOOK_RATE_LIMIT_COOLDOWN_MS,
     bitget_contract_orderbook_rate_limit_does_not_raise_request_cap: true,
@@ -2557,6 +3033,30 @@ export function getContractDepthHealth() {
 }
 
 export async function handleContractDepth(req, res, url) {
+  if (url.pathname === DEPTH_STREAM_HEALTH_ROUTE) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { ok: false, version: STEP_VERSION, error: 'method_not_allowed' });
+      return true;
+    }
+    sendJson(res, 200, contractDepthStreamHealthPayload());
+    return true;
+  }
+  if (url.pathname === DEPTH_STREAM_SELF_TEST_ROUTE) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { ok: false, version: STEP_VERSION, error: 'method_not_allowed' });
+      return true;
+    }
+    const selfTest = contractDepthStreamSelfTest();
+    sendJson(res, selfTest.ok ? 200 : 500, {
+      ok: selfTest.ok,
+      version: STEP_VERSION,
+      self_test: selfTest,
+    });
+    return true;
+  }
+  if (url.pathname === DEPTH_STREAM_ROUTE) {
+    return handleContractDepthStream(req, res, url);
+  }
   if (url.pathname === '/api/gate-depth-self-test') {
     if (req.method !== 'GET') {
       sendJson(res, 405, {
@@ -2633,4 +3133,11 @@ export async function handleContractDepth(req, res, url) {
 export const __contractDepthStep1024Test = Object.freeze({
   clampLimit,
   parseCoinbaseProductFacts,
+});
+
+export const __contractDepthStreamStep1073Test = Object.freeze({
+  selfTest: contractDepthStreamSelfTest,
+  health: contractDepthStreamHealthPayload,
+  isMemoryBacked: depthStreamIsMemoryBacked,
+  semanticFingerprint: depthStreamSemanticFingerprint,
 });

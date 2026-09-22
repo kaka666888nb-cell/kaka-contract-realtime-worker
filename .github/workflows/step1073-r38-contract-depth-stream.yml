@@ -1,0 +1,86 @@
+name: Step1073 R38 contract depth shared stream
+
+on:
+  push:
+    branches:
+      - candidate-step1073-r38-contract-depth-stream
+      - main
+    paths:
+      - 'src/contract-depth.mjs'
+      - '.github/workflows/step1073-r38-contract-depth-stream.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check src/contract-depth.mjs
+          node --input-type=module <<'NODE'
+          const m=await import('./src/contract-depth.mjs');
+          const t=m.__contractDepthStreamStep1073Test;
+          if(!t) throw new Error('missing_r38_test_export');
+          const s=t.selfTest();
+          console.log(JSON.stringify(s));
+          if(!s.ok) process.exit(1);
+          NODE
+
+  production:
+    if: github.ref == 'refs/heads/main'
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Verify production stream health and one event
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 60); do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 20 -o /tmp/health.json -w '%{http_code}' "$BASE/api/contract-depth/stream-health" || true)"
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); s=b.get('self_test') or {}; good=(b.get('version')=='650.8.15.168' and b.get('schema')=='step1073_r38_contract_depth_shared_sse_v1' and b.get('same_exact_key_single_shared_refresh') is True and b.get('user_count_scales_exchange_requests') is False and b.get('provider_min_gap_ms',0)>=220 and b.get('provider_max_inflight',99)<=2 and b.get('client_max',0)>=1000 and s.get('ok') is True); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$code" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$code" = "200"
+          test "$ok" = "1"
+          curl --compressed -fsS --connect-timeout 8 --max-time 20 "$BASE/api/contract-depth/stream-self-test" -o /tmp/self.json
+          python3 - <<'PY'
+          import json
+          h=json.load(open('/tmp/health.json')); s=json.load(open('/tmp/self.json'))
+          assert s.get('ok') is True and (s.get('self_test') or {}).get('ok') is True, s
+          print('health PASS clients=',h.get('client_count'),'keys=',h.get('active_key_count'),'gap=',h.get('provider_min_gap_ms'),'max_inflight=',h.get('provider_max_inflight'))
+          PY
+          python3 - <<'PY'
+          import http.client, json, ssl, time
+          host='kaka-contract-realtime-worker.onrender.com'
+          path='/api/contract-depth/stream?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
+          c=http.client.HTTPSConnection(host,timeout=15,context=ssl.create_default_context())
+          c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'})
+          r=c.getresponse()
+          assert r.status==200,r.status
+          assert 'text/event-stream' in (r.getheader('content-type') or '').lower()
+          deadline=time.time()+12
+          got=False
+          while time.time()<deadline:
+              line=r.readline().decode('utf-8','replace').strip()
+              if not line.startswith('data:'): continue
+              raw=line[5:].strip()
+              if not raw: continue
+              p=json.loads(raw)
+              if isinstance(p.get('bids'),list) and isinstance(p.get('asks'),list):
+                  assert p.get('downstream_fanout_shared') is True,p
+                  assert p.get('user_count_scales_exchange_requests') is False,p
+                  got=True
+                  print('stream PASS cache=',p.get('cache_state'),'bids=',len(p.get('bids',[])),'asks=',len(p.get('asks',[])))
+                  break
+          c.close()
+          assert got,'no_depth_event'
+          PY
