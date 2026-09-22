@@ -76,7 +76,7 @@ const DEX_BASE = 'https://api.dexscreener.com';
 // Paid DEX Screener boosts/ads/CTO remain supplemental identity discovery only and never
 // participate in the hot rank score.
 const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
-const GECKO_MIN_GAP_MS = Math.max(6_500, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 7_000));
+const GECKO_MIN_GAP_MS = Math.max(12_500, Number(process.env.KAKA_GECKO_MIN_GAP_MS || 12_500));
 const GECKO_MAX_QUEUE = Math.max(6, Math.min(32, Number(process.env.KAKA_GECKO_MAX_QUEUE || 20)));
 const GECKO_TIMEOUT_MS = Math.max(6_000, Math.min(25_000, Number(process.env.KAKA_GECKO_TIMEOUT_MS || 15_000)));
 const GECKO_NETWORK = Object.freeze({
