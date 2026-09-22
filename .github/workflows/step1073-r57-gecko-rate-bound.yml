@@ -1,0 +1,78 @@
+name: Step1073 R57 Gecko conservative rate bound
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/onchain-market.mjs'
+      - '.github/workflows/step1073-r57-gecko-rate-bound.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for R57 production health
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 40); do
+            code="$(curl -sS --connect-timeout 8 --max-time 20 -o /tmp/health.json -w '%{http_code}' "$BASE/api/onchain/health" || true)"
+            gap="$(python3 - <<'PY'
+import json
+try:
+    b=json.load(open('/tmp/health.json'))
+    print((b.get('discovery') or {}).get('gecko_min_gap_ms') or '')
+except Exception:
+    print('')
+PY
+)"
+            ceil="$(python3 - <<'PY'
+import json
+try:
+    b=json.load(open('/tmp/health.json'))
+    print((b.get('discovery') or {}).get('gecko_default_requests_per_minute_ceiling') or '')
+except Exception:
+    print('')
+PY
+)"
+            echo "poll=$i http=$code gecko_min_gap_ms=$gap ceiling=$ceil"
+            if [ "$code" = "200" ] && python3 - "$gap" "$ceil" <<'PY'
+import sys
+try:
+    gap=float(sys.argv[1]); ceil=float(sys.argv[2])
+    raise SystemExit(0 if gap >= 12500 and ceil <= 4.8 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+            then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'R57 production health did not reach conservative Gecko bound' >&2
+          exit 1
+
+      - name: Full onchain self-test must be green
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 30 "$BASE/api/onchain/self-test" -o /tmp/self.json
+          python3 - <<'PY'
+import json
+b=json.load(open('/tmp/self.json'))
+tests=b.get('tests') or []
+failed=[x for x in tests if x.get('pass') is not True]
+assert b.get('ok') is True, {'ok':b.get('ok'),'failed':failed}
+name='step1042_2_gecko_nine_chain_conservative_rate_bound'
+match=[x for x in tests if x.get('name')==name]
+assert len(match)==1 and match[0].get('pass') is True, match
+print('PASS overall self-test tests=',len(tests))
+print('PASS',name)
+PY
