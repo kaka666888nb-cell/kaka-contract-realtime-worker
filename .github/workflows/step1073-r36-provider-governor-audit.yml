@@ -1,4 +1,4 @@
-name: Step1073 R37B downstream HTTP 25-concurrency audit
+name: Step1073 R37C sustained 100rps downstream audit
 
 on:
   push:
@@ -15,39 +15,63 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Run finite cached-orderbook load
+      - name: Run 30-second paced cached-orderbook load
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import concurrent.futures, urllib.request, urllib.error, time, json, collections
-          url='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
+          import concurrent.futures, http.client, ssl, threading, time, json, collections
+          host='kaka-contract-realtime-worker.onrender.com'
+          path='/api/contract-depth?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
+          tls=threading.local()
+          context=ssl.create_default_context()
+          def conn():
+              c=getattr(tls,'c',None)
+              if c is None:
+                  c=http.client.HTTPSConnection(host,timeout=15,context=context)
+                  tls.c=c
+              return c
+          def reset():
+              c=getattr(tls,'c',None)
+              if c:
+                  try:c.close()
+                  except:pass
+              tls.c=None
           def one(_):
               t=time.perf_counter()
-              try:
-                  req=urllib.request.Request(url,headers={'User-Agent':'KakaWeb3-R37B-capacity-audit'})
-                  with urllib.request.urlopen(req,timeout=15) as r:
+              for attempt in (1,2):
+                  try:
+                      c=conn()
+                      c.request('GET',path,headers={'User-Agent':'KakaWeb3-R37C-capacity-audit','Connection':'keep-alive'})
+                      r=c.getresponse()
                       body=r.read()
                       code=r.status
-                      cache=r.headers.get('x-kaka-cache','')
-                      size=len(body)
+                      cache=r.getheader('x-kaka-cache','')
                       try:
                           p=json.loads(body)
                           ok=(p.get('ok') is True and isinstance(p.get('bids'),list) and isinstance(p.get('asks'),list))
                       except Exception:
                           ok=False
-                  return code,cache,ok,(time.perf_counter()-t)*1000,size
-              except urllib.error.HTTPError as e:
-                  return e.code,'',False,(time.perf_counter()-t)*1000,0
-              except Exception as e:
-                  return 0,type(e).__name__,False,(time.perf_counter()-t)*1000,0
-          warm=one(-1)
-          print('warm=',warm)
-          total=500
-          workers=25
+                      return code,cache,ok,(time.perf_counter()-t)*1000,len(body)
+                  except Exception as e:
+                      reset()
+                      if attempt==2:
+                          return 0,type(e).__name__,False,(time.perf_counter()-t)*1000,0
+          # warm
+          print('warm=',one(-1))
+          target_rps=100
+          seconds=30
+          total=target_rps*seconds
+          workers=50
+          futures=[]
           start=time.perf_counter()
           with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-              rows=list(ex.map(one,range(total)))
+              for i in range(total):
+                  target=start+i/target_rps
+                  delay=target-time.perf_counter()
+                  if delay>0: time.sleep(delay)
+                  futures.append(ex.submit(one,i))
+              rows=[f.result() for f in futures]
           elapsed=time.perf_counter()-start
           lat=sorted(x[3] for x in rows)
           codes=collections.Counter(x[0] for x in rows)
@@ -57,11 +81,11 @@ jobs:
           def pct(p):
               i=min(len(lat)-1,max(0,int(round((len(lat)-1)*p))))
               return round(lat[i],2)
-          print('total=',total,'workers=',workers,'elapsed_s=',round(elapsed,3),'rps=',round(total/elapsed,2))
+          print('target_rps=',target_rps,'seconds=',seconds,'total=',total,'workers=',workers,'elapsed_s=',round(elapsed,3),'achieved_rps=',round(total/elapsed,2))
           print('codes=',dict(codes),'payload_ok=',oks,'cache_states=',dict(caches))
           print('lat_ms p50=',pct(.50),'p95=',pct(.95),'p99=',pct(.99),'max=',round(max(lat),2))
-          print('body_bytes avg=',round(sum(sizes)/len(sizes),1),'max=',max(sizes),'total=',sum(sizes))
-          assert codes == {200: total}, codes
+          print('body_bytes avg=',round(sum(sizes)/len(sizes),1),'total=',sum(sizes))
+          assert codes.get(200,0) == total, codes
           assert oks == total, oks
           assert pct(.99) < 5000, pct(.99)
           PY
