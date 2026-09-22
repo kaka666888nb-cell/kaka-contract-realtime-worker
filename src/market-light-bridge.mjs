@@ -6,12 +6,17 @@ const STATE_SCOPE = CONSUMER_ROLE === 'deep-market' ? 'deep-market' : CONSUMER_R
 const DEFAULT_POLL_MS =
   CONSUMER_ROLE === 'slow-stats' ? 8_000 :
   CONSUMER_ROLE === 'deep-market' ? 5_000 :
-  2_500;
+  10_000;
 const DEFAULT_STALE_MS =
   CONSUMER_ROLE === 'slow-stats' ? 30_000 :
   CONSUMER_ROLE === 'deep-market' ? 20_000 :
-  15_000;
-const POLL_MS = Math.max(750, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_POLL_MS || DEFAULT_POLL_MS));
+  30_000;
+// Step1073 R59: the parent consumes a 30s market-light shared round for Basis,
+// Reality rank and the 2m asset-rank layer. Polling the same projected ~7k-row
+// round every 2.5s only repeats clone/projection/JSON work. Keep parent at a
+// hard 10s floor while preserving the faster dedicated deep/slow bridges.
+const MIN_POLL_MS = CONSUMER_ROLE === 'parent' ? 10_000 : 750;
+const POLL_MS = Math.max(MIN_POLL_MS, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_POLL_MS || DEFAULT_POLL_MS));
 const STALE_MS = Math.max(5_000, Number(process.env.KAKA_MARKET_LIGHT_BRIDGE_STALE_MS || DEFAULT_STALE_MS));
 
 let timer = null;
