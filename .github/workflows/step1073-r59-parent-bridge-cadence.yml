@@ -1,0 +1,41 @@
+name: Step1073 R59 parent bridge cadence
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/market-light-bridge.mjs'
+      - '.github/workflows/step1073-r59-parent-bridge-cadence.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify parent bridge cadence and consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 30); do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 25 -o /tmp/health.json -w '%{http_code}' "$BASE/health" || true)"
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); m=b.get('market_light_state') or {}; good=(m.get('isolated_bridge_consumer_role')=='parent' and int(m.get('isolated_bridge_poll_ms') or 0)>=10000 and int(m.get('isolated_bridge_stale_ms') or 0)>=30000 and m.get('isolated_bridge_projected_payloads') is True and m.get('isolated_bridge_full_row_copy_disabled') is True); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$code" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$code" = "200"
+          test "$ok" = "1"
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); m=b.get('market_light_state') or {}; print('PASS parent poll_ms=',m.get('isolated_bridge_poll_ms'),'stale_ms=',m.get('isolated_bridge_stale_ms'),'providers=',m.get('isolated_bridge_provider_snapshot_count'),'fresh=',m.get('isolated_bridge_fresh'))"
+
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/basis.json
+          python3 -c "import json; b=json.load(open('/tmp/basis.json')); assert b.get('ok') is True,b; print('PASS basis health')"
+
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/asset-market/rank-health" -o /tmp/rank.json
+          python3 -c "import json; b=json.load(open('/tmp/rank.json')); assert b.get('ok') is True,b; print('PASS asset rank health')"
+
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/asset-klines/reality-ranked-page?sort=change_desc&offset=0&limit=5" -o /tmp/reality.json
+          python3 -c "import json; b=json.load(open('/tmp/reality.json')); assert b.get('ok') is True,b; assert int(b.get('user_read_upstream_requests') or 0)==0,b; print('PASS reality rank rows=',len(b.get('rows') or []),'user_upstream=0')"
