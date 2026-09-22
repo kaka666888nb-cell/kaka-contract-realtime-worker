@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.12';
+const STEP_VERSION = '650.8.15.197.3.3.13';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -58,6 +58,8 @@ const LIQUIDATION_HOUR_TABLE = 'app_contract_liquidation_1h_cache';
 // history base. 5m/15m are derived from 1m; 1H/6H/24H remain based on the
 // long-lived 1h aggregate store. Raw events remain process-memory only.
 const LIQUIDATION_MINUTE_TABLE = 'app_contract_liquidation_1m_cache';
+const LIQUIDATION_MINUTE_DIFF_RPC = 'app_upsert_contract_liquidation_1m_batch_diff';
+const LIQUIDATION_MINUTE_REPLACE_DIFF_RPC = 'app_replace_contract_liquidation_1m_window_diff';
 const LIQUIDATION_GATE_COVERAGE_TABLE = 'app_contract_liquidation_gate_1m_coverage';
 const LIQUIDATION_CLEANUP_RPC = 'kaka_cleanup_contract_liquidation_step997_cache';
 const LIQUIDATION_STEP997_HISTORY_RPC = 'kaka_contract_liquidation_history_step997';
@@ -289,6 +291,9 @@ const liquidationPersistenceHealth = {
   minute_last_flush_rows: 0,
   minute_flush_error: '',
   minute_persisted_rows_total: 0,
+  minute_rpc_unchanged_rows_total: 0,
+  minute_closed_same_signature_skips: 0,
+  minute_official_replace_deleted_rows_total: 0,
   // Step1042.1.4 diagnostics. Counters are process-local and bounded; no raw
   // event body or additional event history is persisted.
   event_time_seconds_to_ms: 0,
@@ -499,6 +504,10 @@ function liquidationHourPersistSignature(row) {
   ]);
 }
 
+function liquidationMinutePersistSignature(row) {
+  return liquidationHourPersistSignature(row);
+}
+
 function capLiquidationMinutePersistQueue() {
   while (liquidationMinutePersistQueue.size > LIQUIDATION_PERSIST_QUEUE_MAX) {
     const first = liquidationMinutePersistQueue.keys().next().value;
@@ -535,9 +544,15 @@ function queueLiquidationMinuteBucket(state, bucket, now = Date.now()) {
   const row = liquidationPersistRow(state, bucket, now, 'render_public_liquidation_ws_minute_bucket_v1');
   if (!row) return;
   const key = `${row.provider}|${row.symbol}|${row.bucket_start}`;
-  const signature = liquidationPersistSignature(row);
+  const signature = liquidationMinutePersistSignature(row);
   const gate = liquidationMinutePersistGate.get(key);
-  if (gate?.signature === signature && now - Number(gate.at || 0) < 3 * 60_000) return;
+  if (gate?.signature === signature) {
+    if (row.bucket_closed === true) {
+      liquidationPersistenceHealth.minute_closed_same_signature_skips += 1;
+      return;
+    }
+    if (now - Number(gate.at || 0) < 3 * 60_000) return;
+  }
   liquidationMinutePersistQueue.set(key, { row, signature });
   capLiquidationMinutePersistQueue();
 }
@@ -548,22 +563,71 @@ async function upsertLiquidationMinuteRows(rows) {
   for (let index = 0; index < rows.length; index += 250) {
     const chunk = rows.slice(index, index + 250);
     const response = await fetch(
-      `${SUPABASE_URL}/rest/v1/${LIQUIDATION_MINUTE_TABLE}?on_conflict=provider,market_type,symbol,bucket_start`,
+      `${SUPABASE_URL}/rest/v1/rpc/${LIQUIDATION_MINUTE_DIFF_RPC}`,
       {
         method: 'POST',
         headers: liquidationSupabaseHeaders({
           'content-type': 'application/json',
-          prefer: 'resolution=merge-duplicates,return=minimal',
         }),
-        body: JSON.stringify(chunk),
+        body: JSON.stringify({ p_rows: chunk }),
         signal: AbortSignal.timeout(15000),
       },
     );
     const responseText = await response.text();
-    if (!response.ok) throw new Error(`liquidation_minute_upsert_http_${response.status}:${responseText.slice(0, 220)}`);
-    written += chunk.length;
+    if (!response.ok) throw new Error(`liquidation_minute_diff_rpc_http_${response.status}:${responseText.slice(0, 220)}`);
+    let payload = null;
+    try { payload = JSON.parse(responseText || '{}'); } catch { payload = null; }
+    const actualWritten = Number(payload?.written);
+    const unchanged = Number(payload?.unchanged);
+    if (!Number.isFinite(actualWritten) || actualWritten < 0 || actualWritten > chunk.length) {
+      throw new Error(`liquidation_minute_diff_rpc_invalid_written:${responseText.slice(0, 220)}`);
+    }
+    if (Number.isFinite(unchanged) && unchanged > 0) {
+      liquidationPersistenceHealth.minute_rpc_unchanged_rows_total += unchanged;
+    }
+    written += actualWritten;
   }
   return written;
+}
+
+async function replaceOfficialLiquidationMinuteRows(provider, startMs, rows) {
+  const startIso = liquidationIso(startMs);
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/rpc/${LIQUIDATION_MINUTE_REPLACE_DIFF_RPC}`,
+    {
+      method: 'POST',
+      headers: liquidationSupabaseHeaders({
+        'content-type': 'application/json',
+      }),
+      body: JSON.stringify({
+        p_provider: provider,
+        p_bucket_start: startIso,
+        p_rows: rows,
+      }),
+      signal: AbortSignal.timeout(15000),
+    },
+  );
+  const responseText = await response.text();
+  if (!response.ok) throw new Error(`liquidation_minute_replace_diff_rpc_http_${response.status}:${responseText.slice(0, 220)}`);
+  let payload = null;
+  try { payload = JSON.parse(responseText || '{}'); } catch { payload = null; }
+  const written = Number(payload?.written);
+  const unchanged = Number(payload?.unchanged);
+  const deleted = Number(payload?.deleted_missing);
+  if (!Number.isFinite(written) || written < 0 || written > rows.length) {
+    throw new Error(`liquidation_minute_replace_diff_rpc_invalid_written:${responseText.slice(0, 220)}`);
+  }
+  if (Number.isFinite(unchanged) && unchanged > 0) {
+    liquidationPersistenceHealth.minute_rpc_unchanged_rows_total += unchanged;
+  }
+  if (Number.isFinite(deleted) && deleted > 0) {
+    liquidationPersistenceHealth.minute_official_replace_deleted_rows_total += deleted;
+  }
+  return {
+    written,
+    unchanged: Number.isFinite(unchanged) ? unchanged : 0,
+    deleted: Number.isFinite(deleted) ? deleted : 0,
+  };
 }
 
 async function flushLiquidationMinutePersistQueue() {
@@ -1865,16 +1929,7 @@ async function upsertGateLiquidationCoverage({ startMs, endMs, rowCount, parsedR
 }
 
 async function replaceGateOfficialMinuteRows(startMs, rows) {
-  const startIso = liquidationIso(startMs);
-  const deleteQuery = new URLSearchParams({ provider: 'eq.gate', bucket_start: `eq.${startIso}` });
-  const del = await fetch(`${SUPABASE_URL}/rest/v1/${LIQUIDATION_MINUTE_TABLE}?${deleteQuery}`, {
-    method: 'DELETE',
-    headers: liquidationSupabaseHeaders({ prefer: 'return=minimal' }),
-    signal: AbortSignal.timeout(15000),
-  });
-  const deleteText = await del.text();
-  if (!del.ok) throw new Error(`gate_liq_minute_replace_delete_http_${del.status}:${deleteText.slice(0, 220)}`);
-  if (rows.length) await upsertLiquidationMinuteRows(rows);
+  return replaceOfficialLiquidationMinuteRows('gate', startMs, rows);
 }
 
 function gateOfficialMinuteRows(rawRows, startMs, endMs) {
@@ -1996,11 +2051,11 @@ async function pollGateOfficialLiquidationMinute(now = Date.now(), { force = fal
         complete,
       });
       if (complete) {
-        await replaceGateOfficialMinuteRows(startMs, materialized.rows);
+        const replaceResult = await replaceGateOfficialMinuteRows(startMs, materialized.rows);
         replaceProviderOfficialHeatmapMinute('gate', startMs, materialized.heatmapEvents, 'gate_official_liq_orders_closed_minute');
         gateOfficialFinalizedMinuteStarts.set(startMs, Date.now());
         gateLiqOrdersHealth.complete_windows += 1;
-        liquidationPersistenceHealth.minute_persisted_rows_total += materialized.rows.length;
+        liquidationPersistenceHealth.minute_persisted_rows_total += replaceResult.written;
         liquidationHistoryCache.clear();
       }
       gateLiqOrdersHealth.successes += 1;
@@ -2220,13 +2275,7 @@ async function replaceBitgetOfficialMinuteRows(startMs, rows) {
   for(const key of [...liquidationMinutePersistGate.keys()]){
     if(key.startsWith('bitget|') && key.endsWith(`|${startIso}`)) liquidationMinutePersistGate.delete(key);
   }
-  const query=new URLSearchParams({provider:'eq.bitget',bucket_start:`eq.${startIso}`});
-  const del=await fetch(`${SUPABASE_URL}/rest/v1/${LIQUIDATION_MINUTE_TABLE}?${query}`,{
-    method:'DELETE',headers:liquidationSupabaseHeaders({prefer:'return=minimal'}),signal:AbortSignal.timeout(15000),
-  });
-  const text=await del.text();
-  if(!del.ok)throw new Error(`bitget_liq_minute_replace_delete_http_${del.status}:${text.slice(0,220)}`);
-  if(rows.length)await upsertLiquidationMinuteRows(rows);
+  return replaceOfficialLiquidationMinuteRows('bitget', startMs, rows);
 }
 
 async function pollBitgetOfficialLiquidationMinute(now=Date.now(),{force=false}={}){
@@ -2320,7 +2369,7 @@ async function pollBitgetOfficialLiquidationMinute(now=Date.now(),{force=false}=
         return {ok:true,deferred:true,reason:coverageCheck.reason,startMs,endMs,requests:requestCount,retry_after_ms:deferred.delayMs};
       }
 
-      await replaceBitgetOfficialMinuteRows(startMs,materialized.rows);
+      const replaceResult=await replaceBitgetOfficialMinuteRows(startMs,materialized.rows);
       replaceProviderOfficialHeatmapMinute('bitget', startMs, materialized.heatmapEvents, 'bitget_official_liquidations_history_reconciled_minute');
       bitgetLiqHistoryDeferredWindows.delete(startMs);
       bitgetLiqHistoryHealth.deferred_windows=bitgetLiqHistoryDeferredWindows.size;
@@ -2334,9 +2383,9 @@ async function pollBitgetOfficialLiquidationMinute(now=Date.now(),{force=false}=
       bitgetLiqHistoryHealth.last_completed_at=new Date().toISOString();
       bitgetLiqHistoryHealth.last_error='';
       bitgetLiqHistoryHealth.last_deferred_reason='';
-      liquidationPersistenceHealth.minute_persisted_rows_total+=materialized.rows.length;
+      liquidationPersistenceHealth.minute_persisted_rows_total+=replaceResult.written;
       liquidationHistoryCache.clear();
-      return {ok:true,startMs,endMs,rows:rawCount,persisted:materialized.rows.length,complete:true,requests:requestCount};
+      return {ok:true,startMs,endMs,rows:rawCount,persisted:materialized.rows.length,physical_written:replaceResult.written,unchanged:replaceResult.unchanged,deleted_missing:replaceResult.deleted,complete:true,requests:requestCount};
     }catch(error){
       bitgetLiqHistoryHealth.failures+=1;
       bitgetLiqHistoryHealth.last_requests=requestCount;
@@ -2404,6 +2453,10 @@ export function getContractLiquidationPersistenceHealth() {
     minute_aggregate_retention_hours: LIQUIDATION_MINUTE_RETENTION_HOURS,
     minute_persist_queue: liquidationMinutePersistQueue.size,
     minute_persist_inflight: Boolean(liquidationMinutePersistInflight),
+    minute_persist_rpc: LIQUIDATION_MINUTE_DIFF_RPC,
+    minute_official_replace_rpc: LIQUIDATION_MINUTE_REPLACE_DIFF_RPC,
+    minute_closed_unchanged_noop: true,
+    minute_closed_same_signature_gate: true,
     zero_event_rows_persisted: false,
     raw_events_process_memory_only: true,
     gate_liq_orders: { ...gateLiqOrdersHealth },
