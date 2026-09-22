@@ -1253,6 +1253,15 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
     error.statusCode = 503;
     throw error;
   }
+  // Step1073 R58: once Moralis confirms account usage is paused, fail fast
+  // BEFORE reserving Kaka's internal CU budget. This prevents an unavailable
+  // provider from burning the shared daily ledger on repeated cache misses.
+  const providerCircuit = moralisKlineCircuitState();
+  if (providerCircuit.open) {
+    const error = new Error(`moralis_provider_circuit_open:${providerCircuit.reason}`);
+    error.statusCode = 503;
+    throw error;
+  }
   return moralisScheduler.enqueue(async () => {
     await reserveMoralisBudget(cu, kind);
     stats.moralis_upstream_started += 1;
@@ -1284,6 +1293,10 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
       return parsed;
     } catch (error) {
       stats.moralis_upstream_failed += 1;
+      // Provider-plan suspension is account-wide, not Kline-specific. Open the
+      // shared circuit here so holders/wallet/signals/trades/funding also stop
+      // retrying Moralis until the bounded recovery window expires.
+      maybeOpenMoralisKlineCircuit(error);
       throw error;
     } finally {
       clearTimeout(timer);
