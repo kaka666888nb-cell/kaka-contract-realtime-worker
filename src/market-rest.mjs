@@ -430,6 +430,103 @@ const klineIdentityStats = {
 
 const coinbaseTickerCache = new Map();
 const coinbaseStatsCache = new Map();
+
+// Step1073 R4-Q:
+// The non-primary quote branches below call successful full-market ticker
+// endpoints. Share by the real upstream identity, not by each user's symbols.
+const R4Q_FULL_TICKER_FRESH_MS = 10_000;
+const R4Q_FULL_TICKER_STALE_MS = 2 * 60_000;
+const R4Q_FULL_TICKER_CACHE_MAX = 64;
+const r4qFullTickerCache = new Map();
+const r4qFullTickerInflight = new Map();
+const r4qFullTickerStats = {
+  reads: 0,
+  fresh_hits: 0,
+  inflight_hits: 0,
+  builds_started: 0,
+  builds_succeeded: 0,
+  builds_failed: 0,
+  stale_fallbacks: 0,
+  evictions: 0,
+};
+
+function pruneR4QFullTickerCache() {
+  const now = Date.now();
+  for (const [key, entry] of r4qFullTickerCache.entries()) {
+    if (Number(entry?.staleUntil || 0) <= now) {
+      r4qFullTickerCache.delete(key);
+    }
+  }
+  while (r4qFullTickerCache.size > R4Q_FULL_TICKER_CACHE_MAX) {
+    const oldest = r4qFullTickerCache.keys().next().value;
+    if (oldest == null) break;
+    r4qFullTickerCache.delete(oldest);
+    r4qFullTickerStats.evictions += 1;
+  }
+}
+
+async function sharedR4QFullTickerResult(key, loader) {
+  r4qFullTickerStats.reads += 1;
+  pruneR4QFullTickerCache();
+  const now = Date.now();
+  const cached = r4qFullTickerCache.get(key);
+  if (cached && Number(cached.freshUntil || 0) > now) {
+    r4qFullTickerStats.fresh_hits += 1;
+    return cached.value;
+  }
+
+  const running = r4qFullTickerInflight.get(key);
+  if (running) {
+    r4qFullTickerStats.inflight_hits += 1;
+    return await running;
+  }
+
+  r4qFullTickerStats.builds_started += 1;
+  const task = Promise.resolve()
+    .then(loader)
+    .then((value) => {
+      r4qFullTickerCache.set(key, {
+        value,
+        freshUntil: Date.now() + R4Q_FULL_TICKER_FRESH_MS,
+        staleUntil: Date.now() + R4Q_FULL_TICKER_STALE_MS,
+      });
+      pruneR4QFullTickerCache();
+      r4qFullTickerStats.builds_succeeded += 1;
+      return value;
+    })
+    .catch((error) => {
+      r4qFullTickerStats.builds_failed += 1;
+      if (cached && Number(cached.staleUntil || 0) > Date.now()) {
+        r4qFullTickerStats.stale_fallbacks += 1;
+        return cached.value;
+      }
+      throw error;
+    });
+
+  r4qFullTickerInflight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (r4qFullTickerInflight.get(key) === task) {
+      r4qFullTickerInflight.delete(key);
+    }
+  }
+}
+
+function getR4QFullTickerHealth() {
+  pruneR4QFullTickerCache();
+  return {
+    mode: 'upstream_identity_shared_completed_result_cache_singleflight_last_good',
+    fresh_ms: R4Q_FULL_TICKER_FRESH_MS,
+    stale_ms: R4Q_FULL_TICKER_STALE_MS,
+    cache_entries: r4qFullTickerCache.size,
+    cache_max: R4Q_FULL_TICKER_CACHE_MAX,
+    inflight_entries: r4qFullTickerInflight.size,
+    cache_key_uses_user_symbols: false,
+    same_upstream_identity_reads_scale_with_users: false,
+    ...r4qFullTickerStats,
+  };
+}
 // Step781.2.8: current price follows the official last-trade ticker snapshot;
 // 24h statistics are cached separately because they do not need per-refresh reads.
 const COINBASE_TICKER_TTL_MS = 1_500;
@@ -2240,26 +2337,46 @@ async function tickers(provider, market, wantedSymbols = []) {
 
   let items = [];
   if (provider === 'okx') {
-    const payload = await jsonFetch(
-      `https://www.okx.com/api/v5/market/tickers?instType=${market === 'contract' ? 'SWAP' : 'SPOT'}`,
+    const instType = market === 'contract' ? 'SWAP' : 'SPOT';
+    const payload = await sharedR4QFullTickerResult(
+      'ticker_full:okx:' + instType,
+      () => jsonFetch(
+        'https://www.okx.com/api/v5/market/tickers?instType=' +
+        encodeURIComponent(instType),
+      ),
     );
     items = payload.data || [];
   } else if (provider === 'gate') {
     const settle = gateContractSettle(requestedQuote);
-    const payload = await jsonFetch(
-      market === 'contract'
-        ? [
-            `https://api.gateio.ws/api/v4/futures/${settle}/tickers`,
-            `https://fx-api.gateio.ws/api/v4/futures/${settle}/tickers`,
-          ]
-        : 'https://api.gateio.ws/api/v4/spot/tickers',
+    const gateCacheKey =
+      'ticker_full:gate:' + market + ':' +
+      (market === 'contract' ? settle : 'all');
+    const payload = await sharedR4QFullTickerResult(
+      gateCacheKey,
+      () => jsonFetch(
+        market === 'contract'
+          ? [
+              'https://api.gateio.ws/api/v4/futures/' + settle + '/tickers',
+              'https://fx-api.gateio.ws/api/v4/futures/' + settle + '/tickers',
+            ]
+          : 'https://api.gateio.ws/api/v4/spot/tickers',
+      ),
     );
     items = Array.isArray(payload) ? payload : [];
   } else if (provider === 'bitget') {
-    const payload = await jsonFetch('https://api.bitget.com/api/v2/spot/market/tickers');
+    const payload = await sharedR4QFullTickerResult(
+      'ticker_full:bitget:spot:all',
+      () => jsonFetch('https://api.bitget.com/api/v2/spot/market/tickers'),
+    );
     items = payloadRows(payload);
   } else if (provider === 'bybit') {
-    const payload = await bybitPublicJson('/v5/market/tickers?category=spot', { requireRows: true });
+    const payload = await sharedR4QFullTickerResult(
+      'ticker_full:bybit:spot:all',
+      () => bybitPublicJson(
+        '/v5/market/tickers?category=spot',
+        { requireRows: true },
+      ),
+    );
     items = payloadRows(payload);
   }
   return items
@@ -4725,6 +4842,8 @@ export function getBinanceMarketRestHealth() {
     one_second_history_window_passes_by_time_span_not_page_count: true,
     coinbase_spot_ticker_current_source: 'exchange_product_ticker_last_trade',
     coinbase_spot_ticker_current_cache_ms: COINBASE_TICKER_TTL_MS,
+    r4q_full_market_ticker_shared_cache: getR4QFullTickerHealth(),
+    r4q_non_primary_completed_result_cache: true,
     coinbase_exact_ticker_official_directory_preflight: true,
     coinbase_nonexistent_product_returns_honest_empty: true,
     coinbase_nonexistent_product_never_calls_ticker_or_stats: true,
