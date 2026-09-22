@@ -175,10 +175,31 @@ const HOLDER_STALE_MS = 6 * 60 * 60_000;
 const HOLDER_NEGATIVE_MS = 2 * 60_000;
 const SOLANA_HELIUS_HOLDER_FRESH_MS = 30 * 60_000;
 const SOLANA_HELIUS_HOLDER_STALE_MS = 12 * 60 * 60_000;
-const GOPLUS_MIN_GAP_MS = Math.max(2_050, Number(process.env.KAKA_GOPLUS_MIN_GAP_MS || 2_100));
+// Step1073 Y35: Token Security currently reports 25 CU/call in GoPlus's
+// account API catalog. Free-plan public pricing is 150K CU/month, 30K CU/day
+// and 150 CU/min. Kaka keeps 20% headroom and fail-closes on DB budget errors.
+// Solana price is conservatively reserved at 50 CU until an account-specific
+// price response is persisted, so it cannot be understated.
+const GOPLUS_MIN_GAP_MS = Math.max(10_000, Number(process.env.KAKA_GOPLUS_MIN_GAP_MS || 10_000));
 const GOPLUS_MAX_QUEUE = Math.max(6, Math.min(40, Number(process.env.KAKA_GOPLUS_MAX_QUEUE || 24)));
 const GOPLUS_TIMEOUT_MS = Math.max(5_000, Math.min(25_000, Number(process.env.KAKA_GOPLUS_TIMEOUT_MS || 12_000)));
 const GOPLUS_ACCESS_TOKEN = String(process.env.GOPLUS_ACCESS_TOKEN || '').trim();
+const GOPLUS_EVM_TOKEN_SECURITY_CU = 25;
+const GOPLUS_SOLANA_TOKEN_SECURITY_RESERVED_CU = 50;
+const GOPLUS_DAILY_CU_BUDGET = Math.max(
+  2_500,
+  Math.min(24_000, Number(process.env.KAKA_GOPLUS_DAILY_CU_BUDGET || 24_000)),
+);
+const GOPLUS_MONTHLY_CU_BUDGET = Math.max(
+  GOPLUS_DAILY_CU_BUDGET,
+  Math.min(120_000, Number(process.env.KAKA_GOPLUS_MONTHLY_CU_BUDGET || 120_000)),
+);
+const GOPLUS_BUDGET_RPC = 'app_claim_goplus_provider_budget';
+const GOPLUS_BUDGET_RPC_TIMEOUT_MS = 5_000;
+const GOPLUS_DB_CUTOVER_DAY_UTC = '2026-09-22';
+const GOPLUS_DB_CUTOVER_MONTH_UTC = '2026-09-01';
+const GOPLUS_DB_CUTOVER_DAILY_SAFETY_RESERVE_CU = 20_000;
+const GOPLUS_DB_CUTOVER_MONTHLY_SAFETY_RESERVE_CU = 100_000;
 const SECURITY_FRESH_MS = 30 * 60_000;
 const SECURITY_STALE_MS = 24 * 60 * 60_000;
 const SECURITY_NEGATIVE_MS = 2 * 60_000;
@@ -391,6 +412,8 @@ const stats = {
   goplus_upstream_started: 0,
   goplus_upstream_succeeded: 0,
   goplus_upstream_failed: 0,
+  goplus_budget_rejections: 0,
+  goplus_budget_db_failures: 0,
   helius_upstream_started: 0,
   helius_upstream_succeeded: 0,
   helius_upstream_failed: 0,
@@ -1269,13 +1292,182 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
 }
 
 
+let goplusLedger = {
+  day: utcBudgetDay(),
+  month: new Date().toISOString().slice(0, 7) + '-01',
+  daily_used_cu: 0,
+  daily_remaining_cu: 0,
+  daily_calls: 0,
+  daily_kind_counts: {},
+  monthly_used_cu: 0,
+  monthly_remaining_cu: 0,
+  monthly_calls: 0,
+  monthly_kind_counts: {},
+  updated_at: null,
+  database_ready: false,
+  last_error: 'database_budget_not_loaded',
+};
+
+function applyGoplusBudgetRow(row) {
+  if (!row || typeof row !== 'object') {
+    throw new Error('goplus_budget_db_invalid_row');
+  }
+  goplusLedger = {
+    day: String(row.day_key || utcBudgetDay()),
+    month: String(row.month_key || (new Date().toISOString().slice(0, 7) + '-01')),
+    daily_used_cu: Math.max(0, Number(row.daily_used_units || 0)),
+    daily_remaining_cu: Math.max(0, Number(row.daily_remaining_units || 0)),
+    daily_calls: Math.max(0, Number(row.daily_requests || 0)),
+    daily_kind_counts:
+      row.daily_kind_counts && typeof row.daily_kind_counts === 'object'
+        ? row.daily_kind_counts
+        : {},
+    monthly_used_cu: Math.max(0, Number(row.monthly_used_units || 0)),
+    monthly_remaining_cu: Math.max(0, Number(row.monthly_remaining_units || 0)),
+    monthly_calls: Math.max(0, Number(row.monthly_requests || 0)),
+    monthly_kind_counts:
+      row.monthly_kind_counts && typeof row.monthly_kind_counts === 'object'
+        ? row.monthly_kind_counts
+        : {},
+    updated_at: new Date().toISOString(),
+    database_ready: true,
+    last_error: null,
+  };
+}
+
+async function callGoplusBudgetRpc(cu, kind) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    goplusLedger.database_ready = false;
+    goplusLedger.daily_remaining_cu = 0;
+    goplusLedger.monthly_remaining_cu = 0;
+    goplusLedger.last_error = 'goplus_budget_supabase_service_role_not_configured';
+    const error = new Error(goplusLedger.last_error);
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GOPLUS_BUDGET_RPC_TIMEOUT_MS);
+  timer.unref?.();
+  let budgetDenied = false;
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/rpc/${GOPLUS_BUDGET_RPC}`,
+      {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify({
+          p_units: Math.max(0, Math.trunc(Number(cu) || 0)),
+          p_kind: String(kind || 'token_security'),
+          p_daily_limit: GOPLUS_DAILY_CU_BUDGET,
+          p_monthly_limit: GOPLUS_MONTHLY_CU_BUDGET,
+        }),
+      },
+    );
+    const raw = await response.text();
+    let payload = null;
+    try { payload = raw ? JSON.parse(raw) : null; } catch (_) { payload = null; }
+    if (!response.ok) {
+      throw new Error(
+        `goplus_budget_db_http_${response.status}:${String(raw || '').slice(0, 220)}`
+      );
+    }
+    const row = Array.isArray(payload) ? payload[0] : payload;
+    applyGoplusBudgetRow(row);
+    if (row?.allowed !== true) {
+      budgetDenied = true;
+      stats.goplus_budget_rejections += 1;
+      const error = new Error(
+        String(row?.reason || 'goplus_cu_budget_exhausted')
+      );
+      error.statusCode = 503;
+      throw error;
+    }
+    return row;
+  } catch (error) {
+    if (!budgetDenied) stats.goplus_budget_db_failures += 1;
+    if (!goplusLedger.database_ready) {
+      goplusLedger.daily_remaining_cu = 0;
+      goplusLedger.monthly_remaining_cu = 0;
+    }
+    goplusLedger.last_error = String(
+      error?.name === 'AbortError'
+        ? 'goplus_budget_db_timeout'
+        : error?.message || error
+    ).slice(0, 300);
+    const out = new Error(goplusLedger.last_error);
+    out.statusCode = Number(error?.statusCode) || 503;
+    throw out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshGoplusBudgetFromDb() {
+  return await callGoplusBudgetRpc(0, 'health');
+}
+
+function goplusBudgetState() {
+  const transitionDay = utcBudgetDay() === GOPLUS_DB_CUTOVER_DAY_UTC;
+  const transitionMonth =
+    (new Date().toISOString().slice(0, 7) + '-01') === GOPLUS_DB_CUTOVER_MONTH_UTC;
+  return {
+    day_utc: goplusLedger.day,
+    month_utc: goplusLedger.month,
+    daily_used_cu: goplusLedger.daily_used_cu,
+    daily_remaining_cu:
+      goplusLedger.database_ready ? goplusLedger.daily_remaining_cu : 0,
+    daily_hard_budget_cu: GOPLUS_DAILY_CU_BUDGET,
+    monthly_used_cu: goplusLedger.monthly_used_cu,
+    monthly_remaining_cu:
+      goplusLedger.database_ready ? goplusLedger.monthly_remaining_cu : 0,
+    monthly_hard_budget_cu: GOPLUS_MONTHLY_CU_BUDGET,
+    provider_free_reference_cu_per_day: 30_000,
+    provider_free_reference_cu_per_month: 150_000,
+    provider_free_reference_cu_per_minute: 150,
+    evm_token_security_reserved_cu_per_call: GOPLUS_EVM_TOKEN_SECURITY_CU,
+    solana_token_security_reserved_cu_per_call:
+      GOPLUS_SOLANA_TOKEN_SECURITY_RESERVED_CU,
+    daily_calls: goplusLedger.daily_calls,
+    monthly_calls: goplusLedger.monthly_calls,
+    ledger_path_kind: 'supabase_atomic_daily_plus_monthly_cu_budget_rpc',
+    database_write: true,
+    database_ready: goplusLedger.database_ready,
+    cross_instance_shared: true,
+    fail_closed_on_db_error: true,
+    rpc: GOPLUS_BUDGET_RPC,
+    last_error: goplusLedger.last_error,
+    updated_at: goplusLedger.updated_at,
+    migration_day_safety_reserve_cu:
+      transitionDay ? GOPLUS_DB_CUTOVER_DAILY_SAFETY_RESERVE_CU : 0,
+    migration_month_safety_reserve_cu:
+      transitionMonth ? GOPLUS_DB_CUTOVER_MONTHLY_SAFETY_RESERVE_CU : 0,
+  };
+}
+
+function goplusSecurityReservedCu(network) {
+  return network === 'solana'
+    ? GOPLUS_SOLANA_TOKEN_SECURITY_RESERVED_CU
+    : GOPLUS_EVM_TOKEN_SECURITY_CU;
+}
+
 const goplusScheduler = createScheduler({
   name: 'goplus',
   minGapMs: GOPLUS_MIN_GAP_MS,
   maxQueue: GOPLUS_MAX_QUEUE,
 });
-async function goplusFetchJson(url, { priority = 0, label = '' } = {}) {
+async function goplusFetchJson(
+  url,
+  { cu = GOPLUS_EVM_TOKEN_SECURITY_CU, kind = 'token_security', priority = 0, label = '' } = {},
+) {
   return goplusScheduler.enqueue(async () => {
+    await callGoplusBudgetRpc(cu, kind);
     stats.goplus_upstream_started += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), GOPLUS_TIMEOUT_MS);
@@ -2131,6 +2323,10 @@ async function buildGoPlusSecurity(network, address) {
   stats.security_builds += 1;
   try {
     const payload = await goplusFetchJson(goplusSecurityUrl(network, address), {
+      cu: goplusSecurityReservedCu(network),
+      kind: network === 'solana'
+        ? 'solana_token_security'
+        : 'evm_token_security',
       priority: 10,
       label: `token_security:${network}:${address}`,
     });
@@ -4947,6 +5143,15 @@ export function startOnchainMarketCollector() {
     moralisLedger.remaining_cu = 0;
     moralisLedger.last_error = String(error?.message || error).slice(0, 300);
   });
+  // Step1073 Y35: health-only startup read. Every GoPlus Token Security
+  // upstream attempt performs an atomic daily+monthly CU claim immediately
+  // before the provider fetch and fails closed when the ledger is unavailable.
+  refreshGoplusBudgetFromDb().catch((error) => {
+    goplusLedger.database_ready = false;
+    goplusLedger.daily_remaining_cu = 0;
+    goplusLedger.monthly_remaining_cu = 0;
+    goplusLedger.last_error = String(error?.message || error).slice(0, 300);
+  });
   // Step1073 R52: startup read is health-only. Every Helius upstream
   // attempt performs a fresh atomic monthly-credit claim immediately before fetch.
   refreshHeliusBudgetFromDb().catch((error) => {
@@ -5051,7 +5256,11 @@ function healthPayload() {
         access_token_exposed: false,
         backend_global_min_gap_ms: GOPLUS_MIN_GAP_MS,
         backend_global_max_starts_per_minute: Math.floor(60_000 / GOPLUS_MIN_GAP_MS),
+        provider_token_security_evm_cu_per_call: GOPLUS_EVM_TOKEN_SECURITY_CU,
+        solana_reserved_cu_per_call: GOPLUS_SOLANA_TOKEN_SECURITY_RESERVED_CU,
+        provider_free_reference_cu_per_minute: 150,
         scheduler: goplusScheduler.state(),
+        budget: goplusBudgetState(),
       },
       helius: {
         docs_get_token_accounts: 'https://www.helius.dev/docs/api-reference/das/gettokenaccounts',
