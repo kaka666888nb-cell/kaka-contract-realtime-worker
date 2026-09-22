@@ -1,4 +1,4 @@
-name: Step1073 R37A downstream HTTP 10-concurrency audit
+name: Step1073 R37B downstream HTTP 25-concurrency audit
 
 on:
   push:
@@ -20,47 +20,47 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import concurrent.futures, urllib.request, urllib.error, time, statistics, json, collections
+          import concurrent.futures, urllib.request, urllib.error, time, json, collections
           url='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
           def one(_):
               t=time.perf_counter()
               try:
-                  req=urllib.request.Request(url, headers={'User-Agent':'KakaWeb3-R37A-capacity-audit'})
-                  with urllib.request.urlopen(req, timeout=15) as r:
+                  req=urllib.request.Request(url,headers={'User-Agent':'KakaWeb3-R37B-capacity-audit'})
+                  with urllib.request.urlopen(req,timeout=15) as r:
                       body=r.read()
                       code=r.status
                       cache=r.headers.get('x-kaka-cache','')
-                      ok=False
+                      size=len(body)
                       try:
                           p=json.loads(body)
                           ok=(p.get('ok') is True and isinstance(p.get('bids'),list) and isinstance(p.get('asks'),list))
                       except Exception:
-                          pass
-                  return code,cache,ok,(time.perf_counter()-t)*1000
+                          ok=False
+                  return code,cache,ok,(time.perf_counter()-t)*1000,size
               except urllib.error.HTTPError as e:
-                  return e.code,'',False,(time.perf_counter()-t)*1000
+                  return e.code,'',False,(time.perf_counter()-t)*1000,0
               except Exception as e:
-                  return 0,type(e).__name__,False,(time.perf_counter()-t)*1000
-          # Warm exact key first so the finite test measures downstream fan-out, not cold startup.
+                  return 0,type(e).__name__,False,(time.perf_counter()-t)*1000,0
           warm=one(-1)
           print('warm=',warm)
-          total=300
-          workers=10
+          total=500
+          workers=25
           start=time.perf_counter()
           with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-              rows=list(ex.map(one, range(total)))
+              rows=list(ex.map(one,range(total)))
           elapsed=time.perf_counter()-start
           lat=sorted(x[3] for x in rows)
           codes=collections.Counter(x[0] for x in rows)
           caches=collections.Counter(x[1] for x in rows)
           oks=sum(1 for x in rows if x[2])
+          sizes=[x[4] for x in rows if x[4]>0]
           def pct(p):
-              if not lat:return None
               i=min(len(lat)-1,max(0,int(round((len(lat)-1)*p))))
               return round(lat[i],2)
           print('total=',total,'workers=',workers,'elapsed_s=',round(elapsed,3),'rps=',round(total/elapsed,2))
           print('codes=',dict(codes),'payload_ok=',oks,'cache_states=',dict(caches))
           print('lat_ms p50=',pct(.50),'p95=',pct(.95),'p99=',pct(.99),'max=',round(max(lat),2))
+          print('body_bytes avg=',round(sum(sizes)/len(sizes),1),'max=',max(sizes),'total=',sum(sizes))
           assert codes == {200: total}, codes
           assert oks == total, oks
           assert pct(.99) < 5000, pct(.99)
