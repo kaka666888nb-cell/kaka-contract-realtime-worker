@@ -1,4 +1,4 @@
-name: Step1073 R37B downstream HTTP 50-concurrency audit
+name: Step1073 R38 production route diagnostic
 
 on:
   push:
@@ -13,54 +13,38 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
-      - name: Run finite cached-orderbook load
+      - name: Diagnose production depth stream routes
         shell: bash
         run: |
           set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for path in             '/api/contract-depth/stream-health'             '/api/contract-depth/stream-self-test'
+          do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 20 -D /tmp/hdr.txt -o /tmp/body.txt -w '%{http_code}' "$BASE$path" || true)"
+            echo "PATH=$path CODE=$code"
+            echo "--- headers ---"
+            cat /tmp/hdr.txt || true
+            echo "--- body ---"
+            cat /tmp/body.txt || true
+            echo
+          done
           python3 - <<'PY'
-          import concurrent.futures, urllib.request, urllib.error, time, json, collections
-          url='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
-          def one(_):
-              t=time.perf_counter()
-              try:
-                  req=urllib.request.Request(url, headers={'User-Agent':'KakaWeb3-R37B-capacity-audit'})
-                  with urllib.request.urlopen(req, timeout=20) as r:
-                      body=r.read()
-                      code=r.status
-                      cache=r.headers.get('x-kaka-cache','')
-                      ok=False
-                      try:
-                          p=json.loads(body)
-                          ok=(p.get('ok') is True and isinstance(p.get('bids'),list) and isinstance(p.get('asks'),list))
-                      except Exception:
-                          pass
-                  return code,cache,ok,(time.perf_counter()-t)*1000
-              except urllib.error.HTTPError as e:
-                  return e.code,'',False,(time.perf_counter()-t)*1000
-              except Exception as e:
-                  return 0,type(e).__name__,False,(time.perf_counter()-t)*1000
-          warm=one(-1)
-          print('warm=',warm)
-          total=500
-          workers=50
-          start=time.perf_counter()
-          with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-              rows=list(ex.map(one, range(total)))
-          elapsed=time.perf_counter()-start
-          lat=sorted(x[3] for x in rows)
-          codes=collections.Counter(x[0] for x in rows)
-          caches=collections.Counter(x[1] for x in rows)
-          oks=sum(1 for x in rows if x[2])
-          def pct(p):
-              if not lat:return None
-              i=min(len(lat)-1,max(0,int(round((len(lat)-1)*p))))
-              return round(lat[i],2)
-          print('total=',total,'workers=',workers,'elapsed_s=',round(elapsed,3),'rps=',round(total/elapsed,2))
-          print('codes=',dict(codes),'payload_ok=',oks,'cache_states=',dict(caches))
-          print('lat_ms p50=',pct(.50),'p95=',pct(.95),'p99=',pct(.99),'max=',round(max(lat),2))
-          assert codes == {200: total}, codes
-          assert oks == total, oks
-          assert pct(.99) < 8000, pct(.99)
+          import http.client, ssl, time
+          host='kaka-contract-realtime-worker.onrender.com'
+          path='/api/contract-depth/stream?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
+          c=http.client.HTTPSConnection(host,timeout=15,context=ssl.create_default_context())
+          c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'})
+          r=c.getresponse()
+          print('STREAM status=',r.status,'content-type=',r.getheader('content-type'),'schema=',r.getheader('x-kaka-stream-schema'))
+          deadline=time.time()+8
+          lines=[]
+          while time.time()<deadline and len(lines)<12:
+              line=r.readline().decode('utf-8','replace').rstrip()
+              lines.append(line)
+              if line.startswith('data:') and '"bids"' in line:
+                  break
+          print('\n'.join(lines))
+          c.close()
           PY
