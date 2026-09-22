@@ -1,6 +1,6 @@
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.124';
+const VERSION = '650.8.15.125';
 const CONSUMER_ROLE = String(process.env.KAKA_ISOLATED_COLLECTOR_ROLE || 'parent').trim() || 'parent';
 const STATE_SCOPE = CONSUMER_ROLE === 'deep-market' ? 'deep-market' : CONSUMER_ROLE === 'slow-stats' ? 'slow-stats' : 'parent';
 const DEFAULT_POLL_MS =
@@ -25,20 +25,36 @@ let lastSuccessAt = 0;
 let lastAttemptAt = 0;
 let lastError = '';
 let remoteHealth = null;
+let pollAttempts = 0;
+let fullUpdates = 0;
+let notModifiedHits = 0;
+let lastAppliedRound = 0;
 const providers = new Map();
 
 async function poll() {
   if (running) return;
   running = true;
+  pollAttempts += 1;
   lastAttemptAt = Date.now();
   try {
-    const payload = await requestIsolatedJson('market-light', `/_isolated/state?scope=${encodeURIComponent(STATE_SCOPE)}`, 8_000);
+    const knownRound = Math.max(0, Number(remoteHealth?.round || lastAppliedRound || 0));
+    const query = new URLSearchParams({ scope: STATE_SCOPE });
+    if (knownRound > 0) query.set('if_round', String(knownRound));
+    const payload = await requestIsolatedJson('market-light', `/_isolated/state?${query.toString()}`, 8_000);
     if (!payload?.ok || !payload?.health) throw new Error('market_light_bridge_invalid_payload');
     remoteHealth = payload.health;
+    if (payload.not_modified === true) {
+      notModifiedHits += 1;
+      lastSuccessAt = Date.now();
+      lastError = '';
+      return;
+    }
     providers.clear();
     for (const [key, value] of Object.entries(payload.providers || {})) {
       providers.set(key, value);
     }
+    fullUpdates += 1;
+    lastAppliedRound = Math.max(0, Number(payload.shared_round || payload.health?.round || 0));
     lastSuccessAt = Date.now();
     lastError = '';
   } catch (error) {
@@ -106,6 +122,11 @@ export function getMarketLightSnapshotHealth() {
     isolated_bridge_last_attempt_at: lastAttemptAt ? new Date(lastAttemptAt).toISOString() : null,
     isolated_bridge_last_success_at: lastSuccessAt ? new Date(lastSuccessAt).toISOString() : null,
     isolated_bridge_last_error: lastError,
+    isolated_bridge_conditional_round_reads: true,
+    isolated_bridge_source_round: Math.max(0, Number(remoteHealth?.round || lastAppliedRound || 0)),
+    isolated_bridge_poll_attempts: pollAttempts,
+    isolated_bridge_full_updates: fullUpdates,
+    isolated_bridge_not_modified_hits: notModifiedHits,
     parent_starts_market_light_scanner: false,
     reads_scale_with_users: false,
   };

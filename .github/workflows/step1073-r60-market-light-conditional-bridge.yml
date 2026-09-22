@@ -1,0 +1,38 @@
+name: Step1073 R60 market-light conditional bridge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/market-light-bridge.mjs'
+      - 'src/isolated-collector-worker.mjs'
+      - '.github/workflows/step1073-r60-market-light-conditional-bridge.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify conditional round reads and consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 45); do
+            curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/health" -o /tmp/health.json || true
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); m=b.get('market_light_state') or {}; good=(m.get('isolated_bridge_conditional_round_reads') is True and int(m.get('isolated_bridge_poll_ms') or 0)>=10000 and int(m.get('isolated_bridge_provider_snapshot_count') or 0)==10 and int(m.get('isolated_bridge_full_updates') or 0)>=1 and int(m.get('isolated_bridge_not_modified_hits') or 0)>=1 and int(m.get('isolated_bridge_poll_attempts') or 0)>int(m.get('isolated_bridge_full_updates') or 0)); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$ok" = "1"
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); m=b.get('market_light_state') or {}; print('PASS round=',m.get('isolated_bridge_source_round'),'polls=',m.get('isolated_bridge_poll_attempts'),'full=',m.get('isolated_bridge_full_updates'),'not_modified=',m.get('isolated_bridge_not_modified_hits'),'fresh=',m.get('isolated_bridge_fresh'))"
+
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/contract-basis/health" -o /tmp/basis.json
+          python3 -c "import json; b=json.load(open('/tmp/basis.json')); assert b.get('ok') is True,b; print('PASS basis')"
+
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/asset-market/rank-health" -o /tmp/rank.json
+          python3 -c "import json; b=json.load(open('/tmp/rank.json')); assert b.get('ok') is True,b; print('PASS asset rank')"

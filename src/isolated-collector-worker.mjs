@@ -38,6 +38,40 @@ if (ROLE === 'market-light') {
   handleRoleRoute = module.handleMarketLightSnapshot;
   internalState = (url) => {
     const scope = String(url?.searchParams?.get('scope') || 'parent');
+    const health = module.getMarketLightSnapshotHealth();
+    const currentRound = Math.max(0, Number(health?.round || 0));
+    const ifRound = Math.max(0, Number(url?.searchParams?.get('if_round') || 0));
+    const common = {
+      ok: true,
+      collector_role: ROLE,
+      collector_version: VERSION,
+      module_version: health?.version || null,
+      runtime: isMainThread ? 'child_process' : 'worker_thread',
+      pid: process.pid,
+      thread_id: isMainThread ? null : threadId,
+      ppid: process.ppid,
+      uptime_seconds: Math.round(process.uptime()),
+      state_scope: scope,
+      shared_round: currentRound,
+      memory_usage: {
+        rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+        heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
+      },
+      provider_governor: getProviderGovernorHealth(),
+      health,
+      timestamp_ms: Date.now(),
+    };
+    // Step1073 R60: the projected provider rows only change when the shared
+    // market-light round advances. Let bridges poll freshness without cloning,
+    // projecting and serializing thousands of unchanged rows every time.
+    if (ifRound > 0 && currentRound > 0 && ifRound === currentRound) {
+      return {
+        ...common,
+        not_modified: true,
+        provider_snapshot_count: 0,
+        providers: {},
+      };
+    }
     const providers = {};
     const wanted = scopeTargets(scope);
     for (const [market, provider] of wanted) {
@@ -45,25 +79,10 @@ if (ROLE === 'market-light') {
       providers[`${market}:${provider}`] = projectMarketLightSnapshot(full, { scope, market, provider });
     }
     return {
-      ok: true,
-      collector_role: ROLE,
-      collector_version: VERSION,
-      module_version: module.getMarketLightSnapshotHealth().version || null,
-      runtime: isMainThread ? 'child_process' : 'worker_thread',
-      pid: process.pid,
-      thread_id: isMainThread ? null : threadId,
-      ppid: process.ppid,
-      uptime_seconds: Math.round(process.uptime()),
-      state_scope: scope,
+      ...common,
+      not_modified: false,
       provider_snapshot_count: Object.keys(providers).length,
-      memory_usage: {
-        rss_mb: Math.round(process.memoryUsage().rss / 1048576),
-        heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
-      },
-      provider_governor: getProviderGovernorHealth(),
-      health: module.getMarketLightSnapshotHealth(),
       providers,
-      timestamp_ms: Date.now(),
     };
   };
 } else if (ROLE === 'liquidation') {
