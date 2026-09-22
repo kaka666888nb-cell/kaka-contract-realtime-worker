@@ -64,6 +64,178 @@ const watchlistTickerSharedCacheStats = {
   canonical_item_deduped: 0,
 };
 
+const ONCHAIN_COST_ADMISSION_VERSION = '1073.r53a.ip-cost-admission.1';
+const ONCHAIN_COST_ADMISSION_WINDOW_MS = 60_000;
+const ONCHAIN_COST_ADMISSION_HOUR_MS = 60 * 60_000;
+// Deliberately generous for carrier-NAT compatibility. This is an abuse ceiling,
+// not a normal-user quota. Provider DB budgets from R51/R52 remain authoritative.
+const ONCHAIN_COST_POINTS_PER_IP_1M = Math.max(
+  120,
+  Math.min(1000, Number(process.env.KAKA_ONCHAIN_COST_POINTS_PER_IP_1M || 240)),
+);
+const ONCHAIN_COST_POINTS_PER_IP_1H = Math.max(
+  ONCHAIN_COST_POINTS_PER_IP_1M * 4,
+  Math.min(10000, Number(process.env.KAKA_ONCHAIN_COST_POINTS_PER_IP_1H || 1800)),
+);
+const ONCHAIN_COST_ROUTE_POINTS = Object.freeze({
+  '/api/onchain/klines': 1,
+  '/api/onchain/trades': 1,
+  '/api/onchain/holders': 4,
+  '/api/onchain/security': 2,
+  '/api/onchain/token-wallets': 4,
+  '/api/onchain/wallet-quickview': 6,
+  '/api/onchain/relations': 12,
+});
+const ONCHAIN_COST_SHARED_CACHE_ROUTES = new Set([
+  '/api/onchain/klines',
+  '/api/onchain/trades',
+  '/api/onchain/holders',
+  '/api/onchain/security',
+]);
+const ONCHAIN_COST_DIRECT_ROUTES = new Set([
+  '/api/onchain/token-wallets',
+  '/api/onchain/wallet-quickview',
+  '/api/onchain/relations',
+]);
+const onchainCostEventsByIp = new Map();
+const onchainCostAdmissionStats = {
+  admitted_events: 0,
+  admitted_points: 0,
+  shared_cold_miss_admitted: 0,
+  shared_stale_refresh_admitted: 0,
+  shared_stale_refresh_suppressed: 0,
+  direct_route_admitted: 0,
+  rejected_events: 0,
+  rejected_points: 0,
+  rejected_1m: 0,
+  rejected_1h: 0,
+  active_ip_buckets: 0,
+  last_rejection_at: null,
+};
+
+function onchainCostClientIp(req) {
+  const forwarded = String(req?.headers?.['x-forwarded-for'] || '')
+    .split(',')
+    .map((part) => part.trim())
+    .find(Boolean) || '';
+  return forwarded || String(req?.socket?.remoteAddress || 'unknown');
+}
+
+function pruneOnchainCostEvents(ip, now = Date.now()) {
+  const cutoff = now - ONCHAIN_COST_ADMISSION_HOUR_MS;
+  const events = onchainCostEventsByIp.get(ip) || [];
+  while (events.length && Number(events[0]?.at || 0) < cutoff) events.shift();
+  if (events.length) onchainCostEventsByIp.set(ip, events);
+  else onchainCostEventsByIp.delete(ip);
+  return events;
+}
+
+function pruneAllOnchainCostEvents(now = Date.now()) {
+  for (const ip of [...onchainCostEventsByIp.keys()]) {
+    pruneOnchainCostEvents(ip, now);
+  }
+  onchainCostAdmissionStats.active_ip_buckets = onchainCostEventsByIp.size;
+}
+
+function onchainCostPoints(pathname) {
+  return Math.max(0, Number(ONCHAIN_COST_ROUTE_POINTS[String(pathname || '')] || 0));
+}
+
+function admitOnchainCost(req, pathname, mode) {
+  const points = onchainCostPoints(pathname);
+  if (points <= 0) return { ok: true, points: 0, remaining_1m: ONCHAIN_COST_POINTS_PER_IP_1M, remaining_1h: ONCHAIN_COST_POINTS_PER_IP_1H };
+
+  const now = Date.now();
+  const ip = onchainCostClientIp(req);
+  const events = pruneOnchainCostEvents(ip, now);
+  const minuteCutoff = now - ONCHAIN_COST_ADMISSION_WINDOW_MS;
+  let used1m = 0;
+  let used1h = 0;
+  for (const event of events) {
+    const p = Math.max(0, Number(event?.points || 0));
+    used1h += p;
+    if (Number(event?.at || 0) >= minuteCutoff) used1m += p;
+  }
+
+  const blocked1m = used1m + points > ONCHAIN_COST_POINTS_PER_IP_1M;
+  const blocked1h = used1h + points > ONCHAIN_COST_POINTS_PER_IP_1H;
+  if (blocked1m || blocked1h) {
+    onchainCostAdmissionStats.rejected_events += 1;
+    onchainCostAdmissionStats.rejected_points += points;
+    if (blocked1m) onchainCostAdmissionStats.rejected_1m += 1;
+    if (blocked1h) onchainCostAdmissionStats.rejected_1h += 1;
+    onchainCostAdmissionStats.last_rejection_at = new Date(now).toISOString();
+    return {
+      ok: false,
+      points,
+      reason: blocked1m ? 'onchain_cost_ip_1m_limit' : 'onchain_cost_ip_1h_limit',
+      retry_after_seconds: blocked1m ? 60 : 300,
+      remaining_1m: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1M - used1m),
+      remaining_1h: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1H - used1h),
+    };
+  }
+
+  events.push({ at: now, points, mode: String(mode || 'unknown'), path: String(pathname || '') });
+  onchainCostEventsByIp.set(ip, events);
+  onchainCostAdmissionStats.active_ip_buckets = onchainCostEventsByIp.size;
+  onchainCostAdmissionStats.admitted_events += 1;
+  onchainCostAdmissionStats.admitted_points += points;
+  if (mode === 'shared_cold_miss') onchainCostAdmissionStats.shared_cold_miss_admitted += 1;
+  if (mode === 'shared_stale_refresh') onchainCostAdmissionStats.shared_stale_refresh_admitted += 1;
+  if (mode === 'direct_route') onchainCostAdmissionStats.direct_route_admitted += 1;
+
+  return {
+    ok: true,
+    points,
+    remaining_1m: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1M - used1m - points),
+    remaining_1h: Math.max(0, ONCHAIN_COST_POINTS_PER_IP_1H - used1h - points),
+  };
+}
+
+function sendOnchainCostRateLimit(res, admission) {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
+  const retry = Math.max(1, Number(admission?.retry_after_seconds || 60));
+  const body = Buffer.from(JSON.stringify({
+    ok: false,
+    error: String(admission?.reason || 'onchain_cost_rate_limited'),
+    admission_version: ONCHAIN_COST_ADMISSION_VERSION,
+    retry_after_seconds: retry,
+    cost_points: Number(admission?.points || 0),
+    provider_request_started: false,
+    user_read_upstream_requests: 0,
+  }));
+  res.writeHead(429, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'retry-after': String(retry),
+    'content-length': String(body.length),
+  });
+  res.end(body);
+}
+
+function onchainCostAdmissionHealth() {
+  pruneAllOnchainCostEvents();
+  return {
+    ready: true,
+    version: ONCHAIN_COST_ADMISSION_VERSION,
+    identity_mode: 'render_real_ip_until_app_auth_install_identity_cutover',
+    login_required: false,
+    app_change_required: false,
+    shared_cache_hits_do_not_consume_admission_points: true,
+    inflight_coalesced_hits_do_not_consume_admission_points: true,
+    stale_cached_response_survives_refresh_admission_rejection: true,
+    per_ip_points_1m: ONCHAIN_COST_POINTS_PER_IP_1M,
+    per_ip_points_1h: ONCHAIN_COST_POINTS_PER_IP_1H,
+    carrier_nat_compatibility: 'generous_abuse_ceiling_not_normal_user_quota',
+    route_points: { ...ONCHAIN_COST_ROUTE_POINTS },
+    shared_cache_routes: [...ONCHAIN_COST_SHARED_CACHE_ROUTES],
+    direct_routes: [...ONCHAIN_COST_DIRECT_ROUTES],
+    provider_db_budgets_remain_authoritative: true,
+    full_per_user_or_install_identity_gate_complete: false,
+    ...onchainCostAdmissionStats,
+  };
+}
+
 function sharedResponsePolicy(pathname) {
   const path = String(pathname || '');
   if (path === '/api/market-light/current-snapshot') return { freshMs: 2_000, staleMs: 10_000, cdnSMaxAgeSec: 2 };
@@ -320,7 +492,20 @@ function proxySharedCachedCollectorGet(req, res, url, role, policy) {
   if (cached && age <= policy.staleMs) {
     sharedResponseStats.stale_hits += 1;
     if (watchlistTickerRoute) watchlistTickerSharedCacheStats.stale_hits += 1;
-    startSharedResponseRefresh(key, role, req.url).catch(() => {});
+    const isOnchainCostShared =
+      role === 'onchain-market' &&
+      ONCHAIN_COST_SHARED_CACHE_ROUTES.has(String(url?.pathname || ''));
+    const refreshAlreadyInflight = sharedResponseInflight.has(key);
+    if (!isOnchainCostShared || refreshAlreadyInflight) {
+      startSharedResponseRefresh(key, role, req.url).catch(() => {});
+    } else {
+      const admission = admitOnchainCost(req, url?.pathname, 'shared_stale_refresh');
+      if (admission.ok) {
+        startSharedResponseRefresh(key, role, req.url).catch(() => {});
+      } else {
+        onchainCostAdmissionStats.shared_stale_refresh_suppressed += 1;
+      }
+    }
     sendSharedResponse(req, res, cached, 'stale', policy);
     return;
   }
@@ -334,6 +519,16 @@ function proxySharedCachedCollectorGet(req, res, url, role, policy) {
   } else {
     sharedResponseStats.cold_misses += 1;
     if (watchlistTickerRoute) watchlistTickerSharedCacheStats.cold_misses += 1;
+    if (
+      role === 'onchain-market' &&
+      ONCHAIN_COST_SHARED_CACHE_ROUTES.has(String(url?.pathname || ''))
+    ) {
+      const admission = admitOnchainCost(req, url?.pathname, 'shared_cold_miss');
+      if (!admission.ok) {
+        sendOnchainCostRateLimit(res, admission);
+        return;
+      }
+    }
   }
   const pending = existing || startSharedResponseRefresh(key, role, req.url);
   pending.then((entry) => sendSharedResponse(req, res, entry, existing ? 'coalesced' : 'miss', policy))
@@ -612,6 +807,17 @@ export function proxyIsolatedCollectorRequest(req, res, url) {
     return true;
   }
 
+  if (
+    role === 'onchain-market' &&
+    ONCHAIN_COST_DIRECT_ROUTES.has(String(url?.pathname || ''))
+  ) {
+    const admission = admitOnchainCost(req, url?.pathname, 'direct_route');
+    if (!admission.ok) {
+      sendOnchainCostRateLimit(res, admission);
+      return true;
+    }
+  }
+
   const port = isolatedCollectorPort(role);
   const upstream = http.request({
     hostname: '127.0.0.1',
@@ -754,6 +960,7 @@ export function getCollectorIsolationHealth() {
     memory_safety_design: 'first_batch_child_processes_plus_second_batch_resource_limited_worker_isolates_plus_exchange_assets_child_process_plus_projected_internal_bridges',
     projected_internal_bridge_payloads: true,
     full_market_rows_not_copied_to_second_batch: true,
+    onchain_cost_admission: onchainCostAdmissionHealth(),
     shared_read_transport_cache: {
       ready: true,
       response_cache_enabled: true,
