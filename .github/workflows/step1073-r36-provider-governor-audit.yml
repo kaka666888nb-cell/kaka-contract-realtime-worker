@@ -1,0 +1,56 @@
+name: Step1073 R36 provider governor production audit
+
+on:
+  push:
+    branches:
+      - audit-step1073-r36-provider-governor
+    paths:
+      - '.github/workflows/step1073-r36-provider-governor-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify production global provider governor
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/provider-governor/health" -o /tmp/health.json
+          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/provider-governor/self-test" -o /tmp/self.json
+          python3 - <<'PY'
+          import json
+          h=json.load(open('/tmp/health.json'))
+          s=json.load(open('/tmp/self.json'))
+          parent=h.get('provider_request_governor',{}).get('parent') or h.get('parent') or {}
+          child=h.get('provider_request_governor',{}).get('child') or h.get('child') or {}
+          assert parent.get('enabled') is True, parent
+          assert parent.get('mode') == 'shared_provider_queue_exact_get_inflight_merge_retry_after_hard_cooldown_negative_cache', parent
+          governed=set(parent.get('governed_providers') or [])
+          assert {'okx','bybit','bitget','gate','coinbase'} <= governed, governed
+          providers=parent.get('providers') or {}
+          for p in ('okx','bybit','bitget','gate','coinbase'):
+              row=providers.get(p) or {}
+              policy=row.get('policy') or {}
+              assert policy.get('min_start_gap_ms',0) >= 200, (p,row)
+              assert policy.get('max_concurrent',99) <= 2, (p,row)
+              assert policy.get('max_queue',999) <= 96, (p,row)
+          st=s.get('self_test') or {}
+          assert s.get('ok') is True, s
+          assert st.get('ok') is True, st
+          tests=st.get('tests') or []
+          failed=[x for x in tests if x.get('pass') is not True and x.get('ok') is not True]
+          assert not failed, failed
+          print('PASS provider_governor_enabled=',parent.get('enabled'))
+          print('mode=',parent.get('mode'))
+          print('governed=',sorted(governed))
+          for p in ('okx','bybit','bitget','gate','coinbase'):
+              row=providers[p]
+              print(p,'policy=',row.get('policy'),'queue=',row.get('queue_length'),'active=',row.get('active'),'inflight=',row.get('inflight_keys'))
+          print('self_test_count=',len(tests),'failed=',len(failed))
+          print('child_present=',bool(child))
+          PY
