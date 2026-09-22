@@ -1,0 +1,77 @@
+name: Step1073 R58 Moralis paused-provider fail-fast
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/onchain-market.mjs'
+      - '.github/workflows/step1073-r58b-moralis-paused-failfast.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify first paused probe then zero-CU fail-fast
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          TOKEN='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+          POOL='0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640'
+
+          health() {
+            curl -fsS --connect-timeout 8 --max-time 25 "$BASE/api/onchain/health"
+          }
+
+          used_cu() {
+            python3 -c "import json,sys; b=json.load(sys.stdin); print((((b.get('sources') or {}).get('moralis') or {}).get('budget') or {}).get('used_cu') or 0)"
+          }
+
+          circuit_reason() {
+            python3 -c "import json,sys; b=json.load(sys.stdin); print((((b.get('sources') or {}).get('moralis') or {}).get('kline_circuit') or {}).get('reason') or '')"
+          }
+
+          H0="$(health)"
+          U0="$(printf '%s' "$H0" | used_cu)"
+          echo "used_before=$U0"
+
+          END1="$(python3 -c "import time; print(int((time.time()-9*24*3600)*1000))")"
+          URL1="$BASE/api/onchain/klines?network=ethereum&address=$TOKEN&pool_address=$POOL&interval=1h&limit=2&end_time=$END1"
+          C1="$(curl -sS --connect-timeout 8 --max-time 55 -o /tmp/one.json -w '%{http_code}' "$URL1" || true)"
+          echo "probe1_http=$C1"
+          test "$C1" = "200"
+          python3 -c "import json; b=json.load(open('/tmp/one.json')); assert b.get('ok') is True,b; err=str(b.get('primary_error') or '').lower(); assert 'moralis_http_401' in err and ('usage is paused' in err or 'upgrade to a paid plan' in err or 'planselect' in err),err; assert b.get('fallback_used') is True,b; print('PASS probe1 paused provider + Gecko fallback')"
+
+          H1="$(health)"
+          U1="$(printf '%s' "$H1" | used_cu)"
+          R1="$(printf '%s' "$H1" | circuit_reason)"
+          echo "used_after_probe1=$U1 circuit_reason=$R1"
+          test "$R1" = "moralis_free_usage_paused"
+
+          END2="$(python3 -c "import time; print(int((time.time()-10*24*3600)*1000))")"
+          URL2="$BASE/api/onchain/klines?network=ethereum&address=$TOKEN&pool_address=$POOL&interval=1h&limit=2&end_time=$END2"
+          C2="$(curl -sS --connect-timeout 8 --max-time 55 -o /tmp/two.json -w '%{http_code}' "$URL2" || true)"
+          echo "probe2_http=$C2"
+          test "$C2" = "200"
+          python3 -c "import json; b=json.load(open('/tmp/two.json')); assert b.get('ok') is True,b; err=str(b.get('primary_error') or ''); assert err.startswith('moralis_provider_circuit_open:moralis_free_usage_paused'),err; assert b.get('fallback_used') is True,b; print('PASS probe2 provider circuit fail-fast + Gecko fallback')"
+
+          H2="$(health)"
+          U2="$(printf '%s' "$H2" | used_cu)"
+          R2="$(printf '%s' "$H2" | circuit_reason)"
+          echo "used_after_probe2=$U2 circuit_reason=$R2"
+          test "$R2" = "moralis_free_usage_paused"
+          test "$U2" = "$U1"
+          echo "PASS second distinct cache miss consumed zero additional Moralis CU"
+
+      - name: Full onchain self-test remains green
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl -fsS --connect-timeout 8 --max-time 30 "$BASE/api/onchain/self-test" -o /tmp/self.json
+          python3 -c "import json; b=json.load(open('/tmp/self.json')); failed=[x for x in (b.get('tests') or []) if x.get('pass') is not True]; assert b.get('ok') is True,failed; print('PASS onchain self-test tests=',len(b.get('tests') or []))"
