@@ -4,7 +4,7 @@ import {
   translatePrivateText,
 } from './content-translation.mjs';
 
-const VERSION = '1073.r48.private-translation.1';
+const VERSION = '1073.r48.private-translation.2';
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = String(
   process.env.SUPABASE_SERVICE_ROLE_KEY || '',
@@ -41,6 +41,7 @@ const state = {
   provider_failures: 0,
   successes: 0,
   inflight_hits: 0,
+  language_direction_corrections: 0,
   last_success_at: null,
   last_error: null,
 };
@@ -157,6 +158,18 @@ async function verifyUser(req) {
   }
 }
 
+function detectDominantZhEn(raw) {
+  const value = text(raw);
+  if (!value) return '';
+  const cjk = (value.match(/[\u3400-\u4dbf\u4e00-\u9fff]/g) || []).length;
+  const latin = (value.match(/[A-Za-z]/g) || []).length;
+  if (cjk >= 4 && cjk * 1.15 >= latin) return 'zh';
+  if (latin >= 8 && latin >= cjk * 1.8) return 'en';
+  if (cjk >= 2 && cjk > latin) return 'zh';
+  if (latin >= 5 && latin > cjk) return 'en';
+  return '';
+}
+
 function statusForError(error) {
   const code = text(error?.code);
   const message = text(error?.message);
@@ -225,16 +238,16 @@ export async function handlePrivateTranslation(req, res, url) {
   }
 
   const rawText = text(body?.text);
-  const sourceLanguage = text(body?.source_language).toLowerCase();
-  const targetLanguage = text(body?.target_language).toLowerCase();
+  const claimedSourceLanguage = text(body?.source_language).toLowerCase();
+  const claimedTargetLanguage = text(body?.target_language).toLowerCase();
   const sourceBytes = Buffer.byteLength(rawText, 'utf8');
 
   if (
     !rawText ||
     sourceBytes > MAX_TEXT_BYTES ||
-    !['zh', 'en'].includes(sourceLanguage) ||
-    !['zh', 'en'].includes(targetLanguage) ||
-    sourceLanguage === targetLanguage
+    !['zh', 'en'].includes(claimedSourceLanguage) ||
+    !['zh', 'en'].includes(claimedTargetLanguage) ||
+    claimedSourceLanguage === claimedTargetLanguage
   ) {
     state.validation_rejects += 1;
     json(res, sourceBytes > MAX_TEXT_BYTES ? 413 : 400, {
@@ -245,6 +258,28 @@ export async function handlePrivateTranslation(req, res, url) {
           : 'invalid_translation_request',
     });
     return true;
+  }
+
+  // OCR can contain a stray Han character inside otherwise-English text (or
+  // vice versa). Never let one noisy character flip the whole translation
+  // direction. When the payload has a decisive dominant language, derive the
+  // opposite target server-side; otherwise preserve the authenticated
+  // client's explicit direction.
+  const dominantSourceLanguage = detectDominantZhEn(rawText);
+  const sourceLanguage =
+    dominantSourceLanguage || claimedSourceLanguage;
+  const targetLanguage =
+    dominantSourceLanguage
+      ? (sourceLanguage === 'zh' ? 'en' : 'zh')
+      : claimedTargetLanguage;
+  if (
+    dominantSourceLanguage &&
+    (
+      sourceLanguage !== claimedSourceLanguage ||
+      targetLanguage !== claimedTargetLanguage
+    )
+  ) {
+    state.language_direction_corrections += 1;
   }
 
   const digest = crypto
