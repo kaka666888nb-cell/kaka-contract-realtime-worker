@@ -1,4 +1,4 @@
-name: Step1073 R38C500 SSE 500-client capacity audit
+name: Step1073 R38C1000 SSE 1000-client capacity audit
 
 on:
   push:
@@ -14,28 +14,33 @@ jobs:
   load:
     strategy:
       fail-fast: false
-      max-parallel: 17
+      max-parallel: 20
       matrix:
-        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 10
+    env:
+      SHARD: ${{ matrix.shard }}
     steps:
-      - name: Hold 30 SSE clients on one exact key
+      - name: Hold 50 SSE clients per runner; shard 1 monitors server peak
         shell: bash
         run: |
           set -euo pipefail
           sleep 8
           python3 - <<'PY'
-          import concurrent.futures, http.client, ssl, socket, time, collections
+          import concurrent.futures, http.client, ssl, socket, time, collections, urllib.request, json, os
           host='kaka-contract-realtime-worker.onrender.com'
           path='/api/contract-depth/stream?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
-          clients=30
-          hold_s=45
+          health='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth/stream-health'
+          clients=50
+          hold_s=55
+          shard=int(os.environ.get('SHARD','0'))
+
           def one(i):
               c=None
               try:
-                  c=http.client.HTTPSConnection(host,timeout=15,context=ssl.create_default_context())
-                  c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache','User-Agent':'KakaWeb3-R38C500'})
+                  c=http.client.HTTPSConnection(host,timeout=18,context=ssl.create_default_context())
+                  c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache','User-Agent':'KakaWeb3-R38C1000'})
                   r=c.getresponse()
                   if r.status!=200:
                       return ('status_'+str(r.status),False,0,r.read(250).decode('utf-8','replace')[:100])
@@ -61,42 +66,47 @@ jobs:
                   try:
                       if c: c.close()
                   except Exception: pass
-          with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as ex:
-              rows=list(ex.map(one,range(clients)))
-          kinds=collections.Counter(x[0] for x in rows); shared=sum(1 for x in rows if x[1]); ev=[x[2] for x in rows]
-          print('clients=',clients,'kinds=',dict(kinds),'shared=',shared,'events_min=',min(ev),'events_max=',max(ev))
+
+          ex=concurrent.futures.ThreadPoolExecutor(max_workers=clients)
+          futures=[ex.submit(one,i) for i in range(clients)]
+
+          peak=0; peak_keys=0; peak_bg=0; first_refresh=None; last_refresh=None
+          samples=[]
+          if shard==1:
+              # Let all 20 GitHub runners reach the service, then watch the full overlap.
+              time.sleep(8)
+              for i in range(50):
+                  try:
+                      with urllib.request.urlopen(health,timeout=10) as r: h=json.load(r)
+                      c=int(h.get('client_count') or 0)
+                      k=int(h.get('active_key_count') or 0)
+                      bg=int((h.get('provider_groups') or {}).get('binance') or 0)
+                      rr=int(h.get('refresh_started') or 0)
+                      if first_refresh is None: first_refresh=rr
+                      last_refresh=rr
+                      peak=max(peak,c); peak_keys=max(peak_keys,k); peak_bg=max(peak_bg,bg)
+                      samples.append((i,c,k,bg,rr,h.get('downstream_events')))
+                  except Exception as e:
+                      samples.append((i,'ERR',type(e).__name__))
+                  time.sleep(1)
+
+          rows=[f.result() for f in futures]
+          ex.shutdown(wait=True)
+          kinds=collections.Counter(x[0] for x in rows)
+          shared=sum(1 for x in rows if x[1])
+          ev=[x[2] for x in rows]
+          print('shard=',shard,'clients=',clients,'kinds=',dict(kinds),'shared=',shared,'events_min=',min(ev),'events_max=',max(ev))
           bad=[x for x in rows if x[0]!='ok' or not x[1]]
-          if bad: print('bad_samples=',bad[:5])
+          if bad: print('bad_samples=',bad[:8])
           assert kinds=={'ok':clients}, kinds
           assert shared==clients, shared
-          PY
 
-  monitor:
-    runs-on: ubuntu-latest
-    timeout-minutes: 9
-    steps:
-      - name: Observe production stream health peak
-        shell: bash
-        run: |
-          set -euo pipefail
-          sleep 12
-          python3 - <<'PY'
-          import urllib.request, json, time
-          url='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth/stream-health'
-          peak=0; peak_keys=0; peak_bg=0; first=None; last=None; tail=[]
-          for i in range(60):
-              try:
-                  with urllib.request.urlopen(url,timeout=10) as r: h=json.load(r)
-                  c=int(h.get('client_count') or 0); k=int(h.get('active_key_count') or 0)
-                  bg=int((h.get('provider_groups') or {}).get('binance') or 0); rr=int(h.get('refresh_started') or 0)
-                  if first is None:first=rr
-                  last=rr; peak=max(peak,c); peak_keys=max(peak_keys,k); peak_bg=max(peak_bg,bg)
-                  tail.append((i,c,k,bg,rr,h.get('downstream_events')))
-              except Exception as e: tail.append((i,'ERR',type(e).__name__))
-              time.sleep(1)
-          print('samples_tail=',tail[-15:])
-          print('PEAK client_count=',peak,'active_key_count=',peak_keys,'binance_groups=',peak_bg,'refresh_delta=',None if first is None else last-first)
-          assert peak>=500, peak
-          assert peak_keys<=4, peak_keys
-          assert peak_bg>=1, peak_bg
+          if shard==1:
+              print('samples_tail=',samples[-15:])
+              delta=None if first_refresh is None else last_refresh-first_refresh
+              print('PEAK client_count=',peak,'active_key_count=',peak_keys,'binance_groups=',peak_bg,'refresh_delta=',delta)
+              assert peak>=1000, peak
+              assert peak_keys<=4, peak_keys
+              assert peak_bg>=1, peak_bg
+              assert delta is not None and delta<120, delta
           PY
