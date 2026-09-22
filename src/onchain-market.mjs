@@ -2,14 +2,15 @@
 // Kaka Web3 on-chain market phase 2.
 // Step1036 DEX Screener foundation is preserved. Step1037 adds exact-pool OHLCV/history and
 // recent swaps through Moralis Data API, with backend-only secret, separate bounded scheduler,
-// CU budget ledger, cache + singleflight, exact chain/token/pool preflight and no user-scale
+// DB-backed atomic CU budget ledger, cache + singleflight, exact chain/token/pool preflight and no user-scale
 // upstream amplification. No trading, wallet signing or database writes.
 
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { KAKA_FULL_INTERVALS, KAKA_DERIVED_PLAN, klineIntervalMs, klineDerivedPlan, deriveAndFillKlines } from './kline-derived.mjs';
 import { restoreOnchainHotSnapshot, persistOnchainHotSnapshot, getOnchainHotPersistenceHealth } from './onchain-hot-persistence.mjs';
 
 const VERSION = '650.8.15.197.3.2';
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 const DATA_VERSION = 1049002;
 const SCHEMA_VERSION = 'step1037_3_onchain_market_v2';
 const STEP1038_FEATURE_SCHEMA_VERSION = 'step1038_onchain_holder_security_v1';
@@ -145,7 +146,7 @@ const STEP1041_NEW_POOL_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 
 // Step1037 Moralis production guard.
 // Current official pricing: pair candlesticks=150 CU, pair swaps=50 CU.
-// Free plan currently includes 40,000 CU/day; Kaka reserves headroom and fails closed at 30,000 CU/day.
+// Kaka enforces a DB-shared 30,000 CU/day hard budget before each Moralis upstream attempt.
 // The API key exists only in Render Environment. It is never returned to App/health/logs.
 const MORALIS_API_KEY = String(process.env.MORALIS_API_KEY || '').trim();
 const MORALIS_MIN_GAP_MS = Math.max(750, Number(process.env.KAKA_MORALIS_MIN_GAP_MS || 1_200));
@@ -154,7 +155,10 @@ const MORALIS_TIMEOUT_MS = Math.max(5_000, Math.min(30_000, Number(process.env.K
 const MORALIS_DAILY_CU_BUDGET = Math.max(3_000, Math.min(38_000, Number(process.env.KAKA_MORALIS_DAILY_CU_BUDGET || 30_000)));
 const MORALIS_KLINE_CU = 150;
 const MORALIS_TRADES_CU = 50;
-const MORALIS_LEDGER_PATH = process.env.KAKA_MORALIS_LEDGER_PATH || '/tmp/kaka_onchain_moralis_budget_v1.json';
+const MORALIS_BUDGET_RPC = 'app_claim_external_provider_daily_budget';
+const MORALIS_BUDGET_RPC_TIMEOUT_MS = 5_000;
+const MORALIS_DB_CUTOVER_DAY_UTC = '2026-09-22';
+const MORALIS_DB_CUTOVER_SAFETY_RESERVE_CU = 20_000;
 const KLINE_CACHE_MAX_ENTRIES = 128;
 const KLINE_FEATURE_SCHEMA_VERSION = 'step1046_2_5_onchain_kline_continuity_v1';
 const TRADE_CACHE_MAX_ENTRIES = 96;
@@ -1047,77 +1051,148 @@ function productBadgesForToken(pair, token) {
 function utcBudgetDay() {
   return new Date().toISOString().slice(0, 10);
 }
-function loadMoralisLedger() {
-  const fallback = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, wallet_calls: 0, signal_calls: 0, updated_at: null };
-  try {
-    const parsed = JSON.parse(readFileSync(MORALIS_LEDGER_PATH, 'utf8'));
-    if (!parsed || parsed.day !== utcBudgetDay()) return fallback;
-    return {
-      day: parsed.day,
-      used_cu: Math.max(0, Number(parsed.used_cu || 0)),
-      calls: Math.max(0, Number(parsed.calls || 0)),
-      kline_calls: Math.max(0, Number(parsed.kline_calls || 0)),
-      trade_calls: Math.max(0, Number(parsed.trade_calls || 0)),
-      holder_calls: Math.max(0, Number(parsed.holder_calls || 0)),
-      wallet_calls: Math.max(0, Number(parsed.wallet_calls || 0)),
-      signal_calls: Math.max(0, Number(parsed.signal_calls || 0)),
-      updated_at: parsed.updated_at || null,
-    };
-  } catch {
-    return fallback;
-  }
-}
-let moralisLedger = loadMoralisLedger();
 
-function refreshMoralisBudgetDay() {
-  if (moralisLedger.day === utcBudgetDay()) return;
-  moralisLedger = { day: utcBudgetDay(), used_cu: 0, calls: 0, kline_calls: 0, trade_calls: 0, holder_calls: 0, wallet_calls: 0, signal_calls: 0, updated_at: null };
-  persistMoralisLedger();
-}
-function persistMoralisLedger() {
-  const next = `${MORALIS_LEDGER_PATH}.${process.pid}.tmp`;
-  try {
-    writeFileSync(next, JSON.stringify(moralisLedger), 'utf8');
-    renameSync(next, MORALIS_LEDGER_PATH);
-  } catch {
-    // Budget protection still stays in-memory if /tmp is unavailable.
+let moralisLedger = {
+  day: utcBudgetDay(),
+  used_cu: 0,
+  remaining_cu: 0,
+  calls: 0,
+  kind_counts: {},
+  updated_at: null,
+  database_ready: false,
+  last_error: 'database_budget_not_loaded',
+};
+
+function applyMoralisBudgetRow(row) {
+  if (!row || typeof row !== 'object') {
+    throw new Error('moralis_budget_db_invalid_row');
   }
-}
-function moralisBudgetState() {
-  refreshMoralisBudgetDay();
-  return {
-    day_utc: moralisLedger.day,
-    used_cu: moralisLedger.used_cu,
-    remaining_cu: Math.max(0, MORALIS_DAILY_CU_BUDGET - moralisLedger.used_cu),
-    hard_budget_cu: MORALIS_DAILY_CU_BUDGET,
-    provider_free_plan_reference_cu_per_day: 40_000,
-    calls: moralisLedger.calls,
-    kline_calls: moralisLedger.kline_calls,
-    trade_calls: moralisLedger.trade_calls,
-    holder_calls: moralisLedger.holder_calls,
-    wallet_calls: moralisLedger.wallet_calls,
-    signal_calls: moralisLedger.signal_calls,
-    ledger_path_kind: 'local_ephemeral_process_restart_persistent_tmp',
-    database_write: false,
+  const day = String(row.day_key || utcBudgetDay());
+  const used = Math.max(0, Number(row.used_units || 0));
+  const remaining = Math.max(0, Number(row.remaining_units || 0));
+  const calls = Math.max(0, Number(row.requests || 0));
+  const counts = row.kind_counts && typeof row.kind_counts === 'object'
+    ? row.kind_counts
+    : {};
+  moralisLedger = {
+    day,
+    used_cu: used,
+    remaining_cu: remaining,
+    calls,
+    kind_counts: counts,
+    updated_at: new Date().toISOString(),
+    database_ready: true,
+    last_error: null,
   };
 }
-function reserveMoralisBudget(cu, kind) {
-  refreshMoralisBudgetDay();
-  if (moralisLedger.used_cu + cu > MORALIS_DAILY_CU_BUDGET) {
-    stats.moralis_budget_rejections += 1;
-    const error = new Error('moralis_daily_cu_budget_exhausted');
+
+function moralisBudgetKindCount(kind) {
+  return Math.max(0, Number(moralisLedger.kind_counts?.[kind] || 0));
+}
+
+async function callMoralisBudgetRpc(cu, kind) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    moralisLedger.database_ready = false;
+    moralisLedger.last_error = 'moralis_budget_supabase_service_role_not_configured';
+    const error = new Error(moralisLedger.last_error);
     error.statusCode = 503;
     throw error;
   }
-  moralisLedger.used_cu += cu;
-  moralisLedger.calls += 1;
-  if (kind === 'kline') moralisLedger.kline_calls += 1;
-  if (kind === 'trade') moralisLedger.trade_calls += 1;
-  if (kind === 'holder') moralisLedger.holder_calls += 1;
-  if (kind === 'wallet') moralisLedger.wallet_calls += 1;
-  if (kind === 'signal') moralisLedger.signal_calls += 1;
-  moralisLedger.updated_at = new Date().toISOString();
-  persistMoralisLedger();
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MORALIS_BUDGET_RPC_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/rpc/${MORALIS_BUDGET_RPC}`,
+      {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify({
+          p_provider: 'moralis',
+          p_units: Math.max(0, Math.trunc(Number(cu) || 0)),
+          p_hard_limit: MORALIS_DAILY_CU_BUDGET,
+          p_kind: String(kind || 'other'),
+        }),
+      },
+    );
+    const raw = await response.text();
+    let payload = null;
+    try { payload = raw ? JSON.parse(raw) : null; } catch (_) { payload = null; }
+    if (!response.ok) {
+      throw new Error(
+        `moralis_budget_db_http_${response.status}:${String(raw || '').slice(0, 220)}`
+      );
+    }
+    const row = Array.isArray(payload) ? payload[0] : payload;
+    applyMoralisBudgetRow(row);
+    if (row?.allowed !== true) {
+      stats.moralis_budget_rejections += 1;
+      const error = new Error(
+        String(row?.reason || 'moralis_daily_cu_budget_exhausted')
+      );
+      error.statusCode = 503;
+      throw error;
+    }
+    return row;
+  } catch (error) {
+    if (!moralisLedger.database_ready) {
+      moralisLedger.remaining_cu = 0;
+    }
+    moralisLedger.last_error = String(
+      error?.name === 'AbortError'
+        ? 'moralis_budget_db_timeout'
+        : error?.message || error
+    ).slice(0, 300);
+    const out = new Error(moralisLedger.last_error);
+    out.statusCode = Number(error?.statusCode) || 503;
+    throw out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshMoralisBudgetFromDb() {
+  return await callMoralisBudgetRpc(0, 'health');
+}
+
+function moralisBudgetState() {
+  const transitionDay = utcBudgetDay() === MORALIS_DB_CUTOVER_DAY_UTC;
+  return {
+    day_utc: moralisLedger.day,
+    used_cu: moralisLedger.used_cu,
+    remaining_cu: moralisLedger.database_ready ? moralisLedger.remaining_cu : 0,
+    hard_budget_cu: MORALIS_DAILY_CU_BUDGET,
+    provider_free_plan_reference_cu_per_day: 40_000,
+    calls: moralisLedger.calls,
+    kline_calls: moralisBudgetKindCount('kline'),
+    trade_calls: moralisBudgetKindCount('trade'),
+    holder_calls: moralisBudgetKindCount('holder'),
+    wallet_calls: moralisBudgetKindCount('wallet'),
+    signal_calls: moralisBudgetKindCount('signal'),
+    relationship_calls: moralisBudgetKindCount('relationship'),
+    ledger_path_kind: 'supabase_atomic_daily_budget_rpc',
+    database_write: true,
+    database_ready: moralisLedger.database_ready,
+    cross_instance_shared: true,
+    fail_closed_on_db_error: true,
+    rpc: MORALIS_BUDGET_RPC,
+    last_error: moralisLedger.last_error,
+    updated_at: moralisLedger.updated_at,
+    migration_day_prior_tmp_usage_exactly_known: !transitionDay,
+    migration_day_safety_reserve_cu:
+      transitionDay ? MORALIS_DB_CUTOVER_SAFETY_RESERVE_CU : 0,
+  };
+}
+
+async function reserveMoralisBudget(cu, kind) {
+  return await callMoralisBudgetRpc(cu, kind);
 }
 
 const moralisScheduler = createScheduler({
@@ -1134,7 +1209,7 @@ async function moralisFetchJson(url, { cu, kind, priority = 0, label = '' }) {
     throw error;
   }
   return moralisScheduler.enqueue(async () => {
-    reserveMoralisBudget(cu, kind);
+    await reserveMoralisBudget(cu, kind);
     stats.moralis_upstream_started += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), MORALIS_TIMEOUT_MS);
@@ -4681,6 +4756,14 @@ export function startOnchainMarketCollector() {
   // Restore previous exact verified rows immediately. This is one fixed backend read on
   // process startup, never a user-triggered DB/upstream request. Fresh discovery still runs.
   restorePersistedTrendingSnapshot().catch(() => {});
+  // Step1073 R51: load the cross-instance Moralis CU ledger once at process
+  // startup. All paid/provider CU attempts still claim atomically immediately
+  // before their upstream request; this startup read is only for health state.
+  refreshMoralisBudgetFromDb().catch((error) => {
+    moralisLedger.database_ready = false;
+    moralisLedger.remaining_cu = 0;
+    moralisLedger.last_error = String(error?.message || error).slice(0, 300);
+  });
   const first = setTimeout(() => refreshDiscovery().catch(() => {}), 2_500);
   first.unref?.();
   const timer = setInterval(() => refreshDiscovery().catch(() => {}), DISCOVERY_REFRESH_MS);
@@ -5242,6 +5325,9 @@ function runSelfTest() {
   t('kline_limit_bounded', KLINE_MAX_ROWS <= 300);
   t('kline_cache_bounded', KLINE_CACHE_MAX_ENTRIES <= 128);
   t('moralis_budget_below_free_reference', MORALIS_DAILY_CU_BUDGET < 40_000);
+  t('moralis_budget_db_atomic_mode', moralisBudgetState().ledger_path_kind === 'supabase_atomic_daily_budget_rpc');
+  t('moralis_budget_fail_closed', moralisBudgetState().fail_closed_on_db_error === true);
+  t('moralis_budget_cross_instance_shared', moralisBudgetState().cross_instance_shared === true);
   t('moralis_secret_never_exposed', healthPayload().sources.moralis.api_key_exposed === false);
   t('moralis_single_auth_header_only', healthPayload().sources.moralis.auth_header_count_per_request === 1 && healthPayload().sources.moralis.duplicate_case_variant_headers === false);
   t('moralis_pair_swap_schema_not_token_swap_schema', healthPayload().recent_trades.token_swaps_bought_sold_schema_not_assumed === true);
