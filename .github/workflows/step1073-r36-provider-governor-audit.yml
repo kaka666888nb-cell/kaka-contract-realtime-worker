@@ -1,4 +1,4 @@
-name: Step1073 R38C100 SSE 100-client capacity audit
+name: Step1073 R38C300 SSE 300-client capacity audit
 
 on:
   push:
@@ -14,69 +14,61 @@ jobs:
   load:
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 12
       matrix:
-        shard: [1,2,3,4]
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12]
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 9
     steps:
-      - name: Hold 30 SSE clients on one exact key
+      - name: Hold 25 SSE clients on one exact key
         shell: bash
         run: |
           set -euo pipefail
           sleep 8
           python3 - <<'PY'
-          import concurrent.futures, http.client, ssl, socket, time, json, collections
+          import concurrent.futures, http.client, ssl, socket, time, collections
           host='kaka-contract-realtime-worker.onrender.com'
           path='/api/contract-depth/stream?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
-          clients=30
-          hold_s=45
-          started=time.time()
+          clients=25
+          hold_s=50
           def one(i):
               c=None
               try:
                   c=http.client.HTTPSConnection(host,timeout=15,context=ssl.create_default_context())
-                  c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache','User-Agent':'KakaWeb3-R38C100'})
+                  c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache','User-Agent':'KakaWeb3-R38C300'})
                   r=c.getresponse()
                   if r.status!=200:
-                      body=r.read(400).decode('utf-8','replace')
-                      return ('status_'+str(r.status),False,0,body[:120])
+                      body=r.read(300).decode('utf-8','replace')
+                      return ('status_'+str(r.status),False,0,body[:100])
                   if 'text/event-stream' not in str(r.getheader('content-type') or ''):
                       return ('bad_content_type',False,0,str(r.getheader('content-type')))
-                  try:
-                      r.fp.raw._sock.settimeout(5)
-                  except Exception:
-                      pass
-                  got_shared=False
-                  events=0
-                  deadline=time.time()+hold_s
+                  try: r.fp.raw._sock.settimeout(5)
+                  except Exception: pass
+                  shared=False; events=0; deadline=time.time()+hold_s
                   while time.time()<deadline:
                       try:
                           line=r.readline()
-                          if not line:
-                              break
+                          if not line: break
                           s=line.decode('utf-8','replace').strip()
                           if s.startswith('data:'):
                               events+=1
-                              if '"downstream_fanout_shared":true' in s.replace(' ',''):
-                                  got_shared=True
+                              if '"downstream_fanout_shared":true' in s.replace(' ',''): shared=True
                       except socket.timeout:
                           continue
-                  return ('ok',got_shared,events,'')
+                  return ('ok',shared,events,'')
               except Exception as e:
-                  return (type(e).__name__,False,0,str(e)[:120])
+                  return (type(e).__name__,False,0,str(e)[:100])
               finally:
                   try:
                       if c: c.close()
-                  except Exception:
-                      pass
+                  except Exception: pass
+          start=time.time()
           with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as ex:
               rows=list(ex.map(one,range(clients)))
           kinds=collections.Counter(x[0] for x in rows)
           shared=sum(1 for x in rows if x[1])
-          event_counts=[x[2] for x in rows]
-          print('shard clients=',clients,'elapsed_s=',round(time.time()-started,2))
-          print('kinds=',dict(kinds),'shared_first_or_later=',shared,'events_min=',min(event_counts),'events_max=',max(event_counts))
+          ev=[x[2] for x in rows]
+          print('clients=',clients,'elapsed_s=',round(time.time()-start,2),'kinds=',dict(kinds),'shared=',shared,'events_min=',min(ev),'events_max=',max(ev))
           bad=[x for x in rows if x[0]!='ok' or not x[1]]
           if bad: print('bad_samples=',bad[:5])
           assert kinds=={'ok':clients}, kinds
@@ -85,7 +77,7 @@ jobs:
 
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 9
     steps:
       - name: Observe production stream health peak
         shell: bash
@@ -95,25 +87,25 @@ jobs:
           python3 - <<'PY'
           import urllib.request, json, time
           url='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth/stream-health'
-          peak=0
-          peak_keys=0
-          peak_binance_groups=0
-          samples=[]
-          for i in range(45):
+          peak=0; peak_keys=0; peak_bg=0; samples=[]
+          first_refresh=None; last_refresh=None
+          for i in range(60):
               try:
-                  with urllib.request.urlopen(url,timeout=10) as r:
-                      h=json.load(r)
+                  with urllib.request.urlopen(url,timeout=10) as r: h=json.load(r)
                   c=int(h.get('client_count') or 0)
                   k=int(h.get('active_key_count') or 0)
                   bg=int((h.get('provider_groups') or {}).get('binance') or 0)
-                  peak=max(peak,c); peak_keys=max(peak_keys,k); peak_binance_groups=max(peak_binance_groups,bg)
-                  samples.append((i,c,k,bg,h.get('refresh_started'),h.get('downstream_events')))
+                  rr=int(h.get('refresh_started') or 0)
+                  if first_refresh is None: first_refresh=rr
+                  last_refresh=rr
+                  peak=max(peak,c); peak_keys=max(peak_keys,k); peak_bg=max(peak_bg,bg)
+                  samples.append((i,c,k,bg,rr,h.get('downstream_events')))
               except Exception as e:
                   samples.append((i,'ERR',type(e).__name__))
               time.sleep(1)
           print('samples_tail=',samples[-15:])
-          print('PEAK client_count=',peak,'active_key_count=',peak_keys,'binance_groups=',peak_binance_groups)
-          assert peak>=100, peak
+          print('PEAK client_count=',peak,'active_key_count=',peak_keys,'binance_groups=',peak_bg,'refresh_delta=',None if first_refresh is None else last_refresh-first_refresh)
+          assert peak>=300, peak
           assert peak_keys<=4, peak_keys
-          assert peak_binance_groups>=1, peak_binance_groups
+          assert peak_bg>=1, peak_bg
           PY
