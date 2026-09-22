@@ -1,0 +1,32 @@
+name: Step1073 R35P funding current diff persistence
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/contract-flow.mjs'
+      - '.github/workflows/step1073-r35p-funding-current-diff.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - name: Verify production funding-current diff contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 75); do
+            code="$(curl --compressed -sS --connect-timeout 8 --max-time 25 -o /tmp/health.json -w '%{http_code}' "$BASE/api/contract-flow/health" || true)"
+            ok="$(python3 -c "import json; b=json.load(open('/tmp/health.json')); r=b.get('shared_metric_rotation') or {}; good=(b.get('version')=='650.8.15.107' and b.get('shared_current_meta_persistence_rpc')=='app_upsert_funding_rate_current_batch_diff' and b.get('shared_current_meta_same_source_replay_noop') is True and b.get('shared_current_meta_stale_rows_are_not_rewritten_as_fresh') is True and r.get('current_meta_persistence_rpc')=='app_upsert_funding_rate_current_batch_diff' and r.get('current_meta_same_source_replay_noop') is True and str(r.get('current_persist_error') or '')==''); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$code" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$code" = "200"
+          test "$ok" = "1"
+          python3 -c "import json; b=json.load(open('/tmp/health.json')); r=b.get('shared_metric_rotation') or {}; print('PASS version=',b.get('version'),'rpc=',r.get('current_meta_persistence_rpc'),'logical=',r.get('current_rows_persisted'),'physical=',r.get('current_rows_physical_written'),'unchanged=',r.get('current_rows_unchanged'),'stale_guard=',b.get('shared_current_meta_stale_rows_are_not_rewritten_as_fresh'))"

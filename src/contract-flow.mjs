@@ -7,7 +7,7 @@ import { BUSINESS_SOURCE_POLICY_VERSION, getBusinessSourceRule } from './busines
 import { publishContractFlowHotScoreRows, getHotScoreMetricsHealth } from './hot-score-metrics.mjs';
 import { requestIsolatedJson } from './collector-isolation.mjs';
 
-const VERSION = '650.8.15.106';
+const VERSION = '650.8.15.107';
 const PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const states = new Map();
 const gateAdvancedFlowBridge = {
@@ -470,6 +470,8 @@ const sharedMetricRotationState = {
   meta_successes: Object.fromEntries([...PROVIDERS].map((provider) => [provider, 0])),
   meta_errors: Object.fromEntries([...PROVIDERS].map((provider) => [provider, ''])),
   current_rows_persisted: 0,
+  current_rows_physical_written: 0,
+  current_rows_unchanged: 0,
   current_persist_error: '',
 };
 const flowScanState = {
@@ -520,6 +522,7 @@ const METRIC_TABLE = 'app_contract_position_5m_cache';
 // bounded backend rotation. The shared Data-page snapshot can then read OI,
 // ratios, funding, mark/index and basis from Supabase without per-user exact calls.
 const SHARED_CURRENT_META_TABLE = 'app_funding_rate_current_cache';
+const SHARED_CURRENT_META_DIFF_RPC = 'app_upsert_funding_rate_current_batch_diff';
 const metricPersistQueue = new Map();
 let metricPersistFlushPromise = null;
 const METRIC_PERSIST_BATCH_SIZE = Math.max(
@@ -1473,7 +1476,12 @@ function sharedMetricRotationPayload() {
     current_meta_success_by_provider: sharedMetricRotationState.meta_successes,
     current_meta_errors_by_provider: sharedMetricRotationState.meta_errors,
     current_meta_storage_table: SHARED_CURRENT_META_TABLE,
+    current_meta_persistence_rpc: SHARED_CURRENT_META_DIFF_RPC,
+    current_meta_same_source_replay_noop: true,
+    current_meta_freshness_advances_with_source_or_business_change: true,
     current_rows_persisted: sharedMetricRotationState.current_rows_persisted,
+    current_rows_physical_written: sharedMetricRotationState.current_rows_physical_written,
+    current_rows_unchanged: sharedMetricRotationState.current_rows_unchanged,
     current_persist_error: sharedMetricRotationState.current_persist_error,
     current_meta_uses_same_bounded_targets: true,
     current_meta_scales_with_users: false,
@@ -1548,9 +1556,11 @@ function sharedCurrentMetaPersistRow(meta, provider, symbol) {
 }
 
 async function persistSharedCurrentMetaRows(rows) {
-  if (!PERSISTENCE_ENABLED || !rows.length) return 0;
+  if (!PERSISTENCE_ENABLED || !rows.length) {
+    return { logical: 0, written: 0, unchanged: 0 };
+  }
   const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/${SHARED_CURRENT_META_TABLE}?on_conflict=provider,market_type,symbol`,
+    `${SUPABASE_URL}/rest/v1/rpc/${SHARED_CURRENT_META_DIFF_RPC}`,
     {
       method: 'POST',
       headers: {
@@ -1558,17 +1568,35 @@ async function persistSharedCurrentMetaRows(rows) {
         authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
         accept: 'application/json',
         'content-type': 'application/json',
-        prefer: 'resolution=merge-duplicates,return=minimal',
       },
-      body: JSON.stringify(rows),
+      body: JSON.stringify({ p_rows: rows }),
       signal: AbortSignal.timeout(15000),
     },
   );
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`${SHARED_CURRENT_META_TABLE}_upsert_http_${response.status}:${text.slice(0, 220)}`);
+    throw new Error(`${SHARED_CURRENT_META_DIFF_RPC}_http_${response.status}:${text.slice(0, 220)}`);
   }
-  return rows.length;
+  let payload = null;
+  try {
+    payload = JSON.parse(text || '{}');
+  } catch {
+    payload = null;
+  }
+  const written = Number(payload?.written);
+  const unchanged = Number(payload?.unchanged);
+  if (
+    !Number.isFinite(written) ||
+    !Number.isFinite(unchanged) ||
+    written < 0 ||
+    unchanged < 0 ||
+    written + unchanged !== rows.length
+  ) {
+    throw new Error(
+      `${SHARED_CURRENT_META_DIFF_RPC}_invalid_result:${String(text || '').slice(0, 260)}`,
+    );
+  }
+  return { logical: rows.length, written, unchanged };
 }
 
 async function runSharedMetricRotationCycle() {
@@ -1586,6 +1614,8 @@ async function runSharedMetricRotationCycle() {
   sharedMetricRotationState.meta_successes = Object.fromEntries([...PROVIDERS].map((provider) => [provider, 0]));
   sharedMetricRotationState.meta_errors = Object.fromEntries([...PROVIDERS].map((provider) => [provider, '']));
   sharedMetricRotationState.current_rows_persisted = 0;
+  sharedMetricRotationState.current_rows_physical_written = 0;
+  sharedMetricRotationState.current_rows_unchanged = 0;
   sharedMetricRotationState.current_persist_error = '';
   sharedMetricRotationState.running = (async () => {
     await runBoundedConcurrency(
@@ -1655,9 +1685,12 @@ async function runSharedMetricRotationCycle() {
     );
     await flushMetricPersistQueue();
     try {
-      sharedMetricRotationState.current_rows_persisted = await persistSharedCurrentMetaRows(
+      const persistResult = await persistSharedCurrentMetaRows(
         [...currentMetaRows.values()],
       );
+      sharedMetricRotationState.current_rows_persisted = persistResult.logical;
+      sharedMetricRotationState.current_rows_physical_written = persistResult.written;
+      sharedMetricRotationState.current_rows_unchanged = persistResult.unchanged;
       sharedMetricRotationState.current_persist_error = '';
     } catch (error) {
       sharedMetricRotationState.current_persist_error = String(error?.message || error).slice(0, 300);
@@ -4800,7 +4833,7 @@ export function getContractFlowHealth() {
 
 export async function handleContractFlow(req,res,url){
   if(url.pathname==='/api/contract-flow/health'){
-    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,binance_open_interest_history_official_ready:PERSISTENCE_ENABLED,binance_open_interest_history_endpoint:'/futures/data/openInterestHist',binance_open_interest_history_period:'5m',binance_open_interest_history_edge_relay_only:true,binance_long_short_history_official_ready:PERSISTENCE_ENABLED,binance_long_short_history_endpoints:['/futures/data/globalLongShortAccountRatio','/futures/data/topLongShortAccountRatio','/futures/data/topLongShortPositionRatio'],binance_long_short_history_edge_relay_only:true,binance_official_taker:binanceOfficialTakerHealthPayload(),flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,focus_pool_binding:focusFlowBindingPayload(),focus_pool_15_each_kept_active:true,focus_pool_extra_full_universe_rotation_preserved:true,market_snapshot_rotates_scan:false,market_snapshot_shared_cache:marketFlowSharedSnapshotHealth(),shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,hot_score_metrics:{...getHotScoreMetricsHealth(),persistence_hydrate_last_at:hotScoreFlowHydrateAt?new Date(hotScoreFlowHydrateAt).toISOString():null,persistence_hydrate_rows:hotScoreFlowHydrateRows,persistence_hydrate_error:hotScoreFlowHydrateError,persistence_hydrate_every_minutes:HOT_SCORE_FLOW_HYDRATE_MS/60_000},shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,gate_advanced_flow_bridge:{enabled:GATE_ADVANCED_FLOW_BRIDGE_ENABLED,mode:'localhost_slow_stats_focus15_reuse_zero_exchange_requests',poll_ms:GATE_ADVANCED_FLOW_BRIDGE_POLL_MS,stale_ms:GATE_ADVANCED_FLOW_BRIDGE_STALE_MS,running:Boolean(gateAdvancedFlowBridge.running),last_started_at:gateAdvancedFlowBridge.last_started_at?new Date(gateAdvancedFlowBridge.last_started_at).toISOString():null,last_completed_at:gateAdvancedFlowBridge.last_completed_at?new Date(gateAdvancedFlowBridge.last_completed_at).toISOString():null,last_success_at:gateAdvancedFlowBridge.last_success_at?new Date(gateAdvancedFlowBridge.last_success_at).toISOString():null,last_error:gateAdvancedFlowBridge.last_error,polls:gateAdvancedFlowBridge.polls,successes:gateAdvancedFlowBridge.successes,failures:gateAdvancedFlowBridge.failures,rows_seen:gateAdvancedFlowBridge.rows_seen,rows_hydrated:gateAdvancedFlowBridge.rows_hydrated,rows_skipped_stale:gateAdvancedFlowBridge.rows_skipped_stale,rows_skipped_missing_state:gateAdvancedFlowBridge.rows_skipped_missing_state,rows_skipped_sizing:gateAdvancedFlowBridge.rows_skipped_sizing,last_symbols:gateAdvancedFlowBridge.last_symbols,exchange_requests_added:0,user_reads_trigger_bridge:false,reads_scale_with_users:false},shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
+    sendJson(res,200,{ok:true,version:VERSION,streams:states.size,persistence_enabled:PERSISTENCE_ENABLED,persist_queue:persistQueue.size,flow_persist_batch_size:FLOW_PERSIST_BATCH_SIZE,flow_persist_health:{...flowPersistHealth},metric_persist_queue:metricPersistQueue.size,metric_persist_batch_size:METRIC_PERSIST_BATCH_SIZE,metric_persist_health:{...metricPersistHealth},metric_table:METRIC_TABLE,binance_open_interest_history_official_ready:PERSISTENCE_ENABLED,binance_open_interest_history_endpoint:'/futures/data/openInterestHist',binance_open_interest_history_period:'5m',binance_open_interest_history_edge_relay_only:true,binance_long_short_history_official_ready:PERSISTENCE_ENABLED,binance_long_short_history_endpoints:['/futures/data/globalLongShortAccountRatio','/futures/data/topLongShortAccountRatio','/futures/data/topLongShortPositionRatio'],binance_long_short_history_edge_relay_only:true,binance_official_taker:binanceOfficialTakerHealthPayload(),flow_memory_mode:'fixed_histogram',max_active_streams:MAX_ACTIVE_STATES,binance_active_streams:[...states.values()].filter((state)=>state.provider==='binance').length,binance_max_active_streams:BINANCE_FLOW_MAX_STATES,binance_ws_connect_gap_ms:BINANCE_FLOW_CONNECT_GAP_MS,binance_ws_max_connect_attempts_5m:BINANCE_FLOW_MAX_CONNECT_ATTEMPTS_5M,binance_ws_connect_attempts_in_window:(pruneBinanceFlowConnectAttempts(),binanceFlowConnectAttempts.length),binance_ws_connect_attempts_total:binanceFlowWsStats.attempts,binance_ws_connect_waits:binanceFlowWsStats.waits,binance_ws_connect_window_blocks:binanceFlowWsStats.window_blocks,binance_ws_capacity_rejections:binanceFlowWsStats.capacity_rejections,metric_merge_mode:'coalesce_non_null',contract_meta_cache:contractMetaCache.size,contract_meta_ttl_seconds:30,contract_meta_stale_seconds:1800,binance_meta_first_paint:'mark_price_websocket',binance_oi_first_paint:'critical_edge_relay_priority_first',binance_long_short_first_paint:'critical_edge_relay_after_oi',binance_long_short_first_paint_wait_ms:BINANCE_RATIO_FIRST_PAINT_WAIT_MS,binance_long_short_history_limit:BINANCE_RATIO_CRITICAL_LIMIT,binance_global_ratio_schema:'global_long_account_global_short_account',binance_global_ratio_legacy_keys_accepted:true,binance_metric_native_symbol_scope_fix:true,bybit_non_usdt_account_ratio_official_unavailable:true,bybit_non_usdt_account_ratio_substitution:'none',flow_first_paint_waits_for_binance_oi:true,flow_first_paint_waits_for_full_metrics:false,usdc_native_identity:true,okx_usdc_contract_retired:true,okx_current_contract_quotes:['USDT','USD'],usd_inverse_native_identity:true,bybit_usdc_native:'BTCPERP',bitget_usdc_native:'BTCPERP',bitget_usdc_product_type:'USDC-FUTURES',bitget_usd_product_type:'COIN-FUTURES',bybit_usd_category:'inverse',gate_usd_settle:'btc',okx_contract_value:true,okx_unit_source:'v2',gate_contract_sizing:true,gate_btc_usd_quote_value_per_contract:GATE_BTC_USD_QUOTE_VALUE_PER_CONTRACT,gate_inverse_sizing_without_quanto_multiplier:true,gate_inverse_public_trade_quote_value:true,gate_contract_stat_current_schema:true,gate_contract_stat_ratio_fields:'lsr_account_top_lsr_account_top_lsr_size_plus_current_parts',gate_contract_stat_taker_aggregate:true,gate_metric_first_paint_wait:true,gate_contract_stats_interval:GATE_CONTRACT_STATS_INTERVAL,gate_contract_stats_limit:GATE_CONTRACT_STATS_LIMIT,gate_contract_stats_official_max_limit:100,gate_contract_stats_non_empty_host_fallback:true,gate_contract_stats_live_diagnostic:true,gate_metric_latest_time_key_fix:true,open_interest_unit_metadata:true,bybit_inverse_open_interest_unit:'quote_asset',bybit_inverse_open_interest_value_unit:'base_asset',bybit_inverse_open_interest_value_formula:'open_interest_div_last_price',fixed_symbol_whitelist:false,focus_pool_binding:focusFlowBindingPayload(),focus_pool_15_each_kept_active:true,focus_pool_extra_full_universe_rotation_preserved:true,market_snapshot_rotates_scan:false,market_snapshot_shared_cache:marketFlowSharedSnapshotHealth(),shared_current_snapshot_endpoint:'/api/contract-flow/current-snapshot',shared_current_snapshot_rpc:SHARED_CURRENT_SNAPSHOT_RPC,shared_current_snapshot_cache_ttl_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_CACHE_TTL_MS/1000),shared_current_snapshot_stale_seconds:Math.round(SHARED_CURRENT_SNAPSHOT_STALE_MS/1000),shared_current_snapshot_cache_entries:sharedCurrentSnapshotCache.size,shared_current_snapshot_inflight_entries:sharedCurrentSnapshotInflight.size,hot_score_metrics:{...getHotScoreMetricsHealth(),persistence_hydrate_last_at:hotScoreFlowHydrateAt?new Date(hotScoreFlowHydrateAt).toISOString():null,persistence_hydrate_rows:hotScoreFlowHydrateRows,persistence_hydrate_error:hotScoreFlowHydrateError,persistence_hydrate_every_minutes:HOT_SCORE_FLOW_HYDRATE_MS/60_000},shared_current_snapshot_reads_open_exchange_connection:false,data_page_user_exact_5x8_rotation_replaced_by_backend_shared_snapshot:true,shared_metric_rotation:sharedMetricRotationPayload(),shared_metric_rotation_does_not_scale_with_users:true,shared_metric_rotation_reuses_existing_governors:true,gate_advanced_flow_bridge:{enabled:GATE_ADVANCED_FLOW_BRIDGE_ENABLED,mode:'localhost_slow_stats_focus15_reuse_zero_exchange_requests',poll_ms:GATE_ADVANCED_FLOW_BRIDGE_POLL_MS,stale_ms:GATE_ADVANCED_FLOW_BRIDGE_STALE_MS,running:Boolean(gateAdvancedFlowBridge.running),last_started_at:gateAdvancedFlowBridge.last_started_at?new Date(gateAdvancedFlowBridge.last_started_at).toISOString():null,last_completed_at:gateAdvancedFlowBridge.last_completed_at?new Date(gateAdvancedFlowBridge.last_completed_at).toISOString():null,last_success_at:gateAdvancedFlowBridge.last_success_at?new Date(gateAdvancedFlowBridge.last_success_at).toISOString():null,last_error:gateAdvancedFlowBridge.last_error,polls:gateAdvancedFlowBridge.polls,successes:gateAdvancedFlowBridge.successes,failures:gateAdvancedFlowBridge.failures,rows_seen:gateAdvancedFlowBridge.rows_seen,rows_hydrated:gateAdvancedFlowBridge.rows_hydrated,rows_skipped_stale:gateAdvancedFlowBridge.rows_skipped_stale,rows_skipped_missing_state:gateAdvancedFlowBridge.rows_skipped_missing_state,rows_skipped_sizing:gateAdvancedFlowBridge.rows_skipped_sizing,last_symbols:gateAdvancedFlowBridge.last_symbols,exchange_requests_added:0,user_reads_trigger_bridge:false,reads_scale_with_users:false},shared_current_meta_storage_table:SHARED_CURRENT_META_TABLE,shared_current_meta_persistence_rpc:SHARED_CURRENT_META_DIFF_RPC,shared_current_meta_same_source_replay_noop:true,shared_current_meta_freshness_advances_with_source_or_business_change:true,shared_current_meta_rotation_uses_same_bounded_targets:true,shared_current_meta_rotation_scales_with_users:false,shared_current_meta_stale_rows_are_not_rewritten_as_fresh:true,shared_history_endpoint:'/api/contract-flow/history',shared_history_period:'15m',shared_history_cache_ttl_seconds:Math.round(SHARED_FLOW_HISTORY_CACHE_TTL_MS/1000),shared_history_stale_seconds:Math.round(SHARED_FLOW_HISTORY_STALE_MS/1000),shared_history_max_hours:168,shared_history_storage_table:SHARED_FLOW_BUCKET_TABLE,shared_history_refresh_rpc:SHARED_FLOW_REFRESH_RPC,shared_history_cleanup_rpc:SHARED_FLOW_CLEANUP_RPC,shared_history_refresh_last_success_at:sharedFlowMaintenance.lastRefreshSuccessAt?new Date(sharedFlowMaintenance.lastRefreshSuccessAt).toISOString():null,shared_history_refresh_error:sharedFlowMaintenance.lastRefreshError,shared_history_cleanup_last_success_at:sharedFlowMaintenance.lastCleanupSuccessAt?new Date(sharedFlowMaintenance.lastCleanupSuccessAt).toISOString():null,shared_history_cleanup_error:sharedFlowMaintenance.lastCleanupError,shared_history_raw_retention_days:8,shared_history_aggregate_retention_days:31,pinned_symbols:PINNED_SYMBOLS,full_universe_scan:flowScanStatusPayload(),time:new Date().toISOString()});return true;
   }
   if(url.pathname==='/api/gate-usd-flow-self-test'){
     const selfTest=gateUsdFlowSelfTest();
