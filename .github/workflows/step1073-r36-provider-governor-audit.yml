@@ -1,4 +1,4 @@
-name: Step1073 R36 provider governor production audit
+name: Step1073 R37A downstream HTTP 10-concurrency audit
 
 on:
   push:
@@ -15,42 +15,53 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Verify production global provider governor
+      - name: Run finite cached-orderbook load
         shell: bash
         run: |
           set -euo pipefail
-          BASE='https://kaka-contract-realtime-worker.onrender.com'
-          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/provider-governor/health" -o /tmp/health.json
-          curl --compressed -fsS --connect-timeout 8 --max-time 25 "$BASE/api/provider-governor/self-test" -o /tmp/self.json
           python3 - <<'PY'
-          import json
-          h=json.load(open('/tmp/health.json'))
-          s=json.load(open('/tmp/self.json'))
-          parent=h.get('provider_request_governor',{}).get('parent') or h.get('parent') or {}
-          child=h.get('provider_request_governor',{}).get('child') or h.get('child') or {}
-          assert parent.get('enabled') is True, parent
-          assert parent.get('mode') == 'shared_provider_queue_exact_get_inflight_merge_retry_after_hard_cooldown_negative_cache', parent
-          governed=set(parent.get('governed_providers') or [])
-          assert {'okx','bybit','bitget','gate','coinbase'} <= governed, governed
-          providers=parent.get('providers') or {}
-          for p in ('okx','bybit','bitget','gate','coinbase'):
-              row=providers.get(p) or {}
-              policy=row.get('policy') or {}
-              assert policy.get('min_start_gap_ms',0) >= 200, (p,row)
-              assert policy.get('max_concurrent',99) <= 2, (p,row)
-              assert policy.get('max_queue',999) <= 96, (p,row)
-          st=s.get('self_test') or {}
-          assert s.get('ok') is True, s
-          assert st.get('ok') is True, st
-          tests=st.get('tests') or []
-          failed=[x for x in tests if x.get('pass') is not True and x.get('ok') is not True]
-          assert not failed, failed
-          print('PASS provider_governor_enabled=',parent.get('enabled'))
-          print('mode=',parent.get('mode'))
-          print('governed=',sorted(governed))
-          for p in ('okx','bybit','bitget','gate','coinbase'):
-              row=providers[p]
-              print(p,'policy=',row.get('policy'),'queue=',row.get('queue_length'),'active=',row.get('active'),'inflight=',row.get('inflight_keys'))
-          print('self_test_count=',len(tests),'failed=',len(failed))
-          print('child_present=',bool(child))
+          import concurrent.futures, urllib.request, urllib.error, time, statistics, json, collections
+          url='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
+          def one(_):
+              t=time.perf_counter()
+              try:
+                  req=urllib.request.Request(url, headers={'User-Agent':'KakaWeb3-R37A-capacity-audit'})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      body=r.read()
+                      code=r.status
+                      cache=r.headers.get('x-kaka-cache','')
+                      ok=False
+                      try:
+                          p=json.loads(body)
+                          ok=(p.get('ok') is True and isinstance(p.get('bids'),list) and isinstance(p.get('asks'),list))
+                      except Exception:
+                          pass
+                  return code,cache,ok,(time.perf_counter()-t)*1000
+              except urllib.error.HTTPError as e:
+                  return e.code,'',False,(time.perf_counter()-t)*1000
+              except Exception as e:
+                  return 0,type(e).__name__,False,(time.perf_counter()-t)*1000
+          # Warm exact key first so the finite test measures downstream fan-out, not cold startup.
+          warm=one(-1)
+          print('warm=',warm)
+          total=300
+          workers=10
+          start=time.perf_counter()
+          with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+              rows=list(ex.map(one, range(total)))
+          elapsed=time.perf_counter()-start
+          lat=sorted(x[3] for x in rows)
+          codes=collections.Counter(x[0] for x in rows)
+          caches=collections.Counter(x[1] for x in rows)
+          oks=sum(1 for x in rows if x[2])
+          def pct(p):
+              if not lat:return None
+              i=min(len(lat)-1,max(0,int(round((len(lat)-1)*p))))
+              return round(lat[i],2)
+          print('total=',total,'workers=',workers,'elapsed_s=',round(elapsed,3),'rps=',round(total/elapsed,2))
+          print('codes=',dict(codes),'payload_ok=',oks,'cache_states=',dict(caches))
+          print('lat_ms p50=',pct(.50),'p95=',pct(.95),'p99=',pct(.99),'max=',round(max(lat),2))
+          assert codes == {200: total}, codes
+          assert oks == total, oks
+          assert pct(.99) < 5000, pct(.99)
           PY
