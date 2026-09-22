@@ -430,6 +430,8 @@ const klineIdentityStats = {
 
 const coinbaseTickerCache = new Map();
 const coinbaseStatsCache = new Map();
+const coinbaseTickerInflight = new Map();
+const coinbaseStatsInflight = new Map();
 
 // Step1073 R4-Q:
 // The non-primary quote branches below call successful full-market ticker
@@ -529,8 +531,22 @@ function getR4QFullTickerHealth() {
 }
 // Step781.2.8: current price follows the official last-trade ticker snapshot;
 // 24h statistics are cached separately because they do not need per-refresh reads.
-const COINBASE_TICKER_TTL_MS = 1_500;
+const COINBASE_TICKER_TTL_MS = 5_000;
 const COINBASE_STATS_TTL_MS = 30_000;
+const COINBASE_RESULT_CACHE_MAX = 256;
+function pruneCoinbaseResultCaches() {
+  while (coinbaseTickerCache.size > COINBASE_RESULT_CACHE_MAX) {
+    const oldest = coinbaseTickerCache.keys().next().value;
+    if (oldest == null) break;
+    coinbaseTickerCache.delete(oldest);
+  }
+  while (coinbaseStatsCache.size > COINBASE_RESULT_CACHE_MAX) {
+    const oldest = coinbaseStatsCache.keys().next().value;
+    if (oldest == null) break;
+    coinbaseStatsCache.delete(oldest);
+  }
+}
+
 // Step781.2.9: Coinbase trade history is cursor based. A historical request
 // must not restart at the newest trade on every drag; otherwise high-activity
 // USD books hit a practical ~3 minute wall. Keep only lightweight cursor/time
@@ -1997,6 +2013,27 @@ async function coinbaseStats(productId) {
   if (cached && Date.now() - cached.at < COINBASE_STATS_TTL_MS) {
     return cached.value;
   }
+  const running = coinbaseStatsInflight.get(cacheKey);
+  if (running) return await running;
+
+  const task = coinbaseStatsUnshared(productId);
+  coinbaseStatsInflight.set(cacheKey, task);
+  try {
+    return await task;
+  } finally {
+    if (coinbaseStatsInflight.get(cacheKey) === task) {
+      coinbaseStatsInflight.delete(cacheKey);
+    }
+    pruneCoinbaseResultCaches();
+  }
+}
+
+async function coinbaseStatsUnshared(productId) {
+  const cacheKey = String(productId || '').toUpperCase();
+  const cached = coinbaseStatsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < COINBASE_STATS_TTL_MS) {
+    return cached.value;
+  }
   try {
     const value = await jsonFetch(
       `${COINBASE_BASE_URL}/products/${encodeURIComponent(productId)}/stats`,
@@ -2010,6 +2047,27 @@ async function coinbaseStats(productId) {
 }
 
 async function coinbaseTicker(symbol) {
+  const normalized = compact(symbol);
+  const cached = coinbaseTickerCache.get(normalized);
+  if (cached && Date.now() - cached.at < COINBASE_TICKER_TTL_MS) {
+    return cached.row;
+  }
+  const running = coinbaseTickerInflight.get(normalized);
+  if (running) return await running;
+
+  const task = coinbaseTickerUnshared(normalized);
+  coinbaseTickerInflight.set(normalized, task);
+  try {
+    return await task;
+  } finally {
+    if (coinbaseTickerInflight.get(normalized) === task) {
+      coinbaseTickerInflight.delete(normalized);
+    }
+    pruneCoinbaseResultCaches();
+  }
+}
+
+async function coinbaseTickerUnshared(symbol) {
   const normalized = compact(symbol);
   const cacheKey = normalized;
   const cached = coinbaseTickerCache.get(cacheKey);
@@ -4844,6 +4902,10 @@ export function getBinanceMarketRestHealth() {
     coinbase_spot_ticker_current_cache_ms: COINBASE_TICKER_TTL_MS,
     r4q_full_market_ticker_shared_cache: getR4QFullTickerHealth(),
     r4q_non_primary_completed_result_cache: true,
+    r4q_coinbase_exact_product_singleflight: true,
+    r4q_coinbase_ticker_inflight_entries: coinbaseTickerInflight.size,
+    r4q_coinbase_stats_inflight_entries: coinbaseStatsInflight.size,
+    r4q_coinbase_cache_max: COINBASE_RESULT_CACHE_MAX,
     coinbase_exact_ticker_official_directory_preflight: true,
     coinbase_nonexistent_product_returns_honest_empty: true,
     coinbase_nonexistent_product_never_calls_ticker_or_stats: true,
