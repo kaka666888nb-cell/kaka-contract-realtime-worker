@@ -18,6 +18,12 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+      - name: Install runtime dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+
       - name: Syntax and self-test
         shell: bash
         run: |
