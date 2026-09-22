@@ -1,4 +1,4 @@
-name: Step1073 R38 production route diagnostic
+name: Step1073 R38C100 SSE 100-client capacity audit
 
 on:
   push:
@@ -11,40 +11,109 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  load:
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [1,2,3,4]
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - name: Diagnose production depth stream routes
+      - name: Hold 30 SSE clients on one exact key
         shell: bash
         run: |
           set -euo pipefail
-          BASE='https://kaka-contract-realtime-worker.onrender.com'
-          for path in             '/api/contract-depth/stream-health'             '/api/contract-depth/stream-self-test'
-          do
-            code="$(curl --compressed -sS --connect-timeout 8 --max-time 20 -D /tmp/hdr.txt -o /tmp/body.txt -w '%{http_code}' "$BASE$path" || true)"
-            echo "PATH=$path CODE=$code"
-            echo "--- headers ---"
-            cat /tmp/hdr.txt || true
-            echo "--- body ---"
-            cat /tmp/body.txt || true
-            echo
-          done
+          sleep 8
           python3 - <<'PY'
-          import http.client, ssl, time
+          import concurrent.futures, http.client, ssl, socket, time, json, collections
           host='kaka-contract-realtime-worker.onrender.com'
           path='/api/contract-depth/stream?provider=binance&market_type=contract&symbol=BTCUSDT&view=orderbook&limit=20'
-          c=http.client.HTTPSConnection(host,timeout=15,context=ssl.create_default_context())
-          c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'})
-          r=c.getresponse()
-          print('STREAM status=',r.status,'content-type=',r.getheader('content-type'),'schema=',r.getheader('x-kaka-stream-schema'))
-          deadline=time.time()+8
-          lines=[]
-          while time.time()<deadline and len(lines)<12:
-              line=r.readline().decode('utf-8','replace').rstrip()
-              lines.append(line)
-              if line.startswith('data:') and '"bids"' in line:
-                  break
-          print('\n'.join(lines))
-          c.close()
+          clients=30
+          hold_s=45
+          started=time.time()
+          def one(i):
+              c=None
+              try:
+                  c=http.client.HTTPSConnection(host,timeout=15,context=ssl.create_default_context())
+                  c.request('GET',path,headers={'Accept':'text/event-stream','Cache-Control':'no-cache','User-Agent':'KakaWeb3-R38C100'})
+                  r=c.getresponse()
+                  if r.status!=200:
+                      body=r.read(400).decode('utf-8','replace')
+                      return ('status_'+str(r.status),False,0,body[:120])
+                  if 'text/event-stream' not in str(r.getheader('content-type') or ''):
+                      return ('bad_content_type',False,0,str(r.getheader('content-type')))
+                  try:
+                      r.fp.raw._sock.settimeout(5)
+                  except Exception:
+                      pass
+                  got_shared=False
+                  events=0
+                  deadline=time.time()+hold_s
+                  while time.time()<deadline:
+                      try:
+                          line=r.readline()
+                          if not line:
+                              break
+                          s=line.decode('utf-8','replace').strip()
+                          if s.startswith('data:'):
+                              events+=1
+                              if '"downstream_fanout_shared":true' in s.replace(' ',''):
+                                  got_shared=True
+                      except socket.timeout:
+                          continue
+                  return ('ok',got_shared,events,'')
+              except Exception as e:
+                  return (type(e).__name__,False,0,str(e)[:120])
+              finally:
+                  try:
+                      if c: c.close()
+                  except Exception:
+                      pass
+          with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as ex:
+              rows=list(ex.map(one,range(clients)))
+          kinds=collections.Counter(x[0] for x in rows)
+          shared=sum(1 for x in rows if x[1])
+          event_counts=[x[2] for x in rows]
+          print('shard clients=',clients,'elapsed_s=',round(time.time()-started,2))
+          print('kinds=',dict(kinds),'shared_first_or_later=',shared,'events_min=',min(event_counts),'events_max=',max(event_counts))
+          bad=[x for x in rows if x[0]!='ok' or not x[1]]
+          if bad: print('bad_samples=',bad[:5])
+          assert kinds=={'ok':clients}, kinds
+          assert shared==clients, shared
+          PY
+
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Observe production stream health peak
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 12
+          python3 - <<'PY'
+          import urllib.request, json, time
+          url='https://kaka-contract-realtime-worker.onrender.com/api/contract-depth/stream-health'
+          peak=0
+          peak_keys=0
+          peak_binance_groups=0
+          samples=[]
+          for i in range(45):
+              try:
+                  with urllib.request.urlopen(url,timeout=10) as r:
+                      h=json.load(r)
+                  c=int(h.get('client_count') or 0)
+                  k=int(h.get('active_key_count') or 0)
+                  bg=int((h.get('provider_groups') or {}).get('binance') or 0)
+                  peak=max(peak,c); peak_keys=max(peak_keys,k); peak_binance_groups=max(peak_binance_groups,bg)
+                  samples.append((i,c,k,bg,h.get('refresh_started'),h.get('downstream_events')))
+              except Exception as e:
+                  samples.append((i,'ERR',type(e).__name__))
+              time.sleep(1)
+          print('samples_tail=',samples[-15:])
+          print('PEAK client_count=',peak,'active_key_count=',peak_keys,'binance_groups=',peak_binance_groups)
+          assert peak>=100, peak
+          assert peak_keys<=4, peak_keys
+          assert peak_binance_groups>=1, peak_binance_groups
           PY
