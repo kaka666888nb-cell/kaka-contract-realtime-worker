@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 
-const VERSION = 'step1060_3_render_supabase_egress_proxy_v2';
+const VERSION = 'step1073_v101_render_supabase_egress_proxy_v3';
 const MIN_PROXY_BYTES = Math.max(8 * 1024, Number(process.env.KAKA_RENDER_SUPABASE_PROXY_MIN_BYTES || 32 * 1024));
 const MAX_COMPRESSED_BYTES = 4 * 1024 * 1024;
 const ALLOWED_TABLES = new Set([
@@ -10,6 +10,9 @@ const ALLOWED_TABLES = new Set([
   'kaka_project_fundamentals',
   'app_airdrop_events',
   'app_onchain_shared_snapshots',
+]);
+const ALLOWED_RPCS = new Set([
+  'app_upsert_market_backend_snapshots_diff',
 ]);
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
@@ -76,9 +79,14 @@ function eligible(meta) {
     return null;
   }
   if (url.origin !== base.origin || !url.pathname.startsWith('/rest/v1/')) return null;
-  const table = url.pathname.slice('/rest/v1/'.length);
-  if (!ALLOWED_TABLES.has(table) || table.includes('/')) return null;
-  return { url, table };
+  const target = url.pathname.slice('/rest/v1/'.length);
+  if (target.startsWith('rpc/')) {
+    const rpc = target.slice('rpc/'.length);
+    if (!ALLOWED_RPCS.has(rpc) || rpc.includes('/')) return null;
+    return { url, table: target };
+  }
+  if (!ALLOWED_TABLES.has(target) || target.includes('/')) return null;
+  return { url, table: target };
 }
 
 function syntheticFailure(status, error) {
@@ -110,6 +118,7 @@ function proxyHealth() {
     fail_closed_for_large_background_writes: true,
     direct_uncompressed_fallback: false,
     allowed_tables: [...ALLOWED_TABLES],
+    allowed_rpcs: [...ALLOWED_RPCS],
     considered: stats.considered,
     proxied: stats.proxied,
     proxy_failures: stats.proxy_failures,
