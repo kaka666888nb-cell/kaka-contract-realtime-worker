@@ -1,0 +1,34 @@
+name: Step1073 R35D stock catalog low-WAL contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/stock-catalog-v2.mjs'
+      - '.github/workflows/step1073-r35d-stock-catalog-low-wal.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify stock health and self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          for i in $(seq 1 45); do
+            hc="$(curl --compressed -sS --connect-timeout 8 --max-time 25 -o /tmp/health.json -w '%{http_code}' "$BASE/api/stock-catalog-v2/health" || true)"
+            sc="$(curl --compressed -sS --connect-timeout 8 --max-time 25 -o /tmp/self.json -w '%{http_code}' "$BASE/api/stock-catalog-v2/self-test" || true)"
+            ok="$(python3 -c "import json; h=json.load(open('/tmp/health.json')); s=json.load(open('/tmp/self.json')); p=h.get('persistence') or {}; good=(h.get('version')=='650.8.15.196.13' and p.get('commit_contract')=='validated_atomic_sha256_diff_replace_changed_only' and p.get('stage_persistence_mode')=='unlogged_ephemeral' and p.get('hash_sidecar_table')=='kaka_exchange_stock_catalog_v2_hashes' and s.get('ok') is True); print('1' if good else '0')" 2>/dev/null || true)"
+            if [ "$hc" = "200" ] && [ "$sc" = "200" ] && [ "$ok" = "1" ]; then break; fi
+            sleep 5
+          done
+          test "$hc" = "200"
+          test "$sc" = "200"
+          test "$ok" = "1"
+          python3 -c "import json; h=json.load(open('/tmp/health.json')); s=json.load(open('/tmp/self.json')); p=h.get('persistence') or {}; print('PASS version=',h.get('version'),'checks=',s.get('checks'),'commit=',p.get('commit_contract'),'stage=',p.get('stage_persistence_mode'),'hash=',p.get('hash_sidecar_table'))"
