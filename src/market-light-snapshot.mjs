@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.3.2';
+const STEP_VERSION = '650.8.15.197.3.3.6.3.3';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -152,13 +152,12 @@ const BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX = Math.max(
   16,
   Math.min(
     BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS,
-    256,
-    Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX || 96),
+    64,
+    Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX || 24),
   ),
 );
 const BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS = Object.freeze([
-  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','TRXUSDT',
-  'AVAXUSDT','LINKUSDT','SUIUSDT','TONUSDT','BCHUSDT','LTCUSDT','DOTUSDT','UNIUSDT',
+  'BTCUSDT','ETHUSDT',
 ]);
 const BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS = Math.max(250, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS || 750));
 const BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS || 2_000));
