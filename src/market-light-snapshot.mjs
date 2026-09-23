@@ -3,7 +3,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.3.4';
+const STEP_VERSION = '650.8.15.197.3.3.6.3.5';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -466,6 +466,11 @@ const binanceContractBookTicker = {
   baselineFailures: 0,
   baselineRows: 0,
   baselineLastError: '',
+  focusActive: false,
+  idleStops: 0,
+  focusStarts: 0,
+  lastModeChangeAt: 0,
+  lastStopReason: '',
 };
 
 function keyFor(market, provider) {
@@ -1072,7 +1077,9 @@ async function loadProviderRows(provider, market, observedAt) {
   }
   const baseRows = await loadMarketTickers(provider, market, []);
   if (provider === 'binance' && market === 'contract') {
-    ensureBinanceContractBookTicker().catch(() => {});
+    if (binanceContractBookTickerRealtimeDemanded()) {
+      ensureBinanceContractBookTicker().catch(() => {});
+    }
     await refreshBinanceContractBookTickerBaseline().catch(() => false);
     const patches = [...binanceContractBookTicker.rows.values()];
     return mergeRowsByNative(baseRows, patches, provider, market, observedAt, 'USDT');
@@ -2391,7 +2398,58 @@ async function refreshBinanceContractBookTickerBaseline({ force = false } = {}) 
   return await binanceContractBookTicker.baselineConnecting;
 }
 
+function binanceContractBookTickerRealtimeDemanded() {
+  pruneWatchlistTickerFocus();
+  for (const spec of watchlistTickerFocus.values()) {
+    if (spec?.provider === 'binance' && spec?.market === 'contract') return true;
+  }
+  return false;
+}
+
+function stopBinanceContractBookTickerRealtime(reason = 'idle_no_contract_focus') {
+  if (binanceContractBookTicker.reconnectTimer) {
+    clearTimeout(binanceContractBookTicker.reconnectTimer);
+    binanceContractBookTicker.reconnectTimer = null;
+  }
+  const socket = binanceContractBookTicker.socket;
+  const wasActive = Boolean(
+    binanceContractBookTicker.ready ||
+    (socket && wsReady(socket)) ||
+    binanceContractBookTicker.connecting
+  );
+  binanceContractBookTicker.ready = false;
+  binanceContractBookTicker.focusActive = false;
+  binanceContractBookTicker.lastStopReason = String(reason || 'idle_no_contract_focus');
+  if (socket) {
+    binanceContractBookTicker.socket = null;
+    try { closeWs(socket); } catch (_) {}
+  }
+  if (wasActive) {
+    binanceContractBookTicker.idleStops += 1;
+    binanceContractBookTicker.lastModeChangeAt = Date.now();
+  }
+  return true;
+}
+
+async function syncBinanceContractBookTickerRealtimeMode() {
+  const demanded = binanceContractBookTickerRealtimeDemanded();
+  binanceContractBookTicker.focusActive = demanded;
+  if (!demanded) {
+    stopBinanceContractBookTickerRealtime('idle_no_contract_focus');
+    return false;
+  }
+  if (!wsReady(binanceContractBookTicker.socket) || !binanceContractBookTicker.ready) {
+    binanceContractBookTicker.focusStarts += 1;
+    binanceContractBookTicker.lastModeChangeAt = Date.now();
+  }
+  return await ensureBinanceContractBookTicker();
+}
+
 function scheduleBinanceContractBookTickerReconnect() {
+  if (!binanceContractBookTickerRealtimeDemanded()) {
+    stopBinanceContractBookTickerRealtime('reconnect_suppressed_without_focus');
+    return;
+  }
   if (binanceContractBookTicker.reconnectTimer) return;
   const delay = Math.min(
     BINANCE_BOOK_RECONNECT_MAX_MS,
@@ -2475,6 +2533,11 @@ async function openBinanceContractBookTicker() {
 }
 
 async function ensureBinanceContractBookTicker() {
+  if (!binanceContractBookTickerRealtimeDemanded()) {
+    stopBinanceContractBookTickerRealtime('ensure_suppressed_without_focus');
+    return false;
+  }
+  binanceContractBookTicker.focusActive = true;
   if (wsReady(binanceContractBookTicker.socket) && binanceContractBookTicker.ready) return true;
   if (binanceContractBookTicker.connecting) return await binanceContractBookTicker.connecting;
   binanceContractBookTicker.connecting = openBinanceContractBookTicker()
@@ -2500,7 +2563,7 @@ export async function runMarketLightSnapshotCycle({ reason = 'scheduled' } = {})
     ensureBinanceSpotMiniTicker().catch(() => {});
     ensureBinanceSpotBookTicker().catch(() => {});
     refreshBinanceSpotTickerBaseline().catch(() => {});
-    ensureBinanceContractBookTicker().catch(() => {});
+    syncBinanceContractBookTickerRealtimeMode().catch(() => {});
     const targets = [
       ...SPOT_PROVIDERS.map((provider) => ({ provider, market: 'spot' })),
       ...CONTRACT_PROVIDERS.map((provider) => ({ provider, market: 'contract' })),
@@ -2537,8 +2600,9 @@ export function startMarketLightSnapshotScanner() {
   ensureBinanceSpotMiniTicker().catch(() => {});
   ensureBinanceSpotBookTicker().catch(() => {});
   refreshBinanceSpotTickerBaseline().catch(() => {});
-  ensureBinanceContractBookTicker().catch(() => {});
+  refreshBinanceContractBookTickerBaseline().catch(() => false);
   startWatchlistTickerFocusScheduler();
+  syncBinanceContractBookTickerRealtimeMode().catch(() => {});
   refreshDirectoryCounts().catch(() => {});
   scanTimer = setTimeout(() => {
     runMarketLightSnapshotCycle({ reason: 'startup' }).catch(() => {});
@@ -2554,7 +2618,8 @@ export function startMarketLightSnapshotScanner() {
     ensureBinanceSpotMiniTicker().catch(() => {});
     ensureBinanceSpotBookTicker().catch(() => {});
     scheduleBinanceSpotBookTickerSubscriptionSync();
-    ensureBinanceContractBookTicker().catch(() => {});
+    refreshBinanceContractBookTickerBaseline().catch(() => false);
+    syncBinanceContractBookTickerRealtimeMode().catch(() => {});
   }, DIRECTORY_INTERVAL_MS);
   directoryInterval.unref?.();
 }
@@ -4061,6 +4126,7 @@ function startWatchlistTickerFocusScheduler() {
     // The user-facing watchlist route only updates the in-memory bounded focus map.
     scheduleBinanceSpotBookTickerSubscriptionSync();
     refreshWatchlistTickerFocus().catch(() => {});
+    syncBinanceContractBookTickerRealtimeMode().catch(() => {});
   }, WATCHLIST_FOCUS_REFRESH_MS);
   watchlistTickerRefreshTimer.unref?.();
 }
@@ -4089,7 +4155,10 @@ function watchlistTickerPayload(specs) {
     binance_spot_book_ticker_fixed_background_focus_sync: true,
     binance_spot_user_reads_start_connections: false,
     binance_spot_user_reads_start_subscription_messages: false,
-    binance_contract_persistent_shared_stream: true,
+    binance_contract_persistent_shared_stream: false,
+    binance_contract_focus_activated_shared_stream: true,
+    binance_contract_idle_mode: 'periodic_ticker_plus_10m_bbo_baseline',
+    binance_contract_user_reads_start_connections: false,
     coinbase_spot_shared_stream: true,
     generated_at: new Date().toISOString(),
   };
@@ -4475,7 +4544,7 @@ export function getMarketLightSnapshotHealth() {
       user_read_upstream_requests: 0,
       fixed_background_refresh_independent_of_user_count: true,
       binance_spot_source: 'existing_shared_miniticker_plus_shared_multi_symbol_bookticker_websockets',
-      binance_contract_source: 'existing_persistent_usdm_shared_websocket',
+      binance_contract_source: 'periodic_usdm_shared_ticker_plus_focus_activated_bookticker_background_stream',
       coinbase_spot_source: 'existing_public_ticker_batch_websocket',
       other_provider_source: 'fixed_background_exact_focus_ticker_batches',
       stats: { ...watchlistTickerStats },
@@ -4646,7 +4715,8 @@ export function getMarketLightSnapshotHealth() {
       binance_spot_authenticated_rest_requests_from_market_light: 0,
       binance_spot_edge_relay_requests_from_market_light: 0,
       coinbase_shared_market_ws_connections: 1,
-      binance_contract_all_book_ticker_shared_ws_connections: 1,
+      binance_contract_all_book_ticker_shared_ws_connections_max: 1,
+      binance_contract_all_book_ticker_idle_ws_connections: 0,
       binance_contract_bbo_ws_api_baseline_requests_per_10m: 1,
       per_user_upstream_requests: 0,
       per_user_upstream_connections: 0,
@@ -4654,7 +4724,7 @@ export function getMarketLightSnapshotHealth() {
     },
     full_market_light_source_notes: {
       binance_spot: 'one official data-stream.binance.vision !miniTicker@arr shared stream bootstraps live USDT identities and 24h price/volume, plus one fixed backend multi-symbol <symbol>@bookTicker websocket with bounded core+recent-focus subscriptions for real-time best bid/ask; user reads start neither connection nor subscription reconciliation; missing BBO keeps the existing shared-depth Top1 fallback; optional data-api ticker/24hr baseline stays disabled by default',
-      binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot + official USDⓈ-M !bookTicker one shared websocket for all-symbol BBO',
+      binance_contract: 'existing_all_market_ticker_plus_mark_price_shared snapshot; official USDⓈ-M !bookTicker is focus-activated by the fixed backend scheduler, while idle mode keeps the 10m all-symbol WS-API BBO baseline',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
       okx_contract: 'official_SWAP_tickers_batch + canonical OKX SWAP identity merge + dual-host public mark-price batch + USDT index-tickers batch + public open-interest batch; funding remains missing unless officially supplied by a batch source',
@@ -4807,6 +4877,14 @@ export function getMarketLightSnapshotHealth() {
     },
     binance_contract_all_book_ticker: {
       source: 'binance_usdm_all_book_tickers_shared_websocket',
+      mode: 'focus_activated_background_shared_stream',
+      focus_active: binanceContractBookTickerRealtimeDemanded(),
+      idle_mode: 'periodic_ticker_plus_10m_bbo_baseline',
+      user_reads_start_connections: false,
+      idle_stops: binanceContractBookTicker.idleStops,
+      focus_starts: binanceContractBookTicker.focusStarts,
+      last_mode_change_at: binanceContractBookTicker.lastModeChangeAt ? new Date(binanceContractBookTicker.lastModeChangeAt).toISOString() : null,
+      last_stop_reason: binanceContractBookTicker.lastStopReason || null,
       url: BINANCE_CONTRACT_BOOK_TICKER_WS_URL,
       connected: wsReady(binanceContractBookTicker.socket) && binanceContractBookTicker.ready,
       cached_rows: binanceContractBookTicker.rows.size,
