@@ -1,8 +1,9 @@
+import { gzipSync } from 'node:zlib';
 import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-rest.mjs';
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.3.3';
+const STEP_VERSION = '650.8.15.197.3.3.6.3.4';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -4869,6 +4870,36 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
+function sendHealthJson(req, res, status, payload) {
+  if (res.headersSent) return;
+  const raw = Buffer.from(JSON.stringify(payload));
+  const acceptsGzip = /(?:^|,)\s*gzip\s*(?:,|$)/i.test(
+    String(req?.headers?.['accept-encoding'] || ''),
+  );
+  let sent = raw;
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, OPTIONS',
+  };
+  // Step1073 V102.6: health polling is read-only and high-frequency in
+  // production. Preserve the exact decoded payload while avoiding repeated
+  // raw JSON transfer when the caller explicitly supports gzip.
+  if (acceptsGzip && raw.length >= 512) {
+    try {
+      sent = gzipSync(raw, { level: 4 });
+      headers['content-encoding'] = 'gzip';
+      headers.vary = 'Accept-Encoding';
+    } catch (_) {
+      sent = raw;
+    }
+  }
+  headers['content-length'] = String(sent.length);
+  res.writeHead(status, headers);
+  res.end(sent);
+}
+
 export async function handleMarketLightSnapshot(req, res, url) {
   const sectorHistoryRoute = url.pathname === '/api/crypto-sector-professional/history' ||
     url.pathname === '/api/crypto-sector-professional/history-health';
@@ -4887,7 +4918,7 @@ export async function handleMarketLightSnapshot(req, res, url) {
     return true;
   }
   if (url.pathname === HEALTH_ROUTE) {
-    sendJson(res, 200, getMarketLightSnapshotHealth());
+    sendHealthJson(req, res, 200, getMarketLightSnapshotHealth());
     return true;
   }
   if (url.pathname === SECTOR_HEALTH_ROUTE) {
