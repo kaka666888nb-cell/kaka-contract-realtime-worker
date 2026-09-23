@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.3';
+const STEP_VERSION = '650.8.15.197.3.3.6.3.1';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -1723,28 +1723,30 @@ function binanceSpotMiniTickerPatch(raw, existing) {
   if (last == null) return null;
   const open = positive(raw.o);
   const sourceTime = isoMs(raw.E) || new Date().toISOString();
-  return {
-    ...existing,
-    last_price: last,
-    price: last,
-    price_change_percent_24h: open != null && open > 0 ? ((last - open) / open) * 100 : existing.price_change_percent_24h,
-    price_change_percent_24h_source: open != null
-      ? 'derived_from_binance_official_miniticker_close_open'
-      : existing.price_change_percent_24h_source,
-    volume_24h: finite(raw.v) ?? existing.volume_24h,
-    base_volume_24h: finite(raw.v) ?? existing.base_volume_24h,
-    quote_volume_24h: finite(raw.q) ?? existing.quote_volume_24h,
-    high_24h: finite(raw.h) ?? existing.high_24h,
-    low_24h: finite(raw.l) ?? existing.low_24h,
-    source: existing?.stream_bootstrap === true
-      ? 'binance_spot_official_miniticker_stream_bootstrap'
-      : 'binance_spot_official_market_data_only_rest_baseline_plus_miniticker_stream',
-    transport: existing?.stream_bootstrap === true
-      ? 'backend_shared_one_market_stream_bootstrap'
-      : 'backend_shared_market_data_only_rest_baseline_plus_shared_market_stream',
-    source_time: sourceTime,
-    cached_at: sourceTime,
-  };
+  // Step1073 V102.1: this shared stream can update hundreds of rows per second.
+  // Mutate the already-owned live row instead of cloning the whole market row
+  // on every tick. No object escapes this in-memory owner and 30s published
+  // snapshots are still cloned independently by buildProvider.
+  existing.last_price = last;
+  existing.price = last;
+  if (open != null && open > 0) {
+    existing.price_change_percent_24h = ((last - open) / open) * 100;
+    existing.price_change_percent_24h_source = 'derived_from_binance_official_miniticker_close_open';
+  }
+  existing.volume_24h = finite(raw.v) ?? existing.volume_24h;
+  existing.base_volume_24h = finite(raw.v) ?? existing.base_volume_24h;
+  existing.quote_volume_24h = finite(raw.q) ?? existing.quote_volume_24h;
+  existing.high_24h = finite(raw.h) ?? existing.high_24h;
+  existing.low_24h = finite(raw.l) ?? existing.low_24h;
+  existing.source = existing.stream_bootstrap === true
+    ? 'binance_spot_official_miniticker_stream_bootstrap'
+    : 'binance_spot_official_market_data_only_rest_baseline_plus_miniticker_stream';
+  existing.transport = existing.stream_bootstrap === true
+    ? 'backend_shared_one_market_stream_bootstrap'
+    : 'backend_shared_market_data_only_rest_baseline_plus_shared_market_stream';
+  existing.source_time = sourceTime;
+  existing.cached_at = sourceTime;
+  return existing;
 }
 
 function binanceSpotDirectoryFromRows(rows) {
@@ -1914,9 +1916,7 @@ async function openBinanceSpotMiniTicker() {
             discoveredNewSymbol = true;
             continue;
           }
-          const merged = binanceSpotMiniTickerPatch(item, existing);
-          if (!merged) continue;
-          binanceSpotTicker.rows.set(symbol, merged);
+          if (!binanceSpotMiniTickerPatch(item, existing)) continue;
           binanceSpotTicker.acceptedUpdates += 1;
         }
         if (discoveredNewSymbol) scheduleBinanceSpotBookTickerSubscriptionSync();
@@ -2007,9 +2007,14 @@ function applyBinanceSpotBookTickerPatch(patch) {
   if (!existing) return false;
   const hadBbo = positive(existing.best_bid ?? existing.bid_price) != null &&
     positive(existing.best_ask ?? existing.ask_price) != null;
-  const merged = { ...existing, ...patch };
-  binanceSpotTicker.rows.set(symbol, merged);
-  binanceSpotBookTicker.bboRows.set(symbol, { ...patch });
+
+  // Step1073 V102.1: Binance Spot bookTicker can emit thousands of messages
+  // per second across the full USDT universe. The row and patch are exclusively
+  // owned by this collector, so cloning the entire market row plus cloning the
+  // patch on every BBO tick only creates GC pressure. Keep identical fields and
+  // coverage while updating the live row in place and storing the patch itself.
+  Object.assign(existing, patch);
+  binanceSpotBookTicker.bboRows.set(symbol, patch);
 
   const published = binanceSpotPublishedRows.get(symbol);
   if (published) {
