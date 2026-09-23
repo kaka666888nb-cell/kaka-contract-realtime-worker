@@ -1248,13 +1248,24 @@ async function fetchUniverse(
       );
       for (const item of payload.symbols || []) {
         if (String(item.status).toUpperCase() !== 'TRADING') continue;
+        const officialBase = String(item.baseAsset || '').trim().toUpperCase();
+        const officialSymbol = String(item.symbol || '').trim().toUpperCase();
+        // Step1073 R64: current market-light/exact-ticker/App canonical keys are
+        // intentionally ASCII. Binance now has a small number of CJK-native
+        // spot symbols. Do not collapse those into quote-only fake identities
+        // (for example 币安人生USDT -> USDT). Quarantine them fail-closed until
+        // Unicode native-symbol identity is supported end-to-end.
+        if (!/^[A-Z0-9]+$/.test(officialBase) ||
+            !/^[A-Z0-9]+$/.test(officialSymbol)) {
+          continue;
+        }
         rows.push(marketRow(
           provider,
           market,
-          item.symbol,
-          item.baseAsset,
+          officialSymbol,
+          officialBase,
           item.quoteAsset,
-          item.symbol,
+          officialSymbol,
         ));
       }
     }
