@@ -4613,7 +4613,8 @@ async function spotQuoteCatalog() {
 
       return {
         ok: true,
-        schema: 'step1073_r62_spot_quote_catalog_v2',
+        schema: 'step1073_r64_spot_quote_catalog_v3',
+        native_symbol_identity_policy: 'ascii_exact_fail_closed',
         source: 'six_spot_official_public_catalogs_shared',
         provider_count: providers.length,
         total_products: totalProducts,

@@ -21,12 +21,25 @@ jobs:
         run: |
           set -euo pipefail
           BASE='https://kaka-contract-realtime-worker.onrender.com'
-          curl --compressed -fsS --connect-timeout 8 --max-time 35             "$BASE/api/spot-quote-catalog" -o /tmp/quotes.json
+          ready=0
+          for i in $(seq 1 36); do
+            if curl --compressed -fsS --connect-timeout 8 --max-time 35 "$BASE/api/spot-quote-catalog" -o /tmp/quotes.json; then
+              schema="$(python3 -c "import json; print(json.load(open('/tmp/quotes.json')).get('schema',''))" 2>/dev/null || true)"
+              echo "poll=$i schema=$schema"
+              if [ "$schema" = "step1073_r64_spot_quote_catalog_v3" ]; then
+                ready=1
+                break
+              fi
+            fi
+            sleep 5
+          done
+          test "$ready" = 1
           python3 - <<'PY'
           import json
           p=json.load(open('/tmp/quotes.json','r',encoding='utf-8'))
           assert p.get('ok') is True, p
-          assert p.get('schema') == 'step1073_r62_spot_quote_catalog_v2', p
+          assert p.get('schema') == 'step1073_r64_spot_quote_catalog_v3', p
+          assert p.get('native_symbol_identity_policy') == 'ascii_exact_fail_closed', p
           assert p.get('read_only_shared') is True, p
           assert p.get('reads_scale_with_users') is False, p
           assert p.get('parser_covers_current_catalog') is True, p
