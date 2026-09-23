@@ -1,6 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const VERSION = "step1073_v101_render_egress_ingest_v6";
+const VERSION = "step1073_v101_render_egress_ingest_v7";
 const ALLOWED_TABLES = new Set([
   "kaka_exchange_stock_catalog_v2_stage",
   "kaka_exchange_stock_catalog_v2_state",
@@ -9,6 +9,7 @@ const ALLOWED_TABLES = new Set([
 ]);
 const ALLOWED_RPCS = new Set([
   "app_upsert_market_backend_snapshots_diff",
+  "app_upsert_bybit_second_history_chunks",
 ]);
 const MAX_COMPRESSED_BYTES = 4 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024;

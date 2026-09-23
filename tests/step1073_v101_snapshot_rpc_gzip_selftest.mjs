@@ -4,6 +4,8 @@ import { gunzipSync } from 'node:zlib';
 const supabaseUrl = 'https://project-ref.supabase.co';
 const snapshotRpcPath = '/rest/v1/rpc/app_upsert_market_backend_snapshots_diff';
 const snapshotRpcUrl = `${supabaseUrl}${snapshotRpcPath}`;
+const bybitChunkRpcPath = '/rest/v1/rpc/app_upsert_bybit_second_history_chunks';
+const bybitChunkRpcUrl = `${supabaseUrl}${bybitChunkRpcPath}`;
 const unknownRpcUrl = `${supabaseUrl}/rest/v1/rpc/not_approved_for_egress_proxy`;
 
 process.env.SUPABASE_URL = supabaseUrl;
@@ -64,6 +66,20 @@ try {
   assert.ok(calls[0].body.length < Buffer.byteLength(rawBody));
 
   calls.length = 0;
+  await globalThis.fetch(bybitChunkRpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: rawBody,
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, `${supabaseUrl}/functions/v1/kaka-render-egress-ingest`);
+  assert.equal(
+    calls[0].headers.get('x-kaka-target'),
+    encodeURIComponent(bybitChunkRpcPath),
+    'large Bybit history chunks must use the same authenticated gzip path',
+  );
+
+  calls.length = 0;
   await globalThis.fetch(unknownRpcUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -72,7 +88,7 @@ try {
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, unknownRpcUrl, 'unapproved RPCs must bypass the privileged gzip proxy');
 
-  console.log('PASS Step1073 V101 snapshot diff RPC uses the bounded gzip proxy');
+  console.log('PASS Step1073 V101 large approved RPCs use the bounded gzip proxy');
 } finally {
   globalThis.fetch = originalFetch;
   delete process.env.SUPABASE_URL;

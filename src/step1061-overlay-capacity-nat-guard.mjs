@@ -196,6 +196,7 @@ function healthPayload() {
       Number((1 - 15_000 / HEARTBEAT_MIN_INTERVAL_MS).toFixed(4)),
     active_real_ips: realIpActive.size,
     active_connections_tracked: [...realIpActive.values()].reduce((a, b) => a + Number(b || 0), 0),
+    max_active_per_real_ip: Math.max(0, ...realIpActive.values()),
     attempts_real_ips: realIpAttempts.size,
     reads_scale_with_users: false,
     user_read_exchange_requests: 0,

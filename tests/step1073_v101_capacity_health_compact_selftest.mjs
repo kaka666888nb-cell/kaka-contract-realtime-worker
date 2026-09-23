@@ -24,9 +24,12 @@ globalThis.Deno = {
 };
 globalThis.__testServe = (nextHandler) => { handler = nextHandler; };
 globalThis.__testCreateClient = () => ({
-  async rpc(name) {
-    if (name === 'kaka_edge_capacity_alert_decide') {
-      return { data: { notify: false, level: 'normal' }, error: null };
+  async rpc(name, params) {
+    if (name === 'kaka_edge_capacity_dimensions_alert_decide') {
+      assert.equal(params.p_dry_run, true);
+      assert.equal(params.p_dimensions.length, 2);
+      assert.equal(params.p_dimensions[0].runtime_id, 'runtime-test');
+      return { data: { notify: false, level: 'normal', dimension: 'realtime_ws_clients' }, error: null };
     }
     if (name === 'app_get_resend_platform_budget_status') {
       return { data: { allowed: true }, error: null };
@@ -39,12 +42,14 @@ globalThis.fetch = async (input) => {
   fetched.push(url);
   return new Response(JSON.stringify({
     ok: true,
-    binance_shared_ws: {
-      total_clients: 37,
-      max_total_clients: 1000,
-      rejected_capacity: 2,
-      downstream_ip_capacity_rejections: 1,
-    },
+    runtime_id: 'runtime-test',
+    schema: 'step1073_v101_capacity_health_v1',
+    dimensions: [
+      { id: 'realtime_ws_clients', label: 'Kline WebSocket clients', used: 37, limit: 1000, percent: 3.7, rejected: 3 },
+      { id: 'depth_stream_keys', label: 'Depth exact keys', used: 5, limit: 96, percent: 5.21, rejected: 0 },
+    ],
+    highest_utilization: { id: 'depth_stream_keys', used: 5, limit: 96, percent: 5.21 },
+    total_rejected_capacity: 3,
   }), { status: 200, headers: { 'content-type': 'application/json' } });
 };
 
@@ -70,12 +75,12 @@ try {
   }));
   const body = await response.json();
   assert.equal(response.status, 200);
-  assert.deepEqual(fetched, [`${workerBase}/api/realtime-ws-health`]);
-  assert.equal(body.total_clients, 37);
-  assert.equal(body.max_total_clients, 1000);
+  assert.deepEqual(fetched, [`${workerBase}/api/capacity-health`]);
+  assert.equal(body.highest_utilization.id, 'depth_stream_keys');
+  assert.equal(body.dimensions.length, 2);
   assert.equal(body.rejected_capacity, 3);
 
-  console.log('PASS Step1073 V101 capacity monitor uses compact realtime WS health');
+  console.log('PASS Step1073 V101 capacity monitor covers all compact capacity dimensions');
 } finally {
   globalThis.Deno = originalDeno;
   globalThis.fetch = originalFetch;

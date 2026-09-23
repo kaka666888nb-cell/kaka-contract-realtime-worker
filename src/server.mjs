@@ -3,12 +3,14 @@ import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { installProviderGovernorFetch, getProviderGovernorHealth } from './provider-request-governor.mjs';
 import { getBybitSecondHistoryHealth, handleBybitSecondHistoryInternal, startBybitSecondHistoryHotSeeds } from './bybit-second-history.mjs';
+import { installRenderSupabaseEgressProxy, getRenderSupabaseEgressProxyHealth } from './render-supabase-egress-proxy.mjs';
 
 const PORT = Number(process.env.PORT || 10000);
 const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate']);
 const SPOT_PROVIDERS = ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate'];
 const CONTRACT_PROVIDERS = ['binance', 'okx', 'bybit', 'bitget', 'gate'];
 const VALID_INTERVALS = new Set(['timeline','1s','1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1d','3d','1w','1M']);
+installRenderSupabaseEgressProxy();
 installProviderGovernorFetch({ role: 'realtime-child-rest-fallback' });
 
 function providerKey(raw) {
@@ -1374,8 +1376,52 @@ function binanceSharedWsHealth() {
   };
 }
 
+function binanceSharedWsCapacityHealth() {
+  const health = binanceSharedWsHealth();
+  return {
+    enabled: health.enabled,
+    active_streams: health.active_streams,
+    max_streams: health.max_streams,
+    total_clients: health.total_clients,
+    max_total_clients: health.max_total_clients,
+    max_clients_per_stream: health.max_clients_per_stream,
+    max_clients_per_ip: health.max_clients_per_ip,
+    max_streams_per_ip: health.max_streams_per_ip,
+    rejected_capacity: health.rejected_capacity,
+    downstream_ip_capacity_rejections:
+      health.downstream_ip_capacity_rejections,
+    downstream_ip_rate_rejections:
+      health.downstream_ip_rate_rejections,
+    connect_rate_rejections: health.connect_rate_rejections,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const parsedHttpUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  if (parsedHttpUrl.pathname === '/internal/capacity-health') {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify({
+      ok: true,
+      version: 'step1073_v101_realtime_capacity_v1',
+      binance_shared_ws: binanceSharedWsCapacityHealth(),
+      time: new Date().toISOString(),
+    }));
+    return;
+  }
+  if (parsedHttpUrl.pathname === '/internal/bybit-second-history-health') {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify({
+      ...getBybitSecondHistoryHealth(),
+      egress_proxy: getRenderSupabaseEgressProxyHealth(),
+    }));
+    return;
+  }
   if (await handleBybitSecondHistoryInternal(req, res, parsedHttpUrl)) return;
   if (process.env.KAKA_DISABLE_MARKET_API !== '1' && await handleMarketApi(req, res, parsedHttpUrl)) return;
   if (req.url?.startsWith('/ws-health')) {

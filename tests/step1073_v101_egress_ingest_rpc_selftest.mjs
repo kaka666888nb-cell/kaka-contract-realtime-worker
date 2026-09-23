@@ -6,6 +6,7 @@ import { gzipSync } from 'node:zlib';
 const supabaseUrl = 'https://project-ref.supabase.co';
 const serviceRole = 'test-service-role-key';
 const snapshotRpcPath = '/rest/v1/rpc/app_upsert_market_backend_snapshots_diff';
+const bybitChunkRpcPath = '/rest/v1/rpc/app_upsert_bybit_second_history_chunks';
 const allowedTablePath = '/rest/v1/app_airdrop_events?on_conflict=event_key';
 const unknownRpcPath = '/rest/v1/rpc/not_approved_for_egress_proxy';
 const calls = [];
@@ -38,7 +39,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (url === `${supabaseUrl}/rest/v1/rpc/kaka_verify_render_egress_service_role`) {
     return new Response('true', { status: 200, headers: { 'content-type': 'application/json' } });
   }
-  if (url === `${supabaseUrl}${snapshotRpcPath}`) {
+  if (url === `${supabaseUrl}${snapshotRpcPath}` || url === `${supabaseUrl}${bybitChunkRpcPath}`) {
     return new Response(JSON.stringify({ accepted: true }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -94,17 +95,22 @@ try {
   assert.equal(calls[1].body.toString('utf8'), rawBody.toString('utf8'));
   assert.equal(calls[1].headers.get('authorization'), `Bearer ${serviceRole}`);
 
+  const acceptedBybitChunks = await handler(compressedRequest(bybitChunkRpcPath, rawBody));
+  assert.equal(acceptedBybitChunks.status, 200);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].url, `${supabaseUrl}${bybitChunkRpcPath}`);
+
   const acceptedTable = await handler(compressedRequest(allowedTablePath, rawBody));
   assert.equal(acceptedTable.status, 201, 'existing allowlisted table writes must remain supported');
-  assert.equal(calls.length, 3);
-  assert.equal(calls[2].url, `${supabaseUrl}${allowedTablePath}`);
+  assert.equal(calls.length, 4);
+  assert.equal(calls[3].url, `${supabaseUrl}${allowedTablePath}`);
 
   const callsBeforeUnknown = calls.length;
   const rejected = await handler(compressedRequest(unknownRpcPath, rawBody));
   assert.equal(rejected.status, 403);
   assert.equal(calls.length, callsBeforeUnknown, 'unapproved RPC must not reach Supabase');
 
-  console.log('PASS Step1073 V101 egress ingest accepts only the snapshot diff RPC');
+  console.log('PASS Step1073 V101 egress ingest accepts only approved large-write RPCs');
 } finally {
   globalThis.Deno = originalDeno;
   globalThis.fetch = originalFetch;

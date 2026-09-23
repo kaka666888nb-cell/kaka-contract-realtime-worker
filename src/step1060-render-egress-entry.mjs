@@ -2,12 +2,14 @@ import { installRenderEgressCostGuard } from './render-egress-cost-guard.mjs';
 import { installRenderSupabaseEgressProxy } from './render-supabase-egress-proxy.mjs';
 import { installLiquidation1hNoopEgressGuard } from './liquidation-noop-egress-guard.mjs';
 import { installContractFlowPersistContractGuard } from './contract-flow-persist-contract-guard.mjs';
-import { installOverlayCapacityNatGuard } from './step1061-overlay-capacity-nat-guard.mjs';
+import { installOverlayCapacityNatGuard, getOverlayCapacityNatGuardHealth } from './step1061-overlay-capacity-nat-guard.mjs';
 import { installOverlayDeltaEgressGuard } from './step1061-overlay-delta-egress-guard.mjs';
 import { installOverlayNonpositiveEgressGuard } from './step1061-overlay-nonpositive-egress-guard.mjs';
 import { installRtcHealthRedactionGuard } from './step1062-rtc-health-redaction-guard.mjs';
 import { installRtcRingStateVerify } from './step1072-rtc-ring-state-verify.mjs';
 import { installRtcControlPlane } from './step1062-rtc-control.mjs';
+import { getContractDepthStreamHealth } from './contract-depth.mjs';
+import { installStep1073CapacityHealth } from './step1073-capacity-health.mjs';
 
 // Step1060.3: install metering/compression first, then route only the known
 // large background Supabase JSON writes through the authenticated gzip ingest.
@@ -50,9 +52,20 @@ installRtcControlPlane();
 // market-light shared snapshot. Active exact identities, not client count, bound
 // the localhost collector reads. The existing HTTP exact route remains the App
 // fallback and no client stream opens an exchange request or exchange connection.
-await import('./step1060-market-light-ticker-stream.mjs');
+const marketLightStream = await import('./step1060-market-light-ticker-stream.mjs');
 // Step1061.5: one mixed downstream SSE multiplexes exact spot/contract, exchange-assets and
 // on-chain pool identities for the system overlay. It reuses existing shared focus collectors;
 // only on-chain 24h change gets one bounded backend-wide DEX refresh lane, never per-user polling.
-await import('./step1061-overlay-ticker-stream.mjs');
+const overlayStream = await import('./step1061-overlay-ticker-stream.mjs');
+// Step1073 V101: one compact health route covers every bounded downstream
+// client/key dimension. The alert cron no longer downloads the large general
+// health payload and can see SSE/NAT/depth saturation as well as Kline WS.
+installStep1073CapacityHealth({
+  childPort: Number(process.env.KAKA_CHILD_PORT || 10001),
+  getMarketLightHealth:
+    marketLightStream.getMarketLightDownstreamStreamHealth,
+  getOverlayHealth: overlayStream.getOverlayDownstreamStreamHealth,
+  getOverlayNatHealth: getOverlayCapacityNatGuardHealth,
+  getDepthHealth: getContractDepthStreamHealth,
+});
 await import('./step1042-bitget-long-kline-continuity-proxy.mjs');

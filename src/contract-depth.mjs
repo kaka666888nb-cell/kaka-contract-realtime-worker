@@ -2742,6 +2742,10 @@ function contractDepthStreamHealthPayload() {
   };
 }
 
+export function getContractDepthStreamHealth() {
+  return contractDepthStreamHealthPayload();
+}
+
 function handleContractDepthStream(req, res, url) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {

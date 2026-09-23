@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 
-const VERSION = 'step1073_v101_render_supabase_egress_proxy_v3';
+const VERSION = 'step1073_v101_render_supabase_egress_proxy_v4';
 const MIN_PROXY_BYTES = Math.max(8 * 1024, Number(process.env.KAKA_RENDER_SUPABASE_PROXY_MIN_BYTES || 32 * 1024));
 const MAX_COMPRESSED_BYTES = 4 * 1024 * 1024;
 const ALLOWED_TABLES = new Set([
@@ -13,6 +13,7 @@ const ALLOWED_TABLES = new Set([
 ]);
 const ALLOWED_RPCS = new Set([
   'app_upsert_market_backend_snapshots_diff',
+  'app_upsert_bybit_second_history_chunks',
 ]);
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');

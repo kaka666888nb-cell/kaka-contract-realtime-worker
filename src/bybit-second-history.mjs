@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.71';
+const VERSION = '650.8.15.71.1';
 const PROVIDER = 'bybit';
 const MAX_ROWS = 3600;
 const MAX_ENTRIES = 64;
@@ -627,9 +627,19 @@ function buildPersistChunks(entry) {
   if (!Number.isFinite(newestMs) || newestMs <= 0) return { chunks: [], newestMs: 0 };
 
   const previousMs = Number(entry.lastPersistedSourceTimeMs || 0);
-  const thresholdMs = previousMs > 0
+  const persistedThresholdMs = previousMs > 0
     ? Math.floor(previousMs / PERSIST_CHUNK_MS) * PERSIST_CHUNK_MS
     : Number(rows[0]?.open_time_ms || 0);
+  // The database RPC deliberately accepts no more than 30 chunks and retains
+  // only the latest two hours. Sparse markets can hold 3,600 verified seconds
+  // spread across days, so serializing the entire ring only creates an
+  // oversized request that is rejected and retried forever. Start at the
+  // retention boundary while keeping the previously-persisted current chunk
+  // eligible for an in-place update.
+  const thresholdMs = Math.max(
+    persistedThresholdMs,
+    newestMs - PERSIST_CHUNK_RETENTION_MS,
+  );
   const grouped = new Map();
   for (const row of rows) {
     const rowMs = Number(row?.open_time_ms || 0);
@@ -1188,6 +1198,7 @@ export const _test = {
   mergeRows,
   ingestTrade,
   rebuildRowIndex,
+  buildPersistChunks,
   readBybitSecondHistory,
   filteredRows,
   rowsBeforeEnd,

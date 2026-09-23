@@ -2,7 +2,7 @@ import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.197.3.3.25.3';
+const VERSION = '650.8.15.197.3.3.25.4';
 const SCHEMA = 'step1060_render_egress_cost_guard_v1';
 const STARTED_AT = Date.now();
 const MAX_ROUTES = 192;
