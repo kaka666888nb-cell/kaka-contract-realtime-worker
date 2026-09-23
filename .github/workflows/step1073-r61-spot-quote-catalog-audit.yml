@@ -1,6 +1,11 @@
 name: Step1073 R61 spot quote catalog audit
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/market-rest.mjs'
+      - '.github/workflows/step1073-r61-spot-quote-catalog-audit.yml'
   workflow_dispatch:
 
 permissions:
