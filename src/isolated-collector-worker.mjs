@@ -9,7 +9,7 @@ const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT
 process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
 process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
 if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
-const VERSION = '650.8.15.192.2';
+const VERSION = '650.8.15.192.3';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -43,6 +43,10 @@ if (ROLE === 'market-light') {
     return {
       round: Number(health?.round || 0),
       running: health?.running === true,
+      active_focus: Number(health?.watchlist_realtime?.active_focus || 0),
+      binance_spot_book_desired: Number(health?.binance_spot_book_ticker_shared_ws?.desired_symbols || 0),
+      binance_spot_book_subscribed: Number(health?.binance_spot_book_ticker_shared_ws?.subscribed_streams || 0),
+      binance_spot_book_hard_cap: Number(health?.binance_spot_book_ticker_shared_ws?.active_stream_hard_cap || 0),
       coinbase_messages: Number(health?.coinbase_ticker_batch?.messages || 0),
       coinbase_updates: Number(health?.coinbase_ticker_batch?.ticker_updates || 0),
       binance_spot_mini_messages: Number(health?.binance_spot_ticker_shared_ws?.messages || 0),
