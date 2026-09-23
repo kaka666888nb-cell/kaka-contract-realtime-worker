@@ -1,4 +1,4 @@
-import { installRenderEgressCostGuard, egressHealth } from './render-egress-cost-guard.mjs';
+import { installRenderEgressCostGuard } from './render-egress-cost-guard.mjs';
 import { installRenderSupabaseEgressProxy } from './render-supabase-egress-proxy.mjs';
 import { installLiquidation1hNoopEgressGuard } from './liquidation-noop-egress-guard.mjs';
 import { installContractFlowPersistContractGuard } from './contract-flow-persist-contract-guard.mjs';
@@ -16,50 +16,6 @@ import { installStep1073CapacityHealth } from './step1073-capacity-health.mjs';
 // If that ingest is unavailable, large writes fail closed and preserve the
 // last verified DB data instead of silently falling back to expensive raw egress.
 installRenderEgressCostGuard();
-
-// Step1073 V102.4: bounded production egress snapshot for the fixed-cost audit.
-// It only reads counters already maintained by the egress guard and writes four
-// compact log lines. No route, response, collector, cache or upstream behavior changes.
-let v102EgressSamples = 0;
-const v102EgressTimer = setInterval(() => {
-  try {
-    const health = egressHealth();
-    const topRoutes = Array.isArray(health?.http?.top_routes_by_sent_bytes)
-      ? health.http.top_routes_by_sent_bytes.slice(0, 12)
-      : [];
-    const healthClients = Array.isArray(health?.http?.health_probe_clients)
-      ? health.http.health_probe_clients.slice(0, 8)
-      : [];
-    const outboundPaths = Array.isArray(health?.outbound_requests?.top_paths_by_known_request_body_bytes)
-      ? health.outbound_requests.top_paths_by_known_request_body_bytes.slice(0, 10)
-      : [];
-    v102EgressSamples += 1;
-    console.log('[Step1073 V102.4 egress-profiler] ' + JSON.stringify({
-      sample: v102EgressSamples,
-      uptime_seconds: health?.uptime_seconds ?? null,
-      http_requests: health?.http?.requests ?? 0,
-      http_sent_bytes: health?.http?.sent_response_bytes ?? 0,
-      http_gzip_saved_bytes: health?.http?.gzip_saved_bytes ?? 0,
-      websocket_messages: health?.websocket?.downstream_messages ?? 0,
-      websocket_payload_bytes: health?.websocket?.downstream_payload_bytes ?? 0,
-      outbound_requests: health?.outbound_requests?.requests ?? 0,
-      outbound_known_body_bytes: health?.outbound_requests?.known_request_body_bytes ?? 0,
-      top_routes: topRoutes,
-      health_clients: healthClients,
-      top_outbound_paths: outboundPaths,
-      timestamp_ms: Date.now(),
-    }));
-  } catch (error) {
-    console.log('[Step1073 V102.4 egress-profiler] ' + JSON.stringify({
-      sample: v102EgressSamples + 1,
-      error: String(error?.message || error).slice(0, 240),
-      timestamp_ms: Date.now(),
-    }));
-    v102EgressSamples += 1;
-  }
-  if (v102EgressSamples >= 4) clearInterval(v102EgressTimer);
-}, 30_000);
-v102EgressTimer.unref?.();
 
 installRenderSupabaseEgressProxy();
 // Step1060.26: filter identical liquidation 1H persistence rows before they

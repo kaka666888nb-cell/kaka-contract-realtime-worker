@@ -1,5 +1,4 @@
 import http from 'node:http';
-import { performance } from 'node:perf_hooks';
 import { isMainThread, threadId, workerData } from 'node:worker_threads';
 import { installProviderGovernorFetch, getProviderGovernorHealth } from './provider-request-governor.mjs';
 import { projectMarketLightSnapshot, scopeTargets } from './market-light-bridge-projection.mjs';
@@ -31,32 +30,12 @@ function sendJson(res, status, payload) {
 let handleRoleRoute = null;
 let internalState = null;
 let roleVersion = null;
-let runtimeProfileExtra = null;
 
 if (ROLE === 'market-light') {
   const module = await import('./market-light-snapshot.mjs');
   module.startMarketLightSnapshotScanner();
   roleVersion = module.getMarketLightSnapshotHealth().version || null;
   handleRoleRoute = module.handleMarketLightSnapshot;
-  runtimeProfileExtra = () => {
-    const health = module.getMarketLightSnapshotHealth();
-    return {
-      round: Number(health?.round || 0),
-      running: health?.running === true,
-      active_focus: Number(health?.watchlist_realtime?.active_focus || 0),
-      binance_spot_book_desired: Number(health?.binance_spot_book_ticker_shared_ws?.desired_symbols || 0),
-      binance_spot_book_subscribed: Number(health?.binance_spot_book_ticker_shared_ws?.subscribed_streams || 0),
-      binance_spot_book_hard_cap: Number(health?.binance_spot_book_ticker_shared_ws?.active_stream_hard_cap || 0),
-      coinbase_messages: Number(health?.coinbase_ticker_batch?.messages || 0),
-      coinbase_updates: Number(health?.coinbase_ticker_batch?.ticker_updates || 0),
-      binance_spot_mini_messages: Number(health?.binance_spot_ticker_shared_ws?.messages || 0),
-      binance_spot_mini_updates: Number(health?.binance_spot_ticker_shared_ws?.accepted_updates || 0),
-      binance_spot_book_messages: Number(health?.binance_spot_book_ticker_shared_ws?.messages || 0),
-      binance_spot_book_updates: Number(health?.binance_spot_book_ticker_shared_ws?.accepted_updates || 0),
-      binance_contract_book_messages: Number(health?.binance_contract_all_book_ticker?.messages || 0),
-      binance_contract_book_updates: Number(health?.binance_contract_all_book_ticker?.accepted_updates || 0),
-    };
-  };
   internalState = (url) => {
     const scope = String(url?.searchParams?.get('scope') || 'parent');
     const health = module.getMarketLightSnapshotHealth();
@@ -316,84 +295,6 @@ if (ROLE === 'market-light') {
 } else {
   throw new Error(`unsupported_isolated_collector_role:${ROLE}`);
 }
-
-// Step1073 V102: temporary bounded role profiler. It observes only this
-// isolated collector's event-loop utilization after boot; it does not change
-// scanners, intervals, upstream requests, persistence, routing, or cache data.
-// Sampling auto-stops after ~3 minutes so normal production logging/egress is
-// unchanged outside the diagnostic window.
-const RUNTIME_PROFILE_INTERVAL_MS = 5_000;
-const RUNTIME_PROFILE_MAX_SAMPLES = 36;
-let runtimeProfileSamples = 0;
-let runtimeProfilePreviousElu = performance.eventLoopUtilization();
-let runtimeProfilePreviousCpu = process.cpuUsage();
-let runtimeProfilePreviousAt = performance.now();
-let runtimeProfilePreviousExtra = runtimeProfileExtra ? runtimeProfileExtra() : null;
-const runtimeProfileTimer = setInterval(() => {
-  try {
-    const now = performance.now();
-    const elu = performance.eventLoopUtilization(runtimeProfilePreviousElu);
-    runtimeProfilePreviousElu = performance.eventLoopUtilization();
-    const cpu = process.cpuUsage(runtimeProfilePreviousCpu);
-    runtimeProfilePreviousCpu = process.cpuUsage();
-    const wallUs = Math.max(1, (now - runtimeProfilePreviousAt) * 1000);
-    runtimeProfilePreviousAt = now;
-    const memory = process.memoryUsage();
-    const currentExtra = runtimeProfileExtra ? runtimeProfileExtra() : null;
-    const extraDelta = currentExtra && runtimeProfilePreviousExtra
-      ? Object.fromEntries(
-          Object.entries(currentExtra)
-            .filter(([key, value]) =>
-              key !== 'running' &&
-              key !== 'round' &&
-              Number.isFinite(Number(value)) &&
-              Number.isFinite(Number(runtimeProfilePreviousExtra?.[key]))
-            )
-            .map(([key, value]) => [`${key}_delta`, Number(value) - Number(runtimeProfilePreviousExtra[key])])
-        )
-      : null;
-    const roundDelta = currentExtra && runtimeProfilePreviousExtra
-      ? Number(currentExtra.round || 0) - Number(runtimeProfilePreviousExtra.round || 0)
-      : null;
-    runtimeProfilePreviousExtra = currentExtra;
-    runtimeProfileSamples += 1;
-    console.log('[Step1073 V102 runtime-profiler] ' + JSON.stringify({
-      collector_role: ROLE,
-      runtime: isMainThread ? 'child_process' : 'worker_thread',
-      pid: process.pid,
-      thread_id: isMainThread ? null : threadId,
-      sample: runtimeProfileSamples,
-      interval_ms: RUNTIME_PROFILE_INTERVAL_MS,
-      event_loop_utilization_pct: Number((Number(elu?.utilization || 0) * 100).toFixed(2)),
-      event_loop_active_ms: Number(Number(elu?.active || 0).toFixed(2)),
-      event_loop_idle_ms: Number(Number(elu?.idle || 0).toFixed(2)),
-      child_process_cpu_pct: isMainThread
-        ? Number((((Number(cpu?.user || 0) + Number(cpu?.system || 0)) / wallUs) * 100).toFixed(2))
-        : null,
-      rss_mb: Math.round(memory.rss / 1048576),
-      heap_used_mb: Math.round(memory.heapUsed / 1048576),
-      market_light: currentExtra ? {
-        ...currentExtra,
-        round_delta: roundDelta,
-        ...(extraDelta || {}),
-      } : null,
-      timestamp_ms: Date.now(),
-    }));
-  } catch (error) {
-    console.log('[Step1073 V102 runtime-profiler] ' + JSON.stringify({
-      collector_role: ROLE,
-      runtime: isMainThread ? 'child_process' : 'worker_thread',
-      sample: runtimeProfileSamples + 1,
-      error: String(error?.message || error).slice(0, 240),
-      timestamp_ms: Date.now(),
-    }));
-    runtimeProfileSamples += 1;
-  }
-  if (runtimeProfileSamples >= RUNTIME_PROFILE_MAX_SAMPLES) {
-    clearInterval(runtimeProfileTimer);
-  }
-}, RUNTIME_PROFILE_INTERVAL_MS);
-runtimeProfileTimer.unref?.();
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
