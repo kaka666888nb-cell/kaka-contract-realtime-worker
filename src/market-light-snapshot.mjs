@@ -3,7 +3,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.3.5';
+const STEP_VERSION = '650.8.15.197.3.3.6.3.6';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -144,11 +144,11 @@ const BINANCE_SPOT_RECONNECT_MAX_MS = Math.max(BINANCE_SPOT_RECONNECT_MIN_MS, Nu
 // coverage if the live USDT universe ever exceeds that documented bound.
 const BINANCE_SPOT_BOOK_TICKER_WS_URL = 'wss://data-stream.binance.vision:443/stream';
 const BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS = Math.max(1, Math.min(1024, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS || 1024)));
-// Step1073 V102.2: full-USDT bookTicker produced several thousand JSON messages/sec
+// Step1073 V102.9: full-USDT bookTicker produced several thousand JSON messages/sec
 // while ordinary list pages only need miniTicker price/change. Keep one shared backend
-// connection but bound BBO subscriptions to a fixed core + recent global exact focus.
+// connection but make BBO subscriptions focus-only; idle mode subscribes zero symbols.
 // User reads only register focus in memory; the fixed 5s scheduler performs subscription
-// reconciliation. Detail first-paint still has the existing shared-depth Top1 fallback.
+// reconciliation. Detail first-paint keeps the existing shared-depth Top1 fallback.
 const BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX = Math.max(
   16,
   Math.min(
@@ -157,9 +157,7 @@ const BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX = Math.max(
     Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX || 24),
   ),
 );
-const BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS = Object.freeze([
-  'BTCUSDT','ETHUSDT',
-]);
+const BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS = Object.freeze([]);
 const BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS = Math.max(250, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS || 750));
 const BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS || 2_000));
 const BINANCE_SPOT_BOOK_TICKER_RECONNECT_MAX_MS = Math.max(BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_RECONNECT_MAX_MS || 30_000));
@@ -4723,7 +4721,7 @@ export function getMarketLightSnapshotHealth() {
       note: 'collector budget only; shared caches/governors may reduce physical upstream calls further',
     },
     full_market_light_source_notes: {
-      binance_spot: 'one official data-stream.binance.vision !miniTicker@arr shared stream bootstraps live USDT identities and 24h price/volume, plus one fixed backend multi-symbol <symbol>@bookTicker websocket with bounded core+recent-focus subscriptions for real-time best bid/ask; user reads start neither connection nor subscription reconciliation; missing BBO keeps the existing shared-depth Top1 fallback; optional data-api ticker/24hr baseline stays disabled by default',
+      binance_spot: 'one official data-stream.binance.vision !miniTicker@arr shared stream bootstraps live USDT identities and 24h price/volume, plus one fixed backend multi-symbol <symbol>@bookTicker websocket with focus-only subscriptions for real-time best bid/ask; idle mode subscribes zero BBO streams; user reads start neither connection nor subscription reconciliation; missing BBO keeps the existing shared-depth Top1 fallback; optional data-api ticker/24hr baseline stays disabled by default',
       binance_contract: 'existing_all_market_ticker_plus_mark_price_shared snapshot; official USDⓈ-M !bookTicker is focus-activated by the fixed backend scheduler, while idle mode keeps the 10m all-symbol WS-API BBO baseline',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
@@ -4841,7 +4839,8 @@ export function getMarketLightSnapshotHealth() {
       documented_stream_cap_per_connection: BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS,
       active_stream_hard_cap: BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX,
       fixed_core_symbols: BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS,
-      focus_source: 'bounded_recent_global_watchlist_focus_reconciled_by_fixed_background_scheduler',
+      focus_source: 'focus_only_recent_global_watchlist_reconciled_by_fixed_background_scheduler',
+      idle_subscribed_streams_target: 0,
       full_usdt_universe_bbo_subscribed: false,
       shared_depth_top1_fallback_preserved: true,
       user_reads_start_subscription_messages: false,
