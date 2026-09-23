@@ -538,7 +538,13 @@ const server = http.createServer(async (req, res) => {
       error: String(error?.message || error),
       onchain_market: null,
     }));
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    // Step1073 V102.5.1: keep headers unsent until the final health body reaches
+    // the outer egress guard. The Step1042 wrapper can still append its health
+    // marker first, then the existing guard safely gzip-negotiates the complete
+    // JSON without changing any decompressed fields.
+    res.statusCode = 200;
+    res.setHeader('content-type', 'application/json; charset=utf-8');
+    res.setHeader('cache-control', 'no-store');
     res.end(JSON.stringify({
       ok: true,
       service: 'kaka-contract-realtime-worker',
