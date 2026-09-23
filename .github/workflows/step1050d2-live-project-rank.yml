@@ -1,12 +1,7 @@
 name: Step1050D.2 live project Top3000 rank
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/market-light-snapshot.mjs'
-      - 'src/proxy.mjs'
-      - '.github/workflows/step1050d2-live-project-rank.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

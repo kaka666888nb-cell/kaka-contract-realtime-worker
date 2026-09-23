@@ -1,12 +1,7 @@
 name: Step1049.2 live cross-chain search pool units
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/onchain-market.mjs'
-      - 'src/proxy.mjs'
-      - '.github/workflows/step1049_2-live-search-pool-units.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

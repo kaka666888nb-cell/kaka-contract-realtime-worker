@@ -1,12 +1,7 @@
 name: Step1050B live Top3000 market-cap rank
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/market-light-snapshot.mjs'
-      - 'src/proxy.mjs'
-      - '.github/workflows/step1050b-live-market-cap-rank.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

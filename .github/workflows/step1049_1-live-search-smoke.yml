@@ -1,12 +1,7 @@
 name: Step1049.1 live onchain search smoke
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/onchain-market.mjs'
-      - 'src/proxy.mjs'
-      - '.github/workflows/step1049_1-live-search-smoke.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

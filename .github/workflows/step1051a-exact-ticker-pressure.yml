@@ -1,12 +1,7 @@
 name: Step1051A exact ticker shared pressure
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/collector-isolation.mjs'
-      - 'src/proxy.mjs'
-      - '.github/workflows/step1051a-exact-ticker-pressure.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
