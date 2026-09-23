@@ -1,5 +1,6 @@
 import { handleMarketApi, fetchMarketKlines, resolveNativeMarketIdentity } from './market-rest.mjs';
 import http from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { WebSocketServer, WebSocket } from 'ws';
 import { installProviderGovernorFetch, getProviderGovernorHealth } from './provider-request-governor.mjs';
 import { getBybitSecondHistoryHealth, handleBybitSecondHistoryInternal, startBybitSecondHistoryHotSeeds } from './bybit-second-history.mjs';
@@ -1432,8 +1433,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url?.startsWith('/health')) {
-    res.writeHead(200, {'content-type':'application/json'});
-    res.end(JSON.stringify({
+    const healthBody = Buffer.from(JSON.stringify({
       ok: true,
       version: '650.8.15.70.2',
       protocol: 'kaka.market.realtime.v1',
@@ -1463,6 +1463,29 @@ const server = http.createServer(async (req, res) => {
       provider_request_governor: getProviderGovernorHealth(),
       time: new Date().toISOString(),
     }));
+    const acceptsGzip = /(?:^|,)\s*gzip\s*(?:,|$)/i.test(
+      String(req.headers?.['accept-encoding'] || ''),
+    );
+    let healthSent = healthBody;
+    const headers = {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    };
+    // Step1073 V102.5: preserve the full health contract byte-for-byte after
+    // decompression, but stop paying raw-JSON egress for high-frequency health
+    // clients that explicitly advertise gzip support.
+    if (acceptsGzip && healthBody.length >= 512) {
+      try {
+        healthSent = gzipSync(healthBody, { level: 4 });
+        headers['content-encoding'] = 'gzip';
+        headers.vary = 'Accept-Encoding';
+      } catch (_) {
+        healthSent = healthBody;
+      }
+    }
+    headers['content-length'] = String(healthSent.length);
+    res.writeHead(200, headers);
+    res.end(healthSent);
     return;
   }
   if (req.url?.startsWith('/diagnose') || req.url?.startsWith('/browser-test')) {
