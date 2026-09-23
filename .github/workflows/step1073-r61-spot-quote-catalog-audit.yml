@@ -1,0 +1,51 @@
+name: Step1073 R61 spot quote catalog audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify six-provider shared spot quote catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          curl --compressed -fsS --connect-timeout 8 --max-time 35             "$BASE/api/spot-quote-catalog" -o /tmp/quotes.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/quotes.json','r',encoding='utf-8'))
+          assert p.get('ok') is True, p
+          assert p.get('schema') == 'step1073_r61_spot_quote_catalog_v1', p
+          assert p.get('read_only_shared') is True, p
+          assert p.get('reads_scale_with_users') is False, p
+          providers=p.get('providers') or []
+          names={str(x.get('provider') or '') for x in providers}
+          expected={'binance','okx','bybit','bitget','gate','coinbase'}
+          assert names == expected, (names, expected)
+          rows=p.get('rows') or []
+          assert rows, p
+          assert int(p.get('total_quote_assets') or 0) == len(rows), p
+          byq={str(x.get('quote_asset') or ''):x for x in rows}
+          for q in ('USDT','USDC','USD'):
+              assert q in byq, q
+          print('PASS provider_count=',len(providers),
+                'total_products=',p.get('total_products'),
+                'total_quote_assets=',len(rows))
+          print('GLOBAL_QUOTES')
+          for x in rows:
+              print(x.get('quote_asset'),
+                    'products=',x.get('product_count'),
+                    'providers=',x.get('provider_count'),
+                    json.dumps(x.get('providers') or {},sort_keys=True))
+          print('PROVIDER_QUOTES')
+          for x in sorted(providers,key=lambda y:y.get('provider','')):
+              print(x.get('provider'),
+                    'products=',x.get('product_count'),
+                    'quotes=',','.join(q.get('quote_asset','') for q in (x.get('quotes') or [])))
+          PY

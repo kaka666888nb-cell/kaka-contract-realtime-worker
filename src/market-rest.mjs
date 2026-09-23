@@ -4522,6 +4522,89 @@ async function assetQuoteSummary(rawBase) {
   );
 }
 
+async function spotQuoteCatalog() {
+  return await sharedMarketResult(
+    'spot_quote_catalog:v1',
+    15 * 60_000,
+    async () => {
+      const providerGroups = await Promise.all(
+        SPOT_PROVIDER_LIST.map(async (provider) => {
+          try {
+            return [provider, await universeCatalog(provider, 'spot')];
+          } catch (_) {
+            return [provider, []];
+          }
+        }),
+      );
+
+      const totals = new Map();
+      const providers = [];
+      let totalProducts = 0;
+
+      for (const [provider, rows] of providerGroups) {
+        const quoteCounts = new Map();
+        for (const item of rows) {
+          const quote = String(item?.quote_asset || '').trim().toUpperCase();
+          if (!quote) continue;
+          quoteCounts.set(quote, Number(quoteCounts.get(quote) || 0) + 1);
+        }
+
+        const quotes = [...quoteCounts.entries()]
+          .map(([quote_asset, product_count]) => ({
+            quote_asset,
+            product_count,
+          }))
+          .sort((a, b) =>
+            (b.product_count - a.product_count) ||
+            a.quote_asset.localeCompare(b.quote_asset)
+          );
+
+        providers.push({
+          provider,
+          product_count: rows.length,
+          quote_asset_count: quotes.length,
+          quotes,
+        });
+        totalProducts += rows.length;
+
+        for (const row of quotes) {
+          const current = totals.get(row.quote_asset) || {
+            quote_asset: row.quote_asset,
+            product_count: 0,
+            provider_count: 0,
+            providers: {},
+          };
+          current.product_count += row.product_count;
+          current.provider_count += 1;
+          current.providers[provider] = row.product_count;
+          totals.set(row.quote_asset, current);
+        }
+      }
+
+      const rows = [...totals.values()].sort((a, b) =>
+        (b.product_count - a.product_count) ||
+        (b.provider_count - a.provider_count) ||
+        a.quote_asset.localeCompare(b.quote_asset)
+      );
+
+      return {
+        ok: true,
+        schema: 'step1073_r61_spot_quote_catalog_v1',
+        source: 'six_spot_official_public_catalogs_shared',
+        provider_count: providers.length,
+        total_products: totalProducts,
+        total_quote_assets: rows.length,
+        rows,
+        providers,
+        read_only_shared: true,
+        reads_scale_with_users: false,
+        user_read_may_refresh_shared_catalog: true,
+        built_at: new Date().toISOString(),
+      };
+    },
+  );
+}
+
 async function binanceAssetQuoteSummary(rawBase) {
   // Backward-compatible route. Step657 App uses the all-provider route.
   return assetQuoteSummary(rawBase);
@@ -4949,6 +5032,7 @@ export function getBinanceMarketRestHealth() {
 const OWNED_MARKET_API_PATHS = new Set([
   '/api/binance-asset-quotes',
   '/api/asset-quote-summary',
+  '/api/spot-quote-catalog',
   '/api/contract-quote-self-test',
   '/api/market-unit-self-test',
   '/api/universe',
@@ -5107,6 +5191,11 @@ export async function handleMarketApi(req, res, url) {
         binance_coin_m_usd_enabled: false,
         cached_at: new Date().toISOString(),
       });
+      return true;
+    }
+    if (url.pathname === '/api/spot-quote-catalog') {
+      const payload = await spotQuoteCatalog();
+      send(res, 200, payload);
       return true;
     }
     if (url.pathname === '/api/binance-asset-quotes') {
