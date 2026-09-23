@@ -798,9 +798,18 @@ function compact(raw) {
 // ticker, native WebSocket symbol and 1-second history pagination.
 // Order matters: longest USD/EUR suffixes must precede USD/EUR.
 const SUPPORTED_EXACT_QUOTE_ASSETS = Object.freeze([
-  'FDUSD', 'PYUSD', 'USDT', 'USDC', 'USD1', 'TUSD', 'BUSD', 'EURC',
+  // Step1073 R62: parser superset = all 37 currently active official spot
+  // quote assets across Binance/OKX/Bybit/Bitget/Gate/Coinbase plus the
+  // previously supported historical/compatibility quote identities. Longest
+  // suffixes stay first; one-letter U must stay last.
+  'FDUSD', 'PYUSD', 'RLUSD',
+  'USDT', 'USDC', 'USD1', 'TUSD', 'BUSD', 'EURC', 'USDE', 'USDS',
+  'GUSD', 'XUSD', 'EURI',
   'DAI', 'USD', 'BTC', 'BNB', 'ETH', 'EUR', 'GBP', 'JPY', 'KRW',
   'TRY', 'BRL', 'AUD', 'CAD', 'SGD', 'HKD', 'CHF', 'MXN', 'PLN',
+  'IDR', 'AED', 'THB', 'SOL', 'ARS', 'INR', 'COP', 'KZT', 'UAH',
+  'VND', 'XRP', 'ZAR',
+  'U',
 ]);
 function split(symbol) {
   for (const quote of SUPPORTED_EXACT_QUOTE_ASSETS) {
@@ -4587,13 +4596,20 @@ async function spotQuoteCatalog() {
         a.quote_asset.localeCompare(b.quote_asset)
       );
 
+      const unsupportedQuoteAssets = rows
+        .map((row) => row.quote_asset)
+        .filter((quote) => !SUPPORTED_EXACT_QUOTE_ASSETS.includes(quote));
+
       return {
         ok: true,
-        schema: 'step1073_r61_spot_quote_catalog_v1',
+        schema: 'step1073_r62_spot_quote_catalog_v2',
         source: 'six_spot_official_public_catalogs_shared',
         provider_count: providers.length,
         total_products: totalProducts,
         total_quote_assets: rows.length,
+        parser_supported_quote_assets: SUPPORTED_EXACT_QUOTE_ASSETS.length,
+        unsupported_quote_assets: unsupportedQuoteAssets,
+        parser_covers_current_catalog: unsupportedQuoteAssets.length === 0,
         rows,
         providers,
         read_only_shared: true,

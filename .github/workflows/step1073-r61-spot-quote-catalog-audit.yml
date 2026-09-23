@@ -21,9 +21,11 @@ jobs:
           import json
           p=json.load(open('/tmp/quotes.json','r',encoding='utf-8'))
           assert p.get('ok') is True, p
-          assert p.get('schema') == 'step1073_r61_spot_quote_catalog_v1', p
+          assert p.get('schema') == 'step1073_r62_spot_quote_catalog_v2', p
           assert p.get('read_only_shared') is True, p
           assert p.get('reads_scale_with_users') is False, p
+          assert p.get('parser_covers_current_catalog') is True, p
+          assert (p.get('unsupported_quote_assets') or []) == [], p
           providers=p.get('providers') or []
           names={str(x.get('provider') or '') for x in providers}
           expected={'binance','okx','bybit','bitget','gate','coinbase'}
