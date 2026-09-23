@@ -9,7 +9,7 @@ const PORT = Number(workerData?.port || process.env.KAKA_ISOLATED_COLLECTOR_PORT
 process.env.KAKA_ISOLATED_COLLECTOR_ROLE = ROLE;
 process.env.KAKA_ISOLATED_COLLECTOR_PORT = String(PORT);
 if (workerData?.disable_binance_rest === true) process.env.KAKA_DISABLE_BINANCE_REST = '1';
-const VERSION = '650.8.15.192.1';
+const VERSION = '650.8.15.192.2';
 
 if (!ROLE || !PORT) {
   throw new Error('isolated_collector_role_and_port_required');
@@ -31,12 +31,28 @@ function sendJson(res, status, payload) {
 let handleRoleRoute = null;
 let internalState = null;
 let roleVersion = null;
+let runtimeProfileExtra = null;
 
 if (ROLE === 'market-light') {
   const module = await import('./market-light-snapshot.mjs');
   module.startMarketLightSnapshotScanner();
   roleVersion = module.getMarketLightSnapshotHealth().version || null;
   handleRoleRoute = module.handleMarketLightSnapshot;
+  runtimeProfileExtra = () => {
+    const health = module.getMarketLightSnapshotHealth();
+    return {
+      round: Number(health?.round || 0),
+      running: health?.running === true,
+      coinbase_messages: Number(health?.coinbase_ticker_batch?.messages || 0),
+      coinbase_updates: Number(health?.coinbase_ticker_batch?.ticker_updates || 0),
+      binance_spot_mini_messages: Number(health?.binance_spot_ticker_shared_ws?.messages || 0),
+      binance_spot_mini_updates: Number(health?.binance_spot_ticker_shared_ws?.accepted_updates || 0),
+      binance_spot_book_messages: Number(health?.binance_spot_book_ticker_shared_ws?.messages || 0),
+      binance_spot_book_updates: Number(health?.binance_spot_book_ticker_shared_ws?.accepted_updates || 0),
+      binance_contract_book_messages: Number(health?.binance_contract_all_book_ticker?.messages || 0),
+      binance_contract_book_updates: Number(health?.binance_contract_all_book_ticker?.accepted_updates || 0),
+    };
+  };
   internalState = (url) => {
     const scope = String(url?.searchParams?.get('scope') || 'parent');
     const health = module.getMarketLightSnapshotHealth();
@@ -308,6 +324,7 @@ let runtimeProfileSamples = 0;
 let runtimeProfilePreviousElu = performance.eventLoopUtilization();
 let runtimeProfilePreviousCpu = process.cpuUsage();
 let runtimeProfilePreviousAt = performance.now();
+let runtimeProfilePreviousExtra = runtimeProfileExtra ? runtimeProfileExtra() : null;
 const runtimeProfileTimer = setInterval(() => {
   try {
     const now = performance.now();
@@ -318,6 +335,23 @@ const runtimeProfileTimer = setInterval(() => {
     const wallUs = Math.max(1, (now - runtimeProfilePreviousAt) * 1000);
     runtimeProfilePreviousAt = now;
     const memory = process.memoryUsage();
+    const currentExtra = runtimeProfileExtra ? runtimeProfileExtra() : null;
+    const extraDelta = currentExtra && runtimeProfilePreviousExtra
+      ? Object.fromEntries(
+          Object.entries(currentExtra)
+            .filter(([key, value]) =>
+              key !== 'running' &&
+              key !== 'round' &&
+              Number.isFinite(Number(value)) &&
+              Number.isFinite(Number(runtimeProfilePreviousExtra?.[key]))
+            )
+            .map(([key, value]) => [`${key}_delta`, Number(value) - Number(runtimeProfilePreviousExtra[key])])
+        )
+      : null;
+    const roundDelta = currentExtra && runtimeProfilePreviousExtra
+      ? Number(currentExtra.round || 0) - Number(runtimeProfilePreviousExtra.round || 0)
+      : null;
+    runtimeProfilePreviousExtra = currentExtra;
     runtimeProfileSamples += 1;
     console.log('[Step1073 V102 runtime-profiler] ' + JSON.stringify({
       collector_role: ROLE,
@@ -334,6 +368,11 @@ const runtimeProfileTimer = setInterval(() => {
         : null,
       rss_mb: Math.round(memory.rss / 1048576),
       heap_used_mb: Math.round(memory.heapUsed / 1048576),
+      market_light: currentExtra ? {
+        ...currentExtra,
+        round_delta: roundDelta,
+        ...(extraDelta || {}),
+      } : null,
       timestamp_ms: Date.now(),
     }));
   } catch (error) {
