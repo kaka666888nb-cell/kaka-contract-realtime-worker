@@ -71,8 +71,35 @@ jobs:
                     'quotes=',','.join(q.get('quote_asset','') for q in (x.get('quotes') or [])))
           PY
 
+          curl --compressed -fsS --connect-timeout 8 --max-time 20 \
+            "$BASE/api/asset-quote-summary?base=BTC" -o /tmp/btc-quotes.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/btc-quotes.json','r',encoding='utf-8'))
+          assert p.get('ok') is True, p
+          assert p.get('base_asset') == 'BTC', p
+          rows={str(x.get('quote_asset') or ''):x for x in (p.get('rows') or [])}
+          assert 'FDUSD' in rows, rows
+          fd=rows['FDUSD']
+          providers=fd.get('providers') or {}
+          spot={k for k,v in providers.items() if int((v or {}).get('spot_count') or 0)>0}
+          assert spot == {'binance'}, fd
+          assert int(fd.get('spot_count') or 0) >= 1, fd
+          print('PASS BTC asset quote summary',
+                'quotes=',len(rows),
+                'FDUSD_spot_providers=',sorted(spot),
+                'RLUSD_spot_providers=',sorted(
+                  k for k,v in (rows.get('RLUSD',{}).get('providers') or {}).items()
+                  if int((v or {}).get('spot_count') or 0)>0
+                ),
+                'USDS_spot_providers=',sorted(
+                  k for k,v in (rows.get('USDS',{}).get('providers') or {}).items()
+                  if int((v or {}).get('spot_count') or 0)>0
+                ))
+          PY
+
           ready=0
-          for i in $(seq 1 30); do
+          for i in $(seq 1 120); do
             curl --compressed -fsS --connect-timeout 8 --max-time 20 \
               "$BASE/api/market-light/watchlist-tickers?items=spot%7Cbinance%7CBTCFDUSD" \
               -o /tmp/fdusd.json
