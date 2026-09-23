@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'src/market-rest.mjs'
+      - 'src/market-light-snapshot.mjs'
       - '.github/workflows/step1073-r61-spot-quote-catalog-audit.yml'
   workflow_dispatch:
 
@@ -69,3 +70,41 @@ jobs:
                     'products=',x.get('product_count'),
                     'quotes=',','.join(q.get('quote_asset','') for q in (x.get('quotes') or [])))
           PY
+
+          ready=0
+          for i in $(seq 1 30); do
+            curl --compressed -fsS --connect-timeout 8 --max-time 20 \
+              "$BASE/api/market-light/watchlist-tickers?items=spot%7Cbinance%7CBTCFDUSD" \
+              -o /tmp/fdusd.json
+            if python3 - <<'PY'
+          import json,sys
+          p=json.load(open('/tmp/fdusd.json','r',encoding='utf-8'))
+          assert p.get('ok') is True, p
+          assert p.get('binance_spot_non_usdt_focus_shared_ws') is True, p
+          assert int(p.get('user_read_upstream_requests') or 0) == 0, p
+          assert p.get('reads_scale_with_users') is False, p
+          items=p.get('items') or []
+          assert len(items)==1, p
+          item=items[0]
+          if item.get('ready') is not True or not isinstance(item.get('row'),dict):
+              sys.exit(2)
+          row=item['row']
+          assert item.get('provider')=='binance', item
+          assert item.get('market_type')=='spot', item
+          assert item.get('symbol')=='BTCFDUSD', item
+          assert row.get('symbol')=='BTCFDUSD', row
+          assert float(row.get('last_price') or row.get('price') or 0) > 0, row
+          assert row.get('reads_scale_with_users') is False, row
+          assert int(row.get('user_upstream_requests') or 0) == 0, row
+          print('PASS non_usdt_shared_exact_ticker BTCFDUSD',
+                'source=',row.get('watchlist_realtime_source') or row.get('source'),
+                'price=',row.get('last_price') or row.get('price'))
+          PY
+            then
+              ready=1
+              break
+            fi
+            echo "BTCFDUSD shared focus not ready poll=$i"
+            sleep 1
+          done
+          test "$ready" = 1

@@ -397,6 +397,7 @@ const binanceSpotTicker = {
   connectAttempts: 0,
   messages: 0,
   acceptedUpdates: 0,
+  focusedNonUsdtUpdates: 0,
   ignoredNonUsdtUpdates: 0,
   ignoredUnknownSymbols: 0,
   streamBootstrapNewRows: 0,
@@ -1737,6 +1738,54 @@ function refreshBinanceSpotStreamDerivedDirectory() {
   return rows;
 }
 
+function binanceSpotFocusedMiniTickerRow(raw, observedAt = new Date().toISOString()) {
+  if (!raw || typeof raw !== 'object') return null;
+  const rawSymbol = String(raw.s ?? raw.symbol ?? '').trim().toUpperCase();
+  // The exact-market stack is intentionally ASCII today. Keep the same
+  // fail-closed identity rule as R64 and never compact a Unicode symbol into
+  // a quote-only fake identity.
+  if (!/^[A-Z0-9]+$/.test(rawSymbol)) return null;
+  const symbol = compact(rawSymbol);
+  if (!symbol || symbol.endsWith('USDT')) return null;
+  const key = watchlistTickerIdentityKey('spot', 'binance', symbol);
+  if (!key || !watchlistTickerFocus.has(key)) return null;
+
+  const last = positive(raw.c ?? raw.lastPrice);
+  if (last == null) return null;
+  const open = positive(raw.o ?? raw.openPrice);
+  const sourceTime = isoMs(raw.E ?? raw.closeTime) || observedAt;
+  const baseVolume = finite(raw.v ?? raw.volume);
+  const quoteVolume = finite(raw.q ?? raw.quoteVolume);
+
+  return {
+    provider: 'binance',
+    market_type: 'spot',
+    symbol,
+    raw_symbol: symbol,
+    native_symbol: symbol,
+    last_price: last,
+    price: last,
+    price_change_percent_24h:
+      open != null && open > 0 ? ((last - open) / open) * 100 : null,
+    price_change_percent_24h_source:
+      open != null ? 'derived_from_binance_official_miniticker_close_open' : null,
+    volume_24h: baseVolume,
+    base_volume_24h: baseVolume,
+    quote_volume_24h: quoteVolume,
+    high_24h: finite(raw.h ?? raw.highPrice),
+    low_24h: finite(raw.l ?? raw.lowPrice),
+    source: 'binance_spot_official_miniticker_focus_shared_websocket',
+    transport: 'backend_shared_existing_miniticker_focus',
+    source_time: sourceTime,
+    cached_at: sourceTime,
+    backend_shared: true,
+    read_only_shared: true,
+    user_upstream_requests: 0,
+    user_upstream_connections: 0,
+    reads_scale_with_users: false,
+  };
+}
+
 function binanceSpotMiniTickerPatch(raw, existing) {
   if (!raw || typeof raw !== 'object' || !existing) return null;
   const symbol = compact(raw.s ?? raw.symbol);
@@ -1920,9 +1969,26 @@ async function openBinanceSpotMiniTicker() {
         binanceSpotTicker.lastMessageAt = Date.now();
         let discoveredNewSymbol = false;
         for (const item of items) {
-          const symbol = compact(item?.s ?? item?.symbol);
-          if (!symbol || !symbol.endsWith('USDT')) {
-            binanceSpotTicker.ignoredNonUsdtUpdates += 1;
+          const rawSymbol = String(item?.s ?? item?.symbol ?? '').trim().toUpperCase();
+          const symbol = compact(rawSymbol);
+          if (!symbol) {
+            binanceSpotTicker.ignoredUnknownSymbols += 1;
+            continue;
+          }
+          if (!symbol.endsWith('USDT')) {
+            const focused = binanceSpotFocusedMiniTickerRow(item);
+            if (focused) {
+              const key = watchlistTickerIdentityKey('spot', 'binance', symbol);
+              watchlistTickerRows.set(key, {
+                ...focused,
+                watchlist_realtime_source: 'binance_spot_shared_miniticker_non_usdt_focus',
+                watchlist_realtime_price_semantics: 'official_last_trade_miniticker',
+              });
+              binanceSpotTicker.focusedNonUsdtUpdates += 1;
+              binanceSpotTicker.acceptedUpdates += 1;
+            } else {
+              binanceSpotTicker.ignoredNonUsdtUpdates += 1;
+            }
             continue;
           }
           const existing = binanceSpotTicker.rows.get(symbol);
@@ -3977,16 +4043,25 @@ function baseWatchlistTickerRow(spec) {
 
 function liveWatchlistTickerPatch(spec) {
   if (spec.provider === 'binance' && spec.market === 'spot') {
-    const row = binanceSpotTicker.rows.get(spec.symbol);
+    const primary = binanceSpotTicker.rows.get(spec.symbol);
+    const focused = watchlistTickerRows.get(spec.key);
+    const row = primary || focused;
     if (!row) return null;
     const bid = positive(row.best_bid ?? row.bid_price);
     const ask = positive(row.best_ask ?? row.ask_price);
+    const nonUsdt = !spec.symbol.endsWith('USDT');
     return {
       ...row,
-      watchlist_realtime_source: bid != null && ask != null
-        ? 'binance_spot_shared_miniticker_plus_bookticker_websockets'
-        : 'binance_spot_shared_miniticker_websocket_waiting_bookticker_bbo',
+      watchlist_realtime_source: nonUsdt
+        ? 'binance_spot_shared_miniticker_non_usdt_focus'
+        : (bid != null && ask != null
+          ? 'binance_spot_shared_miniticker_plus_bookticker_websockets'
+          : 'binance_spot_shared_miniticker_websocket_waiting_bookticker_bbo'),
       watchlist_realtime_bbo_ready: bid != null && ask != null && ask >= bid,
+      read_only_shared: true,
+      user_upstream_requests: 0,
+      user_upstream_connections: 0,
+      reads_scale_with_users: false,
     };
   }
   if (spec.provider === 'binance' && spec.market === 'contract') {
@@ -4148,6 +4223,7 @@ function watchlistTickerPayload(specs) {
     reads_scale_with_users: false,
     fixed_background_focus_refresh: true,
     binance_spot_shared_stream: true,
+    binance_spot_non_usdt_focus_shared_ws: true,
     binance_spot_shared_book_ticker_stream: true,
     binance_spot_book_ticker_active_stream_hard_cap: BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX,
     binance_spot_book_ticker_fixed_background_focus_sync: true,
@@ -4797,6 +4873,7 @@ export function getMarketLightSnapshotHealth() {
       connect_attempts: binanceSpotTicker.connectAttempts,
       messages: binanceSpotTicker.messages,
       accepted_updates: binanceSpotTicker.acceptedUpdates,
+      focused_non_usdt_updates: binanceSpotTicker.focusedNonUsdtUpdates,
       ignored_non_usdt_updates: binanceSpotTicker.ignoredNonUsdtUpdates,
       ignored_unknown_symbols: binanceSpotTicker.ignoredUnknownSymbols,
       stream_bootstrap_new_rows: binanceSpotTicker.streamBootstrapNewRows,
