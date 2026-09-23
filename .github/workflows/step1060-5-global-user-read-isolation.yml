@@ -1,18 +1,6 @@
 name: Step1060.5 global user-read isolation gate
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/market-light-snapshot.mjs'
-      - 'src/stock-catalog-v2.mjs'
-      - 'src/kline-asset-rank.mjs'
-      - 'src/onchain-market.mjs'
-      - 'src/social-watch.mjs'
-      - 'src/airdrop-watch.mjs'
-      - 'src/render-egress-cost-guard.mjs'
-      - 'src/render-supabase-egress-proxy.mjs'
-      - '.github/workflows/step1060-5-global-user-read-isolation.yml'
   workflow_dispatch:
 
 permissions:

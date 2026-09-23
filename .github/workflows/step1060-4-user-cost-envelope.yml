@@ -1,12 +1,6 @@
 name: Step1060.4 real user egress cost envelope
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/render-egress-cost-guard.mjs'
-      - 'src/render-supabase-egress-proxy.mjs'
-      - '.github/workflows/step1060-4-user-cost-envelope.yml'
   workflow_dispatch:
 
 permissions:

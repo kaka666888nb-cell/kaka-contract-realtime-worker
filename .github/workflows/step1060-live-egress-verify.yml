@@ -1,16 +1,7 @@
 name: Step1060 live egress verify
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/render-egress-cost-guard.mjs'
-      - 'src/render-supabase-egress-proxy.mjs'
-      - 'src/step1060-render-egress-entry.mjs'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'render.yaml'
-      - '.github/workflows/step1060-live-egress-verify.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
