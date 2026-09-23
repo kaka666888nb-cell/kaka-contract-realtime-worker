@@ -2,7 +2,7 @@ import { getMarketUniverseRows, tickers as loadMarketTickers } from './market-re
 import { getBinanceContractRealtimeMeta } from './binance-contract-market.mjs';
 import { getCryptoSectorHistoryHealth, handleCryptoSectorHistory, maybeArchiveCryptoSectorSnapshot, primeCryptoSectorHistory } from './crypto-sector-history.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.6.3.1';
+const STEP_VERSION = '650.8.15.197.3.3.6.3.2';
 const SNAPSHOT_ROUTE = '/api/market-light/current-snapshot';
 const RANKED_PAGE_ROUTE = '/api/market-light/ranked-page';
 const PROJECT_RANKED_PAGE_ROUTE = '/api/market-light/project-ranked-page';
@@ -143,6 +143,23 @@ const BINANCE_SPOT_RECONNECT_MAX_MS = Math.max(BINANCE_SPOT_RECONNECT_MIN_MS, Nu
 // coverage if the live USDT universe ever exceeds that documented bound.
 const BINANCE_SPOT_BOOK_TICKER_WS_URL = 'wss://data-stream.binance.vision:443/stream';
 const BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS = Math.max(1, Math.min(1024, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS || 1024)));
+// Step1073 V102.2: full-USDT bookTicker produced several thousand JSON messages/sec
+// while ordinary list pages only need miniTicker price/change. Keep one shared backend
+// connection but bound BBO subscriptions to a fixed core + recent global exact focus.
+// User reads only register focus in memory; the fixed 5s scheduler performs subscription
+// reconciliation. Detail first-paint still has the existing shared-depth Top1 fallback.
+const BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX = Math.max(
+  16,
+  Math.min(
+    BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS,
+    256,
+    Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX || 96),
+  ),
+);
+const BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS = Object.freeze([
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','TRXUSDT',
+  'AVAXUSDT','LINKUSDT','SUIUSDT','TONUSDT','BCHUSDT','LTCUSDT','DOTUSDT','UNIUSDT',
+]);
 const BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS = Math.max(250, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_SYNC_DELAY_MS || 750));
 const BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS = Math.max(1_000, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS || 2_000));
 const BINANCE_SPOT_BOOK_TICKER_RECONNECT_MAX_MS = Math.max(BINANCE_SPOT_BOOK_TICKER_RECONNECT_MIN_MS, Number(process.env.KAKA_MARKET_LIGHT_BINANCE_SPOT_BOOK_TICKER_RECONNECT_MAX_MS || 30_000));
@@ -2033,10 +2050,43 @@ function applyBinanceSpotBookTickerPatch(patch) {
 }
 
 function desiredBinanceSpotBookTickerSymbols() {
-  return [...binanceSpotTicker.rows.keys()]
-    .map(compact)
-    .filter((symbol) => symbol.endsWith('USDT'))
-    .sort();
+  pruneWatchlistTickerFocus();
+  const available = binanceSpotTicker.rows;
+  const desired = [];
+  const seen = new Set();
+  const push = (raw) => {
+    const symbol = compact(raw);
+    if (!symbol || !symbol.endsWith('USDT') || seen.has(symbol) || !available.has(symbol)) return;
+    seen.add(symbol);
+    desired.push(symbol);
+  };
+
+  for (const symbol of BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS) push(symbol);
+
+  const recentFocus = [...watchlistTickerFocus.values()]
+    .filter((spec) => spec?.provider === 'binance' && spec?.market === 'spot')
+    .sort((a, b) => Number(b?.seen_at || 0) - Number(a?.seen_at || 0));
+  for (const spec of recentFocus) {
+    if (desired.length >= BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX) break;
+    push(spec?.symbol);
+  }
+
+  return desired.slice(0, BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX);
+}
+
+function clearBinanceSpotBookTickerBbo(symbol) {
+  const fields = [
+    'best_bid','best_ask','bid_price','ask_price','bid_quantity','ask_quantity',
+    'spread_percent','bbo_source','bbo_transport','bbo_source_time','bbo_update_id',
+    'bbo_available_in_source',
+  ];
+  const live = binanceSpotTicker.rows.get(symbol);
+  const published = binanceSpotPublishedRows.get(symbol);
+  for (const row of [live, published]) {
+    if (!row || typeof row !== 'object') continue;
+    for (const field of fields) delete row[field];
+  }
+  binanceSpotBookTicker.bboRows.delete(symbol);
 }
 
 function syncBinanceSpotBookTickerSubscriptions() {
@@ -2057,7 +2107,14 @@ function syncBinanceSpotBookTickerSubscriptions() {
         params: extras.map((symbol) => `${symbol.toLowerCase()}@bookTicker`),
         id,
       }));
-      for (const symbol of extras) binanceSpotBookTicker.subscribedSymbols.delete(symbol);
+      for (const symbol of extras) {
+        binanceSpotBookTicker.subscribedSymbols.delete(symbol);
+        clearBinanceSpotBookTickerBbo(symbol);
+      }
+      // Subscription changes are infrequent (fixed 5s focus reconciliation), so
+      // invalidate serialized full-market responses once to avoid serving stale BBO
+      // fields after a symbol leaves the bounded focus set.
+      responseCache.clear();
       binanceSpotBookTicker.unsubscribeMessages += 1;
     }
     if (missing.length) {
@@ -4000,6 +4057,9 @@ async function refreshWatchlistTickerFocus() {
 function startWatchlistTickerFocusScheduler() {
   if (watchlistTickerRefreshTimer) return;
   watchlistTickerRefreshTimer = setInterval(() => {
+    // Fixed background cadence owns Binance Spot BBO subscription reconciliation.
+    // The user-facing watchlist route only updates the in-memory bounded focus map.
+    scheduleBinanceSpotBookTickerSubscriptionSync();
     refreshWatchlistTickerFocus().catch(() => {});
   }, WATCHLIST_FOCUS_REFRESH_MS);
   watchlistTickerRefreshTimer.unref?.();
@@ -4025,7 +4085,10 @@ function watchlistTickerPayload(specs) {
     fixed_background_focus_refresh: true,
     binance_spot_shared_stream: true,
     binance_spot_shared_book_ticker_stream: true,
+    binance_spot_book_ticker_active_stream_hard_cap: BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX,
+    binance_spot_book_ticker_fixed_background_focus_sync: true,
     binance_spot_user_reads_start_connections: false,
+    binance_spot_user_reads_start_subscription_messages: false,
     binance_contract_persistent_shared_stream: true,
     coinbase_spot_shared_stream: true,
     generated_at: new Date().toISOString(),
@@ -4572,6 +4635,9 @@ export function getMarketLightSnapshotHealth() {
       binance_spot_shared_miniticker_ws_connections: 1,
       binance_spot_shared_multi_symbol_book_ticker_ws_connections: 1,
       binance_spot_book_ticker_documented_stream_cap_per_connection: BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS,
+      binance_spot_book_ticker_active_stream_hard_cap: BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX,
+      binance_spot_book_ticker_fixed_core_streams: BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS.length,
+      binance_spot_book_ticker_focus_sync_ms: WATCHLIST_FOCUS_REFRESH_MS,
       binance_spot_market_data_only_rest_baseline_requests_per_6h_max_when_explicitly_enabled: 1,
       binance_spot_market_data_only_rest_weight_per_baseline: 80,
       binance_spot_average_rest_weight_per_minute_default: 0,
@@ -4587,7 +4653,7 @@ export function getMarketLightSnapshotHealth() {
       note: 'collector budget only; shared caches/governors may reduce physical upstream calls further',
     },
     full_market_light_source_notes: {
-      binance_spot: 'one official data-stream.binance.vision !miniTicker@arr shared stream bootstraps live USDT identities and 24h price/volume, plus one fixed backend multi-symbol <symbol>@bookTicker websocket for real-time best bid/ask; user reads start neither stream and do not scale exchange connections; optional data-api ticker/24hr baseline stays disabled by default',
+      binance_spot: 'one official data-stream.binance.vision !miniTicker@arr shared stream bootstraps live USDT identities and 24h price/volume, plus one fixed backend multi-symbol <symbol>@bookTicker websocket with bounded core+recent-focus subscriptions for real-time best bid/ask; user reads start neither connection nor subscription reconciliation; missing BBO keeps the existing shared-depth Top1 fallback; optional data-api ticker/24hr baseline stays disabled by default',
       binance_contract: 'existing_all_market_ticker_plus_mark_price_shared_snapshot + official USDⓈ-M !bookTicker one shared websocket for all-symbol BBO',
       coinbase_spot: 'public_ticker_batch_shared_websocket; BBO intentionally unavailable in ticker_batch',
       okx_spot: 'official_SPOT_tickers_batch',
@@ -4703,6 +4769,13 @@ export function getMarketLightSnapshotHealth() {
       desired_symbols: binanceSpotBookTicker.desiredSymbols,
       subscribed_streams: binanceSpotBookTicker.subscribedSymbols.size,
       documented_stream_cap_per_connection: BINANCE_SPOT_BOOK_TICKER_MAX_STREAMS,
+      active_stream_hard_cap: BINANCE_SPOT_BOOK_TICKER_ACTIVE_STREAM_MAX,
+      fixed_core_symbols: BINANCE_SPOT_BOOK_TICKER_CORE_SYMBOLS,
+      focus_source: 'bounded_recent_global_watchlist_focus_reconciled_by_fixed_background_scheduler',
+      full_usdt_universe_bbo_subscribed: false,
+      shared_depth_top1_fallback_preserved: true,
+      user_reads_start_subscription_messages: false,
+      bounded_upstream_work_independent_of_unbounded_user_count: true,
       limit_exceeded_by: binanceSpotBookTicker.limitExceededBy,
       subscription_complete: binanceSpotBookTicker.limitExceededBy === 0 &&
         binanceSpotBookTicker.desiredSymbols > 0 &&
