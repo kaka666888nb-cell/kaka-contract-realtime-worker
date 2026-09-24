@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { isMainThread, threadId, workerData } from 'node:worker_threads';
 import { installProviderGovernorFetch, getProviderGovernorHealth } from './provider-request-governor.mjs';
+import { installRenderSupabaseEgressProxy, getRenderSupabaseEgressProxyHealth } from './render-supabase-egress-proxy.mjs';
 import { projectMarketLightSnapshot, scopeTargets } from './market-light-bridge-projection.mjs';
 
 const ROLE = String(workerData?.role || process.env.KAKA_ISOLATED_COLLECTOR_ROLE || '').trim();
@@ -15,6 +16,7 @@ if (!ROLE || !PORT) {
 }
 
 installProviderGovernorFetch({ role: `isolated-${ROLE}` });
+if (ROLE === 'slow-stats') installRenderSupabaseEgressProxy();
 
 function sendJson(res, status, payload) {
   if (res.headersSent) return;
@@ -281,6 +283,7 @@ if (ROLE === 'market-light') {
       heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
     },
     provider_governor: getProviderGovernorHealth(),
+    supabase_egress_proxy: getRenderSupabaseEgressProxyHealth(),
     market_light_bridge: marketBridge.getMarketLightSnapshotHealth(),
     deep_market_bridge: deepBridge.getDeepMarketBridgeHealth(),
     binance_advanced: binance.getBinanceAdvancedStatsHealth(),
