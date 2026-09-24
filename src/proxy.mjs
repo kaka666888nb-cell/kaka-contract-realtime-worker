@@ -1421,6 +1421,10 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 startCmeExpirySharedCollector();
-server.listen(PORT, '0.0.0.0', () => {
+// Step1073 R71.1: raise the kernel pending-accept queue for bursty long-lived
+// SSE/WebSocket fan-out. Node defaults this backlog to 511; 500 mixed users can
+// create ~2000 simultaneous public long-lived handshakes. This changes only
+// transport admission and does not change collectors, routes, user limits, or egress.
+server.listen(PORT, '0.0.0.0', 4096, () => {
   console.log(`[Step${STEP_VERSION}] proxy + Step1041.6.1 market-cap rank Supabase shared tokenomics reuse + Step1041.6 shared rank-before-pagination + Step1041.5.4.3.4.2.2.1 exact-pool background inflight assignment-order fix + Step1041.5.4.3.4.2.1 Binance first-real-data readiness + market-data-only Spot WS fix + Step1041.1 five-feed verified 50-hot/new-token/overview/pressure rollout-safe fix + Step1038.2.1 Solana Helius exact holders + Step1038 holder concentration/creator-owner/LP/token-security + Step1037.5 onchain shared near-realtime/metadata/ECB-FX + Step1037 exact-pool OHLCV/history/recent-trades + Step1036 recent-hot/search/pools foundation + Step1034 project protocol fundamentals shared background + Step1032.2 Binance spot shared WebSocket API detail Kline/depth/trades recovery + Step1031.2 market-light + six-venue provider-isolated shared spot + Step1026 all-asset official market ticker/orderbook/trades/rules/status/hours shared cache + persistent Binance contract market + contract flow + shared liquidation/basis/depth/flow/RPI/funding/current persistence listening on 0.0.0.0:${PORT}; legacy=${CHILD_PORT}`);
 });
