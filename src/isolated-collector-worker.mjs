@@ -16,7 +16,7 @@ if (!ROLE || !PORT) {
 }
 
 installProviderGovernorFetch({ role: `isolated-${ROLE}` });
-if (ROLE === 'slow-stats') installRenderSupabaseEgressProxy();
+if (ROLE === 'slow-stats' || ROLE === 'onchain-market') installRenderSupabaseEgressProxy();
 
 function sendJson(res, status, payload) {
   if (res.headersSent) return;
@@ -170,6 +170,7 @@ if (ROLE === 'market-light') {
       heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1048576),
     },
     provider_governor: getProviderGovernorHealth(),
+    supabase_egress_proxy: getRenderSupabaseEgressProxyHealth(),
     onchain_market: module.getOnchainMarketHealth(),
     timestamp_ms: Date.now(),
   });
