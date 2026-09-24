@@ -1,10 +1,51 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { egressHealth } from './render-egress-cost-guard.mjs';
 
-const VERSION = '1073.101.1';
-const SCHEMA = 'step1073_v101_capacity_health_v1';
+const VERSION = '1073.103.67';
+const SCHEMA = 'step1073_r67_capacity_and_egress_health_v2';
 const HEALTH_ROUTE = '/api/capacity-health';
 const RUNTIME_ID = `${process.pid}:${Date.now()}:${randomUUID()}`;
+let lastEgressSnapshot = null;
+let lastEgressAt = Date.now();
+
+function egressCounters({ marketLight = {}, overlay = {}, depth = {} } = {}) {
+  const guard = egressHealth();
+  const ws = guard?.websocket || {};
+  return {
+    market_sse_bytes: finiteNonnegative(marketLight?.downstream_bytes),
+    overlay_sse_bytes: finiteNonnegative(overlay?.downstream_bytes),
+    depth_sse_bytes: finiteNonnegative(depth?.downstream_bytes),
+    kline_ws_tunnel_bytes: finiteNonnegative(ws?.raw_tunnel_total_downstream_bytes),
+  };
+}
+
+function buildEgressLedger({ marketLight = {}, overlay = {}, depth = {} } = {}) {
+  const now = Date.now();
+  const cumulative = egressCounters({ marketLight, overlay, depth });
+  const previous = lastEgressSnapshot;
+  const intervalSeconds = Math.max(0, (now - lastEgressAt) / 1000);
+  const interval = previous
+    ? Object.fromEntries(Object.entries(cumulative).map(([key, value]) => [
+        key,
+        Math.max(0, value - finiteNonnegative(previous?.[key])),
+      ]))
+    : null;
+  const total = Object.values(cumulative).reduce((sum, value) => sum + finiteNonnegative(value), 0);
+  const intervalTotal = interval
+    ? Object.values(interval).reduce((sum, value) => sum + finiteNonnegative(value), 0)
+    : null;
+  lastEgressSnapshot = cumulative;
+  lastEgressAt = now;
+  return {
+    schema: 'step1073_r67_long_lived_egress_v1',
+    runtime_id: RUNTIME_ID,
+    interval_seconds: Number(intervalSeconds.toFixed(3)),
+    cumulative: { ...cumulative, total_long_lived_bytes: total },
+    interval: interval ? { ...interval, total_long_lived_bytes: intervalTotal } : null,
+    excludes_tls_and_render_edge_overhead: true,
+  };
+}
 
 function finiteNonnegative(value) {
   const parsed = Number(value);
@@ -203,13 +244,19 @@ export function installStep1073CapacityHealth({
         if (!response.ok || child?.ok !== true || !child?.binance_shared_ws) {
           throw new Error(`realtime_child_capacity_http_${response.status}`);
         }
+        const marketLight = getMarketLightHealth();
+        const overlay = getOverlayHealth();
+        const overlayNat = getOverlayNatHealth();
+        const depth = getDepthHealth();
         const payload = buildCapacitySnapshot({
           realtimeWs: child.binance_shared_ws,
-          marketLight: getMarketLightHealth(),
-          overlay: getOverlayHealth(),
-          overlayNat: getOverlayNatHealth(),
-          depth: getDepthHealth(),
+          marketLight,
+          overlay,
+          overlayNat,
+          depth,
         });
+        payload.egress = buildEgressLedger({ marketLight, overlay, depth });
+        console.log(`[Step1073 R67 long-lived-egress] ${JSON.stringify(payload.egress)}`);
         sendJson(res, 200, payload);
       } catch (error) {
         sendJson(res, 503, {
