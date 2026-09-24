@@ -10,6 +10,7 @@ const ALLOWED_TABLES = new Set([
   'kaka_project_fundamentals',
   'app_airdrop_events',
   'app_onchain_shared_snapshots',
+  'app_market_backend_snapshots',
 ]);
 const ALLOWED_RPCS = new Set([
   'app_upsert_market_backend_snapshots_diff',
