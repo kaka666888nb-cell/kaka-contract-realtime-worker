@@ -1,4 +1,4 @@
-name: Step1073 R71 distributed 500-user Render load
+name: Step1073 R72 overlay explicit-close probe
 
 on:
   push:
@@ -11,199 +11,56 @@ permissions:
   contents: read
 
 jobs:
-  shard:
-    strategy:
-      fail-fast: false
-      max-parallel: 20
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Install load-test clients
-        run: |
-          python3 -m pip install --disable-pip-version-check --no-cache-dir aiohttp==3.10.11 websockets==13.1
-
-      - name: Run 25-user mixed shard for distributed 500
-        env:
-          SHARD: ${{ matrix.shard }}
-          COMMIT_TS: '${{ github.event.head_commit.timestamp }}'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import asyncio, aiohttp, websockets, json, os, time, urllib.parse
-
-          BASE='https://kaka-contract-realtime-worker.onrender.com'
-          WSS='wss://kaka-contract-realtime-worker.onrender.com'
-          shard=int(os.environ['SHARD'])
-          users=50 if shard<4 else 25
-          duration=30.0
-
-          exact_specs=[
-            'spot|binance|BTCUSDT','spot|okx|ETHUSDT','spot|bybit|SOLUSDT','spot|bitget|BTCUSDT','spot|gate|ETHUSDT',
-            'contract|binance|BTCUSDT','contract|okx|ETHUSDT','contract|bybit|SOLUSDT','contract|bitget|BTCUSDT','contract|gate|ETHUSDT',
-          ]
-          depth_specs=[
-            ('binance','spot','BTCUSDT'),('okx','spot','ETHUSDT'),('bybit','spot','SOLUSDT'),('bitget','spot','BTCUSDT'),('gate','spot','ETHUSDT'),
-            ('binance','contract','BTCUSDT'),('okx','contract','ETHUSDT'),('bybit','contract','SOLUSDT'),('bitget','contract','BTCUSDT'),('gate','contract','ETHUSDT'),
-          ]
-          kline_specs=[
-            ('spot','BTCUSDT'),('spot','ETHUSDT'),('spot','SOLUSDT'),('contract','BTCUSDT'),('contract','ETHUSDT'),
-            ('spot','BTCUSDT'),('spot','ETHUSDT'),('spot','SOLUSDT'),('contract','BTCUSDT'),('contract','ETHUSDT'),
-          ]
-
-          async def sse(session,url):
-            last={'ok':False,'status':0,'bytes':0,'chunks':0,'error':'not_started','attempts':0}
-            for attempt in range(3):
-              started=time.monotonic()
-              status=0; total=0; chunks=0; err=''
-              try:
-                timeout=aiohttp.ClientTimeout(total=duration+12,connect=10,sock_read=duration+5)
-                async with session.get(url,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'},timeout=timeout) as r:
-                  status=r.status
-                  if status!=200:
-                    err=(await r.text())[:200]
-                  else:
-                    deadline=started+duration
-                    while time.monotonic()<deadline:
-                      remaining=deadline-time.monotonic()
-                      try:
-                        chunk=await asyncio.wait_for(r.content.readany(),timeout=max(0.05,min(1.0,remaining)))
-                      except asyncio.TimeoutError:
-                        continue
-                      if not chunk:
-                        break
-                      total+=len(chunk); chunks+=1
-              except Exception as e:
-                err=f'{type(e).__name__}:{e}'[:250]
-              last={'ok':status==200 and total>0 and not err,'status':status,'bytes':total,'chunks':chunks,'error':err,'attempts':attempt+1}
-              if last['ok']:
-                return last
-              await asyncio.sleep(0.35*(attempt+1))
-            return last
-
-          async def ws(url):
-            last={'ok':False,'opened':False,'messages':0,'bytes':0,'error':'not_started','attempts':0}
-            for attempt in range(3):
-              opened=False; messages=0; total=0; err=''
-              started=time.monotonic()
-              try:
-                async with websockets.connect(url,open_timeout=10,close_timeout=3,ping_interval=15,ping_timeout=8,max_size=2**22) as sock:
-                  opened=True
-                  deadline=started+duration
-                  while time.monotonic()<deadline:
-                    try:
-                      msg=await asyncio.wait_for(sock.recv(),timeout=max(0.1,min(3,deadline-time.monotonic())))
-                      messages+=1
-                      total+=len(msg.encode() if isinstance(msg,str) else msg)
-                    except asyncio.TimeoutError:
-                      continue
-              except Exception as e:
-                err=f'{type(e).__name__}:{e}'[:250]
-              last={'ok':opened and messages>0 and not err,'opened':opened,'messages':messages,'bytes':total,'error':err,'attempts':attempt+1}
-              if last['ok']:
-                return last
-              await asyncio.sleep(0.35*(attempt+1))
-            return last
-
-          async def one_user(session,local_index):
-            # Simulate organic arrivals rather than 2,000 handshakes in the same instant.
-            await asyncio.sleep(local_index * 0.20 + shard * 0.05)
-            global_index=(shard*50 if shard<4 else 200+(shard-4)*25)+local_index
-            spec=exact_specs[global_index%len(exact_specs)]
-            dp,dm,ds=depth_specs[global_index%len(depth_specs)]
-            km,ks=kline_specs[global_index%len(kline_specs)]
-            market=f"{BASE}/api/market-light/watchlist-stream?items={urllib.parse.quote(spec,safe='')}"
-            overlay=f"{BASE}/api/overlay/watchlist-stream?items={urllib.parse.quote(spec,safe='')}"
-            depth=f"{BASE}/api/contract-depth/stream?provider={dp}&market_type={dm}&view=orderbook&symbol={ds}&limit=20"
-            kline=f"{WSS}/ws?provider=binance&market={km}&symbol={ks}&interval=15m"
-            a,b,c,d=await asyncio.gather(sse(session,market),sse(session,overlay),sse(session,depth),ws(kline))
-            return {'index':global_index,'market':a,'overlay':b,'depth':c,'kline':d}
-
-          async def main():
-            import datetime
-            raw_ts=os.environ.get('COMMIT_TS','').strip()
-            target=0.0
-            if raw_ts:
-              target=datetime.datetime.fromisoformat(raw_ts.replace('Z','+00:00')).timestamp()+180.0
-            wait=max(0.0,target-time.time())
-            if wait>0:
-              await asyncio.sleep(wait)
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0,ttl_dns_cache=60)) as session:
-              async with session.get('https://api.ipify.org?format=json',timeout=10) as r:
-                public_ip=(await r.json())['ip']
-              started=time.time()
-              rows=await asyncio.gather(*(one_user(session,i) for i in range(users)))
-              finished=time.time()
-            summary={
-              'shard':shard,
-              'public_ip':public_ip,
-              'users':users,
-              'started_at_epoch':started,
-              'finished_at_epoch':finished,
-              'duration_seconds':finished-started,
-              'market_ok':sum(1 for x in rows if x['market']['ok']),
-              'overlay_ok':sum(1 for x in rows if x['overlay']['ok']),
-              'depth_ok':sum(1 for x in rows if x['depth']['ok']),
-              'kline_ok':sum(1 for x in rows if x['kline']['ok']),
-              'market_bytes':sum(x['market']['bytes'] for x in rows),
-              'overlay_bytes':sum(x['overlay']['bytes'] for x in rows),
-              'depth_bytes':sum(x['depth']['bytes'] for x in rows),
-              'kline_bytes':sum(x['kline']['bytes'] for x in rows),
-              'failures':[x for x in rows if not (x['market']['ok'] and x['overlay']['ok'] and x['depth']['ok'] and x['kline']['ok'])],
-            }
-            print(json.dumps(summary,separators=(',',':')))
-            with open(f"summary-{shard}.json","w") as f:
-              json.dump(summary,f)
-            assert summary['market_ok']==users, summary
-            assert summary['overlay_ok']==users, summary
-            assert summary['depth_ok']==users, summary
-            assert summary['kline_ok']==users, summary
-
-          asyncio.run(main())
-          PY
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: step1073-r71-shard-${{ matrix.shard }}
-          path: summary-${{ matrix.shard }}.json
-          retention-days: 1
-
-  aggregate:
-    needs: shard
+  probe:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: step1073-r71-shard-*
-          path: summaries
-          merge-multiple: true
+      - name: Install aiohttp
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir aiohttp==3.10.11
 
-      - name: Require 500 successes, per-IP <=50, and overlap
+      - name: Open one overlay SSE and force-close transport
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import glob,json
-          rows=[json.load(open(p)) for p in sorted(glob.glob('summaries/summary-*.json'))]
-          assert len(rows)==16, rows
-          from collections import Counter
-          ip_counts=Counter(r['public_ip'] for r in rows)
-          ip_users=Counter()
-          for r in rows:
-            ip_users[r['public_ip']]+=r['users']
-          ips=set(ip_counts)
-          total_users=sum(r['users'] for r in rows)
-          overlap=min(r['finished_at_epoch'] for r in rows)-max(r['started_at_epoch'] for r in rows)
-          totals={k:sum(r[k] for r in rows) for k in ['market_ok','overlay_ok','depth_ok','kline_ok']}
-          out={'shards':len(rows),'unique_public_ips':sorted(ips),'ip_shards':dict(sorted(ip_counts.items())),'ip_users':dict(sorted(ip_users.items())),'max_users_per_ip':max(ip_users.values()),'total_users':total_users,'overlap_seconds':overlap,**totals,
-               'bytes':{k:sum(r[k] for r in rows) for k in ['market_bytes','overlay_bytes','depth_bytes','kline_bytes']}}
-          print(json.dumps(out,indent=2))
-          assert total_users==500,out
-          assert max(ip_users.values())<=50,out
-          assert len(ips)>=10,out
-          assert overlap>=20,out
-          assert all(totals[k]==500 for k in totals),out
+          import asyncio,aiohttp,json,time
+
+          HEALTH='https://kaka-contract-realtime-worker.onrender.com/api/overlay/watchlist-stream-health'
+          STREAM='https://kaka-contract-realtime-worker.onrender.com/api/overlay/watchlist-stream?items=spot%7Cbinance%7CBTCUSDT'
+
+          async def health(session):
+            async with session.get(HEALTH,timeout=15) as r:
+              r.raise_for_status()
+              return await r.json()
+
+          async def main():
+            connector=aiohttp.TCPConnector(limit=4,force_close=True,enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+              before=await health(session)
+              response=await session.get(STREAM,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'},timeout=aiohttp.ClientTimeout(total=None,connect=10,sock_read=10))
+              assert response.status==200,response.status
+              chunk=await asyncio.wait_for(response.content.read(4096),timeout=10)
+              assert chunk, 'no_sse_bytes'
+              accepted_mid=(await health(session))
+              response.close()
+              if response.connection and response.connection.transport:
+                response.connection.transport.abort()
+              await asyncio.sleep(3)
+              after3=await health(session)
+              await asyncio.sleep(7)
+              after10=await health(session)
+
+            out={
+              'before':{'client_count':before['client_count'],'accepted':before['accepted_connections'],'closed':before['closed_connections']},
+              'mid':{'client_count':accepted_mid['client_count'],'accepted':accepted_mid['accepted_connections'],'closed':accepted_mid['closed_connections']},
+              'after3':{'client_count':after3['client_count'],'accepted':after3['accepted_connections'],'closed':after3['closed_connections']},
+              'after10':{'client_count':after10['client_count'],'accepted':after10['accepted_connections'],'closed':after10['closed_connections']},
+            }
+            out['accepted_delta']=out['mid']['accepted']-out['before']['accepted']
+            out['closed_delta_10s']=out['after10']['closed']-out['before']['closed']
+            print(json.dumps(out,indent=2))
+            assert out['accepted_delta']==1,out
+            assert out['closed_delta_10s']>=1,out
+
+          asyncio.run(main())
           PY
