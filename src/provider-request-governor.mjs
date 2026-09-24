@@ -1,5 +1,116 @@
 const GOVERNOR_VERSION = '652.1C.2';
 const NATIVE_FETCH = globalThis.fetch.bind(globalThis);
+const STEP1073_EGRESS_SCHEMA = 'step1073_r66_fetch_attribution_v1';
+const STEP1073_EGRESS_LOG_MS = Math.max(60_000, Number(process.env.KAKA_STEP1073_EGRESS_LOG_MS || 300_000));
+const STEP1073_EGRESS_FIRST_LOG_MS = Math.max(30_000, Number(process.env.KAKA_STEP1073_EGRESS_FIRST_LOG_MS || 60_000));
+const step1073EgressHosts = new Map();
+let step1073EgressRequests = 0;
+let step1073EgressKnownBodyBytes = 0;
+let step1073EgressEstimatedHeaderBytes = 0;
+let step1073EgressTimer = null;
+let step1073EgressFirstTimer = null;
+
+function step1073BytesOf(value) {
+  if (value == null) return 0;
+  if (typeof value === 'string') return Buffer.byteLength(value);
+  if (Buffer.isBuffer(value)) return value.length;
+  if (value instanceof Uint8Array) return value.byteLength;
+  if (value instanceof ArrayBuffer) return value.byteLength;
+  if (value instanceof URLSearchParams) return Buffer.byteLength(value.toString());
+  return 0;
+}
+function step1073IsLoopback(host) {
+  const value = String(host || '').toLowerCase();
+  return value === 'localhost' || value === '::1' || value === '[::1]' ||
+    value === '127.0.0.1' || value.startsWith('127.');
+}
+function step1073HeaderBytes(headersLike) {
+  let total = 0;
+  try {
+    const headers = new Headers(headersLike || undefined);
+    headers.forEach((value, key) => {
+      total += Buffer.byteLength(String(key)) + Buffer.byteLength(String(value)) + 4;
+    });
+  } catch (_) {}
+  return total;
+}
+function recordStep1073TransportEgress(input, init = undefined) {
+  let url;
+  let method = 'GET';
+  let headers = init?.headers || null;
+  let bodyBytes = step1073BytesOf(init?.body);
+  try {
+    if (input instanceof Request) {
+      url = new URL(input.url);
+      method = String(init?.method || input.method || 'GET').toUpperCase();
+      headers = new Headers(input.headers);
+      if (init?.headers) {
+        const extra = new Headers(init.headers);
+        extra.forEach((value, key) => headers.set(key, value));
+      }
+      if (bodyBytes <= 0) {
+        const declared = Number(headers.get('content-length') || 0);
+        if (Number.isFinite(declared) && declared > 0) bodyBytes = declared;
+      }
+    } else {
+      url = new URL(String(input || ''));
+      method = String(init?.method || 'GET').toUpperCase();
+    }
+  } catch (_) { return; }
+  const host = String(url.hostname || '').toLowerCase();
+  if (!host || step1073IsLoopback(host)) return;
+  const target = `${url.pathname || '/'}${url.search || ''}`;
+  const headerBytes = step1073HeaderBytes(headers) + Buffer.byteLength(method) + Buffer.byteLength(target) + 12;
+  step1073EgressRequests += 1;
+  step1073EgressKnownBodyBytes += bodyBytes;
+  step1073EgressEstimatedHeaderBytes += headerBytes;
+  let row = step1073EgressHosts.get(host);
+  if (!row) {
+    row = { host, requests: 0, known_body_bytes: 0, estimated_header_bytes: 0, methods: {} };
+    step1073EgressHosts.set(host, row);
+  }
+  row.requests += 1;
+  row.known_body_bytes += bodyBytes;
+  row.estimated_header_bytes += headerBytes;
+  row.methods[method] = Number(row.methods[method] || 0) + 1;
+  while (step1073EgressHosts.size > 48) {
+    step1073EgressHosts.delete(step1073EgressHosts.keys().next().value);
+  }
+}
+function step1073EgressSnapshot() {
+  const rows = [...step1073EgressHosts.values()]
+    .map((row) => ({ ...row, estimated_send_bytes: row.known_body_bytes + row.estimated_header_bytes }))
+    .sort((a, b) => b.estimated_send_bytes - a.estimated_send_bytes)
+    .slice(0, 16);
+  return {
+    schema: STEP1073_EGRESS_SCHEMA,
+    role: processRole,
+    loopback_excluded: true,
+    content_values_logged: false,
+    requests: step1073EgressRequests,
+    known_body_bytes: step1073EgressKnownBodyBytes,
+    estimated_header_bytes: step1073EgressEstimatedHeaderBytes,
+    estimated_send_bytes: step1073EgressKnownBodyBytes + step1073EgressEstimatedHeaderBytes,
+    top_hosts: rows,
+  };
+}
+function emitStep1073EgressLog(reason) {
+  try {
+    console.log(`[Step1073 R66 fetch-egress] ${JSON.stringify({ reason, at: new Date().toISOString(), ...step1073EgressSnapshot() })}`);
+  } catch (_) {}
+}
+function startStep1073EgressLogs() {
+  if (step1073EgressTimer) return;
+  step1073EgressFirstTimer = setTimeout(() => emitStep1073EgressLog('first_window'), STEP1073_EGRESS_FIRST_LOG_MS);
+  step1073EgressFirstTimer.unref?.();
+  step1073EgressTimer = setInterval(() => emitStep1073EgressLog('interval'), STEP1073_EGRESS_LOG_MS);
+  step1073EgressTimer.unref?.();
+}
+function step1073NativeFetch(input, init = undefined) {
+  recordStep1073TransportEgress(input, init);
+  return NATIVE_FETCH(input, init);
+}
+
 const GLOBAL_MAX_ACTIVE = 6;
 const UNSUPPORTED_TTL_MS = 15 * 60_000;
 const MAX_UNSUPPORTED_ENTRIES = 500;
@@ -357,7 +468,7 @@ async function executeTask(state, task) {
     timeout.unref?.();
     let response;
     try {
-      response = await NATIVE_FETCH(task.url, {
+      response = await step1073NativeFetch(task.url, {
         method: task.method,
         headers: task.headers,
         redirect: task.redirect,
@@ -414,9 +525,9 @@ async function executeTask(state, task) {
 async function governedFetch(input, init = undefined) {
   let request;
   try { request = new Request(input, init); }
-  catch (_) { return NATIVE_FETCH(input, init); }
+  catch (_) { return step1073NativeFetch(input, init); }
   const provider = hostProvider(request.url);
-  if (!provider || !['GET','HEAD'].includes(request.method)) return NATIVE_FETCH(input, init);
+  if (!provider || !['GET','HEAD'].includes(request.method)) return step1073NativeFetch(input, init);
 
   const state = states.get(provider);
   state.counters.seen += 1;
@@ -495,6 +606,7 @@ export function installProviderGovernorFetch({ role = 'worker' } = {}) {
     installed = true;
   }
   processRole = String(role || processRole || 'worker');
+  startStep1073EgressLogs();
   return getProviderGovernorHealth();
 }
 
@@ -537,6 +649,7 @@ export function getProviderGovernorHealth() {
     exact_get_inflight_entries: inflight.size,
     unsupported_cache_entries: unsupportedCache.size,
     unsupported_cache_ttl_seconds: Math.round(UNSUPPORTED_TTL_MS / 1000),
+    step1073_egress_attribution: step1073EgressSnapshot(),
     providers: Object.fromEntries([...states.entries()].map(([key, state]) => [key, stateHealth(state)])),
     time: new Date().toISOString(),
   };
