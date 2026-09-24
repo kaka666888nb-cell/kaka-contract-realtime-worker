@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       max-parallel: 20
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,7 +27,7 @@ jobs:
       - name: Run 25-user mixed shard for distributed 500
         env:
           SHARD: ${{ matrix.shard }}
-          TARGET_EPOCH: '1790237935'
+          COMMIT_TS: '${{ github.event.head_commit.timestamp }}'
         shell: bash
         run: |
           set -euo pipefail
@@ -37,7 +37,7 @@ jobs:
           BASE='https://kaka-contract-realtime-worker.onrender.com'
           WSS='wss://kaka-contract-realtime-worker.onrender.com'
           shard=int(os.environ['SHARD'])
-          users=50 if shard==0 else 25
+          users=50 if shard<4 else 25
           duration=30.0
 
           exact_specs=[
@@ -110,7 +110,7 @@ jobs:
           async def one_user(session,local_index):
             # Simulate organic arrivals rather than 2,000 handshakes in the same instant.
             await asyncio.sleep(local_index * 0.20 + shard * 0.05)
-            global_index=(0 if shard==0 else 50+(shard-1)*25)+local_index
+            global_index=(shard*50 if shard<4 else 200+(shard-4)*25)+local_index
             spec=exact_specs[global_index%len(exact_specs)]
             dp,dm,ds=depth_specs[global_index%len(depth_specs)]
             km,ks=kline_specs[global_index%len(kline_specs)]
@@ -122,7 +122,11 @@ jobs:
             return {'index':global_index,'market':a,'overlay':b,'depth':c,'kline':d}
 
           async def main():
-            target=float(os.environ.get('TARGET_EPOCH','0') or 0)
+            import datetime
+            raw_ts=os.environ.get('COMMIT_TS','').strip()
+            target=0.0
+            if raw_ts:
+              target=datetime.datetime.fromisoformat(raw_ts.replace('Z','+00:00')).timestamp()+180.0
             wait=max(0.0,target-time.time())
             if wait>0:
               await asyncio.sleep(wait)
@@ -184,7 +188,7 @@ jobs:
           python3 - <<'PY'
           import glob,json
           rows=[json.load(open(p)) for p in sorted(glob.glob('summaries/summary-*.json'))]
-          assert len(rows)==19, rows
+          assert len(rows)==16, rows
           from collections import Counter
           ip_counts=Counter(r['public_ip'] for r in rows)
           ip_users=Counter()
