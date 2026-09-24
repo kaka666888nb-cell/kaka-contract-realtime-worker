@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { recordRenderWsTunnelConnection, recordRenderWsTunnelDownstreamBytes } from './render-egress-cost-guard.mjs';
 import { getContractFlowHealth, getContractFocusPoolHealth, getContractDeepSharedHealth, startDeepMarketBridge } from './deep-market-bridge.mjs';
 import { getContractDepthHealth, handleContractDepth } from './contract-depth.mjs';
 import { getBinanceLiquidationWsHealth, getContractLiquidationPersistenceHealth, startLiquidationBridge } from './liquidation-bridge.mjs';
@@ -1371,15 +1372,23 @@ server.on('upgrade', (req, socket, head) => {
     headers: { ...req.headers, host: `127.0.0.1:${CHILD_PORT}` },
   });
   upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    recordRenderWsTunnelConnection();
+    upstreamSocket.on('data', (chunk) => {
+      recordRenderWsTunnelDownstreamBytes(chunk?.length || 0);
+    });
     let response = `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n`;
     for (const [name, value] of Object.entries(upstreamRes.headers)) {
       if (Array.isArray(value)) for (const item of value) response += `${name}: ${item}\r\n`;
       else if (value != null) response += `${name}: ${value}\r\n`;
     }
     response += '\r\n';
+    recordRenderWsTunnelDownstreamBytes(Buffer.byteLength(response), { handshake: true });
     socket.write(response);
     if (head?.length) upstreamSocket.write(head);
-    if (upstreamHead?.length) socket.write(upstreamHead);
+    if (upstreamHead?.length) {
+      recordRenderWsTunnelDownstreamBytes(upstreamHead.length, { handshake: true });
+      socket.write(upstreamHead);
+    }
     socket.pipe(upstreamSocket).pipe(socket);
   });
   upstream.on('response', (upstreamRes) => {
