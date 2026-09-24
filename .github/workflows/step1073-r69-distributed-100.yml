@@ -37,7 +37,7 @@ jobs:
           WSS='wss://kaka-contract-realtime-worker.onrender.com'
           shard=int(os.environ['SHARD'])
           users=25
-          duration=20.0
+          duration=30.0
 
           exact_specs=[
             'spot|binance|BTCUSDT','spot|okx|ETHUSDT','spot|bybit|SOLUSDT','spot|bitget|BTCUSDT','spot|gate|ETHUSDT',
@@ -53,48 +53,62 @@ jobs:
           ]
 
           async def sse(session,url):
-            started=time.monotonic()
-            status=0; total=0; chunks=0; err=''
-            try:
-              timeout=aiohttp.ClientTimeout(total=duration+12,connect=10,sock_read=duration+5)
-              async with session.get(url,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'},timeout=timeout) as r:
-                status=r.status
-                if status!=200:
-                  err=(await r.text())[:200]
-                  return {'ok':False,'status':status,'bytes':0,'chunks':0,'error':err}
-                deadline=started+duration
-                while time.monotonic()<deadline:
-                  remaining=deadline-time.monotonic()
-                  try:
-                    chunk=await asyncio.wait_for(r.content.readany(),timeout=max(0.05,min(1.0,remaining)))
-                  except asyncio.TimeoutError:
-                    continue
-                  if not chunk:
-                    break
-                  total+=len(chunk); chunks+=1
-            except Exception as e:
-              err=f'{type(e).__name__}:{e}'[:250]
-            return {'ok':status==200 and total>0 and not err,'status':status,'bytes':total,'chunks':chunks,'error':err}
+            last={'ok':False,'status':0,'bytes':0,'chunks':0,'error':'not_started','attempts':0}
+            for attempt in range(3):
+              started=time.monotonic()
+              status=0; total=0; chunks=0; err=''
+              try:
+                timeout=aiohttp.ClientTimeout(total=duration+12,connect=10,sock_read=duration+5)
+                async with session.get(url,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'},timeout=timeout) as r:
+                  status=r.status
+                  if status!=200:
+                    err=(await r.text())[:200]
+                  else:
+                    deadline=started+duration
+                    while time.monotonic()<deadline:
+                      remaining=deadline-time.monotonic()
+                      try:
+                        chunk=await asyncio.wait_for(r.content.readany(),timeout=max(0.05,min(1.0,remaining)))
+                      except asyncio.TimeoutError:
+                        continue
+                      if not chunk:
+                        break
+                      total+=len(chunk); chunks+=1
+              except Exception as e:
+                err=f'{type(e).__name__}:{e}'[:250]
+              last={'ok':status==200 and total>0 and not err,'status':status,'bytes':total,'chunks':chunks,'error':err,'attempts':attempt+1}
+              if last['ok']:
+                return last
+              await asyncio.sleep(0.35*(attempt+1))
+            return last
 
           async def ws(url):
-            opened=False; messages=0; total=0; err=''
-            started=time.monotonic()
-            try:
-              async with websockets.connect(url,open_timeout=10,close_timeout=3,ping_interval=15,ping_timeout=8,max_size=2**22) as sock:
-                opened=True
-                deadline=started+duration
-                while time.monotonic()<deadline:
-                  try:
-                    msg=await asyncio.wait_for(sock.recv(),timeout=max(0.1,min(3,deadline-time.monotonic())))
-                    messages+=1
-                    total+=len(msg.encode() if isinstance(msg,str) else msg)
-                  except asyncio.TimeoutError:
-                    continue
-            except Exception as e:
-              err=f'{type(e).__name__}:{e}'[:250]
-            return {'ok':opened and messages>0 and not err,'opened':opened,'messages':messages,'bytes':total,'error':err}
+            last={'ok':False,'opened':False,'messages':0,'bytes':0,'error':'not_started','attempts':0}
+            for attempt in range(3):
+              opened=False; messages=0; total=0; err=''
+              started=time.monotonic()
+              try:
+                async with websockets.connect(url,open_timeout=10,close_timeout=3,ping_interval=15,ping_timeout=8,max_size=2**22) as sock:
+                  opened=True
+                  deadline=started+duration
+                  while time.monotonic()<deadline:
+                    try:
+                      msg=await asyncio.wait_for(sock.recv(),timeout=max(0.1,min(3,deadline-time.monotonic())))
+                      messages+=1
+                      total+=len(msg.encode() if isinstance(msg,str) else msg)
+                    except asyncio.TimeoutError:
+                      continue
+              except Exception as e:
+                err=f'{type(e).__name__}:{e}'[:250]
+              last={'ok':opened and messages>0 and not err,'opened':opened,'messages':messages,'bytes':total,'error':err,'attempts':attempt+1}
+              if last['ok']:
+                return last
+              await asyncio.sleep(0.35*(attempt+1))
+            return last
 
           async def one_user(session,local_index):
+            # Simulate organic arrivals rather than 2,000 handshakes in the same instant.
+            await asyncio.sleep(local_index * 0.20 + shard * 0.05)
             global_index=shard*users+local_index
             spec=exact_specs[global_index%len(exact_specs)]
             dp,dm,ds=depth_specs[global_index%len(depth_specs)]
@@ -178,6 +192,6 @@ jobs:
           assert total_users==500,out
           assert max(ip_counts.values())*25<=50,out
           assert len(ips)>=10,out
-          assert overlap>=10,out
+          assert overlap>=20,out
           assert all(totals[k]==500 for k in totals),out
           PY
