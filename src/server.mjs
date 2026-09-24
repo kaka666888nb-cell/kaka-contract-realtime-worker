@@ -11,7 +11,11 @@ const PROVIDERS = new Set(['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gat
 const SPOT_PROVIDERS = ['binance', 'coinbase', 'okx', 'bybit', 'bitget', 'gate'];
 const CONTRACT_PROVIDERS = ['binance', 'okx', 'bybit', 'bitget', 'gate'];
 const VALID_INTERVALS = new Set(['timeline','1s','1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1d','3d','1w','1M']);
-// Step1073 R66: install the provider governor first, then wrap it with the\n// Supabase large-write gzip proxy. The old order let the governor overwrite\n// global fetch and bypass the child-process compression path entirely.\ninstallProviderGovernorFetch({ role: 'realtime-child-rest-fallback' });\ninstallRenderSupabaseEgressProxy();
+// Step1073 R66: install the provider governor first, then wrap it with the
+// Supabase large-write gzip proxy. The old order let the governor overwrite
+// global fetch and bypass the child-process compression path entirely.
+installProviderGovernorFetch({ role: 'realtime-child-rest-fallback' });
+installRenderSupabaseEgressProxy();
 
 function providerKey(raw) {
   const value = String(raw || '').trim().toLowerCase().replaceAll('gate.io', 'gate');
