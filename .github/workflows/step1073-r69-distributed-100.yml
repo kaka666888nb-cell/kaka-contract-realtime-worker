@@ -1,4 +1,4 @@
-name: Step1073 R69 distributed 100-user Render load
+name: Step1073 R71 distributed 500-user Render load
 
 on:
   push:
@@ -14,8 +14,9 @@ jobs:
   shard:
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -23,7 +24,7 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check --no-cache-dir aiohttp==3.10.11 websockets==13.1
 
-      - name: Run 25-user mixed shard
+      - name: Run 25-user mixed shard for distributed 500
         env:
           SHARD: ${{ matrix.shard }}
         shell: bash
@@ -142,7 +143,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: step1073-r69-shard-${{ matrix.shard }}
+          name: step1073-r71-shard-${{ matrix.shard }}
           path: summary-${{ matrix.shard }}.json
           retention-days: 1
 
@@ -153,27 +154,30 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: step1073-r69-shard-*
+          pattern: step1073-r71-shard-*
           path: summaries
           merge-multiple: true
 
-      - name: Require 100 successes, 4 real egress IPs, and overlap
+      - name: Require 500 successes, per-IP <=50, and overlap
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import glob,json
           rows=[json.load(open(p)) for p in sorted(glob.glob('summaries/summary-*.json'))]
-          assert len(rows)==4, rows
-          ips={r['public_ip'] for r in rows}
+          assert len(rows)==20, rows
+          from collections import Counter
+          ip_counts=Counter(r['public_ip'] for r in rows)
+          ips=set(ip_counts)
           total_users=sum(r['users'] for r in rows)
           overlap=min(r['finished_at_epoch'] for r in rows)-max(r['started_at_epoch'] for r in rows)
           totals={k:sum(r[k] for r in rows) for k in ['market_ok','overlay_ok','depth_ok','kline_ok']}
-          out={'shards':len(rows),'unique_public_ips':sorted(ips),'total_users':total_users,'overlap_seconds':overlap,**totals,
+          out={'shards':len(rows),'unique_public_ips':sorted(ips),'ip_shards':dict(sorted(ip_counts.items())),'max_users_per_ip':max(ip_counts.values())*25,'total_users':total_users,'overlap_seconds':overlap,**totals,
                'bytes':{k:sum(r[k] for r in rows) for k in ['market_bytes','overlay_bytes','depth_bytes','kline_bytes']}}
           print(json.dumps(out,indent=2))
-          assert total_users==100,out
-          assert len(ips)==4,out
+          assert total_users==500,out
+          assert max(ip_counts.values())*25<=50,out
+          assert len(ips)>=10,out
           assert overlap>=10,out
-          assert all(totals[k]==100 for k in totals),out
+          assert all(totals[k]==500 for k in totals),out
           PY
