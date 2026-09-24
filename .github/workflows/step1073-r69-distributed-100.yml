@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       max-parallel: 20
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -36,7 +36,7 @@ jobs:
           BASE='https://kaka-contract-realtime-worker.onrender.com'
           WSS='wss://kaka-contract-realtime-worker.onrender.com'
           shard=int(os.environ['SHARD'])
-          users=25
+          users=50 if shard==0 else 25
           duration=30.0
 
           exact_specs=[
@@ -109,7 +109,7 @@ jobs:
           async def one_user(session,local_index):
             # Simulate organic arrivals rather than 2,000 handshakes in the same instant.
             await asyncio.sleep(local_index * 0.20 + shard * 0.05)
-            global_index=shard*users+local_index
+            global_index=(0 if shard==0 else 50+(shard-1)*25)+local_index
             spec=exact_specs[global_index%len(exact_specs)]
             dp,dm,ds=depth_specs[global_index%len(depth_specs)]
             km,ks=kline_specs[global_index%len(kline_specs)]
@@ -179,7 +179,7 @@ jobs:
           python3 - <<'PY'
           import glob,json
           rows=[json.load(open(p)) for p in sorted(glob.glob('summaries/summary-*.json'))]
-          assert len(rows)==20, rows
+          assert len(rows)==19, rows
           from collections import Counter
           ip_counts=Counter(r['public_ip'] for r in rows)
           ips=set(ip_counts)
