@@ -1,0 +1,175 @@
+name: Step1073 R69 distributed 100-user Render load
+
+on:
+  push:
+    branches:
+      - step1073-r69-distributed-100
+    paths:
+      - '.github/workflows/step1073-r69-distributed-100.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  shard:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install load-test clients
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-cache-dir aiohttp==3.10.11 websockets==13.1
+
+      - name: Run 25-user mixed shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import asyncio, aiohttp, websockets, json, os, time, urllib.parse
+
+          BASE='https://kaka-contract-realtime-worker.onrender.com'
+          WSS='wss://kaka-contract-realtime-worker.onrender.com'
+          shard=int(os.environ['SHARD'])
+          users=25
+          duration=20.0
+
+          exact_specs=[
+            'spot|binance|BTCUSDT','spot|okx|ETHUSDT','spot|bybit|SOLUSDT','spot|bitget|BTCUSDT','spot|gate|ETHUSDT',
+            'contract|binance|BTCUSDT','contract|okx|ETHUSDT','contract|bybit|SOLUSDT','contract|bitget|BTCUSDT','contract|gate|ETHUSDT',
+          ]
+          depth_specs=[
+            ('binance','spot','BTCUSDT'),('okx','spot','ETHUSDT'),('bybit','spot','SOLUSDT'),('bitget','spot','BTCUSDT'),('gate','spot','ETHUSDT'),
+            ('binance','contract','BTCUSDT'),('okx','contract','ETHUSDT'),('bybit','contract','SOLUSDT'),('bitget','contract','BTCUSDT'),('gate','contract','ETHUSDT'),
+          ]
+          kline_specs=[
+            ('spot','BTCUSDT'),('spot','ETHUSDT'),('spot','SOLUSDT'),('contract','BTCUSDT'),('contract','ETHUSDT'),
+            ('spot','BTCUSDT'),('spot','ETHUSDT'),('spot','SOLUSDT'),('contract','BTCUSDT'),('contract','ETHUSDT'),
+          ]
+
+          async def sse(session,url):
+            started=time.monotonic()
+            status=0; total=0; chunks=0; err=''
+            try:
+              timeout=aiohttp.ClientTimeout(total=duration+12,connect=10,sock_read=duration+5)
+              async with session.get(url,headers={'Accept':'text/event-stream','Cache-Control':'no-cache'},timeout=timeout) as r:
+                status=r.status
+                if status!=200:
+                  err=(await r.text())[:200]
+                  return {'ok':False,'status':status,'bytes':0,'chunks':0,'error':err}
+                deadline=started+duration
+                async for chunk in r.content.iter_chunked(8192):
+                  if chunk:
+                    total+=len(chunk); chunks+=1
+                  if time.monotonic()>=deadline:
+                    break
+            except Exception as e:
+              err=f'{type(e).__name__}:{e}'[:250]
+            return {'ok':status==200 and total>0 and not err,'status':status,'bytes':total,'chunks':chunks,'error':err}
+
+          async def ws(url):
+            opened=False; messages=0; total=0; err=''
+            started=time.monotonic()
+            try:
+              async with websockets.connect(url,open_timeout=10,close_timeout=3,ping_interval=15,ping_timeout=8,max_size=2**22) as sock:
+                opened=True
+                deadline=started+duration
+                while time.monotonic()<deadline:
+                  try:
+                    msg=await asyncio.wait_for(sock.recv(),timeout=max(0.1,min(3,deadline-time.monotonic())))
+                    messages+=1
+                    total+=len(msg.encode() if isinstance(msg,str) else msg)
+                  except asyncio.TimeoutError:
+                    continue
+            except Exception as e:
+              err=f'{type(e).__name__}:{e}'[:250]
+            return {'ok':opened and messages>0 and not err,'opened':opened,'messages':messages,'bytes':total,'error':err}
+
+          async def one_user(session,local_index):
+            global_index=shard*users+local_index
+            spec=exact_specs[global_index%len(exact_specs)]
+            dp,dm,ds=depth_specs[global_index%len(depth_specs)]
+            km,ks=kline_specs[global_index%len(kline_specs)]
+            market=f"{BASE}/api/market-light/watchlist-stream?items={urllib.parse.quote(spec,safe='')}"
+            overlay=f"{BASE}/api/overlay/watchlist-stream?items={urllib.parse.quote(spec,safe='')}"
+            depth=f"{BASE}/api/contract-depth/stream?provider={dp}&market_type={dm}&view=orderbook&symbol={ds}&limit=20"
+            kline=f"{WSS}/ws?provider=binance&market={km}&symbol={ks}&interval=15m"
+            a,b,c,d=await asyncio.gather(sse(session,market),sse(session,overlay),sse(session,depth),ws(kline))
+            return {'index':global_index,'market':a,'overlay':b,'depth':c,'kline':d}
+
+          async def main():
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0,ttl_dns_cache=60)) as session:
+              async with session.get('https://api.ipify.org?format=json',timeout=10) as r:
+                public_ip=(await r.json())['ip']
+              started=time.time()
+              rows=await asyncio.gather(*(one_user(session,i) for i in range(users)))
+              finished=time.time()
+            summary={
+              'shard':shard,
+              'public_ip':public_ip,
+              'users':users,
+              'started_at_epoch':started,
+              'finished_at_epoch':finished,
+              'duration_seconds':finished-started,
+              'market_ok':sum(1 for x in rows if x['market']['ok']),
+              'overlay_ok':sum(1 for x in rows if x['overlay']['ok']),
+              'depth_ok':sum(1 for x in rows if x['depth']['ok']),
+              'kline_ok':sum(1 for x in rows if x['kline']['ok']),
+              'market_bytes':sum(x['market']['bytes'] for x in rows),
+              'overlay_bytes':sum(x['overlay']['bytes'] for x in rows),
+              'depth_bytes':sum(x['depth']['bytes'] for x in rows),
+              'kline_bytes':sum(x['kline']['bytes'] for x in rows),
+              'failures':[x for x in rows if not (x['market']['ok'] and x['overlay']['ok'] and x['depth']['ok'] and x['kline']['ok'])],
+            }
+            print(json.dumps(summary,separators=(',',':')))
+            with open(f"summary-{shard}.json","w") as f:
+              json.dump(summary,f)
+            assert summary['market_ok']==users, summary
+            assert summary['overlay_ok']==users, summary
+            assert summary['depth_ok']==users, summary
+            assert summary['kline_ok']==users, summary
+
+          asyncio.run(main())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: step1073-r69-shard-${{ matrix.shard }}
+          path: summary-${{ matrix.shard }}.json
+          retention-days: 1
+
+  aggregate:
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: step1073-r69-shard-*
+          path: summaries
+          merge-multiple: true
+
+      - name: Require 100 successes, 4 real egress IPs, and overlap
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob,json
+          rows=[json.load(open(p)) for p in sorted(glob.glob('summaries/summary-*.json'))]
+          assert len(rows)==4, rows
+          ips={r['public_ip'] for r in rows}
+          total_users=sum(r['users'] for r in rows)
+          overlap=min(r['finished_at_epoch'] for r in rows)-max(r['started_at_epoch'] for r in rows)
+          totals={k:sum(r[k] for r in rows) for k in ['market_ok','overlay_ok','depth_ok','kline_ok']}
+          out={'shards':len(rows),'unique_public_ips':sorted(ips),'total_users':total_users,'overlap_seconds':overlap,**totals,
+               'bytes':{k:sum(r[k] for r in rows) for k in ['market_bytes','overlay_bytes','depth_bytes','kline_bytes']}}
+          print(json.dumps(out,indent=2))
+          assert total_users==100,out
+          assert len(ips)==4,out
+          assert overlap>=10,out
+          assert all(totals[k]==100 for k in totals),out
+          PY
