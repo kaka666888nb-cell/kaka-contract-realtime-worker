@@ -27,6 +27,7 @@ jobs:
       - name: Run 25-user mixed shard for distributed 500
         env:
           SHARD: ${{ matrix.shard }}
+          TARGET_EPOCH: '1790237935'
         shell: bash
         run: |
           set -euo pipefail
@@ -121,6 +122,10 @@ jobs:
             return {'index':global_index,'market':a,'overlay':b,'depth':c,'kline':d}
 
           async def main():
+            target=float(os.environ.get('TARGET_EPOCH','0') or 0)
+            wait=max(0.0,target-time.time())
+            if wait>0:
+              await asyncio.sleep(wait)
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0,ttl_dns_cache=60)) as session:
               async with session.get('https://api.ipify.org?format=json',timeout=10) as r:
                 public_ip=(await r.json())['ip']
@@ -182,15 +187,18 @@ jobs:
           assert len(rows)==19, rows
           from collections import Counter
           ip_counts=Counter(r['public_ip'] for r in rows)
+          ip_users=Counter()
+          for r in rows:
+            ip_users[r['public_ip']]+=r['users']
           ips=set(ip_counts)
           total_users=sum(r['users'] for r in rows)
           overlap=min(r['finished_at_epoch'] for r in rows)-max(r['started_at_epoch'] for r in rows)
           totals={k:sum(r[k] for r in rows) for k in ['market_ok','overlay_ok','depth_ok','kline_ok']}
-          out={'shards':len(rows),'unique_public_ips':sorted(ips),'ip_shards':dict(sorted(ip_counts.items())),'max_users_per_ip':max(ip_counts.values())*25,'total_users':total_users,'overlap_seconds':overlap,**totals,
+          out={'shards':len(rows),'unique_public_ips':sorted(ips),'ip_shards':dict(sorted(ip_counts.items())),'ip_users':dict(sorted(ip_users.items())),'max_users_per_ip':max(ip_users.values()),'total_users':total_users,'overlap_seconds':overlap,**totals,
                'bytes':{k:sum(r[k] for r in rows) for k in ['market_bytes','overlay_bytes','depth_bytes','kline_bytes']}}
           print(json.dumps(out,indent=2))
           assert total_users==500,out
-          assert max(ip_counts.values())*25<=50,out
+          assert max(ip_users.values())<=50,out
           assert len(ips)>=10,out
           assert overlap>=20,out
           assert all(totals[k]==500 for k in totals),out
