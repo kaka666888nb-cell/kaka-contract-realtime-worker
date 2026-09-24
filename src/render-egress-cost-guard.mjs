@@ -2,7 +2,7 @@ import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { WebSocket } from 'ws';
 
-const VERSION = '650.8.15.197.3.3.25.4';
+const VERSION = 'step1073_r67_render_egress_cost_guard_v5';
 const SCHEMA = 'step1060_render_egress_cost_guard_v1';
 const STARTED_AT = Date.now();
 const MAX_ROUTES = 192;
@@ -19,6 +19,9 @@ let httpSentBytes = 0;
 let gzipResponses = 0;
 let wsMessages = 0;
 let wsPayloadBytes = 0;
+let wsTunnelConnections = 0;
+let wsTunnelDownstreamBytes = 0;
+let wsTunnelHandshakeBytes = 0;
 let outboundRequests = 0;
 let outboundKnownBodyBytes = 0;
 let installed = false;
@@ -136,6 +139,11 @@ export function egressHealth() {
     websocket: {
       downstream_messages: wsMessages,
       downstream_payload_bytes: wsPayloadBytes,
+      raw_tunnel_connections: wsTunnelConnections,
+      raw_tunnel_downstream_bytes: wsTunnelDownstreamBytes,
+      raw_tunnel_handshake_bytes: wsTunnelHandshakeBytes,
+      raw_tunnel_total_downstream_bytes: wsTunnelDownstreamBytes + wsTunnelHandshakeBytes,
+      raw_tunnel_scope: 'parent /ws proxy bytes from realtime child to public client; excludes TLS framing',
     },
     outbound_requests: {
       requests: outboundRequests,
@@ -353,6 +361,17 @@ function installHttpMeterAndCompression() {
   }
   patchedCreateServer.__kakaEgressWrapped = true;
   http.createServer = patchedCreateServer;
+}
+
+export function recordRenderWsTunnelConnection() {
+  wsTunnelConnections += 1;
+}
+
+export function recordRenderWsTunnelDownstreamBytes(value, { handshake = false } = {}) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (!bytes) return;
+  if (handshake) wsTunnelHandshakeBytes += bytes;
+  else wsTunnelDownstreamBytes += bytes;
 }
 
 export function installRenderEgressCostGuard() {
