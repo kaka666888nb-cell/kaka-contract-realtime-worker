@@ -62,11 +62,15 @@ jobs:
                   err=(await r.text())[:200]
                   return {'ok':False,'status':status,'bytes':0,'chunks':0,'error':err}
                 deadline=started+duration
-                async for chunk in r.content.iter_chunked(8192):
-                  if chunk:
-                    total+=len(chunk); chunks+=1
-                  if time.monotonic()>=deadline:
+                while time.monotonic()<deadline:
+                  remaining=deadline-time.monotonic()
+                  try:
+                    chunk=await asyncio.wait_for(r.content.readany(),timeout=max(0.05,min(1.0,remaining)))
+                  except asyncio.TimeoutError:
+                    continue
+                  if not chunk:
                     break
+                  total+=len(chunk); chunks+=1
             except Exception as e:
               err=f'{type(e).__name__}:{e}'[:250]
             return {'ok':status==200 and total>0 and not err,'status':status,'bytes':total,'chunks':chunks,'error':err}
