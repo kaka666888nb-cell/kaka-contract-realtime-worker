@@ -32,6 +32,10 @@ const MONTHLY_VIDEO_DISABLE_WEIGHTED_MINUTES = intEnv('KAKA_RTC_MONTHLY_VIDEO_DI
 const MONTHLY_STOP_WEIGHTED_MINUTES = intEnv('KAKA_RTC_MONTHLY_STOP_WEIGHTED_MINUTES', 9500, 1, 100000000);
 const SUPABASE_URL = text(process.env.SUPABASE_URL).replace(/\/$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = text(process.env.SUPABASE_SERVICE_ROLE_KEY);
+const RTC_PUSH_DIRECT_URL = SUPABASE_URL
+  ? `${SUPABASE_URL}/functions/v1/kaka-push-dispatch`
+  : '';
+const RTC_PUSH_DIRECT_TIMEOUT_MS = 5000;
 
 const stats = {
   auth_ok: 0,
@@ -44,6 +48,9 @@ const stats = {
   status_reads: 0,
   db_errors: 0,
   last_error: '',
+  rtc_push_direct_ok: 0,
+  rtc_push_direct_failed: 0,
+  last_rtc_push_error: '',
 };
 
 function json(res, status, payload) {
@@ -188,6 +195,59 @@ async function dbRpc(name, params) {
   }
 }
 
+async function wakeRtcPushDirect(userAuthorization, callId) {
+  const auth = text(userAuthorization);
+  const id = text(callId);
+  if (!RTC_PUSH_DIRECT_URL || !/^Bearer\s+\S+/i.test(auth) || !id) {
+    stats.rtc_push_direct_failed += 1;
+    stats.last_rtc_push_error = 'direct_wake_precondition';
+    return false;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(),
+    RTC_PUSH_DIRECT_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(RTC_PUSH_DIRECT_URL, {
+      method: 'POST',
+      headers: {
+        authorization: auth,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        reason: 'rtc_create_direct',
+        rtc_call_id: id,
+      }),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    let payload = null;
+    try { payload = raw ? JSON.parse(raw) : null; } catch (_) {}
+    const ok = response.ok &&
+      payload?.ok === true &&
+      payload?.dispatch_mode === 'rtc_create_direct';
+    if (ok) {
+      stats.rtc_push_direct_ok += 1;
+      stats.last_rtc_push_error = '';
+      return true;
+    }
+    stats.rtc_push_direct_failed += 1;
+    stats.last_rtc_push_error = `direct_wake_http_${response.status}`;
+    return false;
+  } catch (error) {
+    stats.rtc_push_direct_failed += 1;
+    stats.last_rtc_push_error =
+      error?.name === 'AbortError'
+        ? 'direct_wake_timeout'
+        : 'direct_wake_network';
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function publicCall(row) {
   if (!row || typeof row !== 'object') return null;
   return {
@@ -293,6 +353,10 @@ async function handleCreate(req, res) {
     });
     if (!row) throw new Error('rtc_create_empty');
     stats.create_ok += 1;
+    // Step1077.5.11: bypass shared pg_net head-of-line blocking for ringing.
+    // This is one bounded request per real call create. It does not block the
+    // outgoing call UI, and the database pg_net + minute cron paths remain fallback.
+    void wakeRtcPushDirect(req.headers.authorization, row.id);
     return json(res, 201, {
       ok: true,
       step: STEP,
