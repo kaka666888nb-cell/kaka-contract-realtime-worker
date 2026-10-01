@@ -1,6 +1,6 @@
 import { getMarketUniverseRows } from './market-rest.mjs';
 
-const STEP_VERSION = '650.8.15.197.3.3.13';
+const STEP_VERSION = '650.8.15.197.3.3.14';
 const SUPPORTED_PROVIDERS = new Set(['binance', 'okx', 'bybit', 'bitget', 'gate']);
 const GLOBAL_FEED_PROVIDERS = new Set(['binance', 'okx', 'bitget', 'gate']);
 const FEEDS = new Map();
@@ -233,8 +233,8 @@ const bitgetLiqHistoryHealth = {
   deferred_retry_max_seconds: Math.round(BITGET_LIQ_HISTORY_RETRY_MAX_MS/1000),
   max_deferred_windows: BITGET_LIQ_HISTORY_MAX_DEFERRED_WINDOWS,
   pending_window_cleared_after_every_attempt: true,
-  amount_semantics: 'REST docs omit amount unit; normalize amount as quote-coin notional only by matching the official public liquidation WS identical symbol/side/price/amount/ts schema whose amount unit is explicitly quote coin',
-  amount_unit_source: 'REST_history_unit_not_stated; matching_official_public_liquidation_WS_identical_schema_explicitly_states_amount_unit_quote_coin',
+  amount_semantics: 'REST history amount unit is category-dependent in practice: USDT/USDC futures amount is normalized as base-coin quantity then multiplied by price; COIN futures amount remains quote-coin notional. Public WS amount semantics remain separate and unchanged.',
+  amount_unit_source: 'REST_history_docs_omit_unit; REST BTCUSDT example price~29990 amount=0.5 plus Bitget futures quantity conventions establish USDT/USDC base-coin quantity; public WS explicitly documents quote-coin amount and is handled separately',
   provider_request_governor_reused: true,
   provider_governor_transport: 'global_fetch_provider_request_governor_652.1C.2_plus_endpoint_350ms_serial_gap',
   side_semantics: 'buy=long_position_liquidation;sell=short_position_liquidation',
@@ -2077,20 +2077,43 @@ function bitgetLiquidationEventFromOfficialRow(raw, category, startMs, endMs) {
   const symbol = compactSymbol(raw?.symbol);
   const side = String(raw?.side || '').trim().toLowerCase();
   const price = positiveNumber(raw?.price);
-  const notional = positiveNumber(raw?.amount);
+  const rawAmount = positiveNumber(raw?.amount);
   const timeMs = integerValue(raw?.ts);
-  if (!symbol || !['buy','sell'].includes(side) || price == null || notional == null || timeMs < startMs || timeMs >= endMs) return null;
-  const quantity = notional / price;
-  if (!Number.isFinite(quantity) || quantity <= 0) return null;
+  const normalizedCategory = String(category || '').trim().toUpperCase();
+  if (!symbol || !['buy','sell'].includes(side) || price == null || rawAmount == null || timeMs < startMs || timeMs >= endMs) return null;
+
+  // Step1077.15.18.4.12.4:
+  // Bitget REST liquidation history uses the futures-order quantity convention,
+  // which is NOT the same as the public liquidation WS amount convention.
+  // - USDT/USDC futures: amount is base-coin quantity => quote notional = amount * price.
+  // - COIN futures: amount is quote-coin notional => base quantity = amount / price.
+  // Keep the WS parser unchanged: its official docs explicitly define amount in quote coin.
+  let quantity = null;
+  let notional = null;
+  let rawAmountUnit = '';
+  if (normalizedCategory === 'USDT-FUTURES' || normalizedCategory === 'USDC-FUTURES') {
+    quantity = rawAmount;
+    notional = rawAmount * price;
+    rawAmountUnit = 'base_asset';
+  } else if (normalizedCategory === 'COIN-FUTURES') {
+    notional = rawAmount;
+    quantity = rawAmount / price;
+    rawAmountUnit = 'quote_coin';
+  } else {
+    return null;
+  }
+
+  if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(notional) || notional <= 0) return null;
   return {
-    id: `bitget-rest-liq:${category}:${symbol}:${timeMs}:${side}:${notional}`,
+    id: `bitget-rest-liq:${normalizedCategory}:${symbol}:${timeMs}:${side}:${rawAmount}`,
     provider: 'bitget', symbol, native_symbol: String(raw?.symbol || symbol),
     time_ms: timeMs, price, quantity, notional,
     quantity_unit: 'base_asset', notional_unit: 'quote_coin',
+    raw_amount: rawAmount, raw_amount_unit: rawAmountUnit,
     liquidation_side: side === 'buy' ? 'long' : 'short',
     order_side: side,
     price_type: 'official_liquidation_history',
-    official_category: category,
+    official_category: normalizedCategory,
   };
 }
 
