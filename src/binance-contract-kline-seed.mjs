@@ -88,6 +88,11 @@ const stats = {
   live_messages: 0,
   live_closed_candles: 0,
   live_last_message_at: 0,
+  live_open_persist_skipped: 0,
+  live_open_snapshot_rows_filtered: 0,
+  live_unfinalized_detected: 0,
+  live_finality_repair_requests: 0,
+  live_finality_repair_success: 0,
   live_connect_attempts: 0,
   live_connect_rate_limiter_waits: 0,
   live_connect_window_blocks: 0,
@@ -260,9 +265,42 @@ function normalizeRows(rawRows, symbol, interval, source = 'binance_official_pub
       taker_buy_quote_volume: finite(raw.taker_buy_quote_volume) ?? null,
       source: raw.source || source,
       cached_at: raw.cached_at || iso(Date.now()),
+      ...(raw.is_closed === true || raw.is_closed === false
+        ? { is_closed: raw.is_closed }
+        : {}),
     });
   }
   return [...new Map(rows.map((row) => [row.open_time_ms, row])).values()].sort((a, b) => a.open_time_ms - b.open_time_ms);
+}
+
+function isLiveBridgeRow(row) {
+  return String(row?.source || '') === 'binance_official_public_kline_live_bridge';
+}
+
+function liveRowNeedsFinalization(row, interval, endMs = Date.now()) {
+  if (!isLiveBridgeRow(row)) return false;
+  const openMs = toMs(row?.open_time_ms ?? row?.open_time);
+  if (openMs === null) return false;
+  const nextOpenMs = shiftBucketOpenMs(openMs, interval, 1);
+  if (nextOpenMs > Number(endMs || Date.now())) return false;
+  if (row?.is_closed === true) return false;
+  if (row?.is_closed === false) return true;
+
+  // Legacy snapshots created before Step650.8.15.197.3.3.26 did not persist
+  // Binance's k.x closed flag. A live row cached before its own bucket closed
+  // is provably an in-progress snapshot and must be revalidated.
+  const cachedAtMs = Date.parse(String(row?.cached_at || ''));
+  if (!Number.isFinite(cachedAtMs)) return true;
+  return cachedAtMs < nextOpenMs;
+}
+
+function persistableSnapshotRows(rows, interval, nowMs = Date.now()) {
+  return (Array.isArray(rows) ? rows : []).filter((row) => {
+    if (!isLiveBridgeRow(row)) return true;
+    if (row?.is_closed === true) return true;
+    if (row?.is_closed === false) return false;
+    return !liveRowNeedsFinalization(row, interval, nowMs);
+  });
 }
 
 function aggregateRows(sourceRows, symbol, targetInterval) {
@@ -455,22 +493,38 @@ function inspectRecentContinuity(rows, interval, endMs, limit = MAX_PERSIST_ROWS
       : shiftBucketOpenMs(lastOpen, interval, 1);
   }
 
+  const unfinalizedLiveRows = sorted.filter(
+    (row) => liveRowNeedsFinalization(row, interval, endMs),
+  );
+  const firstUnfinalizedOpen =
+    unfinalizedLiveRows.at(0)?.open_time_ms ?? null;
+
   return {
     rows: sorted,
     row_count: sorted.length,
     gap_count: gapCount,
     missing_intervals: missingIntervals,
     first_missing_open_ms: firstMissingOpen,
+    unfinalized_live_rows: unfinalizedLiveRows.length,
+    first_unfinalized_open_ms: firstUnfinalizedOpen,
     last_open_ms: lastOpen,
     target_open_ms: targetOpen,
     lag_intervals_to_end: lagIntervals,
-    continuous_to_current: sorted.length > 0 && gapCount === 0 && (lagIntervals ?? safeLimit) <= 1,
+    continuous_to_current:
+      sorted.length > 0 &&
+      gapCount === 0 &&
+      unfinalizedLiveRows.length === 0 &&
+      (lagIntervals ?? safeLimit) <= 1,
   };
 }
 
 function bridgeStartForRecentWindow(rows, interval, endMs, limit = MAX_PERSIST_ROWS) {
   const coverage = inspectRecentContinuity(rows, interval, endMs, limit);
-  if (coverage.first_missing_open_ms != null) return coverage.first_missing_open_ms;
+  const candidates = [
+    coverage.first_missing_open_ms,
+    coverage.first_unfinalized_open_ms,
+  ].filter((value) => Number.isFinite(Number(value)));
+  if (candidates.length) return Math.min(...candidates);
   return coverage.last_open_ms != null
     ? shiftBucketOpenMs(coverage.last_open_ms, interval, 1)
     : shiftBucketOpenMs(coverage.target_open_ms, interval, -(Math.max(2, limit) - 1));
@@ -684,6 +738,7 @@ function liveRowFromPayload(payload, symbol, interval) {
     taker_buy_quote_volume: kline.Q,
     source: 'binance_official_public_kline_live_bridge',
     cached_at: iso(Date.now()),
+    is_closed: Boolean(kline.x),
   }], symbol, interval, 'binance_official_public_kline_live_bridge')[0] || null;
 }
 
@@ -716,8 +771,15 @@ function mergeLiveRow(symbol, interval, row, closed) {
   if (closed) stats.live_closed_candles += 1;
   const state = liveStreams.get(liveKey(symbol, interval));
   if (!state) return;
-  const shouldPersist = closed || Date.now() - state.lastPersistAt >= LIVE_PERSIST_MIN_MS;
-  if (shouldPersist && rows.length) {
+  // Step650.8.15.197.3.3.26:
+  // Never persist an in-progress WebSocket candle. If the shared stream goes
+  // idle before a long interval closes, a partial close must not become a
+  // historical close in Supabase. Persist only Binance-confirmed k.x=true rows.
+  if (!closed) {
+    stats.live_open_persist_skipped += 1;
+    return;
+  }
+  if (rows.length) {
     state.lastPersistAt = Date.now();
     persistRows(symbol, interval, rows, 'binance_official_public_archive_plus_current_bridge')
       .catch((error) => { stats.last_error = String(error?.message || error); });
@@ -1074,7 +1136,10 @@ async function restorePersisted(symbol, interval) {
 
 async function persistRows(symbol, interval, rows, source = 'binance_official_public_archive_kline_seed') {
   if (!supabaseEnabled() || !rows.length) return;
-  const safeRows = rows.slice(-MAX_PERSIST_ROWS);
+  const filteredRows = persistableSnapshotRows(rows, interval, Date.now());
+  stats.live_open_snapshot_rows_filtered += Math.max(0, rows.length - filteredRows.length);
+  const safeRows = filteredRows.slice(-MAX_PERSIST_ROWS);
+  if (!safeRows.length) return;
   const body = [{
     provider: PROVIDER,
     market_type: MARKET_TYPE,
@@ -1149,7 +1214,14 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
     ? inspectRecentContinuity(cached.rows, normalizedInterval, safeEnd, safeLimit)
     : null;
   stats.gap_scan_requests += cached ? 1 : 0;
-  if (cached && Date.now() - cached.loadedAt <= CACHE_TTL_MS &&
+  if ((cachedCoverage?.unfinalized_live_rows ?? 0) > 0) {
+    stats.live_unfinalized_detected += cachedCoverage.unfinalized_live_rows;
+  }
+  const cachedFinalityClean =
+    (cachedCoverage?.unfinalized_live_rows ?? 0) === 0;
+  if (cached &&
+      Date.now() - cached.loadedAt <= CACHE_TTL_MS &&
+      cachedFinalityClean &&
       (!nearNow || cachedCoverage?.continuous_to_current === true)) {
     stats.memory_hits += 1;
     if (nearNow) ensureLiveStream(normalizedSymbol, normalizedInterval);
@@ -1211,39 +1283,86 @@ export async function getBinanceContractKlineSeed({ symbol, interval = '15m', en
       }
     }
     merged = mergeRows(merged, archive).filter((row) => row.open_time_ms < safeEnd);
-    if (nearNow && normalizedInterval !== '1s') {
-      // Step650.4：不能只看最后一根是否已到当前。持久快照可能是“旧归档 + 当前实时一根”，
-      // 此时尾部很新但中间仍有大断层。扫描本次最近窗口，从第一个内部缺口开始补齐。
-      const beforeCoverage = inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit);
+    if (normalizedInterval !== '1s') {
+      // Step650.8.15.197.3.3.26:
+      // Time-bucket continuity alone is insufficient. A legacy live row may
+      // occupy the correct timestamp but contain an in-progress close that was
+      // persisted before k.x=true. Revalidate from the earliest missing OR
+      // unfinalized bucket through the exact authenticated /fapi/v1/klines relay.
+      const beforeCoverage = inspectRecentContinuity(
+        merged, normalizedInterval, safeEnd, safeLimit,
+      );
       stats.gap_scan_requests += 1;
-      const bridgeStart = bridgeStartForRecentWindow(merged, normalizedInterval, safeEnd, safeLimit);
-      const needsBridge = !beforeCoverage.continuous_to_current && bridgeStart < safeEnd;
+      if (beforeCoverage.unfinalized_live_rows > 0) {
+        stats.live_unfinalized_detected += beforeCoverage.unfinalized_live_rows;
+      }
+      const finalityRepairNeeded =
+        beforeCoverage.unfinalized_live_rows > 0;
+      const continuityRepairNeeded =
+        nearNow && !beforeCoverage.continuous_to_current;
+      const bridgeStart = bridgeStartForRecentWindow(
+        merged, normalizedInterval, safeEnd, safeLimit,
+      );
+      const needsBridge =
+        (finalityRepairNeeded || continuityRepairNeeded) &&
+        bridgeStart < safeEnd;
       if (needsBridge) {
         stats.gap_repair_requests += 1;
+        if (finalityRepairNeeded) stats.live_finality_repair_requests += 1;
         stats.gap_repair_last_start_at = bridgeStart;
-        const needed = Math.max(4, Math.min(MAX_PERSIST_ROWS, Math.ceil((safeEnd - bridgeStart) / step) + 4));
-        try { bridge = await fetchCurrentBridgeRows(normalizedSymbol, normalizedInterval, bridgeStart, safeEnd, Math.min(MAX_HTTP_PAGE_ROWS, needed), { signal, requestContext }); } catch (error) {
+        const needed = Math.max(
+          4,
+          Math.min(
+            MAX_PERSIST_ROWS,
+            Math.ceil((safeEnd - bridgeStart) / step) + 4,
+          ),
+        );
+        try {
+          bridge = await fetchCurrentBridgeRows(
+            normalizedSymbol,
+            normalizedInterval,
+            bridgeStart,
+            safeEnd,
+            Math.min(MAX_HTTP_PAGE_ROWS, needed),
+            { signal, requestContext },
+          );
+        } catch (error) {
           stats.bridge_errors += 1;
           stats.bridge_last_error = String(error?.message || error);
         }
-        merged = mergeRows(merged, bridge).filter((row) => row.open_time_ms < safeEnd);
-        const afterCoverage = inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit);
-        stats.gap_repair_remaining_gaps = afterCoverage.missing_intervals;
+        merged = mergeRows(merged, bridge)
+          .filter((row) => row.open_time_ms < safeEnd);
+        const afterCoverage = inspectRecentContinuity(
+          merged, normalizedInterval, safeEnd, safeLimit,
+        );
+        stats.gap_repair_remaining_gaps =
+          afterCoverage.missing_intervals;
+        if (finalityRepairNeeded &&
+            afterCoverage.unfinalized_live_rows === 0) {
+          stats.live_finality_repair_success += 1;
+        }
         if (afterCoverage.continuous_to_current) {
           stats.gap_repair_success += 1;
           stats.gap_repair_last_success_at = Date.now();
         }
       }
-      ensureLiveStream(normalizedSymbol, normalizedInterval);
+      if (nearNow) ensureLiveStream(normalizedSymbol, normalizedInterval);
     }
     memory.set(key, { rows: merged, loadedAt: Date.now() });
-    const finalCoverage = nearNow
-      ? inspectRecentContinuity(merged, normalizedInterval, safeEnd, safeLimit)
+    const finalCoverage = normalizedInterval !== '1s'
+      ? inspectRecentContinuity(
+          merged, normalizedInterval, safeEnd, safeLimit,
+        )
       : null;
-    // Step650.8.15.3：临近当前的快照只有在最近窗口连续时才持久化。
-    // 防止“旧归档 + 当前一根”的partial结果再次污染Supabase并在重启后反复制造同一断层。
+    // Persist only rows with proven live-candle finality. The current open
+    // live candle stays in memory/UI and is filtered out of Supabase.
     const mayPersist = archive.length || bridge.length;
-    const safeToPersist = !nearNow || finalCoverage?.continuous_to_current === true;
+    const finalityClean =
+      finalCoverage == null ||
+      finalCoverage.unfinalized_live_rows === 0;
+    const safeToPersist =
+      finalityClean &&
+      (!nearNow || finalCoverage?.continuous_to_current === true);
     if (mayPersist && safeToPersist) {
       const source = bridge.length
         ? 'binance_official_public_archive_plus_current_bridge'
@@ -1338,6 +1457,10 @@ export function getBinanceContractKlineSeedHealth() {
     monthly_bucket_anchor: 'calendar_month_00_utc',
     persisted_noncanonical_long_interval_rows_filtered: true,
     archive_long_interval_aggregation_calendar_aligned: true,
+    live_open_candles_persisted: false,
+    live_closed_flag_preserved: true,
+    legacy_live_rows_cached_before_close_revalidated: true,
+    continuity_requires_finalized_live_rows: true,
     bridge_min_request_gap_ms: getBinanceContractKlineRelayHealth().min_request_gap_ms,
     source: 'binance_archive_plus_supabase_edge_exact_kline_relay_plus_live_websocket_no_render_binance_rest',
     time: iso(Date.now()),
@@ -1355,6 +1478,8 @@ export const _test = {
   inspectRecentContinuity,
   bridgeStartForRecentWindow,
   inspectBridgeWindow,
+  liveRowNeedsFinalization,
+  persistableSnapshotRows,
   canonicalBucketOpenMs,
   canonicalBucketCloseMs,
   canonicalBucketDistance,
