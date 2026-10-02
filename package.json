@@ -1,6 +1,6 @@
 {
   "name": "kaka-contract-realtime-worker",
-  "version": "650.8.15-197.3.3.25",
+  "version": "650.8.15-197.3.3.26",
   "private": true,
   "type": "module",
   "scripts": {
@@ -25,7 +25,8 @@
     "test:step980.6.3.4": "node tests/step980_6_3_4_selftest.mjs",
     "test:step1023": "node tests/step1023_selftest.mjs",
     "test:step1024": "node tests/step1024_selftest.mjs",
-    "test:step1026.asset-market": "node tests/step1026_asset_market_selftest.mjs"
+    "test:step1026.asset-market": "node tests/step1026_asset_market_selftest.mjs",
+    "test:step1077.15.18.4.12.15.10": "node tests/step1077_15_18_4_12_15_10_kline_finality_selftest.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
