@@ -523,7 +523,7 @@ function bridgeStartForRecentWindow(rows, interval, endMs, limit = MAX_PERSIST_R
   const candidates = [
     coverage.first_missing_open_ms,
     coverage.first_unfinalized_open_ms,
-  ].filter((value) => Number.isFinite(Number(value)));
+  ].filter((value) => value != null && Number.isFinite(Number(value)));
   if (candidates.length) return Math.min(...candidates);
   return coverage.last_open_ms != null
     ? shiftBucketOpenMs(coverage.last_open_ms, interval, 1)
