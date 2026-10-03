@@ -259,11 +259,20 @@ function schedule(delayMs = TICK_MS) {
   if (stopping || !state.enabled) return;
   if (timer) clearTimeout(timer);
   timer = setTimeout(async () => {
-    try { await runOnce(); }
-    finally {
+    let tickFailed = false;
+    try {
+      await runOnce();
+    } catch (error) {
+      // Step1077.15.21.4: transient Supabase/network failures in this optional
+      // publication-translation lane must never terminate the market worker.
+      tickFailed = true;
+      state.failures++;
+      state.last_error = `publication_translation_tick:${String(error?.message || error).slice(0, 400)}`;
+      console.error(state.last_error);
+    } finally {
       if (!stopping) {
         const backlog = state.pending_official_english_titles > 0 || state.pending_official_english_short_bodies > 0 || state.pending_news_titles > 0 || state.pending_news_short_bodies > 0 || state.pending_article_titles > 0 || state.pending_article_short_bodies > 0;
-        schedule(backlog ? TICK_MS : IDLE_TICK_MS);
+        schedule(tickFailed ? IDLE_TICK_MS : (backlog ? TICK_MS : IDLE_TICK_MS));
       }
     }
   }, Math.max(5_000, delayMs));
