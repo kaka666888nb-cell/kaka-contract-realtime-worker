@@ -4,6 +4,7 @@ const STEP1073_EGRESS_SCHEMA = 'step1073_r66_fetch_attribution_v1';
 const STEP1073_EGRESS_LOG_MS = Math.max(60_000, Number(process.env.KAKA_STEP1073_EGRESS_LOG_MS || 300_000));
 const STEP1073_EGRESS_FIRST_LOG_MS = Math.max(30_000, Number(process.env.KAKA_STEP1073_EGRESS_FIRST_LOG_MS || 60_000));
 const step1073EgressHosts = new Map();
+const step1073EgressPaths = new Map();
 let step1073EgressRequests = 0;
 let step1073EgressKnownBodyBytes = 0;
 let step1073EgressEstimatedHeaderBytes = 0;
@@ -76,12 +77,34 @@ function recordStep1073TransportEgress(input, init = undefined) {
   while (step1073EgressHosts.size > 48) {
     step1073EgressHosts.delete(step1073EgressHosts.keys().next().value);
   }
+
+  // Step1077.15.21.6: privacy-safe egress attribution by host + pathname only.
+  // Query strings are intentionally excluded so symbols, IDs and user-provided
+  // parameters never enter diagnostics. This changes telemetry only.
+  const pathKey = `${host}${url.pathname || '/'}`.slice(0, 240);
+  let pathRow = step1073EgressPaths.get(pathKey);
+  if (!pathRow) {
+    pathRow = { path: pathKey, requests: 0, known_body_bytes: 0, estimated_header_bytes: 0, max_request_body_bytes: 0, methods: {} };
+    step1073EgressPaths.set(pathKey, pathRow);
+  }
+  pathRow.requests += 1;
+  pathRow.known_body_bytes += bodyBytes;
+  pathRow.estimated_header_bytes += headerBytes;
+  pathRow.max_request_body_bytes = Math.max(pathRow.max_request_body_bytes, bodyBytes);
+  pathRow.methods[method] = Number(pathRow.methods[method] || 0) + 1;
+  while (step1073EgressPaths.size > 96) {
+    step1073EgressPaths.delete(step1073EgressPaths.keys().next().value);
+  }
 }
 function step1073EgressSnapshot() {
   const rows = [...step1073EgressHosts.values()]
     .map((row) => ({ ...row, estimated_send_bytes: row.known_body_bytes + row.estimated_header_bytes }))
     .sort((a, b) => b.estimated_send_bytes - a.estimated_send_bytes)
     .slice(0, 16);
+  const paths = [...step1073EgressPaths.values()]
+    .map((row) => ({ ...row, estimated_send_bytes: row.known_body_bytes + row.estimated_header_bytes }))
+    .sort((a, b) => b.estimated_send_bytes - a.estimated_send_bytes)
+    .slice(0, 24);
   return {
     schema: STEP1073_EGRESS_SCHEMA,
     role: processRole,
@@ -92,6 +115,7 @@ function step1073EgressSnapshot() {
     estimated_header_bytes: step1073EgressEstimatedHeaderBytes,
     estimated_send_bytes: step1073EgressKnownBodyBytes + step1073EgressEstimatedHeaderBytes,
     top_hosts: rows,
+    top_paths: paths,
   };
 }
 function emitStep1073EgressLog(reason) {
