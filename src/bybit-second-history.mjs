@@ -1018,6 +1018,12 @@ export function getBybitSecondHistoryHealth() {
   };
 }
 
+function isLoopbackRequest(req) {
+  const remote = String(req?.socket?.remoteAddress || '').trim().toLowerCase();
+  return remote === '127.0.0.1' ||
+    remote === '::1' ||
+    remote === '::ffff:127.0.0.1';
+}
 export async function handleBybitSecondHistoryInternal(
   req,
   res,
@@ -1042,6 +1048,24 @@ export async function handleBybitSecondHistoryInternal(
     '/internal/bybit-second-history'
   ) {
     return false;
+  }
+
+  // Step1077.15.21.1: the parent market API bridges this route only through
+  // 127.0.0.1. Never let an external HTTP client create/renew Bybit 1-second
+  // history entries, REST seeds, WebSockets, or persistence work.
+  if (!isLoopbackRequest(req)) {
+    res.writeHead(404, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify({
+      ok: false,
+      version: VERSION,
+      error: 'not_found',
+      guard: 'bybit_second_history_internal_loopback_only',
+      rows: [],
+    }));
+    return true;
   }
 
   try {
