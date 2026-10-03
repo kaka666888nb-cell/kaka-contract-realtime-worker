@@ -1364,6 +1364,15 @@ server.keepAliveTimeout = 120_000;
 server.headersTimeout = 125_000;
 
 server.on('upgrade', (req, socket, head) => {
+  let upstreamSocketRef = null;
+  const closeTunnel = () => {
+    try { if (!socket.destroyed) socket.destroy(); } catch (_) {}
+    try { if (upstreamSocketRef && !upstreamSocketRef.destroyed) upstreamSocketRef.destroy(); } catch (_) {}
+  };
+  // Step1077.15.21.3: a peer TCP reset must never become an unhandled
+  // Socket 'error' event that terminates the whole Render process.
+  socket.on('error', closeTunnel);
+
   const upstream = http.request({
     hostname: '127.0.0.1',
     port: CHILD_PORT,
@@ -1372,6 +1381,8 @@ server.on('upgrade', (req, socket, head) => {
     headers: { ...req.headers, host: `127.0.0.1:${CHILD_PORT}` },
   });
   upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    upstreamSocketRef = upstreamSocket;
+    upstreamSocket.on('error', closeTunnel);
     recordRenderWsTunnelConnection();
     upstreamSocket.on('data', (chunk) => {
       recordRenderWsTunnelDownstreamBytes(chunk?.length || 0);
@@ -1395,7 +1406,7 @@ server.on('upgrade', (req, socket, head) => {
     socket.write(`HTTP/1.1 ${upstreamRes.statusCode || 502} ${upstreamRes.statusMessage || 'Bad Gateway'}\r\n\r\n`);
     socket.destroy();
   });
-  upstream.on('error', () => socket.destroy());
+  upstream.on('error', closeTunnel);
   upstream.end();
 });
 
